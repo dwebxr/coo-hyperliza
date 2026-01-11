@@ -1,6 +1,6 @@
 import fs from 'fs/promises'
 import path from 'path'
-import { EMOTES_LIST } from '../constants.js'
+import { EMOTES_LIST, LOCOMOTION_EMOTES } from '../constants.js'
 import { Emotes } from '../hyperfy/src/core/extras/playerEmotes.js'
 import { hashFileBuffer, getModuleDirectory } from '../utils'
 import { IAgentRuntime, logger } from '@elizaos/core'
@@ -19,6 +19,10 @@ export class EmoteManager {
   }
 
   async uploadEmotes() {
+    // Upload locomotion emotes first and update Emotes object
+    await this.uploadLocomotionEmotes();
+
+    // Upload custom emotes
     for (const emote of EMOTES_LIST) {
       try {
         const moduleDirPath = getModuleDirectory();
@@ -124,5 +128,48 @@ export class EmoteManager {
 
   private getService() {
     return this.runtime.getService<HyperfyService>(HyperfyService.serviceType);
+  }
+
+  private async uploadLocomotionEmotes() {
+    for (const emote of LOCOMOTION_EMOTES) {
+      try {
+        const moduleDirPath = getModuleDirectory();
+        const emoteBuffer = await fs.readFile(moduleDirPath + emote.path);
+        const emoteMimeType = "model/gltf-binary";
+
+        const emoteHash = await hashFileBuffer(emoteBuffer);
+        const emoteExt = emote.path.split(".").pop()?.toLowerCase() || "glb";
+        const emoteFullName = `${emoteHash}.${emoteExt}`;
+        const emoteUrl = `asset://${emoteFullName}`;
+
+        console.info(
+          `[Locomotion] Uploading '${emote.name}' as ${emoteFullName} (${(emoteBuffer.length / 1024).toFixed(2)} KB)`
+        );
+
+        const emoteFile = new File([emoteBuffer], path.basename(emote.path), {
+          type: emoteMimeType,
+        });
+
+        const service = this.getService();
+        const world = service.getWorld();
+        const emoteUploadPromise = world.network.upload(emoteFile);
+        const emoteTimeout = new Promise((_resolve, reject) =>
+          setTimeout(() => reject(new Error("Upload timed out")), 30000)
+        );
+
+        await Promise.race([emoteUploadPromise, emoteTimeout]);
+
+        // Update the Emotes object with the uploaded URL
+        (Emotes as Record<string, string>)[emote.name] = emoteUrl;
+        console.info(
+          `[Locomotion] Emote '${emote.name}' uploaded and registered: ${emoteUrl}`
+        );
+      } catch (err: any) {
+        console.error(
+          `[Locomotion] Failed to upload emote '${emote.name}': ${err.message}`,
+          err.stack
+        );
+      }
+    }
   }
 }

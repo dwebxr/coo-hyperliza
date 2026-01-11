@@ -7,11 +7,11 @@ import path from 'path';
 
 
 export async function hashFileBuffer(buffer: Buffer): Promise<string> {
-    const hashBuf = await crypto.subtle.digest('SHA-256', buffer)
-    const hash = Array.from(new Uint8Array(hashBuf))
-      .map(b => b.toString(16).padStart(2, '0'))
-      .join('')
-    return hash
+  const hashBuf = await crypto.subtle.digest('SHA-256', buffer)
+  const hash = Array.from(new Uint8Array(hashBuf))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('')
+  return hash
 }
 
 export async function convertToAudioBuffer(speechResponse: any): Promise<Buffer> {
@@ -100,7 +100,7 @@ export const resolveUrl = async (url, world) => {
   if (url.startsWith("http://") || url.startsWith("https://")) {
     return url;
   }
-  
+
   try {
     const buffer = await fsPromises.readFile(url);
     const mimeType = getMimeTypeFromPath(url);
@@ -167,4 +167,76 @@ export function formatActions(actions: Action[]) {
     .sort(() => 0.5 - Math.random())
     .map((action: Action) => `- **${action.name}**: ${action.description}`)
     .join('\n\n');
+}
+
+export function getWavHeader(
+  audioLength: number,
+  sampleRate: number,
+  channelCount: number = 1,
+  bitsPerSample: number = 16
+): Buffer {
+  const wavHeader = Buffer.alloc(44);
+  wavHeader.write('RIFF', 0);
+  wavHeader.writeUInt32LE(36 + audioLength, 4);
+  wavHeader.write('WAVE', 8);
+  wavHeader.write('fmt ', 12);
+  wavHeader.writeUInt32LE(16, 16);
+  wavHeader.writeUInt16LE(1, 20);
+  wavHeader.writeUInt16LE(channelCount, 22);
+  wavHeader.writeUInt32LE(sampleRate, 24);
+  wavHeader.writeUInt32LE(sampleRate * channelCount * (bitsPerSample / 8), 28);
+  wavHeader.writeUInt16LE(channelCount * (bitsPerSample / 8), 32);
+  wavHeader.writeUInt16LE(bitsPerSample, 34);
+  wavHeader.write('data', 36);
+  wavHeader.writeUInt32LE(audioLength, 40);
+  return wavHeader;
+}
+
+/**
+ * Direct OpenAI TTS API call - bypasses the @elizaos/plugin-openai which has issues reading the API key
+ * @param text - Text to convert to speech
+ * @returns Buffer containing the audio data (MP3 format)
+ */
+export async function generateOpenAITTS(text: string): Promise<Buffer | null> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    console.error('[OpenAI TTS Direct] No OPENAI_API_KEY found in environment');
+    return null;
+  }
+
+  const model = process.env.OPENAI_TTS_MODEL || 'tts-1';
+  const voice = process.env.OPENAI_TTS_VOICE || 'nova';
+
+  console.log(`[OpenAI TTS Direct] Generating speech with model=${model}, voice=${voice}`);
+  console.log(`[OpenAI TTS Direct] API Key present: ${apiKey.substring(0, 10)}...`);
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/audio/speech', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: model,
+        input: text,
+        voice: voice,
+        response_format: 'mp3',
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`[OpenAI TTS Direct] API error ${response.status}: ${errorText}`);
+      return null;
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    console.log(`[OpenAI TTS Direct] Successfully generated ${buffer.length} bytes of audio`);
+    return buffer;
+  } catch (error) {
+    console.error('[OpenAI TTS Direct] Error:', error);
+    return null;
+  }
 }

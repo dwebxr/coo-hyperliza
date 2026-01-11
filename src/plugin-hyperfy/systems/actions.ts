@@ -26,17 +26,17 @@ export class AgentActions extends System {
 
   getNearby(maxDistance?: number): ActionNode[] {
     const cameraPos = this.world.rig.position;
-  
+
     return this.nodes.filter(node => {
       if (node.finished) return false;
-  
+
       // If no distance provided, return all unfinished nodes
       if (maxDistance == null) return true;
-  
+
       return node.ctx.entity.root.position.distanceTo(cameraPos) <= maxDistance;
     });
   }
-  
+
 
   performAction(entityID?: string) {
     if (this.currentNode) {
@@ -45,7 +45,7 @@ export class AgentActions extends System {
     }
     const nearby = this.getNearby();
     if (!nearby.length) return;
-  
+
     let target: ActionNode | undefined;
 
     if (entityID) {
@@ -70,24 +70,24 @@ export class AgentActions extends System {
     }, target._duration ?? 3000);
 
   }
-  
-  
+
+
   releaseAction() {
     if (!this.currentNode) {
       console.log('No current action to release.');
       return;
     }
-  
+
     console.log('Releasing current action.');
     const control = this.world.controls;
     control.setKey('keyX', true);
     control.keyX.pressed = true;
     control.keyX.onPress?.();
-  
+
     if (typeof this.currentNode._onCancel === 'function') {
       this.currentNode._onCancel();
     }
-  
+
     setTimeout(() => {
       control.setKey('keyX', false);
       control.keyX.released = false;
@@ -95,19 +95,55 @@ export class AgentActions extends System {
       this.currentNode = null;
     }, 500);
   }
-  
+
+  teleportToUser(userId: string) {
+    console.log(`[Actions] Teleporting to user: ${userId}`);
+    // Find the entity corresponding to the user ID
+    // Note: The userId passed here is usually the agent's internal ID or the sender's ID.
+    // We need to map it to the Hyperfy entity ID if possible, or search by name/owner.
+
+    // In Hyperfy, the 'player' entity is the local user (the agent itself).
+    // Other players are entities in world.entities.items.
+    // We need to find the entity that represents the user 'masia' or the sender.
+
+    // For now, let's search for an entity that is a player and not us.
+    // Or if we have the specific entity ID from the message context.
+
+    // If userId is provided and matches an entity ID directly:
+    if (this.world.entities.items.has(userId)) {
+      this.world.controls.teleportToEntity(userId);
+      return;
+    }
+
+    // Fallback: Search for any player entity that isn't us
+    // This is a bit hacky but works for 1-on-1 testing
+    let targetId = null;
+    this.world.entities.items.forEach((entity: any) => {
+      if (entity.isPlayer && entity !== this.world.entities.player) {
+        // Check if name matches or just pick the first one
+        targetId = entity.data.id;
+      }
+    });
+
+    if (targetId) {
+      this.world.controls.teleportToEntity(targetId);
+    } else {
+      console.warn(`[Actions] Could not find user entity to teleport to.`);
+    }
+  }
+
   // Framework stubs
   // init() {}
-  start() {}
-  preTick() {}
-  preFixedUpdate() {}
-  fixedUpdate() {}
-  postFixedUpdate() {}
-  preUpdate() {}
-  update() {}
-  postUpdate() {}
-  lateUpdate() {}
-  postLateUpdate() {}
-  commit() {}
-  postTick() {}
+  start() { }
+  preTick() { }
+  preFixedUpdate() { }
+  fixedUpdate() { }
+  postFixedUpdate() { }
+  preUpdate() { }
+  update() { }
+  postUpdate() { }
+  lateUpdate() { }
+  postLateUpdate() { }
+  commit() { }
+  postTick() { }
 }

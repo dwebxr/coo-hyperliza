@@ -1,6 +1,6 @@
-import { ChannelType, Content, HandlerCallback, IAgentRuntime, Memory, ModelType, UUID, createUniqueUuid, getWavHeader, logger } from "@elizaos/core";
+import { ChannelType, Content, HandlerCallback, IAgentRuntime, Memory, ModelType, UUID, createUniqueUuid, logger } from "@elizaos/core";
 import { HyperfyService } from "../service";
-import { convertToAudioBuffer } from "../utils";
+import { convertToAudioBuffer, getWavHeader } from "../utils";
 import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
 
@@ -35,12 +35,12 @@ export class VoiceManager {
       function isLoudEnough(pcmBuffer: Buffer, threshold = 1000): boolean {
         let sum = 0;
         const sampleCount = Math.floor(pcmBuffer.length / 2); // 16-bit samples
-      
+
         for (let i = 0; i < pcmBuffer.length; i += 2) {
           const sample = pcmBuffer.readInt16LE(i);
           sum += Math.abs(sample);
         }
-      
+
         const avgAmplitude = sum / sampleCount;
         return avgAmplitude > threshold;
       }
@@ -265,7 +265,7 @@ export class VoiceManager {
 
     try {
       await world.livekit.publishAudioStream(audioBuffer);
-    } catch(error) {
+    } catch (error) {
       logger.error(error)
     } finally {
       this.processingVoice = false;
@@ -276,5 +276,5 @@ export class VoiceManager {
     return this.runtime.getService<HyperfyService>(HyperfyService.serviceType);
   }
 
-  
+
 }

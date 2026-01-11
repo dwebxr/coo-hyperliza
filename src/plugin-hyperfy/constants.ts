@@ -1,3 +1,43 @@
+// Locomotion emotes - these are special and update the Emotes object
+export const LOCOMOTION_EMOTES = [
+    {
+      name: "WALK",
+      path: "/emotes/emote-walk.glb",
+      duration: -1,
+      description: "Walking animation"
+    },
+    {
+      name: "RUN",
+      path: "/emotes/emote-run.glb",
+      duration: -1,
+      description: "Running animation"
+    },
+    {
+      name: "IDLE",
+      path: "/emotes/emote-idle.glb",
+      duration: -1,
+      description: "Idle animation"
+    },
+    {
+      name: "FLOAT",
+      path: "/emotes/emote-float.glb",
+      duration: -1,
+      description: "Floating/jumping animation"
+    },
+    {
+      name: "FALL",
+      path: "/emotes/emote-fall.glb",
+      duration: -1,
+      description: "Falling animation"
+    },
+    {
+      name: "FLIP",
+      path: "/emotes/emote-flip.glb",
+      duration: -1,
+      description: "Flip animation"
+    }
+];
+
 export const EMOTES_LIST = [
     {
       name: "crawling",

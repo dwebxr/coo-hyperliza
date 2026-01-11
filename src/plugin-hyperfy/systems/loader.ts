@@ -29,8 +29,8 @@ if (typeof globalThis !== "undefined") {
         // Basic mock for image elements if texture loading is attempted (though we aim to bypass it)
         return {
           src: "",
-          onload: () => {},
-          onerror: () => {},
+          onload: () => { },
+          onerror: () => { },
         };
       }
       // Default mock for other elements like canvas
@@ -38,7 +38,7 @@ if (typeof globalThis !== "undefined") {
     },
     createElement: (type) => {
       if (type === "img") {
-        return { src: "", onload: () => {}, onerror: () => {} };
+        return { src: "", onload: () => { }, onerror: () => { } };
       }
       // Basic canvas mock if needed
       if (type === "canvas") {
@@ -130,22 +130,30 @@ export class AgentLoader extends System {
         if (type === 'script') {
           const code = await response.text();
 
-          const forbiddenTypes = ['video', 'ui', 'image'];
-          const isForbidden = forbiddenTypes.some(type =>
-            new RegExp(`app\\.create\\s*\\(\\s*['"]${type}['"]\\s*(,|\\))`).test(code)
-          );
-
-          if (isForbidden) {
-            console.warn(`[ScriptLoader] Skipping script: disallowed type used\n`);
-            return;
+          // TEMP WORKAROUND: Patch world.getPlayer to prevent crash during script init
+          // Many scripts call world.getPlayer().id immediately, which crashes if player isn't loaded.
+          const originalGetPlayer = this.world.getPlayer?.bind(this.world);
+          if (!this.world.getPlayer || !this.world.getPlayer()) {
+            this.world.getPlayer = () => {
+              return originalGetPlayer?.() || {
+                id: 'temp-loading-id',
+                base: { position: new THREE.Vector3() },
+                root: { position: new THREE.Vector3() }
+              };
+            };
           }
 
-          const script = this.world.scripts.evaluate(code);
-          this.results.set(key, script);
-          return script;
+          try {
+            const script = this.world.scripts.evaluate(code);
+            this.results.set(key, script);
+            return script;
+          } catch (e) {
+            console.error(`[ScriptLoader] Failed to evaluate script: ${e.message}`);
+            return null;
+          }
         }
 
-        
+
         console.warn(`[AgentLoader] Unsupported type in load(): ${type}`);
         return null;
       })
@@ -164,36 +172,36 @@ export class AgentLoader extends System {
 
   async parseGLB(type: string, key: string, url: string) {
     const puppeteerManager = PuppeteerManager.getInstance()
-    const bytes = 
-      type === 'avatar' ? 
-        await puppeteerManager.loadVRMBytes(url) : 
+    const bytes =
+      type === 'avatar' ?
+        await puppeteerManager.loadVRMBytes(url) :
         await puppeteerManager.loadGlbBytes(url);
     const arrayBuffer = Uint8Array.from(bytes).buffer;
-  
+
     const gltf: THREE.GLTF = await new Promise((ok, bad) =>
       this.gltfLoader.parse(arrayBuffer, '', ok, bad)
     );
-  
+
     let result: any;
-  
+
     if (type === 'model') {
       const node = glbToNodes(gltf, this.world);
       result = { gltf, toNodes() { return node.clone(true); } };
-  
+
     } else if (type === 'emote') {
       const factory = createEmoteFactory(gltf, url);
       result = { gltf, toClip(o) { return factory.toClip(o); } };
-  
+
     } else if (type === 'avatar') {
       const factory = null;
       const root = createNode('group', { id: '$root' });
       root.add(new AgentAvatar({ id: 'avatar', factory }));
       result = { gltf, factory, toNodes() { return root.clone(true); } };
-  
+
     } else {
       throw new Error(`[AgentLoader] Unsupported GLTF type: ${type}`);
     }
-  
+
     this.results.set(key, result);
     return result;
   }

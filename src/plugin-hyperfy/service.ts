@@ -102,7 +102,7 @@ export class HyperfyService extends Service {
     this._currentWorldId = config.worldId
     this.appearanceSet = false
     this.nameSet = false
-    
+
     try {
       const world = createNodeClientWorld()
       this.world = world
@@ -114,28 +114,28 @@ export class HyperfyService extends Service {
       this.behaviorManager = new BehaviorManager(this.runtime);
       this.buildManager = new BuildManager(this.runtime);
 
-      ;(world as any).playerNamesMap = this.playerNamesMap
+      ; (world as any).playerNamesMap = this.playerNamesMap
 
       globalThis.self = globalThis
 
       const livekit = new AgentLiveKit(world);
-      ;(world as any).livekit = livekit
+      ; (world as any).livekit = livekit
       world.systems.push(livekit);
 
       const actions = new AgentActions(world);
-      ;(world as any).actions = actions
+      ; (world as any).actions = actions
       world.systems.push(actions);
-      
+
       this.controls = new AgentControls(world)
-      ;(world as any).controls = this.controls
+        ; (world as any).controls = this.controls
       world.systems.push(this.controls)
       // Temporarily comment out AgentLoader to test for updateTransform error
       const loader = new AgentLoader(world)
-      ;(world as any).loader = loader
+        ; (world as any).loader = loader
       world.systems.push(loader);
 
       const environment = new AgentEnvironment(world);
-      ;(world as any).environment = environment
+      ; (world as any).environment = environment
       world.systems.push(environment);
 
       // HACK: Overwriting `chat.add` to prevent crashes caused by the original implementation.
@@ -143,7 +143,7 @@ export class HyperfyService extends Service {
       (world as any).chat.add = (msg, broadcast) => {
         const chat = (world as any).chat;
         const MAX_MSGS = 50;
-        
+
         chat.msgs = [...chat.msgs, msg]
 
         if (chat.msgs.length > MAX_MSGS) {
@@ -163,12 +163,12 @@ export class HyperfyService extends Service {
       };
 
       const mockElement = {
-        appendChild: () => {},
-        removeChild: () => {},
+        appendChild: () => { },
+        removeChild: () => { },
         offsetWidth: 1920,
         offsetHeight: 1080,
-        addEventListener: () => {},
-        removeEventListener: () => {},
+        addEventListener: () => { },
+        removeEventListener: () => { },
         style: {},
       }
 
@@ -219,8 +219,8 @@ export class HyperfyService extends Service {
 
   private subscribeToHyperfyEvents(): void {
     if (!this.world || typeof this.world.on !== 'function') {
-        console.warn("[Hyperfy Events] Cannot subscribe: World or world.on not available.")
-        return
+      console.warn("[Hyperfy Events] Cannot subscribe: World or world.on not available.")
+      return
     }
 
     this.world.off('disconnect')
@@ -376,77 +376,77 @@ export class HyperfyService extends Service {
     let pollingTasks = { avatar: this.appearanceSet, name: this.nameSet }; // Track tasks locally
 
     if (pollingTasks.avatar && pollingTasks.name) {
-        console.info("[Appearance/Name Polling] Already set, skipping start.");
-        return;
+      console.info("[Appearance/Name Polling] Already set, skipping start.");
+      return;
     }
     console.info(`[Appearance/Name Polling] Initializing interval every ${HYPERFY_APPEARANCE_POLL_INTERVAL}ms.`);
 
-    
+
     const f = async () => {
-        // Stop polling if both tasks are complete
-        if (pollingTasks.avatar && pollingTasks.name) {
-            if (this.appearanceIntervalId) clearInterval(this.appearanceIntervalId);
-            this.appearanceIntervalId = null;
-            console.info(`[Appearance/Name Polling] Both avatar and name set. Polling stopped.`);
-            return;
+      // Stop polling if both tasks are complete
+      if (pollingTasks.avatar && pollingTasks.name) {
+        if (this.appearanceIntervalId) clearInterval(this.appearanceIntervalId);
+        this.appearanceIntervalId = null;
+        console.info(`[Appearance/Name Polling] Both avatar and name set. Polling stopped.`);
+        return;
+      }
+
+      const agentPlayer = this.world?.entities?.player; // Get player once
+      const agentPlayerReady = !!agentPlayer;
+      const agentPlayerId = agentPlayer?.data?.id;
+      const agentPlayerIdReady = !!agentPlayerId;
+      const networkReady = this.world?.network?.id != null;
+      const assetsUrlReady = !!this.world?.assetsUrl; // Needed for avatar
+
+      // Condition checks player/ID/network readiness for name, adds assetsUrl for avatar
+      console.log('agentPlayerReady', agentPlayerReady)
+      console.log('agentPlayerIdReady', agentPlayerIdReady)
+      console.log('networkReady', networkReady)
+      if (agentPlayerReady && agentPlayerIdReady && networkReady) {
+        const entityId = createUniqueUuid(this.runtime, this.runtime.agentId);
+        const entity = await this.runtime.getEntityById(entityId)
+        if (entity) {
+          entity.metadata.hyperfy = {
+            id: agentPlayerId,
+            name: agentPlayer?.data?.name,
+            userName: agentPlayer?.data?.name
+          }
+
+          await this.runtime.updateEntity(entity)
         }
 
-        const agentPlayer = this.world?.entities?.player; // Get player once
-        const agentPlayerReady = !!agentPlayer;
-        const agentPlayerId = agentPlayer?.data?.id;
-        const agentPlayerIdReady = !!agentPlayerId;
-        const networkReady = this.world?.network?.id != null;
-        const assetsUrlReady = !!this.world?.assetsUrl; // Needed for avatar
-
-        // Condition checks player/ID/network readiness for name, adds assetsUrl for avatar
-        console.log('agentPlayerReady', agentPlayerReady)
-        console.log('agentPlayerIdReady', agentPlayerIdReady)
-        console.log('networkReady', networkReady)
-        if (agentPlayerReady && agentPlayerIdReady && networkReady) {
-            const entityId = createUniqueUuid(this.runtime, this.runtime.agentId);
-            const entity = await this.runtime.getEntityById(entityId)
-            if (entity) {
-              entity.metadata.hyperfy = {
-                id: agentPlayerId,
-                name: agentPlayer?.data?.name,
-                userName:agentPlayer?.data?.name
-              }
-              
-              await this.runtime.updateEntity(entity)
-            }
-
-             // --- Set Name (if not already done) ---
-             if (!pollingTasks.name) {
-                 console.info(`[Name Polling] Player (ID: ${agentPlayerId}), network ready. Attempting name...`);
-                 try {
-                    await this.changeName(this.runtime.character.name);
-                    this.nameSet = true; // Update global state
-                    pollingTasks.name = true; // Update local task tracker
-                    console.info(`[Name Polling] Initial name successfully set to "${this.runtime.character.name}".`);
-                 } catch (error) {
-                     console.error(`[Name Polling] Failed to set initial name:`, error);
-                 }
-             }
-
-             // --- Set Avatar (if not already done AND assets URL ready) ---
-             if (!pollingTasks.avatar && assetsUrlReady) {
-                 console.info(`[Appearance Polling] Player (ID: ${agentPlayerId}), network, assetsUrl ready. Attempting avatar upload and set...`);
-                 const result = await this.uploadCharacterAssets();
-
-                 if (result.success) {
-                     this.appearanceSet = true; // Update global state
-                     pollingTasks.avatar = true; // Update local task tracker
-                     console.info(`[Appearance Polling] Avatar setting process successfully completed.`);
-                 } else {
-                     console.warn(`[Appearance Polling] Avatar setting process failed: ${result.error || 'Unknown reason'}. Will retry...`);
-                 }
-             } else if (!pollingTasks.avatar) {
-                  console.debug(`[Appearance Polling] Waiting for: Assets URL (${assetsUrlReady})...`);
-             }
-        } else {
-             // Update waiting log
-             console.debug(`[Appearance/Name Polling] Waiting for: Player (${agentPlayerReady}), Player ID (${agentPlayerIdReady}), Network (${networkReady})...`);
+        // --- Set Name (if not already done) ---
+        if (!pollingTasks.name) {
+          console.info(`[Name Polling] Player (ID: ${agentPlayerId}), network ready. Attempting name...`);
+          try {
+            await this.changeName(this.runtime.character.name);
+            this.nameSet = true; // Update global state
+            pollingTasks.name = true; // Update local task tracker
+            console.info(`[Name Polling] Initial name successfully set to "${this.runtime.character.name}".`);
+          } catch (error) {
+            console.error(`[Name Polling] Failed to set initial name:`, error);
+          }
         }
+
+        // --- Set Avatar (if not already done AND assets URL ready) ---
+        if (!pollingTasks.avatar && assetsUrlReady) {
+          console.info(`[Appearance Polling] Player (ID: ${agentPlayerId}), network, assetsUrl ready. Attempting avatar upload and set...`);
+          const result = await this.uploadCharacterAssets();
+
+          if (result.success) {
+            this.appearanceSet = true; // Update global state
+            pollingTasks.avatar = true; // Update local task tracker
+            console.info(`[Appearance Polling] Avatar setting process successfully completed.`);
+          } else {
+            console.warn(`[Appearance Polling] Avatar setting process failed: ${result.error || 'Unknown reason'}. Will retry...`);
+          }
+        } else if (!pollingTasks.avatar) {
+          console.debug(`[Appearance Polling] Waiting for: Assets URL (${assetsUrlReady})...`);
+        }
+      } else {
+        // Update waiting log
+        console.debug(`[Appearance/Name Polling] Waiting for: Player (${agentPlayerReady}), Player ID (${agentPlayerIdReady}), Network (${networkReady})...`);
+      }
     }
     this.appearanceIntervalId = setInterval(f, HYPERFY_APPEARANCE_POLL_INTERVAL);
     f();
@@ -454,9 +454,9 @@ export class HyperfyService extends Service {
 
   private stopAppearancePolling(): void {
     if (this.appearanceIntervalId) {
-        clearInterval(this.appearanceIntervalId)
-        this.appearanceIntervalId = null
-        console.info("[Appearance Polling] Stopped.")
+      clearInterval(this.appearanceIntervalId)
+      this.appearanceIntervalId = null
+      console.info("[Appearance Polling] Stopped.")
     }
   }
 
@@ -477,86 +477,87 @@ export class HyperfyService extends Service {
   }
 
   async handleDisconnect(): Promise<void> {
-      if (!this.isConnectedState && !this.world) return
-      console.info('Handling Hyperfy disconnection...')
-      this.isConnectedState = false
+    if (!this.isConnectedState && !this.world) return
+    console.info('Handling Hyperfy disconnection...')
+    this.isConnectedState = false
 
-      this.stopAppearancePolling()
+    this.stopAppearancePolling()
+    this.behaviorManager?.stop();
 
-      if (this.world) {
-          try {
-              if (this.world.network && typeof this.world.network.disconnect === 'function') {
-                  console.info("[Hyperfy Cleanup] Calling network.disconnect()...")
-                  await this.world.network.disconnect()
-              }
-              if (typeof this.world.destroy === 'function') {
-                  console.info("[Hyperfy Cleanup] Calling world.destroy()...")
-                  this.world.destroy()
-              }
-          } catch (e: any) {
-              console.warn(`[Hyperfy Cleanup] Error during world network disconnect/destroy: ${e.message}`)
-          }
+    if (this.world) {
+      try {
+        if (this.world.network && typeof this.world.network.disconnect === 'function') {
+          console.info("[Hyperfy Cleanup] Calling network.disconnect()...")
+          await this.world.network.disconnect()
+        }
+        if (typeof this.world.destroy === 'function') {
+          console.info("[Hyperfy Cleanup] Calling world.destroy()...")
+          this.world.destroy()
+        }
+      } catch (e: any) {
+        console.warn(`[Hyperfy Cleanup] Error during world network disconnect/destroy: ${e.message}`)
       }
+    }
 
-      this.world = null
-      this.controls = null
-      this.playerNamesMap.clear()
-      this.wsUrl = null
-      this.appearanceSet = false
+    this.world = null
+    this.controls = null
+    this.playerNamesMap.clear()
+    this.wsUrl = null
+    this.appearanceSet = false
 
-      this.processedMsgIds.clear()
+    this.processedMsgIds.clear()
 
-      this.connectionTime = null; // Clear connection time
+    this.connectionTime = null; // Clear connection time
 
-      if (this.appearanceIntervalId) { clearInterval(this.appearanceIntervalId); this.appearanceIntervalId = null; }
+    if (this.appearanceIntervalId) { clearInterval(this.appearanceIntervalId); this.appearanceIntervalId = null; }
 
-      console.info('Hyperfy disconnection handling complete.')
+    console.info('Hyperfy disconnection handling complete.')
   }
 
   async disconnect(): Promise<void> {
-      console.info(`Disconnecting HyperfyService from world ${this._currentWorldId}`)
-      await this.handleDisconnect()
-      console.info('HyperfyService disconnect complete.')
+    console.info(`Disconnecting HyperfyService from world ${this._currentWorldId}`)
+    await this.handleDisconnect()
+    console.info('HyperfyService disconnect complete.')
   }
 
   /**
    * Changes the agent's display name.
    */
   async changeName(newName: string): Promise<void> {
-      if (!this.isConnected() || !this.world?.network || !this.world?.entities?.player) {
-          throw new Error('HyperfyService: Cannot change name. Network or player not ready.');
+    if (!this.isConnected() || !this.world?.network || !this.world?.entities?.player) {
+      throw new Error('HyperfyService: Cannot change name. Network or player not ready.');
+    }
+    const agentPlayerId = this.world.entities.player.data.id;
+    if (!agentPlayerId) {
+      throw new Error('HyperfyService: Cannot change name. Player ID not available.');
+    }
+
+    console.info(`[Action] Attempting to change name to "${newName}" for ID ${agentPlayerId}`);
+
+    try {
+
+      // 2. Update local state immediately
+      // Update the name map
+      if (this.playerNamesMap.has(agentPlayerId)) {
+        console.info(`[Name Map Update] Setting name via changeName for ID ${agentPlayerId}: '${newName}'`);
+        this.playerNamesMap.set(agentPlayerId, newName);
+      } else {
+        console.warn(`[Name Map Update] Attempted changeName for ID ${agentPlayerId} not currently in map. Adding.`);
+        this.playerNamesMap.set(agentPlayerId, newName);
       }
-      const agentPlayerId = this.world.entities.player.data.id;
-      if (!agentPlayerId) {
-          throw new Error('HyperfyService: Cannot change name. Player ID not available.');
-      }
 
-      console.info(`[Action] Attempting to change name to "${newName}" for ID ${agentPlayerId}`);
+      // --- Use agentPlayer.modify for local update --- >
+      const agentPlayer = this.world.entities.player;
+      agentPlayer.modify({ name: newName });
+      agentPlayer.data.name = newName
 
-      try {
+      this.world.network.send('entityModified', { id: agentPlayer.data.id, name: newName })
+      console.debug(`[Action] Called agentPlayer.modify({ name: "${newName}" })`);
 
-          // 2. Update local state immediately
-          // Update the name map
-          if (this.playerNamesMap.has(agentPlayerId)) {
-               console.info(`[Name Map Update] Setting name via changeName for ID ${agentPlayerId}: '${newName}'`);
-               this.playerNamesMap.set(agentPlayerId, newName);
-          } else {
-               console.warn(`[Name Map Update] Attempted changeName for ID ${agentPlayerId} not currently in map. Adding.`);
-               this.playerNamesMap.set(agentPlayerId, newName);
-          }
-
-          // --- Use agentPlayer.modify for local update --- >
-          const agentPlayer = this.world.entities.player;
-              agentPlayer.modify({ name: newName });
-              agentPlayer.data.name = newName
-          
-          this.world.network.send('entityModified', { id: agentPlayer.data.id, name: newName })
-              console.debug(`[Action] Called agentPlayer.modify({ name: "${newName}" })`);
-
-      } catch (error: any) {
-          console.error(`[Action] Error during changeName to "${newName}":`, error);
-          throw error;
-      }
+    } catch (error: any) {
+      console.error(`[Action] Error during changeName to "${newName}":`, error);
+      throw error;
+    }
   }
 
   async stop(): Promise<void> {
@@ -574,15 +575,15 @@ export class HyperfyService extends Service {
 
     // Pre-populate processed IDs with existing messages
     this.world.chat.msgs?.forEach((msg: any) => {
-        if (msg && msg.id) { // Add null check for msg and msg.id
-            this.processedMsgIds.add(msg.id)
-        }
+      if (msg && msg.id) { // Add null check for msg and msg.id
+        this.processedMsgIds.add(msg.id)
+      }
     });
 
     this.world.chat.subscribe((msgs: any[]) => {
       // Wait for player entity (ensures world/chat exist too)
       if (!this.world || !this.world.chat || !this.world.entities?.player || !this.connectionTime) return
-  
+
       const newMessagesFound: any[] = [] // Temporary list for new messages
 
       // Step 1: Identify new messages and update processed set
@@ -590,19 +591,19 @@ export class HyperfyService extends Service {
         // Check timestamp FIRST - only consider messages newer than connection time
         const messageTimestamp = msg.createdAt ? new Date(msg.createdAt).getTime() : 0;
         if (!messageTimestamp || messageTimestamp <= this.connectionTime) {
-            // console.debug(`[Chat Sub] Ignoring historical/old message ID ${msg?.id} (ts: ${messageTimestamp})`);
-            // Ensure historical messages are marked processed if encountered *before* connectionTime was set (edge case)
-            if (msg?.id && !this.processedMsgIds.has(msg.id.toString())) {
-                 this.processedMsgIds.add(msg.id.toString());
-            }
-            return; // Skip this message
+          // console.debug(`[Chat Sub] Ignoring historical/old message ID ${msg?.id} (ts: ${messageTimestamp})`);
+          // Ensure historical messages are marked processed if encountered *before* connectionTime was set (edge case)
+          if (msg?.id && !this.processedMsgIds.has(msg.id.toString())) {
+            this.processedMsgIds.add(msg.id.toString());
+          }
+          return; // Skip this message
         }
 
         // Check if we've already processed this message ID (secondary check for duplicates)
         const msgIdStr = msg.id?.toString();
         if (msgIdStr && !this.processedMsgIds.has(msgIdStr)) {
-           newMessagesFound.push(msg) // Add the full message object
-           this.processedMsgIds.add(msgIdStr) // Mark ID as processed immediately
+          newMessagesFound.push(msg) // Add the full message object
+          this.processedMsgIds.add(msgIdStr) // Mark ID as processed immediately
         }
       })
 

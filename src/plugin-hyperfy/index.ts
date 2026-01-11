@@ -15,6 +15,7 @@ import { hyperfyWalkRandomlyAction } from './actions/walk_randomly';
 import { hyperfyAmbientSpeechAction } from './actions/ambient';
 import { hyperfyScenePerceptionAction } from './actions/perception';
 import { hyperfyEditEntityAction } from './actions/build';
+import { teleportToUserAction } from './actions/teleport';
 import { replyAction } from './actions/reply';
 import { ignoreAction } from './actions/ignore';
 import { hyperfyProvider } from './providers/world';
@@ -55,7 +56,7 @@ export const hyperfyPlugin: Plugin = {
         // Decide if this is a fatal error
         // throw new Error(`Invalid Hyperfy plugin configuration...`);
       } else {
-         logger.error('Unknown error during Hyperfy plugin init:', error);
+        logger.error('Unknown error during Hyperfy plugin init:', error);
         // throw error;
       }
       // Allow initialization to continue even if config fails, service might get config later
@@ -74,6 +75,8 @@ export const hyperfyPlugin: Plugin = {
     hyperfyWalkRandomlyAction,
     hyperfyAmbientSpeechAction,
     hyperfyEditEntityAction,
+    hyperfyEditEntityAction,
+    teleportToUserAction,
     replyAction,
     ignoreAction
   ],

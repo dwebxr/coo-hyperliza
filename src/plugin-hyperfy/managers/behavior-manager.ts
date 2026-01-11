@@ -11,7 +11,7 @@ const TIME_INTERVAL_MAX = 30000; // 30 seconds
 export class BehaviorManager {
   private isRunning: boolean = false;
   private runtime: IAgentRuntime;
-  
+
   constructor(runtime: IAgentRuntime) {
     this.runtime = runtime;
   }
@@ -80,13 +80,13 @@ export class BehaviorManager {
 
     const world = service.getWorld();
     if (!world) {
-      logger.error("[BehaviorManager] Cannot start — world not found");
+      logger.warn("[BehaviorManager] World not found (disconnected or initializing). Skipping behavior.");
       return;
     }
 
     const player = world.entities?.player;
     if (!player) {
-      logger.error("[BehaviorManager] Cannot start — player entity not found");
+      logger.warn("[BehaviorManager] Player entity not found (waiting for spawn). Skipping behavior.");
       return;
     }
     // TODO: There may be slow post-processing in the bootstrap plugin's message handler.
@@ -97,7 +97,7 @@ export class BehaviorManager {
     }
 
     const _currentWorldId = service.currentWorldId;
-    
+
     const elizaRoomId = createUniqueUuid(this.runtime, _currentWorldId || 'hyperfy-unknown-world')
     const entityId = createUniqueUuid(this.runtime, this.runtime.agentId);
 
@@ -115,17 +115,18 @@ export class BehaviorManager {
     const state = await this.runtime.composeState(newMessage);
 
     const actionsData = await getHyperfyActions(
-      this.runtime, 
-      newMessage, 
+      this.runtime,
+      newMessage,
       state, [
-        'HYPERFY_GOTO_ENTITY',
-        'HYPERFY_WALK_RANDOMLY',
-        'HYPERFY_USE_ITEM',
-        'HYPERFY_UNUSE_ITEM',
-        'HYPERFY_AMBIENT_SPEECH',
-        'REPLY',
-        'IGNORE',
-      ]
+      'HYPERFY_GOTO_ENTITY',
+      'HYPERFY_WALK_RANDOMLY',
+      'HYPERFY_USE_ITEM',
+      'HYPERFY_UNUSE_ITEM',
+      'HYPERFY_AMBIENT_SPEECH',
+      'HYPERFY_TELEPORT_TO_USER',
+      'REPLY',
+      'IGNORE',
+    ]
     );
 
     const actionsText = actionsData.length > 0 ? formatActions(actionsData) : '';
@@ -194,10 +195,10 @@ export class BehaviorManager {
         const messageManager = service.getMessageManager();
         messageManager.sendMessage(responseContent.text)
       }
-      
+
       return [];
     };
-    
+
     await this.runtime.processActions(
       newMessage,
       [responseMemory],

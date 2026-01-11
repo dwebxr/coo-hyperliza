@@ -1,0 +1,33 @@
+/* Custom styles for ElizaOS UI */
+/* Hide list bullets/markers in left menu */
+
+ul, ol, li {
+  list-style: none !important;
+  list-style-type: none !important;
+}
+
+li::marker {
+  content: none !important;
+  display: none !important;
+}
+
+/* Specifically target sidebar/navigation lists */
+aside ul,
+aside li,
+nav ul,
+nav li,
+[class*="sidebar"] ul,
+[class*="sidebar"] li,
+[class*="menu"] ul,
+[class*="menu"] li {
+  list-style: none !important;
+  list-style-type: none !important;
+  padding-left: 0;
+  margin-left: 0;
+}
+
+/* Remove any ::before pseudo-elements that might create bullets */
+li::before {
+  content: none !important;
+  display: none !important;
+}

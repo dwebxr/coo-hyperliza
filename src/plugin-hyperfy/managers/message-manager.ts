@@ -1,7 +1,8 @@
-import { ChannelType, Entity, Content, HandlerCallback, IAgentRuntime, Memory, UUID, formatTimestamp, createUniqueUuid, getEntityDetails } from "@elizaos/core";
+import { ChannelType, Entity, Content, HandlerCallback, IAgentRuntime, Memory, UUID, formatTimestamp, createUniqueUuid, getEntityDetails, logger } from "@elizaos/core";
 import { HyperfyService } from "../service";
 import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
+import { generateOpenAITTS } from "../utils";
 import moment from 'moment'
 import { uuid } from '../hyperfy/src/core/utils';
 
@@ -75,7 +76,7 @@ export class MessageManager {
         // Create a callback function to handle responses
         const callback: HandlerCallback = async (responseContent: Content): Promise<Memory[]> => {
           console.info(`[Hyperfy Chat Callback] Received response: ${JSON.stringify(responseContent)}`)
-          
+
           console.log(`[Hyperfy Chat Response] ${responseContent}`)
           const emote = responseContent.emote as string;
           // Send response back to Hyperfy
@@ -85,6 +86,26 @@ export class MessageManager {
           }
           if (responseContent.text) {
             this.sendMessage(responseContent.text);
+
+            // Generate TTS audio and play via LiveKit (using direct OpenAI API call)
+            try {
+              console.log('[MessageManager] Starting TTS generation for:', responseContent.text.substring(0, 50) + '...');
+              const audioBuffer = await generateOpenAITTS(responseContent.text);
+              console.log('[MessageManager] Audio buffer result:', audioBuffer ? `${audioBuffer.length} bytes` : 'null');
+              if (audioBuffer) {
+                const voiceManager = service.getVoiceManager();
+                console.log('[MessageManager] VoiceManager exists:', !!voiceManager);
+                if (voiceManager) {
+                  console.log('[MessageManager] Playing audio via LiveKit...');
+                  await voiceManager.playAudio(audioBuffer);
+                  logger.info('[MessageManager] TTS audio played successfully');
+                }
+              } else {
+                console.log('[MessageManager] No audio generated - check OPENAI_API_KEY in .env');
+              }
+            } catch (ttsError) {
+              logger.warn('[MessageManager] TTS generation failed, text-only response sent:', ttsError);
+            }
           }
           const callbackMemory: Memory = {
             id: createUniqueUuid(this.runtime, Date.now().toString()),
@@ -98,9 +119,9 @@ export class MessageManager {
             roomId: elizaRoomId,
             createdAt: Date.now(),
           };
-          
+
           await this.runtime.createMemory(callbackMemory, 'messages');
-        
+
           return [];
         };
 
