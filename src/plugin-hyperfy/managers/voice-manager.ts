@@ -175,10 +175,8 @@ export class VoiceManager {
         name,
         source: 'hyperfy',
         channelId,
-        serverId: 'hyperfy',
         type: ChannelType.WORLD,
         worldId: _currentWorldId,
-        userId: playerId
       })
 
       const memory: Memory = {
@@ -240,14 +238,14 @@ export class VoiceManager {
 
       agentActivityLock.enter();
       // Emit voice-specific events
-      this.runtime.emitEvent([hyperfyEventType.VOICE_MESSAGE_RECEIVED], {
+      this.runtime.emitEvent(hyperfyEventType.VOICE_MESSAGE_RECEIVED as string, {
         runtime: this.runtime,
         message: memory,
         callback,
         onComplete: () => {
           agentActivityLock.exit();
         },
-      });
+      } as any);
     } catch (error) {
       console.error('Error processing voice message:', error);
     }
@@ -263,12 +261,28 @@ export class VoiceManager {
     const world = service.getWorld();
     this.processingVoice = true;
 
+    // Set speaking state to trigger TALK emote (lip sync animation)
+    const player = world?.entities?.player;
+    console.log('[VoiceManager] Player object:', player ? 'exists' : 'null');
+    console.log('[VoiceManager] Player.setSpeaking:', typeof player?.setSpeaking);
+    console.log('[VoiceManager] Player class:', player?.constructor?.name);
+    if (player?.setSpeaking) {
+      player.setSpeaking(true);
+      console.log('[VoiceManager] Set speaking=true for lip sync');
+      console.log('[VoiceManager] Player.speaking after set:', player.speaking);
+    }
+
     try {
       await world.livekit.publishAudioStream(audioBuffer);
     } catch (error) {
       logger.error(error)
     } finally {
       this.processingVoice = false;
+      // Stop speaking state when done
+      if (player?.setSpeaking) {
+        player.setSpeaking(false);
+        console.log('[VoiceManager] Set speaking=false');
+      }
     }
   }
 

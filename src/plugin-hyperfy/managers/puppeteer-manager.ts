@@ -392,4 +392,48 @@ export class PuppeteerManager {
     return this.runtime.getService<HyperfyService>(HyperfyService.serviceType)
   }
 
+  /**
+   * Set expression on the agent's VRM avatar for lip sync
+   * @param expressionName - VRM expression name (e.g., 'aa', 'ee', 'ih', 'oh', 'ou')
+   * @param weight - Expression weight from 0.0 to 1.0
+   */
+  async setAgentExpression(expressionName: string, weight: number): Promise<void> {
+    await this.init();
+
+    const service = this.getService();
+    const world = service.getWorld();
+    if (!world?.entities?.player) return;
+
+    const avatarUrl = world.entities.player.avatarUrl;
+    if (!avatarUrl) return;
+
+    const resolvedUrl = await resolveUrl(avatarUrl, world);
+
+    await this.page.evaluate((url, name, w) => {
+      // Get or create the agent's VRM instance
+      if (!window.agentVRMInstance) {
+        const factory = window.avatarMap?.get(url);
+        if (!factory) {
+          console.warn('[PuppeteerManager] No factory found for agent avatar:', url);
+          return;
+        }
+
+        const vrmHooks = {
+          camera: window.camera,
+          scene: window.scene,
+          octree: null,
+          setupMaterial: () => {},
+          loader: window.VRMLoader,
+        };
+
+        window.agentVRMInstance = factory.create(new window.THREE.Matrix4(), vrmHooks, null);
+        console.log('[PuppeteerManager] Created agent VRM instance for lip sync');
+      }
+
+      // Set the expression
+      if (window.agentVRMInstance?.setExpression) {
+        window.agentVRMInstance.setExpression(name, w);
+      }
+    }, resolvedUrl, expressionName, weight);
+  }
 }

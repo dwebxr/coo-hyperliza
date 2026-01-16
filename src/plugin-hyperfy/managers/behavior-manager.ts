@@ -178,16 +178,18 @@ export class BehaviorManager {
 
     console.log('****** response\n', parsedXml)
 
-    const responseMemory = {
+    const responseMemory: Memory = {
+      id: createUniqueUuid(this.runtime, Date.now().toString()),
       content: {
-        thought: parsedXml.thought,
-        text: parsedXml.text,
-        actions: parsedXml.actions,
-        providers: parsedXml.providers,
-        emote: parsedXml.emote,
+        thought: parsedXml.thought as string,
+        text: parsedXml.text as string,
+        actions: parsedXml.actions as string[],
+        providers: parsedXml.providers as string[],
+        emote: parsedXml.emote as string,
       },
       entityId: createUniqueUuid(this.runtime, this.runtime.agentId),
       roomId: elizaRoomId,
+      createdAt: Date.now(),
     };
 
     const name = world.entities.player.data.name;
@@ -198,10 +200,8 @@ export class BehaviorManager {
       name,
       source: 'hyperfy',
       channelId: _currentWorldId,
-      serverId: 'hyperfy',
       type: ChannelType.WORLD,
       worldId: _currentWorldId,
-      userId: world.entities.player.data.id
     })
 
     const callback: HandlerCallback = async (responseContent: Content): Promise<Memory[]> => {

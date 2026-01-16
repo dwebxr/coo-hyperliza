@@ -45,10 +45,8 @@ export class MessageManager {
           name: senderName,
           source: 'hyperfy',
           channelId: _currentWorldId,
-          serverId: 'hyperfy',
           type: ChannelType.WORLD,
           worldId: hyperfyWorldId,
-          userId: msg.fromId
         })
 
         // Create the message memory
@@ -159,7 +157,7 @@ export class MessageManager {
         // Emit the MESSAGE_RECEIVED event to trigger the message handler
         console.info(`[Hyperfy Chat] Emitting MESSAGE_RECEIVED event for message: ${messageId}`)
         agentActivityLock.enter();
-        await this.runtime.emitEvent(hyperfyEventType.MESSAGE_RECEIVED, {
+        await this.runtime.emitEvent(hyperfyEventType.MESSAGE_RECEIVED as string, {
             runtime: this.runtime,
             message: memory,
             callback: callback,
@@ -167,7 +165,7 @@ export class MessageManager {
             onComplete: () => {
               agentActivityLock.exit();
             }
-          },
+          } as any,
         )
 
         console.info(`[Hyperfy Chat] Successfully emitted event for message: ${messageId}`)
