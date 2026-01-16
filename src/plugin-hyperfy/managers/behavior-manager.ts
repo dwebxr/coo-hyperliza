@@ -2,10 +2,12 @@ import { ChannelType, Content, HandlerCallback, IAgentRuntime, Memory, ModelType
 import { HyperfyService } from "../service";
 import { autoTemplate } from "../templates";
 import { agentActivityLock } from "./guards";
-import { getHyperfyActions, formatActions } from "../utils";
+import { getHyperfyActions, formatActions, generateElevenLabsTTS, generateOpenAITTS } from "../utils";
 
 const TIME_INTERVAL_MIN = 15000; // 15 seconds
 const TIME_INTERVAL_MAX = 30000; // 30 seconds
+const TIME_INTERVAL_IDLE_MIN = 60000; // 60 seconds when no players around
+const TIME_INTERVAL_IDLE_MAX = 120000; // 120 seconds when no players around
 
 
 export class BehaviorManager {
@@ -26,11 +28,13 @@ export class BehaviorManager {
     }
 
     this.isRunning = true;
+    console.log(`[BehaviorManager] Starting behavior loop for player`);
     logger.info(`[BehaviorManager] Starting behavior loop for player`);
 
-    this.runLoop().catch((err) =>
-      logger.error("[BehaviorManager] Fatal error in run loop:", err)
-    );
+    this.runLoop().catch((err) => {
+      console.error("[BehaviorManager] Fatal error in run loop:", err);
+      logger.error("[BehaviorManager] Fatal error in run loop:", err);
+    });
   }
 
 
@@ -52,14 +56,20 @@ export class BehaviorManager {
    */
   private async runLoop(): Promise<void> {
     while (this.isRunning) {
+      let hasOtherPlayers = false;
       try {
-        await this.executeBehavior();
+        hasOtherPlayers = await this.executeBehavior();
       } catch (error) {
         logger.error("[BehaviorManager] Error in behavior:", error);
       }
 
-      // Short delay between behaviors
-      const delay = TIME_INTERVAL_MIN + Math.floor(Math.random() * (TIME_INTERVAL_MAX - TIME_INTERVAL_MIN));
+      // Adjust delay based on whether other players are present
+      // Longer delay when alone to save costs
+      const [minDelay, maxDelay] = hasOtherPlayers
+        ? [TIME_INTERVAL_MIN, TIME_INTERVAL_MAX]
+        : [TIME_INTERVAL_IDLE_MIN, TIME_INTERVAL_IDLE_MAX];
+
+      const delay = minDelay + Math.floor(Math.random() * (maxDelay - minDelay));
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
@@ -70,30 +80,56 @@ export class BehaviorManager {
 
   /**
    * Executes a behavior
+   * @returns true if other players are present, false otherwise
    */
-  private async executeBehavior(): Promise<void> {
+  private async executeBehavior(): Promise<boolean> {
     const service = this.getService();
     if (!service) {
       logger.error("[BehaviorManager] Cannot start — service not available");
-      return;
+      return false;
     }
 
     const world = service.getWorld();
     if (!world) {
       logger.warn("[BehaviorManager] World not found (disconnected or initializing). Skipping behavior.");
-      return;
+      return false;
     }
 
     const player = world.entities?.player;
     if (!player) {
       logger.warn("[BehaviorManager] Player entity not found (waiting for spawn). Skipping behavior.");
-      return;
+      return false;
     }
+
+    // Check if there are other players in the world
+    // Count players from entities instead of using getPlayers()
+    let otherPlayerCount = 0;
+    const entities = world?.entities?.items;
+    if (entities) {
+      for (const [id, entity] of entities.entries()) {
+        const type = entity?.data?.type;
+        if (type === 'player' && id !== player.data.id) {
+          otherPlayerCount++;
+          logger.debug(`[BehaviorManager] Found other player: ${entity?.data?.name || 'Unknown'} (${id})`);
+        }
+      }
+    }
+    const hasOtherPlayers = otherPlayerCount > 0;
+
+    console.log(`[BehaviorManager] Player check: self=${player.data.id}, otherPlayers=${otherPlayerCount}, hasOthers=${hasOtherPlayers}`);
+    logger.info(`[BehaviorManager] Player check: self=${player.data.id}, otherPlayers=${otherPlayerCount}, hasOthers=${hasOtherPlayers}`);
+
+    // Skip autonomous behavior when alone to save costs
+    if (!hasOtherPlayers) {
+      logger.info("[BehaviorManager] No other players present. Skipping autonomous behavior to save costs.");
+      return false;
+    }
+
     // TODO: There may be slow post-processing in the bootstrap plugin's message handler.
     // Investigate long tail after message handling, especially in emitEvent or runtime methods.
     if (agentActivityLock.isActive()) {
       logger.info("[BehaviorManager] Skipping behavior — message activity in progress");
-      return;
+      return hasOtherPlayers;
     }
 
     const _currentWorldId = service.currentWorldId;
@@ -193,7 +229,29 @@ export class BehaviorManager {
 
       if (responseContent.text) {
         const messageManager = service.getMessageManager();
-        messageManager.sendMessage(responseContent.text)
+        messageManager.sendMessage(responseContent.text);
+
+        // Generate TTS audio and play via LiveKit (prefer ElevenLabs, fallback to OpenAI)
+        try {
+          console.log('[BehaviorManager] Starting TTS generation for:', responseContent.text.substring(0, 50) + '...');
+
+          let audioBuffer = await generateElevenLabsTTS(responseContent.text);
+          if (!audioBuffer) {
+            console.log('[BehaviorManager] ElevenLabs failed, trying OpenAI TTS...');
+            audioBuffer = await generateOpenAITTS(responseContent.text);
+          }
+
+          if (audioBuffer) {
+            const voiceManager = service.getVoiceManager();
+            if (voiceManager) {
+              console.log('[BehaviorManager] Playing audio via LiveKit...');
+              await voiceManager.playAudio(audioBuffer);
+              logger.info('[BehaviorManager] TTS audio played successfully');
+            }
+          }
+        } catch (ttsError) {
+          logger.warn('[BehaviorManager] TTS generation failed, text-only response sent:', ttsError);
+        }
       }
 
       return [];
@@ -209,5 +267,7 @@ export class BehaviorManager {
     await this.runtime.evaluate(newMessage, state, true, callback, [
       responseMemory,
     ]);
+
+    return hasOtherPlayers;
   }
 }

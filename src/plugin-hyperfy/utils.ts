@@ -193,6 +193,65 @@ export function getWavHeader(
 }
 
 /**
+ * Direct ElevenLabs TTS API call
+ * @param text - Text to convert to speech
+ * @returns Buffer containing the audio data (PCM format)
+ */
+export async function generateElevenLabsTTS(text: string): Promise<Buffer | null> {
+  const apiKey = process.env.ELEVENLABS_XI_API_KEY;
+  if (!apiKey) {
+    console.error('[ElevenLabs TTS] No ELEVENLABS_XI_API_KEY found in environment');
+    return null;
+  }
+
+  const voiceId = process.env.ELEVENLABS_VOICE_ID || 'EXAVITQu4vr4xnSDxMaL';
+  const modelId = process.env.ELEVENLABS_MODEL_ID || 'eleven_multilingual_v2';
+  const stability = parseFloat(process.env.ELEVENLABS_VOICE_STABILITY || '0.5');
+  const similarityBoost = parseFloat(process.env.ELEVENLABS_VOICE_SIMILARITY_BOOST || '0.9');
+  const style = parseFloat(process.env.ELEVENLABS_VOICE_STYLE || '0.66');
+  // Use mp3_44100_128 for better compatibility with LiveKit
+  // pcm_16000 causes audio to play at wrong speed because LiveKit expects 48000Hz
+  // mp3 format will be properly converted by ffmpeg to the correct sample rate
+  const outputFormat = process.env.ELEVENLABS_OUTPUT_FORMAT || 'mp3_44100_128';
+
+  console.log(`[ElevenLabs TTS] Generating speech with voiceId=${voiceId}, model=${modelId}, format=${outputFormat}`);
+
+  try {
+    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=${outputFormat}`, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        text: text,
+        model_id: modelId,
+        voice_settings: {
+          stability: stability,
+          similarity_boost: similarityBoost,
+          style: style,
+          use_speaker_boost: process.env.ELEVENLABS_VOICE_USE_SPEAKER_BOOST === 'true',
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`[ElevenLabs TTS] API error ${response.status}: ${errorText}`);
+      return null;
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    console.log(`[ElevenLabs TTS] Successfully generated ${buffer.length} bytes of audio`);
+    return buffer;
+  } catch (error) {
+    console.error('[ElevenLabs TTS] Error:', error);
+    return null;
+  }
+}
+
+/**
  * Direct OpenAI TTS API call - bypasses the @elizaos/plugin-openai which has issues reading the API key
  * @param text - Text to convert to speech
  * @returns Buffer containing the audio data (MP3 format)

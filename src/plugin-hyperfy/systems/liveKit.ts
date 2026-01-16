@@ -210,8 +210,26 @@ export class AgentLiveKit extends System {
 
   private detectAudioFormat(buffer: Buffer): 'mp3' | 'wav' | 'pcm' {
     const header = buffer.slice(0, 4).toString('ascii');
+    console.log('[LiveKit] Buffer header bytes:', buffer.slice(0, 10).toString('hex'));
+
+    // Check for WAV (RIFF header)
     if (header === 'RIFF') return 'wav';
+
+    // Check for MP3 frame sync (0xff followed by 0xe0-0xff)
     if (buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0) return 'mp3';
+
+    // Check for ID3 tag (ID3v2 header at start of mp3)
+    if (header.startsWith('ID3')) return 'mp3';
+
+    // Check for MP3 frame sync elsewhere in first 10 bytes (some mp3s have metadata at start)
+    for (let i = 0; i < Math.min(10, buffer.length - 1); i++) {
+      if (buffer[i] === 0xff && (buffer[i + 1] & 0xe0) === 0xe0) {
+        console.log('[LiveKit] Found MP3 frame sync at offset', i);
+        return 'mp3';
+      }
+    }
+
+    console.log('[LiveKit] Format detection fallback to pcm');
     return 'pcm';
   }
 }

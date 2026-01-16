@@ -45,6 +45,7 @@ export const hyperfyProvider: Provider = {
         const allEntityIds: string[] = [];
         const categorizedEntities: Record<string, string[]> = {};
         let agentText = '## Agent Info (You)\nUnable to find your own entity.';
+        const nearbyPlayers: string[] = [];
 
         for (const [id, entity] of entities.entries()) {
           const name = entity?.data?.name || entity?.blueprint?.name || 'Unnamed';
@@ -74,6 +75,11 @@ export const hyperfyProvider: Provider = {
 
           if (type === 'app') {
             line += `, Scale: ${scaleStr}`;
+          }
+
+          // Track players separately for emphasis
+          if (type === 'player') {
+            nearbyPlayers.push(line);
           }
 
           if (!categorizedEntities[type]) {
@@ -153,9 +159,15 @@ export const hyperfyProvider: Provider = {
           ? `### Your Last Response\n${lastResponseText}\n\n_Do not repeat this unless someone asks again._\n\n### Your Last Action\n${JSON.stringify(lastActions, null, 2)}`
           : `### Your Last Response\nNo recent message.\n\n### Your Last Action\n${JSON.stringify(lastActions, null, 2)}`;
 
+        // Emphasize nearby players for social interaction
+        const playerSummary = nearbyPlayers.length > 0
+          ? `## 🎮 Other Players in World (${nearbyPlayers.length})\n**There ${nearbyPlayers.length === 1 ? 'is' : 'are'} ${nearbyPlayers.length} other player${nearbyPlayers.length === 1 ? '' : 's'} nearby!** Be lively and dynamic — walk around, explore, interact with objects, greet players, or show expressions. Create an engaging presence through varied actions.\n${nearbyPlayers.join('\n')}`
+          : `## 🎮 Other Players in World (0)\nYou are currently alone in the world. No need for autonomous behavior right now.`;
+
         const formattedText = [
           `# Hyperfy World State`,
           `\n## Current UTC Time\n${utcTimeString}`,
+          `\n${playerSummary}`,
           `\n${agentText}`,
           `${categorizedSummary}`,
           `\n${actionText}`,

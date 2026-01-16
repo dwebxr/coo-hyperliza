@@ -2,7 +2,7 @@ import { ChannelType, Entity, Content, HandlerCallback, IAgentRuntime, Memory, U
 import { HyperfyService } from "../service";
 import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
-import { generateOpenAITTS } from "../utils";
+import { generateElevenLabsTTS, generateOpenAITTS } from "../utils";
 import moment from 'moment'
 import { uuid } from '../hyperfy/src/core/utils';
 
@@ -87,10 +87,17 @@ export class MessageManager {
           if (responseContent.text) {
             this.sendMessage(responseContent.text);
 
-            // Generate TTS audio and play via LiveKit (using direct OpenAI API call)
+            // Generate TTS audio and play via LiveKit (prefer ElevenLabs, fallback to OpenAI)
             try {
               console.log('[MessageManager] Starting TTS generation for:', responseContent.text.substring(0, 50) + '...');
-              const audioBuffer = await generateOpenAITTS(responseContent.text);
+
+              // Try ElevenLabs first, then fallback to OpenAI
+              let audioBuffer = await generateElevenLabsTTS(responseContent.text);
+              if (!audioBuffer) {
+                console.log('[MessageManager] ElevenLabs failed, trying OpenAI TTS...');
+                audioBuffer = await generateOpenAITTS(responseContent.text);
+              }
+
               console.log('[MessageManager] Audio buffer result:', audioBuffer ? `${audioBuffer.length} bytes` : 'null');
               if (audioBuffer) {
                 const voiceManager = service.getVoiceManager();
@@ -101,7 +108,7 @@ export class MessageManager {
                   logger.info('[MessageManager] TTS audio played successfully');
                 }
               } else {
-                console.log('[MessageManager] No audio generated - check OPENAI_API_KEY in .env');
+                console.log('[MessageManager] No audio generated - check ELEVENLABS_XI_API_KEY or OPENAI_API_KEY in .env');
               }
             } catch (ttsError) {
               logger.warn('[MessageManager] TTS generation failed, text-only response sent:', ttsError);
