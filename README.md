@@ -30,6 +30,11 @@ An ElizaOS + Hyperfy 3D world integration agent. An AI agent that autonomously a
 - **Scheduled Posts**: Posts daily updates to a configured channel
 - **Community Engagement**: Participates in server conversations
 
+### Twitter/X Integration
+- **Daily Posts**: Posts once per day automatically
+- **Reply to Mentions**: Responds to mentions and replies
+- **Free Plan Optimized**: Conservative API usage for Twitter Free tier
+
 ## Setup
 
 ### 1. Clone the Repository
@@ -69,6 +74,15 @@ DISCORD_API_TOKEN=your-bot-token
 DISCORD_POST_CHANNEL_ID=channel-id-for-auto-posts
 DISCORD_POST_INTERVAL_HOURS=24
 DISCORD_ENABLE_AUTO_POST=true
+
+# Twitter/X (optional - OAuth 1.0a credentials)
+TWITTER_API_KEY=your-api-key
+TWITTER_API_SECRET_KEY=your-api-secret
+TWITTER_ACCESS_TOKEN=your-access-token
+TWITTER_ACCESS_TOKEN_SECRET=your-access-token-secret
+TWITTER_ENABLE_POST=true
+TWITTER_ENABLE_REPLIES=true
+TWITTER_POST_INTERVAL=1440
 
 # Server Settings
 SERVER_PORT=3001
@@ -135,6 +149,21 @@ When using ElevenLabs, set the following in `.env`:
 | `DISCORD_POST_INTERVAL_HOURS` | Hours between auto-posts | `24` |
 | `DISCORD_ENABLE_AUTO_POST` | Enable auto-posting | `true` |
 
+### Twitter/X Settings (Free Plan Optimized)
+
+| Environment Variable | Description | Default |
+|---------------------|-------------|---------|
+| `TWITTER_API_KEY` | OAuth 1.0a API Key | - |
+| `TWITTER_API_SECRET_KEY` | OAuth 1.0a API Secret | - |
+| `TWITTER_ACCESS_TOKEN` | OAuth 1.0a Access Token | - |
+| `TWITTER_ACCESS_TOKEN_SECRET` | OAuth 1.0a Access Secret | - |
+| `TWITTER_ENABLE_POST` | Enable posting | `true` |
+| `TWITTER_ENABLE_REPLIES` | Enable reply to mentions | `true` |
+| `TWITTER_ENABLE_ACTIONS` | Enable likes/retweets | `false` |
+| `TWITTER_POST_INTERVAL` | Minutes between posts | `1440` (24h) |
+| `TWITTER_MAX_ENGAGEMENTS_PER_RUN` | Max replies per cycle | `3` |
+| `TWITTER_DRY_RUN` | Test without posting | `false` |
+
 ### Adjusting Autonomous Behavior
 
 You can adjust action intervals in `src/plugin-hyperfy/managers/behavior-manager.ts`:
@@ -183,6 +212,7 @@ src/
 5. **Improved Player Detection**: Accurate player counting via entity iteration
 6. **PostgreSQL Support**: Local PostgreSQL database usage
 7. **Discord Integration**: Auto-reply and scheduled daily posts
+8. **Twitter/X Integration**: Daily posts and mention replies (Free Plan optimized)
 
 ## Troubleshooting
 
@@ -209,6 +239,16 @@ src/
 - Set `DISCORD_ENABLE_AUTO_POST=true`
 - Verify `DISCORD_POST_CHANNEL_ID` is set correctly
 - Check bot has permission to send messages in the channel
+
+### Twitter 403 Forbidden Error
+- Ensure app has "Read and write" permissions (not just Read)
+- Regenerate Access Token & Secret after changing permissions
+- Verify using OAuth 1.0a credentials (not OAuth 2.0)
+
+### Twitter Not Posting
+- Check `TWITTER_ENABLE_POST=true`
+- Verify all 4 OAuth credentials are set correctly
+- Try `TWITTER_DRY_RUN=true` first to test
 
 ## License
 
