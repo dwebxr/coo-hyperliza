@@ -12,6 +12,7 @@ import {
   type ProjectAgent,
 } from '@elizaos/core';
 import hyperfyPlugin from './plugin-hyperfy';
+import { DiscordAutoPostManager } from './discord/discord-auto-post';
 
 /**
  * Represents the default character (Eliza) with her specific attributes and behaviors.
@@ -28,6 +29,7 @@ export const character: Character = {
     ...(process.env.OPENAI_API_KEY ? ['@elizaos/plugin-openai'] : []),
     ...(process.env.ELEVENLABS_XI_API_KEY ? ['@elizaos/plugin-elevenlabs'] : []),
     ...(process.env.OLLAMA_SERVER_URL || process.env.OLLAMA_MODEL || process.env.OLLAMA_API_ENDPOINT || process.env.LLM_PROVIDER === 'ollama' ? ['@elizaos/plugin-ollama'] : []),
+    ...(process.env.DISCORD_API_TOKEN ? ['@elizaos/plugin-discord'] : []),
   ],
   settings: {
     secrets: {},
@@ -160,13 +162,28 @@ export const character: Character = {
       'Show personality, do not be robotic.',
       'Focus on providing kind and helpful information.',
       'Respond when spoken to or when someone nearby seems to want interaction.',
+      'On Discord, respond to mentions and direct messages promptly.',
+      'Keep messages concise but engaging.',
+    ],
+    post: [
+      'Create friendly, engaging posts for the community.',
+      'Share thoughts, greetings, or questions naturally.',
+      'Mix English and Japanese posts occasionally.',
+      'Keep posts short (1-3 sentences) and conversational.',
     ],
   },
 };
 
-const initCharacter = ({ runtime }: { runtime: IAgentRuntime }) => {
+const initCharacter = async ({ runtime }: { runtime: IAgentRuntime }) => {
   logger.info('Initializing character');
   logger.info('Name: ', character.name);
+
+  // Start Discord auto-post manager if enabled
+  if (process.env.DISCORD_API_TOKEN && process.env.DISCORD_ENABLE_AUTO_POST === 'true') {
+    const discordAutoPost = new DiscordAutoPostManager(runtime);
+    await discordAutoPost.start();
+    logger.info('[Discord] Auto-post manager started');
+  }
 };
 
 export const projectAgent: ProjectAgent = {
