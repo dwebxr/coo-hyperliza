@@ -126,10 +126,10 @@ export class BuildManager {
   ) {
     const service = this.getService();
     const world = service.getWorld();
-    const resolvedUrlurl = await resolveUrl(url, world);
+    const resolvedUrl = await resolveUrl(url, world);
     let file
     
-    const resp = await fetch(resolvedUrlurl)
+    const resp = await fetch(resolvedUrl)
     const blob = await resp.blob()
     file = new File([blob], url.split('/').pop(), { type: resp.headers.get('content-type') })
     if (!file) return
@@ -162,10 +162,10 @@ export class BuildManager {
     };
     const ext = file.name.split('.').pop().toLowerCase()
     if (ext === 'hyp') {
-      this.addApp(file, transform)
+      await this.addApp(file, transform)
     }
     if (ext === 'glb' || ext === 'vrm') {
-      this.addModel(file, transform)
+      await this.addModel(file, transform)
     }
   }
 

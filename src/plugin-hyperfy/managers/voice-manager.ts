@@ -22,14 +22,37 @@ export class VoiceManager {
   > = new Map();
   private processingVoice: boolean = false;
   private transcriptionTimeout: NodeJS.Timeout | null = null;
+  private isStarted: boolean = false;
 
   constructor(runtime: IAgentRuntime) {
     this.runtime = runtime;
   }
 
+  /**
+   * Cleanup timers and state on disconnect
+   */
+  cleanup() {
+    if (this.transcriptionTimeout) {
+      clearTimeout(this.transcriptionTimeout);
+      this.transcriptionTimeout = null;
+    }
+    this.userStates.clear();
+    this.processingVoice = false;
+    this.isStarted = false;
+    logger.info('[VoiceManager] Cleanup completed');
+  }
+
   start() {
     const service = this.getService();
+    if (!service) {
+      console.error('[VoiceManager] Cannot start - service not available');
+      return;
+    }
     const world = service.getWorld();
+    if (!world || !world.livekit) {
+      console.error('[VoiceManager] Cannot start - world or livekit not available');
+      return;
+    }
 
     world.livekit.on('audio', async (data: LiveKitAudioData) => {
       function isLoudEnough(pcmBuffer: Buffer, threshold = 1000): boolean {
@@ -126,7 +149,7 @@ export class VoiceManager {
 
       const transcriptionText = await this.runtime.useModel(ModelType.TRANSCRIPTION, wavBuffer);
 
-      console.log("[VOICE MANAGER] Transcrtion: ", transcriptionText)
+      logger.debug("[VoiceManager] Transcription:", transcriptionText)
       function isValidTranscription(text: string): boolean {
         if (!text || text.includes('[BLANK_AUDIO]')) return false;
         return true;
@@ -251,25 +274,28 @@ export class VoiceManager {
     }
   }
 
-  async playAudio(audioBuffer) {
+  async playAudio(audioBuffer: Buffer) {
     if (this.processingVoice) {
-      logger.info(`[VOICE MANAER] Current voice is processing.....`)
+      logger.info(`[VoiceManager] Current voice is processing...`)
       return;
     }
 
     const service = this.getService();
+    if (!service) {
+      console.error('[VoiceManager] Cannot play audio - service not available');
+      return;
+    }
     const world = service.getWorld();
+    if (!world || !world.livekit) {
+      console.error('[VoiceManager] Cannot play audio - world or livekit not available');
+      return;
+    }
     this.processingVoice = true;
 
     // Set speaking state to trigger TALK emote (lip sync animation)
     const player = world?.entities?.player;
-    console.log('[VoiceManager] Player object:', player ? 'exists' : 'null');
-    console.log('[VoiceManager] Player.setSpeaking:', typeof player?.setSpeaking);
-    console.log('[VoiceManager] Player class:', player?.constructor?.name);
     if (player?.setSpeaking) {
       player.setSpeaking(true);
-      console.log('[VoiceManager] Set speaking=true for lip sync');
-      console.log('[VoiceManager] Player.speaking after set:', player.speaking);
     }
 
     try {
@@ -281,7 +307,6 @@ export class VoiceManager {
       // Stop speaking state when done
       if (player?.setSpeaking) {
         player.setSpeaking(false);
-        console.log('[VoiceManager] Set speaking=false');
       }
     }
   }

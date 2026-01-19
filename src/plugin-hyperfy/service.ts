@@ -18,9 +18,9 @@ import { AgentLiveKit } from './systems/liveKit.js'
 import { AgentActions } from './systems/actions.js'
 import { loadPhysX } from './physx/loadPhysX.js'
 import { BehaviorManager } from "./managers/behavior-manager.js"
-import { EmoteManager } from './managers//emote-manager.js'
-import { MessageManager } from './managers//message-manager.js'
-import { VoiceManager } from './managers//voice-manager.js'
+import { EmoteManager } from './managers/emote-manager.js'
+import { MessageManager } from './managers/message-manager.js'
+import { VoiceManager } from './managers/voice-manager.js'
 import { PuppeteerManager } from './managers/puppeteer-manager.js'
 import { BuildManager } from './managers/build-manager.js'
 import { hashFileBuffer, getModuleDirectory } from './utils'
@@ -483,6 +483,7 @@ export class HyperfyService extends Service {
 
     this.stopAppearancePolling()
     this.behaviorManager?.stop();
+    this.voiceManager?.cleanup();
 
     if (this.world) {
       try {
@@ -590,8 +591,8 @@ export class HyperfyService extends Service {
       msgs.forEach((msg: any) => {
         // Check timestamp FIRST - only consider messages newer than connection time
         const messageTimestamp = msg.createdAt ? new Date(msg.createdAt).getTime() : 0;
-        if (!messageTimestamp || messageTimestamp <= this.connectionTime) {
-          // console.debug(`[Chat Sub] Ignoring historical/old message ID ${msg?.id} (ts: ${messageTimestamp})`);
+        // Also check for NaN (invalid date)
+        if (!messageTimestamp || isNaN(messageTimestamp) || messageTimestamp <= this.connectionTime) {
           // Ensure historical messages are marked processed if encountered *before* connectionTime was set (edge case)
           if (msg?.id && !this.processedMsgIds.has(msg.id.toString())) {
             this.processedMsgIds.add(msg.id.toString());
@@ -603,7 +604,7 @@ export class HyperfyService extends Service {
         const msgIdStr = msg.id?.toString();
         if (msgIdStr && !this.processedMsgIds.has(msgIdStr)) {
           newMessagesFound.push(msg) // Add the full message object
-          this.processedMsgIds.add(msgIdStr) // Mark ID as processed immediately
+          // Don't mark as processed here - mark after successful processing
         }
       })
 
@@ -611,9 +612,26 @@ export class HyperfyService extends Service {
       if (newMessagesFound.length > 0) {
         console.info(`[Chat] Found ${newMessagesFound.length} new messages to process.`)
 
-        newMessagesFound.forEach(async (msg: any) => {
-          await this.messageManager.handleMessage(msg);
-        })
+        // Process messages sequentially with proper error handling (use async IIFE)
+        ;(async () => {
+          for (const msg of newMessagesFound) {
+            try {
+              await this.messageManager.handleMessage(msg);
+              // Mark as processed only after successful handling
+              const msgIdStr = msg.id?.toString();
+              if (msgIdStr) {
+                this.processedMsgIds.add(msgIdStr);
+              }
+            } catch (error) {
+              console.error(`[Chat] Error processing message ${msg.id}:`, error);
+              // Still mark as processed to avoid infinite retry loops
+              const msgIdStr = msg.id?.toString();
+              if (msgIdStr) {
+                this.processedMsgIds.add(msgIdStr);
+              }
+            }
+          }
+        })();
       }
     })
   }

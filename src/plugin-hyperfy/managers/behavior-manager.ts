@@ -176,7 +176,7 @@ export class BehaviorManager {
 
     const parsedXml = parseKeyValueXml(response);
 
-    console.log('****** response\n', parsedXml)
+    logger.debug(`[BehaviorManager] Response: ${JSON.stringify(parsedXml)}`)
 
     const responseMemory: Memory = {
       id: createUniqueUuid(this.runtime, Date.now().toString()),

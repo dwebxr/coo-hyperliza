@@ -68,7 +68,15 @@ export class EmoteManager {
     const fallback = (Emotes as Record<string, string>)[name];
     const hashName = this.emoteHashMap.get(name) || fallback;
     const service = this.getService();
+    if (!service) {
+      console.warn('[Emote] Cannot play emote - service not available');
+      return;
+    }
     const world = service.getWorld();
+    if (!world) {
+      console.warn('[Emote] Cannot play emote - world not available');
+      return;
+    }
 
     if (!hashName) {
       console.warn(`[Emote] Emote '${name}' not found.`);

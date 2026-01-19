@@ -243,7 +243,15 @@ export class MessageManager {
           }
         })();
 
-        const formattedId = entity ? JSON.parse(entity.data).hyperfy.id : "";
+        const formattedId = (() => {
+          if (!entity?.data) return "";
+          try {
+            const parsedData = JSON.parse(entity.data);
+            return parsedData?.hyperfy?.id || "";
+          } catch {
+            return "";
+          }
+        })();
   
         const messageTime = new Date(message.createdAt);
         const hours = messageTime.getHours().toString().padStart(2, "0");
