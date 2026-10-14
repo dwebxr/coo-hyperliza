@@ -1,6 +1,6 @@
 import fs from 'fs/promises'
 import path from 'path'
-import { EMOTES_LIST, LOCOMOTION_EMOTES } from '../constants.js'
+import { EMOTES_LIST, LOCOMOTION_EMOTES, TALK_EMOTE } from '../constants.js'
 import { Emotes } from '../hyperfy/src/core/extras/playerEmotes.js'
 import { hashFileBuffer, getModuleDirectory } from '../utils'
 import { IAgentRuntime, logger } from '@elizaos/core'
@@ -144,44 +144,76 @@ export class EmoteManager {
 
   private async uploadLocomotionEmotes() {
     for (const emote of LOCOMOTION_EMOTES) {
-      try {
-        const moduleDirPath = getModuleDirectory();
-        const emoteBuffer = await fs.readFile(moduleDirPath + emote.path);
-        const emoteMimeType = "model/gltf-binary";
+      await this.uploadLocomotionEmote(emote);
+    }
+    await this.ensureTalkEmote();
+  }
 
-        const emoteHash = await hashFileBuffer(emoteBuffer);
-        const emoteExt = emote.path.split(".").pop()?.toLowerCase() || "glb";
-        const emoteFullName = `${emoteHash}.${emoteExt}`;
-        const emoteUrl = `asset://${emoteFullName}`;
+  /** Uploads a clip and points the shared Emotes entry at it. */
+  private async uploadLocomotionEmote(emote: { name: string; path: string }): Promise<boolean> {
+    try {
+      const moduleDirPath = getModuleDirectory();
+      const emoteBuffer = await fs.readFile(moduleDirPath + emote.path);
+      const emoteMimeType = "model/gltf-binary";
 
-        console.info(
-          `[Locomotion] Uploading '${emote.name}' as ${emoteFullName} (${(emoteBuffer.length / 1024).toFixed(2)} KB)`
-        );
+      const emoteHash = await hashFileBuffer(emoteBuffer);
+      const emoteExt = emote.path.split(".").pop()?.toLowerCase() || "glb";
+      const emoteFullName = `${emoteHash}.${emoteExt}`;
+      const emoteUrl = `asset://${emoteFullName}`;
 
-        const emoteFile = new File([emoteBuffer], path.basename(emote.path), {
-          type: emoteMimeType,
-        });
+      console.info(
+        `[Locomotion] Uploading '${emote.name}' as ${emoteFullName} (${(emoteBuffer.length / 1024).toFixed(2)} KB)`
+      );
 
-        const service = this.getService();
-        const world = service.getWorld();
-        const emoteUploadPromise = world.network.upload(emoteFile);
-        const emoteTimeout = new Promise((_resolve, reject) =>
-          setTimeout(() => reject(new Error("Upload timed out")), 30000)
-        );
+      const emoteFile = new File([emoteBuffer], path.basename(emote.path), {
+        type: emoteMimeType,
+      });
 
-        await Promise.race([emoteUploadPromise, emoteTimeout]);
+      const service = this.getService();
+      const world = service.getWorld();
+      const emoteUploadPromise = world.network.upload(emoteFile);
+      const emoteTimeout = new Promise((_resolve, reject) =>
+        setTimeout(() => reject(new Error("Upload timed out")), 30000)
+      );
 
-        // Update the Emotes object with the uploaded URL
-        (Emotes as Record<string, string>)[emote.name] = emoteUrl;
-        console.info(
-          `[Locomotion] Emote '${emote.name}' uploaded and registered: ${emoteUrl}`
-        );
-      } catch (err: any) {
-        console.error(
-          `[Locomotion] Failed to upload emote '${emote.name}': ${err.message}`,
-          err.stack
-        );
-      }
+      await Promise.race([emoteUploadPromise, emoteTimeout]);
+
+      // Update the Emotes object with the uploaded URL
+      (Emotes as Record<string, string>)[emote.name] = emoteUrl;
+      console.info(
+        `[Locomotion] Emote '${emote.name}' uploaded and registered: ${emoteUrl}`
+      );
+      return true;
+    } catch (err: any) {
+      console.error(
+        `[Locomotion] Failed to upload emote '${emote.name}': ${err.message}`,
+        err.stack
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Speaking shows Emotes.TALK. A clip at public/emotes/emote-talk.glb takes precedence;
+   * otherwise the world's own emote-talk.glb is used, with a warning if it has none.
+   */
+  private async ensureTalkEmote() {
+    const bundled = getModuleDirectory() + TALK_EMOTE.path;
+    const hasBundled = await fs.access(bundled).then(() => true, () => false);
+    if (hasBundled) {
+      await this.uploadLocomotionEmote(TALK_EMOTE);
+      return;
+    }
+
+    const assetsUrl: string | undefined = this.getService()?.getWorld()?.assetsUrl;
+    if (!assetsUrl) return;
+    const url = `${assetsUrl.replace(/\/$/, "")}/emote-talk.glb`;
+    const served = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(10000) })
+      .then((resp) => resp.ok, () => false);
+    if (!served) {
+      logger.warn(
+        `[Emote] The world does not serve emote-talk.glb, so no talking gesture is shown while speaking. Put a clip at public/emotes/emote-talk.glb to upload one.`
+      );
     }
   }
 }

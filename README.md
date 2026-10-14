@@ -18,7 +18,7 @@ An ElizaOS + Hyperfy 3D world integration agent. An AI agent that autonomously a
 ### Avatar Features
 - **VRM Avatar Support**: Use custom VRM avatars
 - **Emote System**: Play animations based on emotions
-- **Lip Sync**: Plays TALK emote during voice output
+- **Talking Gesture**: Plays the TALK animation while speaking. The mouth does not move: Hyperfy clients have no lip sync. A custom clip at `src/plugin-hyperfy/public/emotes/emote-talk.glb` replaces the world's own
 
 ### Autonomous Actions
 - **Walking Around**: Freely move around the world
@@ -236,7 +236,7 @@ src/
 1. **Cost Optimization**: Reduced autonomous action frequency when no players present
 2. **ElevenLabs TTS Integration**: High-quality voice synthesis support
 3. **Audio Format Conversion**: Proper MP3 to PCM conversion (using ffmpeg)
-4. **Lip Sync**: TALK emote playback during voice output
+4. **Talking Gesture**: TALK animation playback during voice output
 5. **Improved Player Detection**: Accurate player counting via entity iteration
 6. **PostgreSQL Support**: Local PostgreSQL database usage
 7. **Discord Integration**: Auto-reply and scheduled daily posts
