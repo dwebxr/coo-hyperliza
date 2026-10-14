@@ -12,6 +12,24 @@ import {
   type ProjectAgent,
 } from '@elizaos/core';
 import hyperfyPlugin from './plugin-hyperfy';
+import { anthropicModelsPlugin } from './anthropic-models';
+import { PROVIDER_PACKAGES, planModelPlugins } from './llm-provider';
+
+let modelPlan: ReturnType<typeof planModelPlugins>;
+try {
+  modelPlan = planModelPlugins(process.env);
+} catch (error) {
+  // The CLI would only log a warning and start a server without Coo; stop with a clear reason instead.
+  logger.error((error as Error).message);
+  process.exit(1);
+}
+// The chosen text provider gets a higher priority than the other model plugins that stay loaded
+const textProviderPlugin =
+  modelPlan.textProvider === 'anthropic'
+    ? anthropicModelsPlugin
+    : modelPlan.textProvider
+      ? { ...(await import(PROVIDER_PACKAGES[modelPlan.textProvider])).default, priority: 100 }
+      : null;
 
 /**
  * Represents the default character (Eliza) with her specific attributes and behaviors.
@@ -21,19 +39,10 @@ import hyperfyPlugin from './plugin-hyperfy';
  */
 export const character: Character = {
   name: 'Coo',
-  plugins: [
-    '@elizaos/plugin-sql',
-    ...(process.env.ANTHROPIC_API_KEY ? ['@elizaos/plugin-anthropic'] : []),
-    ...(process.env.GROQ_API_KEY ? ['@elizaos/plugin-groq'] : []),
-    ...(process.env.OPENAI_API_KEY ? ['@elizaos/plugin-openai'] : []),
-    ...(process.env.ELEVENLABS_XI_API_KEY ? ['@elizaos/plugin-elevenlabs'] : []),
-    ...(process.env.OLLAMA_SERVER_URL || process.env.OLLAMA_MODEL || process.env.OLLAMA_API_ENDPOINT || process.env.LLM_PROVIDER === 'ollama' ? ['@elizaos/plugin-ollama'] : []),
-  ],
+  plugins: modelPlan.packages,
   settings: {
     secrets: {},
     avatar: 'https://dwebxr.xyz/images/coo.jpg',
-    model: 'gpt-oss:120b-cloud',
-    modelProvider: 'ollama',
     voice: {
       model: 'tts-1',
       voice: 'nova',
@@ -172,7 +181,7 @@ const initCharacter = ({ runtime }: { runtime: IAgentRuntime }) => {
 export const projectAgent: ProjectAgent = {
   character,
   init: async (runtime: IAgentRuntime) => await initCharacter({ runtime }),
-  plugins: [hyperfyPlugin],
+  plugins: [...(textProviderPlugin ? [textProviderPlugin] : []), hyperfyPlugin],
 };
 const project: Project = {
   agents: [projectAgent],
