@@ -44,6 +44,12 @@ describe('sanitizeText', () => {
     expect(sanitizeText('a'.repeat(10), 5)).toBe('aaaa…');
     expect(sanitizeText(42, 5)).toBe('');
   });
+
+  it('never cuts an emoji in half', () => {
+    const cut = sanitizeText('🛹🛹🛹', 2);
+    expect(cut).toBe('🛹…');
+    expect(cut).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+  });
 });
 
 describe('toStoreProduct', () => {
@@ -73,6 +79,10 @@ describe('toStoreProduct', () => {
     expect(toStoreProduct(item('h_1', 'alice', { totalJpyc: '1e9' }), ORIGIN)).toBeNull();
     expect(toStoreProduct(item('h_1', 'alice', { title: '  ' }), ORIGIN)).toBeNull();
     expect(toStoreProduct(item('bad id!', 'alice'), ORIGIN)).toBeNull();
+  });
+
+  it('tolerates a numeric total', () => {
+    expect(toStoreProduct(item('h_1', 'alice', { totalJpyc: 101 }), ORIGIN)?.totalJpyc).toBe('101');
   });
 });
 

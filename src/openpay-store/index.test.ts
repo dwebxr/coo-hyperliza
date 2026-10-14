@@ -52,9 +52,13 @@ describe('resolveProduct', () => {
   it('uses the id from <productId> (brackets tolerated)', () => {
     expect(resolveProduct(products, { productId: '[h_dome]' })).toBe(dome);
   });
-  it('shares nothing for an unknown id, even with one product', () => {
-    expect(resolveProduct(products, { productId: 'nope', replyText: 'The HoverBoard is great!' })).toBeNull();
+  it('shares nothing for an unknown id that names no product, even with one product', () => {
+    expect(resolveProduct(products, { productId: 'nope', replyText: 'Sure, here you go!' })).toBeNull();
     expect(resolveProduct([board], { productId: 'nope' })).toBeNull();
+  });
+  it('accepts a title written where the id should be, or a title named in the reply', () => {
+    expect(resolveProduct(products, { productId: 'hoverboard' })).toBe(board);
+    expect(resolveProduct(products, { productId: 'nope', replyText: 'The HoverBoard is great!' })).toBe(board);
   });
   it('falls back to a title named as a whole word in the reply, then in the message', () => {
     expect(resolveProduct(products, { replyText: 'The hoverboard is great!' })).toBe(board);
@@ -109,6 +113,8 @@ describe('createOpenPayStorePlugin', () => {
     expect(result.text).toContain('HoverBoard');
     expect(result.values?.openpayStore).toBe(result.text);
     expect(result.values?.openpayShopHint).toContain('Coo also runs a small shop');
+    expect(result.values?.openpayProductIdKey).toContain('"productId"');
+    expect(result.values?.openpayProductIdOutput).toContain('<productId>');
 
     vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise(() => {}));
     const cold = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'someone' })!;
@@ -143,7 +149,7 @@ describe('createOpenPayStorePlugin', () => {
     const { action } = await loadedPlugin();
     const callback = vi.fn();
     await action.handler(runtime(), { entityId: 'agent', content: { text: '' } } as any, undefined, {}, callback, reply('h_board'));
-    await action.handler(runtime(), userMessage('hyperfy'), undefined, {}, callback, reply('h_unknown'));
+    await action.handler(runtime(), userMessage('hyperfy', { text: 'それのリンクちょうだい' }), undefined, {}, callback, reply('h_unknown'));
     expect(callback).not.toHaveBeenCalled();
   });
 });

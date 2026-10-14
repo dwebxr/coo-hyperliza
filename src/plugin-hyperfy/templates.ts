@@ -128,7 +128,7 @@ Before responding:
 - "actions": Comma-separated list of valid actions. Always start with REPLY if speaking.
 - "text": The message {{agentName}} will say. Required if REPLY is present.
 - "emote": Optional. Choose ONE visible in-game animation that matches the tone or emotion of the response. Leave blank if neutral.
-- "productId": Only with OPENPAY_SHARE_PRODUCT: the id of the shop product to share. Leave blank otherwise.
+{{openpayProductIdKey}}
 </keys>
 
 <output>
@@ -139,7 +139,7 @@ Respond using this format:
   <actions>ACTION1,ACTION2</actions>
   <text>Your message text here</text>
   <emote>emote name here</emote>
-  <productId>shop product id, only with OPENPAY_SHARE_PRODUCT</productId>
+  {{openpayProductIdOutput}}
 </response>
 </output>
 

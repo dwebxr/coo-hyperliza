@@ -53,7 +53,7 @@ export function formatShelf(products: StoreProduct[], { autonomous }: { autonomo
   const more = products.length - lines.length;
   const guidance = autonomous
     ? [
-        '- Now and then you may briefly mention one product that fits the moment. Never post links or ids.',
+        '- Now and then you may briefly mention one product that fits the moment, but not if the shop already came up in the recent conversation. Never post links or ids.',
       ]
     : [
         '- Recommend a product only when it fits the conversation. Be friendly, never pushy.',
@@ -82,7 +82,13 @@ export function resolveProduct(
   { productId, replyText, messageText }: { productId?: unknown; replyText?: unknown; messageText?: unknown }
 ): StoreProduct | null {
   const id = typeof productId === 'string' ? productId.trim().replace(/^\[|\]$/g, '') : '';
-  if (id) return products.find((p) => p.id === id) ?? null;
+  if (id) {
+    const byId = products.find((p) => p.id === id);
+    if (byId) return byId;
+    // The model sometimes writes the product's name instead of its id
+    const byTitle = products.filter((p) => p.title.toLowerCase() === id.toLowerCase());
+    if (byTitle.length === 1) return byTitle[0];
+  }
   for (const text of [replyText, messageText]) {
     if (typeof text !== 'string' || !text) continue;
     // Whole-word match for latin titles ("AI" must not match "details"), substring for Japanese
@@ -120,12 +126,17 @@ export function createOpenPayStorePlugin(env: Record<string, string | undefined>
     get: async (runtime, message) => {
       // Cached only: prompts never wait on the Store API
       const products = catalog.list();
-      if (!products.length) return { text: '', values: { openpayStore: '', openpayShopHint: '' } };
+      if (!products.length) {
+        return { text: '', values: { openpayStore: '', openpayShopHint: '', openpayProductIdKey: '', openpayProductIdOutput: '' } };
+      }
       const text = formatShelf(products, { autonomous: isAutonomous(runtime, message) });
       return {
         text,
         values: {
           openpayStore: text,
+          // Reply-format additions appear only while there is something to sell
+          openpayProductIdKey: `- "productId": Only with ${SHARE_ACTION}: the id of the shop product to share. Leave blank otherwise.`,
+          openpayProductIdOutput: `<productId>shop product id, only with ${SHARE_ACTION}</productId>`,
           // Values are not template-rendered, so the name is filled in here
           openpayShopHint: `${runtime.character.name} also runs a small shop (OpenPay Store); questions about buying or products are directed at them.`,
         },

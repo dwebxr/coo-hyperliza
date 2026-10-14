@@ -173,7 +173,7 @@ Coo can act as a shop clerk for [OpenPay Store](https://open-pay.jp/ja/store): i
 | `OPENPAY_STORE_LOCALE` | `ja` | Language of the purchase pages (`ja` / `en`) |
 | `OPENPAY_STORE_API_URL` | `https://open-pay.jp/api/store/listings` | Listings API (purchase links are only accepted on this origin) |
 
-Products are refreshed every 5 minutes in the background; prompts never wait on the API.
+Products are refreshed every 5 minutes in the background; prompts never wait on the API. In Hyperfy the reply names the product by id; on Discord (whose reply format has no product id) a link is shared only when the reply or message names the product unambiguously.
 
 ### Agent Aliases
 

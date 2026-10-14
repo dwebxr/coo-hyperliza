@@ -46,7 +46,9 @@ export function sanitizeText(value: unknown, max: number): string {
     .replace(/[\u0000-\u001f\u007f<>`]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  return clean.length > max ? `${clean.slice(0, max - 1).trimEnd()}…` : clean;
+  // Count code points, so an emoji is never cut in half into a lone surrogate
+  const chars = Array.from(clean);
+  return chars.length > max ? `${chars.slice(0, max - 1).join('').trimEnd()}…` : clean;
 }
 
 const HANDLE = /^[\w.-]{1,64}$/;
@@ -81,7 +83,9 @@ export function parseLocale(raw: string | undefined): StoreLocale {
 /** Whitelists one API item; null when it is malformed or its url is off the API's origin. */
 export function toStoreProduct(item: any, allowedOrigin: string): StoreProduct | null {
   if (!item || typeof item !== 'object') return null;
-  const { id, handle, totalJpyc, url } = item;
+  const { id, handle, url } = item;
+  // Strings per the API contract; a finite number is tolerated in case that ever changes
+  const totalJpyc = typeof item.totalJpyc === 'number' && Number.isFinite(item.totalJpyc) ? String(item.totalJpyc) : item.totalJpyc;
   if (typeof id !== 'string' || !ID.test(id)) return null;
   if (typeof handle !== 'string' || !HANDLE.test(handle)) return null;
   if (typeof totalJpyc !== 'string' || !AMOUNT.test(totalJpyc)) return null;
@@ -213,6 +217,10 @@ export class StoreCatalog {
     if (body?.ok !== true || !Array.isArray(body.items)) {
       throw new TransientError(`${source}: unexpected response shape`);
     }
-    return body.items.map((item: any) => toStoreProduct(item, this.origin)).filter(Boolean) as StoreProduct[];
+    const products = body.items.map((item: any) => toStoreProduct(item, this.origin)).filter(Boolean) as StoreProduct[];
+    if (body.items.length > 0 && products.length === 0) {
+      logger.warn(`[OpenPayStore] ${source}: all ${body.items.length} item(s) were rejected as malformed`);
+    }
+    return products;
   }
 }

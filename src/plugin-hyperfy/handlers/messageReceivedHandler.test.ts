@@ -26,6 +26,19 @@ function setup({ embeddingModel, embeddingError }: { embeddingModel: boolean; em
   return { runtime, message };
 }
 
+describe('messageReceivedHandler reply fields', () => {
+  it('passes extra reply tags such as <productId> through to the actions', async () => {
+    const { runtime, message } = setup({ embeddingModel: false });
+    runtime.useModel.mockResolvedValue(
+      '<response><thought>sell</thought><actions>REPLY,OPENPAY_SHARE_PRODUCT</actions><text>Here!</text><productId>h_board</productId></response>'
+    );
+    await messageReceivedHandler({ runtime, message, callback: vi.fn() } as any);
+    const responses = runtime.processActions.mock.calls[0][1];
+    expect(responses[0].content.productId).toBe('h_board');
+    expect(responses[0].content.actions).toEqual(['REPLY', 'OPENPAY_SHARE_PRODUCT']);
+  });
+});
+
 describe('messageReceivedHandler embeddings', () => {
   it('replies without trying to embed when no embedding model is registered', async () => {
     const { runtime, message } = setup({ embeddingModel: false });
