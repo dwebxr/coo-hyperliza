@@ -324,6 +324,42 @@ export async function generateOpenAITTS(text: string): Promise<Buffer | null> {
 }
 
 /**
+ * Direct ElevenLabs speech-to-text call. Bypasses @elizaos/plugin-elevenlabs, whose TRANSCRIPTION
+ * handler builds https://api.elevenlabs.io/v1/v1/speech-to-text (404) and reads a different key name.
+ * @returns the transcript, or null when ElevenLabs isn't configured or the call fails
+ */
+export async function transcribeWithElevenLabs(audio: Buffer, fileName = 'speech.wav'): Promise<string | null> {
+  const apiKey = process.env.ELEVENLABS_XI_API_KEY;
+  if (!apiKey) return null;
+
+  const form = new FormData();
+  form.append('model_id', process.env.ELEVENLABS_STT_MODEL_ID || 'scribe_v2');
+  if (process.env.ELEVENLABS_STT_LANGUAGE_CODE) {
+    form.append('language_code', process.env.ELEVENLABS_STT_LANGUAGE_CODE);
+  }
+  form.append('file', new Blob([audio]), fileName);
+
+  try {
+    const response = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
+      method: 'POST',
+      signal: AbortSignal.timeout(TTS_REQUEST_TIMEOUT_MS),
+      headers: { 'xi-api-key': apiKey },
+      body: form,
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`[ElevenLabs STT] API error ${response.status}: ${errorText}`);
+      return null;
+    }
+    const data = (await response.json()) as { text?: unknown };
+    return typeof data?.text === 'string' ? data.text : null;
+  } catch (error) {
+    console.error('[ElevenLabs STT] Error:', error);
+    return null;
+  }
+}
+
+/**
  * Generates speech audio, preferring ElevenLabs and falling back to OpenAI.
  */
 export async function generateSpeech(text: string): Promise<Buffer | null> {

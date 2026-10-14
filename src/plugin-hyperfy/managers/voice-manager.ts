@@ -1,6 +1,6 @@
 import { ChannelType, Content, HandlerCallback, IAgentRuntime, Memory, ModelType, UUID, createUniqueUuid, logger } from "@elizaos/core";
 import { HyperfyService } from "../service";
-import { countOtherPlayers, generateSpeech, getWavHeader } from "../utils";
+import { countOtherPlayers, generateSpeech, getWavHeader, transcribeWithElevenLabs } from "../utils";
 import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
 import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
@@ -155,7 +155,10 @@ export class VoiceManager {
       const wavBuffer = Buffer.concat([wavHeader, inputBuffer]);
       logger.debug('Starting transcription...');
 
-      transcriptionText = await this.runtime.useModel(ModelType.TRANSCRIPTION, wavBuffer);
+      // ElevenLabs directly when configured, otherwise whatever TRANSCRIPTION model is registered
+      transcriptionText =
+        (await transcribeWithElevenLabs(wavBuffer)) ??
+        (await this.runtime.useModel(ModelType.TRANSCRIPTION, wavBuffer));
       console.log("[VOICE MANAGER] Transcription: ", transcriptionText)
     } catch (error) {
       console.error(`Error transcribing audio for user ${playerId}:`, error);

@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { countOtherPlayers, resolveUrl } from './utils';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { countOtherPlayers, resolveUrl, transcribeWithElevenLabs } from './utils';
 
 const world = { assetsUrl: 'https://assets.example.com/' };
 
@@ -53,5 +53,36 @@ describe('countOtherPlayers', () => {
 
   it('returns 0 without a world', () => {
     expect(countOtherPlayers(null)).toBe(0);
+  });
+});
+
+describe('transcribeWithElevenLabs', () => {
+  const realFetch = globalThis.fetch;
+  const realKey = process.env.ELEVENLABS_XI_API_KEY;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    process.env.ELEVENLABS_XI_API_KEY = realKey;
+  });
+
+  it('posts the audio to the correct speech-to-text URL and returns the text', async () => {
+    process.env.ELEVENLABS_XI_API_KEY = 'test-key';
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ text: 'こんにちは' }), { status: 200 }));
+    globalThis.fetch = fetchMock as any;
+
+    await expect(transcribeWithElevenLabs(Buffer.from('RIFF'))).resolves.toBe('こんにちは');
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('https://api.elevenlabs.io/v1/speech-to-text');
+    expect(init.headers['xi-api-key']).toBe('test-key');
+    expect((init.body as FormData).get('model_id')).toBe('scribe_v2');
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('returns null without a key or on an API error, so the caller can fall back', async () => {
+    delete process.env.ELEVENLABS_XI_API_KEY;
+    await expect(transcribeWithElevenLabs(Buffer.from('x'))).resolves.toBeNull();
+
+    process.env.ELEVENLABS_XI_API_KEY = 'test-key';
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('{"detail":"missing_permissions"}', { status: 401 })) as any;
+    await expect(transcribeWithElevenLabs(Buffer.from('x'))).resolves.toBeNull();
   });
 });
