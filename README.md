@@ -5,9 +5,10 @@ An ElizaOS + Hyperfy 3D world integration agent. An AI agent that autonomously a
 ## Features
 
 ### Cost Optimization
-- **Idle Mode Energy Saving**: Reduces autonomous action frequency when no other players are in the world to minimize API call costs
-  - With players present: 15-30 second intervals
-  - Without players: 60-120 second intervals (idle mode)
+- **Idle Mode Energy Saving**: When no other players are in the world, autonomous actions are skipped entirely (no LLM call is made) and the loop only re-checks for players every 60-120 seconds
+  - With players present: autonomous actions every 15-30 seconds
+  - Without players: skipped, re-check every 60-120 seconds (idle mode)
+- **Cheaper Reply Decisions**: Messages that mention the agent's name or an alias (see `HYPERFY_AGENT_ALIASES`) skip the "should I respond?" LLM check
 
 ### Voice Features
 - **ElevenLabs TTS**: High-quality voice synthesis for agent speech
@@ -59,13 +60,13 @@ WS_URL=wss://your-hyperfy-world.xyz/ws
 # Database (PostgreSQL recommended)
 POSTGRES_URL=postgresql://localhost:5432/eliza_hyperfy
 
-# LLM API
-OPENAI_API_KEY=your-openai-api-key
+# LLM API (Claude by default; see "Model Selection")
+ANTHROPIC_API_KEY=your-anthropic-api-key
 
 # ElevenLabs TTS (optional)
 ELEVENLABS_XI_API_KEY=your-elevenlabs-api-key
 ELEVENLABS_VOICE_ID=your-voice-id
-ELEVENLABS_MODEL_ID=eleven_multilingual_v2
+ELEVENLABS_MODEL_ID=eleven_flash_v2_5
 ELEVENLABS_OUTPUT_FORMAT=mp3_44100_128
 
 # Discord (optional)
@@ -87,6 +88,8 @@ TWITTER_POST_INTERVAL=1440
 # Server Settings
 SERVER_PORT=3001
 ```
+
+> **Security**: `localstorage.json` holds the agent's Hyperfy auth token. Never commit it.
 
 ### 3. Setup PostgreSQL (Optional)
 
@@ -132,12 +135,37 @@ When using ElevenLabs, set the following in `.env`:
 |---------------------|-------------|---------|
 | `ELEVENLABS_XI_API_KEY` | ElevenLabs API key | - |
 | `ELEVENLABS_VOICE_ID` | Voice ID to use | `EXAVITQu4vr4xnSDxMaL` |
-| `ELEVENLABS_MODEL_ID` | Model ID | `eleven_multilingual_v2` |
+| `ELEVENLABS_MODEL_ID` | Model ID (`eleven_flash_v2_5` uses about half the credits and is faster; supports Japanese) | `eleven_multilingual_v2` |
 | `ELEVENLABS_OUTPUT_FORMAT` | Output format | `mp3_44100_128` |
-| `ELEVENLABS_STABILITY` | Voice stability (0-1) | `0.5` |
-| `ELEVENLABS_SIMILARITY_BOOST` | Similarity boost (0-1) | `0.75` |
-| `ELEVENLABS_STYLE` | Style (0-1) | `0` |
-| `ELEVENLABS_USE_SPEAKER_BOOST` | Speaker boost | `true` |
+| `ELEVENLABS_VOICE_STABILITY` | Voice stability (0-1) | `0.5` |
+| `ELEVENLABS_VOICE_SIMILARITY_BOOST` | Similarity boost (0-1) | `0.9` |
+| `ELEVENLABS_VOICE_STYLE` | Style (0-1) | `0.66` |
+| `ELEVENLABS_VOICE_USE_SPEAKER_BOOST` | Speaker boost (enabled only when set to exactly `true`) | off |
+
+### Model Selection
+
+`LLM_PROVIDER` picks which plugin generates text: `anthropic`, `openai`, `ollama` or `groq` (an unknown value stops startup with an error). Left empty, Claude is used when `ANTHROPIC_API_KEY` is set. Other model plugins stay loaded for what they provide, but never take over text generation from the chosen one.
+
+| Job | Provided by |
+|---|---|
+| Replies, decisions, JSON extraction, describing what the agent sees | The `LLM_PROVIDER` (Claude by default) |
+| Speech output (TTS) | ElevenLabs (`ELEVENLABS_XI_API_KEY`), with OpenAI as an optional fallback |
+| Voice input (speech-to-text) | ElevenLabs, called directly (the key needs the `speech_to_text` permission; model `ELEVENLABS_STT_MODEL_ID`, default `scribe_v2`, optional `ELEVENLABS_STT_LANGUAGE_CODE`), else the registered TRANSCRIPTION model |
+| Embeddings | Optional (OpenAI or Ollama). Nothing in this agent searches memories by embedding, so replies work without them |
+
+**Anthropic (default when `ANTHROPIC_API_KEY` is set and `LLM_PROVIDER` is unset)** - handled by `src/anthropic-models.ts` with the official SDK, because `@elizaos/plugin-anthropic` sends `temperature` (rejected by current Claude models) and defaults to retired model IDs.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ANTHROPIC_SMALL_MODEL` | `claude-haiku-5-5` | "Should I respond?" checks, small JSON extractions |
+| `ANTHROPIC_LARGE_MODEL` | `claude-haiku-5-5` | Replies and autonomous actions; `claude-sonnet-5-5` for higher quality at ~20x the cost |
+| `ANTHROPIC_EFFORT` | `low` | `low` / `medium` / `high`; higher is slower and more expensive |
+
+**Ollama** - set `LLM_PROVIDER=ollama`; models come from `OLLAMA_API_ENDPOINT`, `OLLAMA_SMALL_MODEL` and `OLLAMA_LARGE_MODEL` (`OLLAMA_MODEL` is not read by the plugin). Requires a running Ollama server.
+
+### Agent Aliases
+
+`HYPERFY_AGENT_ALIASES` is a comma-separated list of extra names the agent answers to (e.g. `クー`). A message containing the agent's name or one of these aliases skips the "should I respond?" LLM check. The check is also skipped when the agent is 1-on-1 with a single player.
 
 ### Discord Settings
 
@@ -225,6 +253,7 @@ src/
 - Verify `WS_URL` is correct
 - Check if Hyperfy world is running
 - Check console error logs
+- The agent auto-reconnects to the Hyperfy world with exponential backoff (5s up to a maximum of 5 minutes). If the world is full or another session is already using the same auth token (`localstorage.json`), it retries every 5 minutes; the other session is not disturbed.
 
 ### Audio Distorted / Wrong Speed
 - Set `ELEVENLABS_OUTPUT_FORMAT=mp3_44100_128`

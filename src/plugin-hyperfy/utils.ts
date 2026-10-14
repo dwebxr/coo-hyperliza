@@ -81,7 +81,11 @@ function getMimeTypeFromPath(filePath) {
   return mimeTypes[ext] || 'application/octet-stream';
 }
 
-export const resolveUrl = async (url, world) => {
+export const resolveUrl = async (
+  url,
+  world,
+  { allowLocal = true }: { allowLocal?: boolean } = {}
+): Promise<string | null> => {
   if (typeof url !== "string") {
     console.error(`Invalid URL type provided: ${typeof url}`);
     return null;
@@ -97,21 +101,23 @@ export const resolveUrl = async (url, world) => {
     const baseUrl = world.assetsUrl.replace(/[/\\\\]$/, ""); // Remove trailing slash (either / or \)
     return `${baseUrl}/${filename}`;
   }
-  if (url.startsWith("http://") || url.startsWith("https://")) {
+  if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("data:") || url.startsWith("blob:")) {
     return url;
   }
 
-  try {
-    const buffer = await fsPromises.readFile(url);
-    const mimeType = getMimeTypeFromPath(url);
-    return `data:${mimeType};base64,${buffer.toString('base64')}`;
-  } catch (err: any) {
-    console.warn(`File not found at "${url}", falling back to resolve relative to module directory.`);
+  if (!allowLocal) {
+    console.warn(`[resolveUrl] Refusing to read local path "${url}".`);
+    return null;
   }
 
-  // Fallback: resolve relative to module directory
-  const moduleDir = getModuleDirectory();
+  // Local files are only read from inside the module directory (bundled assets),
+  // never from arbitrary paths supplied by world content.
+  const moduleDir = path.resolve(getModuleDirectory());
   const fullPath = path.resolve(moduleDir, url);
+  if (path.isAbsolute(url) || (fullPath !== moduleDir && !fullPath.startsWith(moduleDir + path.sep))) {
+    console.warn(`[resolveUrl] Refusing to read "${url}" outside the module directory.`);
+    return null;
+  }
 
   try {
     const buffer = await fsPromises.readFile(fullPath);
@@ -119,12 +125,26 @@ export const resolveUrl = async (url, world) => {
     return `data:${mimeType};base64,${buffer.toString('base64')}`;
   } catch (err: any) {
     if (err.code === 'ENOENT') {
-      console.error(`[AgentLoader] File not found at either "${url}" or "${fullPath}"`);
+      console.error(`[AgentLoader] File not found at "${fullPath}"`);
     } else {
-      console.error(`Error reading fallback file at "${fullPath}":`, err);
+      console.error(`Error reading file at "${fullPath}":`, err);
     }
     return null;
   }
+}
+
+/**
+ * Counts player entities other than the agent itself.
+ */
+export function countOtherPlayers(world: any): number {
+  const selfId = world?.entities?.player?.data?.id;
+  const entities = world?.entities?.items;
+  if (!entities) return 0;
+  let count = 0;
+  for (const [id, entity] of entities.entries()) {
+    if (entity?.data?.type === 'player' && id !== selfId) count++;
+  }
+  return count;
 }
 
 /**
@@ -197,6 +217,8 @@ export function getWavHeader(
  * @param text - Text to convert to speech
  * @returns Buffer containing the audio data (PCM format)
  */
+const TTS_REQUEST_TIMEOUT_MS = 30_000;
+
 export async function generateElevenLabsTTS(text: string): Promise<Buffer | null> {
   const apiKey = process.env.ELEVENLABS_XI_API_KEY;
   if (!apiKey) {
@@ -219,6 +241,7 @@ export async function generateElevenLabsTTS(text: string): Promise<Buffer | null
   try {
     const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=${outputFormat}`, {
       method: 'POST',
+      signal: AbortSignal.timeout(TTS_REQUEST_TIMEOUT_MS),
       headers: {
         'xi-api-key': apiKey,
         'Content-Type': 'application/json',
@@ -267,11 +290,11 @@ export async function generateOpenAITTS(text: string): Promise<Buffer | null> {
   const voice = process.env.OPENAI_TTS_VOICE || 'nova';
 
   console.log(`[OpenAI TTS Direct] Generating speech with model=${model}, voice=${voice}`);
-  console.log(`[OpenAI TTS Direct] API Key present: ${apiKey.substring(0, 10)}...`);
 
   try {
     const response = await fetch('https://api.openai.com/v1/audio/speech', {
       method: 'POST',
+      signal: AbortSignal.timeout(TTS_REQUEST_TIMEOUT_MS),
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
@@ -298,4 +321,50 @@ export async function generateOpenAITTS(text: string): Promise<Buffer | null> {
     console.error('[OpenAI TTS Direct] Error:', error);
     return null;
   }
+}
+
+/**
+ * Direct ElevenLabs speech-to-text call. Bypasses @elizaos/plugin-elevenlabs, whose TRANSCRIPTION
+ * handler builds https://api.elevenlabs.io/v1/v1/speech-to-text (404) and reads a different key name.
+ * @returns the transcript, or null when ElevenLabs isn't configured or the call fails
+ */
+export async function transcribeWithElevenLabs(audio: Buffer, fileName = 'speech.wav'): Promise<string | null> {
+  const apiKey = process.env.ELEVENLABS_XI_API_KEY;
+  if (!apiKey) return null;
+
+  const form = new FormData();
+  form.append('model_id', process.env.ELEVENLABS_STT_MODEL_ID || 'scribe_v2');
+  if (process.env.ELEVENLABS_STT_LANGUAGE_CODE) {
+    form.append('language_code', process.env.ELEVENLABS_STT_LANGUAGE_CODE);
+  }
+  form.append('file', new Blob([audio]), fileName);
+
+  try {
+    const response = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
+      method: 'POST',
+      signal: AbortSignal.timeout(TTS_REQUEST_TIMEOUT_MS),
+      headers: { 'xi-api-key': apiKey },
+      body: form,
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`[ElevenLabs STT] API error ${response.status}: ${errorText}`);
+      return null;
+    }
+    const data = (await response.json()) as { text?: unknown };
+    return typeof data?.text === 'string' ? data.text : null;
+  } catch (error) {
+    console.error('[ElevenLabs STT] Error:', error);
+    return null;
+  }
+}
+
+/**
+ * Generates speech audio, preferring ElevenLabs and falling back to OpenAI.
+ */
+export async function generateSpeech(text: string): Promise<Buffer | null> {
+  const audio = await generateElevenLabsTTS(text);
+  if (audio) return audio;
+  console.log('[TTS] ElevenLabs unavailable, trying OpenAI TTS...');
+  return generateOpenAITTS(text);
 }

@@ -123,6 +123,10 @@ export class EmoteManager {
     this.clearTimers();
   }
 
+  stop() {
+    this.clearTimers();
+  }
+
   private clearTimers() {
     if (this.currentEmoteTimeout) {
       clearTimeout(this.currentEmoteTimeout);

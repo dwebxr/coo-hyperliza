@@ -6,6 +6,8 @@ export default defineConfig({
     environment: 'node',
     globals: true,
     testTimeout: 60000,
+    include: ['src/**/*.test.ts'],
+    exclude: ['**/node_modules/**', 'src/plugin-hyperfy/hyperfy/**', 'dist/**'],
   },
   resolve: {
     alias: {

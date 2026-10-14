@@ -52,7 +52,7 @@ export const hyperfyPlugin: Plugin = {
       // Store validated config for service use (runtime.pluginConfigs is usually the way)
     } catch (error) {
       if (error instanceof z.ZodError) {
-        logger.error(`Invalid Hyperfy plugin configuration: ${error.errors.map((e) => e.message).join(', ')}`);
+        logger.error(`Invalid Hyperfy plugin configuration: ${error.issues.map((e) => e.message).join(', ')}`);
         // Decide if this is a fatal error
         // throw new Error(`Invalid Hyperfy plugin configuration...`);
       } else {
@@ -74,7 +74,6 @@ export const hyperfyPlugin: Plugin = {
     hyperfyStopMovingAction,
     hyperfyWalkRandomlyAction,
     hyperfyAmbientSpeechAction,
-    hyperfyEditEntityAction,
     hyperfyEditEntityAction,
     teleportToUserAction,
     replyAction,

@@ -71,6 +71,7 @@ export const messageReceivedHandler = async ({
     });
 
     const processingPromise = (async () => {
+      let runError: string | undefined;
       try {
         if (message.entityId === runtime.agentId) {
           logger.debug(`[Bootstrap] Skipping message from self (${runtime.agentId})`);
@@ -81,12 +82,15 @@ export const messageReceivedHandler = async ({
           `[Bootstrap] Processing message: ${truncateToCompleteSentence(message.content.text || '', 50)}...`
         );
 
-        // First, save the incoming message
+        // First, save the incoming message. Nothing in this agent searches memories by embedding,
+        // so a missing or failing embedding provider must not stop the reply.
         logger.debug('[Bootstrap] Saving message to memory and embeddings');
-        await Promise.all([
-          runtime.addEmbeddingToMemory(message),
-          runtime.createMemory(message, 'messages'),
-        ]);
+        const embedding = runtime.getModel(ModelType.TEXT_EMBEDDING)
+          ? runtime.addEmbeddingToMemory(message).catch((error) => {
+              logger.warn(`[Bootstrap] Embedding failed, continuing without it: ${error?.message || error}`);
+            })
+          : undefined;
+        await Promise.all([embedding, runtime.createMemory(message, 'messages')]);
 
         const agentUserState = await runtime.getParticipantUserState(
           message.roomId,
@@ -101,48 +105,47 @@ export const messageReceivedHandler = async ({
           return;
         }
 
+        // Composed once and reused for the response prompt; recomposing re-runs every provider.
         let state = await runtime.composeState(
           message,
         );
 
-        // Skip shouldRespond check for DM and VOICE_DM channels
-        const room = await runtime.getRoom(message.roomId);
-        logger.debug(
-          `[Bootstrap] Skipping shouldRespond check for ${runtime.character.name} because ${room?.type} ${room?.source}`
-        );
+        // Set by the Hyperfy message/voice managers
+        const metadata = (message.content?.metadata ?? {}) as { directlyAddressed?: boolean; soloPlayer?: boolean };
+        let shouldRespond = false;
 
-        // Handle shouldRespond
-        const shouldRespondPrompt = composePromptFromState({
-          state,
-          template: hyperfyShouldRespondTemplate,
-        });
+        if (metadata.directlyAddressed || metadata.soloPlayer) {
+          logger.debug(
+            `[Bootstrap] Skipping shouldRespond check for ${runtime.character.name} (directlyAddressed=${!!metadata.directlyAddressed}, soloPlayer=${!!metadata.soloPlayer})`
+          );
+          shouldRespond = true;
+        } else {
+          const shouldRespondPrompt = composePromptFromState({
+            state,
+            template: hyperfyShouldRespondTemplate,
+          });
 
-        logger.debug(
-          `[Bootstrap] Evaluating response for ${runtime.character.name}\nPrompt: ${shouldRespondPrompt}`
-        );
+          logger.debug(
+            `[Bootstrap] Evaluating response for ${runtime.character.name}\nPrompt: ${shouldRespondPrompt}`
+          );
 
-        const response = await runtime.useModel(ModelType.TEXT_SMALL, {
-          prompt: shouldRespondPrompt,
-        });
+          const response = await runtime.useModel(ModelType.TEXT_SMALL, {
+            prompt: shouldRespondPrompt,
+          });
 
-        logger.debug(
-          `[Bootstrap] Response evaluation for ${runtime.character.name}:\n${response}`
-        );
-        logger.debug(`[Bootstrap] Response type: ${typeof response}`);
+          logger.debug(
+            `[Bootstrap] Response evaluation for ${runtime.character.name}:\n${response}`
+          );
 
-        // Try to preprocess response by removing code blocks markers if present
-        // let processedResponse = response.replace('```json', '').replaceAll('```', '').trim(); // No longer needed for XML
+          const responseObject = parseKeyValueXml(response);
+          logger.debug(`[Bootstrap] Parsed response: ${JSON.stringify(responseObject)}`);
 
-        const responseObject = parseKeyValueXml(response);
-        console.log('[Bootstrap] Parsed response:', responseObject);
+          shouldRespond = responseObject?.action === 'RESPOND';
+        }
 
-        const shouldRespond = responseObject?.action && responseObject.action === 'RESPOND';
-        
         let responseMessages: Memory[] = [];
 
         if (shouldRespond) {
-          state = await runtime.composeState(message);
-
           const prompt = composePromptFromState({
             state,
             template: hyperfyMessageHandlerTemplate,
@@ -261,22 +264,8 @@ export const messageReceivedHandler = async ({
             inReplyTo: createUniqueUuid(runtime, message.id), // Reference original message
           };
 
-          // Call the callback directly with the ignore content
+          // The callback persists the ignore content to memory
           await callback(ignoreContent);
-
-          // Also save this ignore action/thought to memory
-          const ignoreMemory = {
-            id: asUUID(v4()),
-            entityId: runtime.agentId,
-            agentId: runtime.agentId,
-            content: ignoreContent,
-            roomId: message.roomId,
-            createdAt: Date.now(),
-          };
-          await runtime.createMemory(ignoreMemory, 'messages');
-          logger.debug('[Bootstrap] Saved ignore response to memory', {
-            memoryId: ignoreMemory.id,
-          });
 
           // Clean up the response ID since we handled it
           agentResponses.delete(message.roomId);
@@ -288,21 +277,10 @@ export const messageReceivedHandler = async ({
           // await runtime.evaluate(message, state, shouldRespond, callback, []);
         }
 
-        // Emit run ended event on successful completion
-        await runtime.emitEvent(EventType.RUN_ENDED, {
-          runtime,
-          runId,
-          messageId: message.id,
-          roomId: message.roomId,
-          entityId: message.entityId,
-          startTime,
-          status: 'completed',
-          endTime: Date.now(),
-          duration: Date.now() - startTime,
-          source: 'messageHandler',
-        });
       } catch (error: any) {
-        // Emit run ended event with error
+        runError = error?.message || String(error);
+      } finally {
+        // Emitted on every path, including early returns (muted room, superseded response)
         await runtime.emitEvent(EventType.RUN_ENDED, {
           runtime,
           runId,
@@ -310,12 +288,12 @@ export const messageReceivedHandler = async ({
           roomId: message.roomId,
           entityId: message.entityId,
           startTime,
-          status: 'error',
+          status: runError ? 'error' : 'completed',
           endTime: Date.now(),
           duration: Date.now() - startTime,
-          error: error.message,
+          ...(runError ? { error: runError } : {}),
           source: 'messageHandler',
-        });
+        } as any).catch((error) => logger.warn('[Bootstrap] RUN_ENDED handler failed:', error));
       }
     })();
 

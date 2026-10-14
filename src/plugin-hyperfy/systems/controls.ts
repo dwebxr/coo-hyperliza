@@ -5,7 +5,6 @@ import { Vector3Enhanced } from '../hyperfy/src/core/extras/Vector3Enhanced.js'
 
 const FORWARD = new THREE.Vector3(0, 0, -1)
 const v1 = new THREE.Vector3()
-const v2 = new THREE.Vector3()
 const e1 = new THREE.Euler(0, 0, 0, 'YXZ')
 const e2 = new THREE.Euler(0, 0, 0, 'YXZ')
 const q1 = new THREE.Quaternion()
@@ -205,10 +204,9 @@ export class AgentControls extends System {
     const token = new ControlsToken();
     this._currentWalkToken = token;
     this._isNavigating = true;
-    v2.set(0, 0, 0);
     await this._navigateTowards(() => {
       const target = this.world.entities.items.get(entityId);
-      if (!target) return v2;
+      if (!target) return null;
       return target.base?.position?.clone() || target.root?.position?.clone() || null;
     }, stopDistance, token);
   }

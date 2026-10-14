@@ -181,7 +181,7 @@ ${summary}
     ) => {
       const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
       const world = service?.getWorld();
-      const buildManager = service.getBuildManager();
+      const buildManager = service?.getBuildManager();
     
       if (!service || !world || !buildManager) {
         logger.error('[EDIT_ENTITY Action] Hyperfy service, world, or buildManager not found.');
@@ -224,43 +224,47 @@ ${summary}
         }
     
         const { operation, target, parameters, description } = op;
-        
-        switch (operation) {
-          case EditOperationType.TRANSLATE:
-            await buildManager.translate(target, parameters?.position);
-            break;
-    
-          case EditOperationType.ROTATE:
-            await buildManager.rotate(target, parameters?.rotation);
-            break;
-    
-          case EditOperationType.SCALE:
-            await buildManager.scale(target, parameters?.scale);
-            break;
-    
-          case EditOperationType.DUPLICATE:
-            await buildManager.duplicate(target);
-            break;
-    
-          case EditOperationType.DELETE:
-            await buildManager.delete(target);
-            break;
 
-          case EditOperationType.IMPORT:
-            await buildManager.importEntity(
-              target,
-              parameters?.position,
-              parameters?.rotation
-            );
-            break;
-    
-          default:
-            logger.warn(`[EDIT_ENTITY Action] Unsupported operation type: ${operation}`);
-            break;
-        }
-        if (description) {
-          const messageManager = service.getMessageManager();
-          messageManager.sendMessage(description);
+        try {
+          switch (operation) {
+            case EditOperationType.TRANSLATE:
+              await buildManager.translate(target, parameters?.position);
+              break;
+
+            case EditOperationType.ROTATE:
+              await buildManager.rotate(target, parameters?.rotation);
+              break;
+
+            case EditOperationType.SCALE:
+              await buildManager.scale(target, parameters?.scale);
+              break;
+
+            case EditOperationType.DUPLICATE:
+              await buildManager.duplicate(target);
+              break;
+
+            case EditOperationType.DELETE:
+              await buildManager.delete(target);
+              break;
+
+            case EditOperationType.IMPORT:
+              await buildManager.importEntity(
+                target,
+                parameters?.position,
+                parameters?.rotation
+              );
+              break;
+
+            default:
+              logger.warn(`[EDIT_ENTITY Action] Unsupported operation type: ${operation}`);
+              break;
+          }
+          if (description) {
+            const messageManager = service.getMessageManager();
+            messageManager.sendMessage(description);
+          }
+        } catch (error) {
+          logger.error(`[EDIT_ENTITY Action] Operation ${operation} on "${target}" failed:`, error);
         }
       }
       const summaryText = operationResults.operations.map(op => {
