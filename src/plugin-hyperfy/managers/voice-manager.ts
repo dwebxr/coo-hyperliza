@@ -282,8 +282,10 @@ export class VoiceManager {
 
           await this.runtime.createMemory(responseMemory, 'messages');
 
-          // A shop link is posted to chat by its action and is not spoken
-          if (responseMemory.content.text?.trim() && !isOpenPayLink(content)) {
+          if (responseMemory.content.text?.trim() && isOpenPayLink(content)) {
+            // Voice replies are only spoken, but a shop link has to be clickable: post it to chat
+            service.getMessageManager()?.sendMessage(content.text);
+          } else if (responseMemory.content.text?.trim()) {
             const emoteManager = service.getEmoteManager();
             const emote = content.emote as string || "TALK";
             emoteManager.playEmote(emote);

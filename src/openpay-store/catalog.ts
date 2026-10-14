@@ -9,6 +9,7 @@ export const DEFAULT_OPENPAY_STORE_API_URL = 'https://open-pay.jp/api/store/list
 const LIMIT = 100; // API maximum
 const TTL_MS = 5 * 60_000; // the API's data is up to ~4 minutes stale anyway
 const TIMEOUT_MS = 10_000;
+const RETRY_BASE_MS = 30_000; // after a failure: 30 s, 60 s, ... up to the TTL
 
 export type StoreLocale = 'ja' | 'en';
 
@@ -24,6 +25,8 @@ export interface StoreProduct {
   totalJpyc: string;
   /** Purchase page, passed through unchanged (only accepted on the API's own origin). */
   url: string;
+  /** Milliseconds; used to keep the merged list newest-first across sellers. */
+  updatedAt: number;
 }
 
 export interface StoreCatalogConfig {
@@ -84,15 +87,16 @@ export function toStoreProduct(item: any, allowedOrigin: string): StoreProduct |
   if (typeof totalJpyc !== 'string' || !AMOUNT.test(totalJpyc)) return null;
   const title = sanitizeText(item.title, 120);
   if (!title) return null;
-  let parsedUrl: URL;
+  if (typeof url !== 'string') return null;
   try {
-    parsedUrl = new URL(url);
+    if (new URL(url).origin !== allowedOrigin) return null;
   } catch {
     return null;
   }
-  if (parsedUrl.origin !== allowedOrigin) return null;
+  const updatedAt = typeof item.updatedAt === 'number' && Number.isFinite(item.updatedAt) ? item.updatedAt : 0;
 
-  const product: StoreProduct = { id, title, handle, totalJpyc, url: parsedUrl.href };
+  // The url string itself is kept as the API sent it
+  const product: StoreProduct = { id, title, handle, totalJpyc, url, updatedAt };
   const desc = sanitizeText(item.desc, 200);
   if (desc) product.desc = desc;
   const emoji = sanitizeText(item.emoji, 4);
@@ -106,12 +110,13 @@ class TransientError extends Error {}
 
 /**
  * In-memory copy of the configured products. list() never waits on the network: it returns what
- * is cached and refreshes in the background once the copy is older than the TTL. Transient
- * failures (503, timeouts) keep the last good list.
+ * is cached and refreshes in the background when due (every TTL after a success; with backoff
+ * after a failure). Transient failures (5xx, timeouts, unreadable bodies) keep the last good list.
  */
 export class StoreCatalog {
   private products: StoreProduct[] = [];
-  private fetchedAt = 0;
+  private nextAttemptAt = 0;
+  private failures = 0;
   private inflight: Promise<void> | null = null;
   private readonly origin: string;
 
@@ -123,9 +128,12 @@ export class StoreCatalog {
   }
 
   list(): StoreProduct[] {
-    const now = this.options.now?.() ?? Date.now();
-    if (now - this.fetchedAt >= (this.options.ttlMs ?? TTL_MS)) void this.refresh();
+    if (this.now() >= this.nextAttemptAt) void this.refresh();
     return this.products;
+  }
+
+  private now(): number {
+    return this.options.now?.() ?? Date.now();
   }
 
   find(id: string): StoreProduct | undefined {
@@ -144,22 +152,33 @@ export class StoreCatalog {
 
   private async load(): Promise<void> {
     const handles = this.config.handles;
-    try {
-      const pages = await Promise.all(handles === '*' ? [this.fetchPage()] : handles.map((h) => this.fetchPage(h)));
-      const seen = new Set<string>();
-      const products: StoreProduct[] = [];
-      for (const product of pages.flat()) {
+    const ttl = this.options.ttlMs ?? TTL_MS;
+    // allSettled: the refresh stays in flight until every seller's request has finished
+    const results = await Promise.allSettled(handles === '*' ? [this.fetchPage()] : handles.map((h) => this.fetchPage(h)));
+    const failure = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+    if (failure) {
+      // Keep the previous list and back off before the next attempt
+      this.failures++;
+      this.nextAttemptAt = this.now() + Math.min(RETRY_BASE_MS * 2 ** (this.failures - 1), ttl);
+      logger.warn(`[OpenPayStore] Could not refresh products (keeping ${this.products.length}): ${failure.reason?.message || failure.reason}`);
+      return;
+    }
+
+    const seen = new Set<string>();
+    const products: StoreProduct[] = [];
+    for (const result of results as PromiseFulfilledResult<StoreProduct[]>[]) {
+      for (const product of result.value) {
         if (seen.has(product.id)) continue;
         seen.add(product.id);
         products.push(product);
       }
-      this.products = products;
-      this.fetchedAt = this.options.now?.() ?? Date.now();
-      logger.info(`[OpenPayStore] Loaded ${products.length} product(s)`);
-    } catch (error: any) {
-      // Keep the previous list; try again on a later list() call
-      logger.warn(`[OpenPayStore] Could not refresh products (keeping ${this.products.length}): ${error?.message || error}`);
     }
+    // Newest first across sellers, like the API orders each page (stable for equal times)
+    products.sort((a, b) => b.updatedAt - a.updatedAt);
+    this.products = products;
+    this.failures = 0;
+    this.nextAttemptAt = this.now() + ttl;
+    logger.info(`[OpenPayStore] Loaded ${products.length} product(s)`);
   }
 
   private async fetchPage(handle?: string): Promise<StoreProduct[]> {
@@ -175,14 +194,24 @@ export class StoreCatalog {
     } catch (error: any) {
       throw new TransientError(`request failed: ${error?.message || error}`);
     }
-    if (response.status === 503 || response.status >= 500) {
-      throw new TransientError(`HTTP ${response.status}`);
-    }
-    const body: any = await response.json().catch(() => null);
-    if (!response.ok || body?.ok !== true || !Array.isArray(body.items)) {
-      // 400 invalid_query / 404 not_found (store off): nothing to sell from this source
-      logger.warn(`[OpenPayStore] ${handle ? `@${handle}` : 'All products'}: HTTP ${response.status} ${body?.error ?? ''}`.trim());
+    const source = handle ? `@${handle}` : 'All products';
+    if (response.status === 400 || response.status === 404) {
+      // invalid_query / not_found (store off): definitively nothing to sell from this source
+      const body: any = await response.json().catch(() => null);
+      logger.warn(`[OpenPayStore] ${source}: HTTP ${response.status} ${body?.error ?? ''}`.trim());
       return [];
+    }
+    if (!response.ok) throw new TransientError(`${source}: HTTP ${response.status}`);
+
+    let body: any;
+    try {
+      body = await response.json();
+    } catch (error: any) {
+      // Includes the body read timing out after the headers arrived
+      throw new TransientError(`${source}: unreadable response (${error?.message || error})`);
+    }
+    if (body?.ok !== true || !Array.isArray(body.items)) {
+      throw new TransientError(`${source}: unexpected response shape`);
     }
     return body.items.map((item: any) => toStoreProduct(item, this.origin)).filter(Boolean) as StoreProduct[];
   }

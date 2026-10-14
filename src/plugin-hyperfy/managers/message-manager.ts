@@ -101,8 +101,10 @@ export class MessageManager {
           if (emote) {
             emoteManager.playEmote(emote);
           }
-          // A shop link was already posted by its action; don't post it twice or read it aloud
-          if (responseContent.text && !isOpenPayLink(responseContent)) {
+          if (responseContent.text && isOpenPayLink(responseContent)) {
+            // Shop links are posted, never read aloud
+            this.sendMessage(responseContent.text);
+          } else if (responseContent.text) {
             this.sendMessage(responseContent.text);
             await service.getVoiceManager()?.speak(responseContent.text);
           }

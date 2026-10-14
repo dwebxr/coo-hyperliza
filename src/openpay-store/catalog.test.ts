@@ -58,7 +58,13 @@ describe('toStoreProduct', () => {
       desc: 'Desc',
       emoji: '🛹',
       category: '3d-game',
+      updatedAt: 1,
     });
+  });
+
+  it('keeps the url exactly as the API sent it', () => {
+    const url = `${ORIGIN}/ja/@alice?product=h_1&from=agent&note=ホバー`;
+    expect(toStoreProduct(item('h_1', 'alice', { url }), ORIGIN)?.url).toBe(url);
   });
 
   it('rejects items with a url off the API origin or malformed fields', () => {
@@ -131,6 +137,62 @@ describe('StoreCatalog', () => {
     expect(catalog.list().map((p) => p.id)).toEqual(['a1']);
 
     fetchImpl.mockRejectedValueOnce(new Error('timeout'));
+    await catalog.refresh();
+    expect(catalog.list().map((p) => p.id)).toEqual(['a1']);
+  });
+
+  it('merges sellers newest-first so a new product from a later seller is not hidden', async () => {
+    const fetchImpl = vi.fn(async (url: URL) =>
+      url.searchParams.get('handle') === 'alice'
+        ? ok([item('a_new', 'alice', { updatedAt: 50 }), item('a_old', 'alice', { updatedAt: 10 })])
+        : ok([item('b_newest', 'bob', { updatedAt: 99 })])
+    );
+    const catalog = new StoreCatalog({ apiUrl: API, handles: ['alice', 'bob'], locale: 'ja' }, { fetchImpl: fetchImpl as any });
+    await catalog.refresh();
+    expect(catalog.list().map((p) => p.id)).toEqual(['b_newest', 'a_new', 'a_old']);
+  });
+
+  it('backs off after a failure instead of retrying on every list()', async () => {
+    let now = 0;
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ ok: false, error: 'storage_unavailable' }), { status: 503 }));
+    const catalog = new StoreCatalog({ apiUrl: API, handles: ['alice'], locale: 'ja' }, { fetchImpl: fetchImpl as any, now: () => now });
+    await catalog.refresh();
+    for (let i = 0; i < 4; i++) catalog.list();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    now = 30_000;
+    catalog.list();
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+    now = 30_000 + 59_999; // second failure: 60 s backoff
+    catalog.list();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('stays in flight until every seller has answered, even if one fails fast', async () => {
+    let releaseBob!: (r: Response) => void;
+    const fetchImpl = vi.fn((url: URL) =>
+      url.searchParams.get('handle') === 'alice'
+        ? Promise.reject(new Error('reset'))
+        : new Promise<Response>((r) => (releaseBob = r))
+    );
+    const catalog = new StoreCatalog({ apiUrl: API, handles: ['alice', 'bob'], locale: 'ja' }, { fetchImpl: fetchImpl as any });
+    const first = catalog.refresh();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(catalog.refresh()).toBe(first);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    releaseBob(ok([]));
+    await first;
+  });
+
+  it('keeps the last good list when the body cannot be read or has the wrong shape', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(ok([item('a1', 'alice')]));
+    const catalog = new StoreCatalog({ apiUrl: API, handles: ['alice'], locale: 'ja' }, { fetchImpl: fetchImpl as any });
+    await catalog.refresh();
+
+    fetchImpl.mockResolvedValueOnce({ status: 200, ok: true, json: () => Promise.reject(new Error('body timeout')) });
+    await catalog.refresh();
+    expect(catalog.list().map((p) => p.id)).toEqual(['a1']);
+
+    fetchImpl.mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }));
     await catalog.refresh();
     expect(catalog.list().map((p) => p.id)).toEqual(['a1']);
   });

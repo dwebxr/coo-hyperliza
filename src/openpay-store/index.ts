@@ -7,6 +7,7 @@ import {
   type Provider,
   logger,
 } from '@elizaos/core';
+import { isDirectlyAddressed } from '../plugin-hyperfy/lib/addressing';
 import {
   DEFAULT_OPENPAY_STORE_API_URL,
   StoreCatalog,
@@ -25,7 +26,7 @@ export const SHARE_ACTION = 'OPENPAY_SHARE_PRODUCT';
 const SHELF_LIMIT = 12;
 const SHELF_MAX_CHARS = 1500;
 
-/** Set on the link message's content so Hyperfy callbacks neither re-post nor speak it. */
+/** Marks a link message: Hyperfy callbacks post it to chat (also for voice turns) and never speak it. */
 export const OPENPAY_LINK_FLAG = 'openpayLink';
 
 export function isOpenPayLink(content: object | undefined): boolean {
@@ -72,30 +73,32 @@ export function formatShelf(products: StoreProduct[], { autonomous }: { autonomo
 }
 
 /**
- * Which product the reply meant: the id the model put in <productId>, else a title mentioned in the
- * reply or the player's message (when exactly one matches), else the only product. Never a URL
- * from the model.
+ * Which product the reply meant: the id the model put in <productId> (an unknown id shares nothing),
+ * else the one product whose title the reply or the player's message names as a whole word.
+ * Never a URL from the model, and never a guess.
  */
 export function resolveProduct(
   products: StoreProduct[],
   { productId, replyText, messageText }: { productId?: unknown; replyText?: unknown; messageText?: unknown }
 ): StoreProduct | null {
   const id = typeof productId === 'string' ? productId.trim().replace(/^\[|\]$/g, '') : '';
-  if (id) {
-    const byId = products.find((p) => p.id === id);
-    if (byId) return byId;
-  }
+  if (id) return products.find((p) => p.id === id) ?? null;
   for (const text of [replyText, messageText]) {
     if (typeof text !== 'string' || !text) continue;
-    const lower = text.toLowerCase();
-    const matches = products.filter((p) => lower.includes(p.title.toLowerCase()));
+    // Whole-word match for latin titles ("AI" must not match "details"), substring for Japanese
+    const matches = products.filter((p) => isDirectlyAddressed(text, [p.title]));
     if (matches.length === 1) return matches[0];
   }
-  return products.length === 1 ? products[0] : null;
+  return null;
 }
 
 export function formatLinkMessage(product: StoreProduct): string {
   return `🛒 ${product.emoji ? `${product.emoji} ` : ''}${product.title} — ${product.totalJpyc} JPYC\n${product.url}`;
+}
+
+/** For voice-only replies outside Hyperfy (e.g. Discord voice), which are spoken and never posted. */
+export function formatSpokenProduct(product: StoreProduct): string {
+  return `${product.title} — ${product.totalJpyc} JPYC. OpenPay Store, @${product.handle}.`;
 }
 
 export function createOpenPayStorePlugin(env: Record<string, string | undefined>): Plugin | null {
@@ -161,18 +164,15 @@ export function createOpenPayStorePlugin(env: Record<string, string | undefined>
         return;
       }
 
-      const text = formatLinkMessage(product);
-      if (message.content.source === 'hyperfy') {
-        // Hyperfy voice replies are spoken only, never posted to chat, so post the link here;
-        // the flag below stops the Hyperfy callbacks from posting or speaking it again.
-        const hyperfy = runtime.getService('hyperfy') as { getMessageManager?: () => { sendMessage(text: string): Promise<unknown> } } | null;
-        await hyperfy?.getMessageManager?.()?.sendMessage(text);
-      }
+      // Delivery stays with the platform callback, which knows whether this turn is still current.
+      // Hyperfy's callbacks post flagged links to chat (voice turns included) without speaking them.
+      // Other platforms' voice callbacks speak the text and post nothing, so they get no URL.
+      const spokenOnly = message.content.source !== 'hyperfy' && (message.content as { isVoiceMessage?: boolean }).isVoiceMessage === true;
       await callback?.({
-        text,
+        text: spokenOnly ? formatSpokenProduct(product) : formatLinkMessage(product),
         actions: [SHARE_ACTION],
         source: message.content.source,
-        metadata: { [OPENPAY_LINK_FLAG]: true, productId: product.id },
+        metadata: spokenOnly ? { productId: product.id } : { [OPENPAY_LINK_FLAG]: true, productId: product.id },
       });
     },
     examples: [],

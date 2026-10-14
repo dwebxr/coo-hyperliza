@@ -171,3 +171,32 @@ describe('VoiceManager.speak and links', () => {
     tts.mockRestore();
   });
 });
+
+describe('VoiceManager shop links', () => {
+  it('posts a shop link from a voice turn to chat (voice replies are otherwise only spoken) without speaking it', async () => {
+    let callback: any;
+    const sendMessage = vi.fn();
+    const world = { entities: { getPlayer: () => ({ data: { name: 'Alice' } }), items: new Map() } };
+    const service = {
+      getWorld: () => world,
+      currentWorldId: 'w1',
+      getEmoteManager: () => ({ playEmote: vi.fn() }),
+      getMessageManager: () => ({ sendMessage }),
+    };
+    const runtime: any = {
+      agentId: 'agent',
+      character: { name: 'Coo' },
+      getService: () => service,
+      ensureConnection: vi.fn(),
+      createMemory: vi.fn(),
+      emitEvent: vi.fn(async (_e: string, payload: any) => { callback = payload.callback; }),
+    };
+    const manager = new VoiceManager(runtime);
+    const speak = vi.spyOn(manager, 'speak');
+    await (manager as any).handleMessage('HoverBoardのリンクちょうだい', 'p1');
+    const link = '🛒 HoverBoard — 505 JPYC\nhttps://open-pay.jp/ja/@a?product=x';
+    await callback({ text: link, metadata: { openpayLink: true } });
+    expect(sendMessage).toHaveBeenCalledWith(link);
+    expect(speak).not.toHaveBeenCalled();
+  });
+});

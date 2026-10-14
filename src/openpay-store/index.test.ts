@@ -5,6 +5,7 @@ import {
   createOpenPayStorePlugin,
   formatLinkMessage,
   formatShelf,
+  formatSpokenProduct,
   isOpenPayLink,
   resolveProduct,
 } from './index';
@@ -16,6 +17,7 @@ const product = (id: string, title: string, extra: Partial<StoreProduct> = {}): 
   handle: 'masia02',
   totalJpyc: '505',
   url: `https://open-pay.jp/ja/@masia02?product=${id}&from=agent`,
+  updatedAt: 1,
   ...extra,
 });
 const board = product('h_board', 'HoverBoard', { emoji: '🛹', category: '3d-game', desc: 'Ride it' });
@@ -47,22 +49,30 @@ describe('formatShelf', () => {
 
 describe('resolveProduct', () => {
   const products = [board, dome];
-  it('prefers the id from <productId> (brackets tolerated)', () => {
+  it('uses the id from <productId> (brackets tolerated)', () => {
     expect(resolveProduct(products, { productId: '[h_dome]' })).toBe(dome);
   });
-  it('falls back to a title named in the reply, then in the message', () => {
-    expect(resolveProduct(products, { productId: 'nope', replyText: 'The hoverboard is great!' })).toBe(board);
-    expect(resolveProduct(products, { messageText: 'I want the Bio Dome' })).toBe(dome);
+  it('shares nothing for an unknown id, even with one product', () => {
+    expect(resolveProduct(products, { productId: 'nope', replyText: 'The HoverBoard is great!' })).toBeNull();
+    expect(resolveProduct([board], { productId: 'nope' })).toBeNull();
   });
-  it('uses the only product, and gives up when ambiguous', () => {
-    expect(resolveProduct([board], {})).toBe(board);
+  it('falls back to a title named as a whole word in the reply, then in the message', () => {
+    expect(resolveProduct(products, { replyText: 'The hoverboard is great!' })).toBe(board);
+    expect(resolveProduct(products, { messageText: 'I want the Bio Dome' })).toBe(dome);
+    const jp = product('h_jp', 'バイオドーム');
+    expect(resolveProduct([board, jp], { messageText: 'バイオドームください' })).toBe(jp);
+  });
+  it('never matches a title inside another word, and never guesses', () => {
+    const ai = product('h_ai', 'AI');
+    expect(resolveProduct([ai, board], { messageText: 'Can I get details?' })).toBeNull();
+    expect(resolveProduct([board], {})).toBeNull();
     expect(resolveProduct(products, { replyText: 'Both HoverBoard and Bio Dome are nice' })).toBeNull();
-    expect(resolveProduct(products, {})).toBeNull();
   });
 });
 
 it('formats the link message on one line plus the url, and flags it', () => {
   expect(formatLinkMessage(board)).toBe(`🛒 🛹 HoverBoard — 505 JPYC\n${board.url}`);
+  expect(formatSpokenProduct(board)).not.toContain('http');
   expect(isOpenPayLink({ metadata: { [OPENPAY_LINK_FLAG]: true } })).toBe(true);
   expect(isOpenPayLink({ metadata: {} })).toBe(false);
   expect(isOpenPayLink(undefined)).toBe(false);
@@ -88,14 +98,9 @@ describe('createOpenPayStorePlugin', () => {
     return { provider, action };
   }
 
-  const runtime = (sendMessage = vi.fn()) =>
-    ({
-      agentId: 'agent',
-      character: { name: 'Coo' },
-      getService: (name: string) => (name === 'hyperfy' ? { getMessageManager: () => ({ sendMessage }) } : null),
-    }) as any;
-  const userMessage = (source: string, text = 'HoverBoardほしい！リンクちょうだい') =>
-    ({ entityId: 'player', content: { text, source } }) as any;
+  const runtime = () => ({ agentId: 'agent', character: { name: 'Coo' }, getService: vi.fn() }) as any;
+  const userMessage = (source: string, extra: Record<string, unknown> = {}) =>
+    ({ entityId: 'player', content: { text: 'HoverBoardほしい！リンクちょうだい', source, ...extra } }) as any;
   const reply = (productId?: string) => [{ content: { text: 'いいね！', productId } }] as any;
 
   it('provider returns the shelf as text and values without waiting on the API', async () => {
@@ -111,30 +116,34 @@ describe('createOpenPayStorePlugin', () => {
     expect(empty.text).toBe('');
   });
 
-  it('in Hyperfy: posts the link to world chat itself (voice replies are not posted) and flags the callback', async () => {
+  it('hands a flagged link to the platform callback (Hyperfy text and voice, Discord text)', async () => {
     const { action } = await loadedPlugin();
-    const sendMessage = vi.fn().mockResolvedValue(true);
-    const callback = vi.fn();
-    await action.handler(runtime(sendMessage), userMessage('hyperfy'), undefined, {}, callback, reply('h_board'));
-    expect(sendMessage).toHaveBeenCalledWith(formatLinkMessage(board));
-    expect(callback).toHaveBeenCalledWith(expect.objectContaining({ text: formatLinkMessage(board), metadata: { [OPENPAY_LINK_FLAG]: true, productId: 'h_board' } }));
+    for (const message of [userMessage('hyperfy'), userMessage('hyperfy', { isVoiceMessage: true }), userMessage('discord')]) {
+      const callback = vi.fn();
+      const rt = runtime();
+      await action.handler(rt, message, undefined, {}, callback, reply('h_board'));
+      expect(callback).toHaveBeenCalledWith(
+        expect.objectContaining({ text: formatLinkMessage(board), metadata: { [OPENPAY_LINK_FLAG]: true, productId: 'h_board' } })
+      );
+      expect(rt.getService).not.toHaveBeenCalled(); // never posts behind the callback's turn checks
+    }
   });
 
-  it('elsewhere (e.g. Discord): leaves posting to the callback', async () => {
+  it('gives voice-only platforms (Discord voice) a spoken line without the URL', async () => {
     const { action } = await loadedPlugin();
-    const sendMessage = vi.fn();
     const callback = vi.fn();
-    await action.handler(runtime(sendMessage), userMessage('discord'), undefined, {}, callback, reply('h_board'));
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect(callback).toHaveBeenCalledTimes(1);
+    await action.handler(runtime(), userMessage('discord', { isVoiceMessage: true }), undefined, {}, callback, reply('h_board'));
+    const content = callback.mock.calls[0][0];
+    expect(content.text).toBe(formatSpokenProduct(board));
+    expect(content.text).not.toContain('http');
+    expect(isOpenPayLink(content)).toBe(false);
   });
 
-  it('never shares on autonomous turns, even if the model emits the action', async () => {
+  it('never shares on autonomous turns or for an unresolvable product', async () => {
     const { action } = await loadedPlugin();
-    const sendMessage = vi.fn();
     const callback = vi.fn();
-    await action.handler(runtime(sendMessage), { entityId: 'agent', content: { text: '' } } as any, undefined, {}, callback, reply('h_board'));
-    expect(sendMessage).not.toHaveBeenCalled();
+    await action.handler(runtime(), { entityId: 'agent', content: { text: '' } } as any, undefined, {}, callback, reply('h_board'));
+    await action.handler(runtime(), userMessage('hyperfy'), undefined, {}, callback, reply('h_unknown'));
     expect(callback).not.toHaveBeenCalled();
   });
 });
