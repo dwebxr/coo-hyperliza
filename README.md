@@ -56,7 +56,7 @@ ANTHROPIC_API_KEY=your-anthropic-api-key
 # ElevenLabs TTS (optional)
 ELEVENLABS_XI_API_KEY=your-elevenlabs-api-key
 ELEVENLABS_VOICE_ID=your-voice-id
-ELEVENLABS_MODEL_ID=eleven_multilingual_v2
+ELEVENLABS_MODEL_ID=eleven_flash_v2_5
 ELEVENLABS_OUTPUT_FORMAT=mp3_44100_128
 
 # Server Settings
@@ -109,7 +109,7 @@ When using ElevenLabs, set the following in `.env`:
 |---------------------|-------------|---------|
 | `ELEVENLABS_XI_API_KEY` | ElevenLabs API key | - |
 | `ELEVENLABS_VOICE_ID` | Voice ID to use | `EXAVITQu4vr4xnSDxMaL` |
-| `ELEVENLABS_MODEL_ID` | Model ID | `eleven_multilingual_v2` |
+| `ELEVENLABS_MODEL_ID` | Model ID (`eleven_flash_v2_5` uses about half the credits and is faster; supports Japanese) | `eleven_multilingual_v2` |
 | `ELEVENLABS_OUTPUT_FORMAT` | Output format | `mp3_44100_128` |
 | `ELEVENLABS_VOICE_STABILITY` | Voice stability (0-1) | `0.5` |
 | `ELEVENLABS_VOICE_SIMILARITY_BOOST` | Similarity boost (0-1) | `0.9` |
