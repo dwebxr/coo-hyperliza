@@ -6,6 +6,9 @@ import { hashFileBuffer, getModuleDirectory } from '../utils'
 import { IAgentRuntime, logger } from '@elizaos/core'
 import { HyperfyService } from '../service.js'
 
+// Emotes is shared process-wide and overridden per world below; keep the engine defaults to reset to
+const DEFAULT_EMOTES: Record<string, string> = { ...(Emotes as Record<string, string>) };
+
 export class EmoteManager {
   private emoteHashMap: Map<string, string>
   private currentEmoteTimeout: NodeJS.Timeout | null
@@ -142,7 +145,17 @@ export class EmoteManager {
     return this.runtime.getService<HyperfyService>(HyperfyService.serviceType);
   }
 
+  /** Whether the world's asset server serves `fileName` (asset:// names resolve there). */
+  private async assetExists(fileName: string): Promise<boolean> {
+    const assetsUrl: string | undefined = this.getService()?.getWorld()?.assetsUrl;
+    if (!assetsUrl) return false;
+    const url = `${assetsUrl.replace(/\/$/, "")}/${fileName}`;
+    return fetch(url, { method: "HEAD", signal: AbortSignal.timeout(10000) }).then((resp) => resp.ok, () => false);
+  }
+
   private async uploadLocomotionEmotes() {
+    // Don't carry another world's uploaded hashes into this one
+    Object.assign(Emotes as Record<string, string>, DEFAULT_EMOTES);
     for (const emote of LOCOMOTION_EMOTES) {
       await this.uploadLocomotionEmote(emote);
     }
@@ -178,6 +191,13 @@ export class EmoteManager {
 
       await Promise.race([emoteUploadPromise, emoteTimeout]);
 
+      // ClientNetwork.upload doesn't check the response, so confirm the asset is really there
+      // before pointing everyone at it (a failed upload would otherwise break the animation)
+      if (!(await this.assetExists(emoteFullName))) {
+        console.error(`[Locomotion] '${emote.name}' upload could not be verified; keeping ${(Emotes as Record<string, string>)[emote.name]}`);
+        return false;
+      }
+
       // Update the Emotes object with the uploaded URL
       (Emotes as Record<string, string>)[emote.name] = emoteUrl;
       console.info(
@@ -200,17 +220,9 @@ export class EmoteManager {
   private async ensureTalkEmote() {
     const bundled = getModuleDirectory() + TALK_EMOTE.path;
     const hasBundled = await fs.access(bundled).then(() => true, () => false);
-    if (hasBundled) {
-      await this.uploadLocomotionEmote(TALK_EMOTE);
-      return;
-    }
+    if (hasBundled && (await this.uploadLocomotionEmote(TALK_EMOTE))) return;
 
-    const assetsUrl: string | undefined = this.getService()?.getWorld()?.assetsUrl;
-    if (!assetsUrl) return;
-    const url = `${assetsUrl.replace(/\/$/, "")}/emote-talk.glb`;
-    const served = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(10000) })
-      .then((resp) => resp.ok, () => false);
-    if (!served) {
+    if (!(await this.assetExists("emote-talk.glb"))) {
       logger.warn(
         `[Emote] The world does not serve emote-talk.glb, so no talking gesture is shown while speaking. Put a clip at public/emotes/emote-talk.glb to upload one.`
       );
