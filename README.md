@@ -5,9 +5,10 @@ An ElizaOS + Hyperfy 3D world integration agent. An AI agent that autonomously a
 ## Features
 
 ### Cost Optimization
-- **Idle Mode Energy Saving**: Reduces autonomous action frequency when no other players are in the world to minimize API call costs
-  - With players present: 15-30 second intervals
-  - Without players: 60-120 second intervals (idle mode)
+- **Idle Mode Energy Saving**: When no other players are in the world, autonomous actions are skipped entirely (no LLM call is made) and the loop only re-checks for players every 60-120 seconds
+  - With players present: autonomous actions every 15-30 seconds
+  - Without players: skipped, re-check every 60-120 seconds (idle mode)
+- **Cheaper Reply Decisions**: Messages that mention the agent's name or an alias (see `HYPERFY_AGENT_ALIASES`) skip the "should I respond?" LLM check
 
 ### Voice Features
 - **ElevenLabs TTS**: High-quality voice synthesis for agent speech
@@ -62,6 +63,8 @@ ELEVENLABS_OUTPUT_FORMAT=mp3_44100_128
 SERVER_PORT=3001
 ```
 
+> **Security**: `localstorage.json` holds the agent's Hyperfy auth token. Never commit it.
+
 ### 3. Setup PostgreSQL (Optional)
 
 To use PostgreSQL locally:
@@ -108,10 +111,18 @@ When using ElevenLabs, set the following in `.env`:
 | `ELEVENLABS_VOICE_ID` | Voice ID to use | `EXAVITQu4vr4xnSDxMaL` |
 | `ELEVENLABS_MODEL_ID` | Model ID | `eleven_multilingual_v2` |
 | `ELEVENLABS_OUTPUT_FORMAT` | Output format | `mp3_44100_128` |
-| `ELEVENLABS_STABILITY` | Voice stability (0-1) | `0.5` |
-| `ELEVENLABS_SIMILARITY_BOOST` | Similarity boost (0-1) | `0.75` |
-| `ELEVENLABS_STYLE` | Style (0-1) | `0` |
-| `ELEVENLABS_USE_SPEAKER_BOOST` | Speaker boost | `true` |
+| `ELEVENLABS_VOICE_STABILITY` | Voice stability (0-1) | `0.5` |
+| `ELEVENLABS_VOICE_SIMILARITY_BOOST` | Similarity boost (0-1) | `0.9` |
+| `ELEVENLABS_VOICE_STYLE` | Style (0-1) | `0.66` |
+| `ELEVENLABS_VOICE_USE_SPEAKER_BOOST` | Speaker boost (enabled only when set to exactly `true`) | off |
+
+### Model Selection (Ollama)
+
+When using `plugin-ollama`, the models are chosen with `OLLAMA_API_ENDPOINT`, `OLLAMA_SMALL_MODEL` and `OLLAMA_LARGE_MODEL`. `OLLAMA_MODEL` is not read by the plugin.
+
+### Agent Aliases
+
+`HYPERFY_AGENT_ALIASES` is a comma-separated list of extra names the agent answers to (e.g. `クー`). A message containing the agent's name or one of these aliases skips the "should I respond?" LLM check. The check is also skipped when the agent is 1-on-1 with a single player.
 
 ### Adjusting Autonomous Behavior
 
@@ -168,6 +179,7 @@ src/plugin-hyperfy/
 - Verify `WS_URL` is correct
 - Check if Hyperfy world is running
 - Check console error logs
+- The agent auto-reconnects to the Hyperfy world with exponential backoff (5s up to a maximum of 5 minutes). If the world is full or another session is already using the same auth token (`localstorage.json`), it retries every 5 minutes; the other session is not disturbed.
 
 ### Audio Distorted / Wrong Speed
 - Set `ELEVENLABS_OUTPUT_FORMAT=mp3_44100_128`
