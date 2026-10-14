@@ -50,8 +50,8 @@ WS_URL=wss://your-hyperfy-world.xyz/ws
 # Database (PostgreSQL recommended)
 POSTGRES_URL=postgresql://localhost:5432/eliza_hyperfy
 
-# LLM API
-OPENAI_API_KEY=your-openai-api-key
+# LLM API (Claude by default; see "Model Selection")
+ANTHROPIC_API_KEY=your-anthropic-api-key
 
 # ElevenLabs TTS (optional)
 ELEVENLABS_XI_API_KEY=your-elevenlabs-api-key
@@ -116,9 +116,26 @@ When using ElevenLabs, set the following in `.env`:
 | `ELEVENLABS_VOICE_STYLE` | Style (0-1) | `0.66` |
 | `ELEVENLABS_VOICE_USE_SPEAKER_BOOST` | Speaker boost (enabled only when set to exactly `true`) | off |
 
-### Model Selection (Ollama)
+### Model Selection
 
-When using `plugin-ollama`, the models are chosen with `OLLAMA_API_ENDPOINT`, `OLLAMA_SMALL_MODEL` and `OLLAMA_LARGE_MODEL`. `OLLAMA_MODEL` is not read by the plugin.
+`LLM_PROVIDER` picks which plugin generates text: `anthropic`, `openai`, `ollama` or `groq` (an unknown value stops startup with an error). Left empty, Claude is used when `ANTHROPIC_API_KEY` is set. Other model plugins stay loaded for what they provide, but never take over text generation from the chosen one.
+
+| Job | Provided by |
+|---|---|
+| Replies, decisions, JSON extraction, describing what the agent sees | The `LLM_PROVIDER` (Claude by default) |
+| Speech output (TTS) | ElevenLabs (`ELEVENLABS_XI_API_KEY`), with OpenAI as an optional fallback |
+| Voice input (speech-to-text) | ElevenLabs, called directly (the key needs the `speech_to_text` permission; model `ELEVENLABS_STT_MODEL_ID`, default `scribe_v2`, optional `ELEVENLABS_STT_LANGUAGE_CODE`), else the registered TRANSCRIPTION model |
+| Embeddings | Optional (OpenAI or Ollama). Nothing in this agent searches memories by embedding, so replies work without them |
+
+**Anthropic (default when `ANTHROPIC_API_KEY` is set and `LLM_PROVIDER` is unset)** - handled by `src/anthropic-models.ts` with the official SDK, because `@elizaos/plugin-anthropic` sends `temperature` (rejected by current Claude models) and defaults to retired model IDs.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ANTHROPIC_SMALL_MODEL` | `claude-haiku-5-5` | "Should I respond?" checks, small JSON extractions |
+| `ANTHROPIC_LARGE_MODEL` | `claude-haiku-5-5` | Replies and autonomous actions; `claude-sonnet-5-5` for higher quality at ~20x the cost |
+| `ANTHROPIC_EFFORT` | `low` | `low` / `medium` / `high`; higher is slower and more expensive |
+
+**Ollama** - set `LLM_PROVIDER=ollama`; models come from `OLLAMA_API_ENDPOINT`, `OLLAMA_SMALL_MODEL` and `OLLAMA_LARGE_MODEL` (`OLLAMA_MODEL` is not read by the plugin). Requires a running Ollama server.
 
 ### Agent Aliases
 
