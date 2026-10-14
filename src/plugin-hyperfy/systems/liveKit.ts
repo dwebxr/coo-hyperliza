@@ -5,7 +5,6 @@ import {
   Room,
   TrackPublishOptions,
   TrackSource,
-  dispose,
   RoomEvent,
   TrackKind,
   AudioStream
@@ -18,6 +17,12 @@ export interface LiveKitInitOptions {
   token: string;
 }
 
+export interface PublishAudioOptions {
+  signal?: AbortSignal;
+}
+
+const FFMPEG_TIMEOUT_MS = 30_000;
+
 export class AgentLiveKit extends System {
   private room: Room | null = null;
   private audioSource: AudioSource | null = null;
@@ -27,55 +32,85 @@ export class AgentLiveKit extends System {
     super(world);
   }
 
+  // Called by ClientNetwork without awaiting, so this must never reject.
   async deserialize(opts: LiveKitInitOptions): Promise<void> {
-    console.log('[LiveKit] deserialize called with opts:', opts);
     if (!opts) {
       console.log('[LiveKit] No LiveKit options provided by server - voice chat not available');
       return;
     }
     const { wsUrl, token } = opts;
     console.log('[LiveKit] Connecting to:', wsUrl);
-    this.room = new Room();
-    await this.room.connect(wsUrl, token, {
-      autoSubscribe: true,
-      dynacast: true,
-    });
-    console.log('[LiveKit] Connected to room');
-    this.setupRoomEvents();
-  }
-
-  async stop(): Promise<void> {
-    if (this.room) {
-      await this.room.disconnect();
+    await this.disconnectRoom();
+    const room = new Room();
+    this.room = room;
+    try {
+      await room.connect(wsUrl, token, {
+        autoSubscribe: true,
+        dynacast: true,
+      });
+    } catch (error: any) {
+      console.error('[LiveKit] Failed to connect to room:', error?.message || error);
+      if (this.room === room) this.room = null;
+      return;
     }
-    await dispose();
+    // Torn down or replaced while joining: disconnect() on a joining room is a no-op,
+    // so the join has to be undone here or the connection lingers untracked.
+    if (this.room !== room) {
+      console.log('[LiveKit] Room superseded while connecting; leaving it');
+      await room.disconnect().catch(() => { });
+      return;
+    }
+    console.log('[LiveKit] Connected to room');
+    this.setupRoomEvents(room);
   }
 
-  private setupRoomEvents(): void {
-    if (!this.room) return;
+  /**
+   * Leaves the current room. Does not call rtc-node's dispose(), which would
+   * shut down the native runtime and make later reconnects impossible.
+   */
+  async disconnectRoom(): Promise<void> {
+    const room = this.room;
+    this.room = null;
+    // The track and source belong to the old room's publication.
+    this.audioSource = null;
+    this.localTrack = null;
+    if (room) {
+      try {
+        await room.disconnect();
+      } catch (error: any) {
+        console.warn('[LiveKit] Error while disconnecting room:', error?.message || error);
+      }
+    }
+  }
 
-    this.room.on(RoomEvent.ParticipantConnected, (p) => {
+  // World.destroy() calls this on every system.
+  destroy() {
+    this.disconnectRoom().catch(() => { });
+  }
+
+  private setupRoomEvents(room: Room): void {
+    room.on(RoomEvent.ParticipantConnected, (p) => {
       console.log(`[LiveKit] Participant connected: ${p.identity}`);
     });
 
-    this.room.on(RoomEvent.Disconnected, () => {
+    room.on(RoomEvent.Disconnected, () => {
       console.log('[LiveKit] Disconnected from room');
     });
 
-    this.room.on(RoomEvent.TrackPublished, (publication, participant) => {
+    room.on(RoomEvent.TrackPublished, (publication, participant) => {
       console.log(`[LiveKit] TrackPublished by ${participant.identity}`);
     });
 
-    this.room.on(RoomEvent.TrackSubscribed, async (track, _publication, participant) => {
+    room.on(RoomEvent.TrackSubscribed, async (track, _publication, participant) => {
       console.log(`[LiveKit] TrackSubscribed: ${track.kind} from ${participant.identity}`);
       if (track.kind === TrackKind.KIND_AUDIO) {
         const stream = new AudioStream(track);
         for await (const frame of stream) {
-          if (!track.sid) return;
+          if (!track.sid || this.room !== room) return;
           const int16 = frame.data;
           (this as any).emit('audio', {
             participant: participant.identity,
-            buffer: Buffer.from(int16.buffer),
+            buffer: Buffer.from(int16.buffer, int16.byteOffset, int16.byteLength),
           });
         }
       }
@@ -97,8 +132,16 @@ export class AgentLiveKit extends System {
   postTick() { }
   start() { }
 
-  async publishAudioStream(audioBuffer: Buffer, onLipSync?: (weight: number) => void): Promise<void> {
+  async publishAudioStream(
+    audioBuffer: Buffer,
+    onLipSync?: (weight: number) => void,
+    { signal }: PublishAudioOptions = {}
+  ): Promise<void> {
     console.log('[LiveKit] publishAudioStream called with buffer size:', audioBuffer.length);
+    if (!this.room) {
+      console.warn('[LiveKit] Not connected to a room - skipping audio playback');
+      return;
+    }
     const sampleRate = 48000;
     const numChannels = 1;
     const frameDurationMs = 100;
@@ -112,26 +155,37 @@ export class AgentLiveKit extends System {
     }
     console.log('[LiveKit] PCM data decoded, samples:', int16.length);
 
+    const room = this.room;
+    if (!room || signal?.aborted) return;
+
     if (!this.audioSource) {
       console.log('[LiveKit] Creating audio source and track...');
-      this.audioSource = new AudioSource(sampleRate, numChannels);
-      this.localTrack = LocalAudioTrack.createAudioTrack('agent-voice', this.audioSource);
+      const audioSource = new AudioSource(sampleRate, numChannels);
+      const localTrack = LocalAudioTrack.createAudioTrack('agent-voice', audioSource);
 
       const options = new TrackPublishOptions();
       options.source = TrackSource.SOURCE_MICROPHONE;
       console.log('[LiveKit] Publishing track to room...');
-      await this.room?.localParticipant.publishTrack(this.localTrack, options);
+      await room.localParticipant.publishTrack(localTrack, options);
+      if (this.room !== room) return;
+      this.audioSource = audioSource;
+      this.localTrack = localTrack;
       console.log('[LiveKit] Track published successfully');
     }
+    const audioSource = this.audioSource;
 
     const silence = new Int16Array(samplesPerFrame);
-    await this.audioSource.captureFrame(new AudioFrame(silence, sampleRate, numChannels, silence.length));
+    await audioSource.captureFrame(new AudioFrame(silence, sampleRate, numChannels, silence.length));
 
     console.log('[LiveKit] Streaming audio frames...');
     const totalFrames = Math.ceil(int16.length / samplesPerFrame);
     const startTime = Date.now();
 
     for (let i = 0; i < int16.length; i += samplesPerFrame) {
+      if (signal?.aborted || this.room !== room) {
+        console.warn('[LiveKit] Audio streaming stopped early');
+        break;
+      }
       const frameIndex = Math.floor(i / samplesPerFrame);
       const expectedTime = startTime + (frameIndex * frameDurationMs);
       const currentTime = Date.now();
@@ -143,7 +197,7 @@ export class AgentLiveKit extends System {
 
       const slice = int16.slice(i, i + samplesPerFrame);
       const frame = new AudioFrame(slice, sampleRate, numChannels, slice.length);
-      await this.audioSource.captureFrame(frame);
+      await audioSource.captureFrame(frame);
 
       // Lip sync: calculate RMS volume and call callback
       if (onLipSync) {
@@ -177,7 +231,7 @@ export class AgentLiveKit extends System {
 
     if (format === 'pcm') {
       console.log('[LiveKit] Already PCM, no conversion needed');
-      return new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length / 2);
+      return toInt16Array(buffer);
     }
 
     const ffmpegArgs: string[] = [
@@ -197,11 +251,23 @@ export class AgentLiveKit extends System {
     console.log('[LiveKit] Running ffmpeg to convert', format, 'to PCM...');
     return new Promise((resolve, reject) => {
       const ff = spawn('ffmpeg', ffmpegArgs);
-      let raw = Buffer.alloc(0);
+      const chunks: Buffer[] = [];
       let stderrOutput = '';
+      let settled = false;
+      const finish = (error: Error | null, samples?: Int16Array) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error) reject(error);
+        else resolve(samples!);
+      };
+      const timer = setTimeout(() => {
+        ff.kill('SIGKILL');
+        finish(new Error(`ffmpeg timed out after ${FFMPEG_TIMEOUT_MS}ms`));
+      }, FFMPEG_TIMEOUT_MS);
 
       ff.stdout.on('data', (chunk) => {
-        raw = Buffer.concat([raw, chunk]);
+        chunks.push(chunk);
       });
 
       ff.stderr.on('data', (data) => {
@@ -210,18 +276,23 @@ export class AgentLiveKit extends System {
 
       ff.on('error', (err) => {
         console.error('[LiveKit] ffmpeg spawn error:', err.message);
-        reject(err);
+        finish(err);
+      });
+
+      // Without this, ffmpeg exiting early (bad input) surfaces as an uncaught EPIPE.
+      ff.stdin.on('error', (err) => {
+        console.error('[LiveKit] ffmpeg stdin error:', err.message);
       });
 
       ff.on('close', (code) => {
         if (code !== 0) {
           console.error('[LiveKit] ffmpeg failed with code', code);
           console.error('[LiveKit] ffmpeg stderr:', stderrOutput);
-          return reject(new Error(`ffmpeg failed (code ${code})`));
+          return finish(new Error(`ffmpeg failed (code ${code})`));
         }
+        const raw = Buffer.concat(chunks);
         console.log('[LiveKit] ffmpeg conversion successful, output size:', raw.length);
-        const samples = new Int16Array(raw.buffer, raw.byteOffset, raw.byteLength / 2);
-        resolve(samples);
+        finish(null, toInt16Array(raw));
       });
 
       ff.stdin.write(buffer);
@@ -253,4 +324,15 @@ export class AgentLiveKit extends System {
     console.log('[LiveKit] Format detection fallback to pcm');
     return 'pcm';
   }
+}
+
+// Int16Array needs an even byteOffset; Buffers from pools or concat may not have one.
+function toInt16Array(buffer: Buffer): Int16Array {
+  const length = Math.floor(buffer.byteLength / 2);
+  if (buffer.byteOffset % 2 === 0) {
+    return new Int16Array(buffer.buffer, buffer.byteOffset, length);
+  }
+  const copy = new Uint8Array(length * 2);
+  copy.set(buffer.subarray(0, length * 2));
+  return new Int16Array(copy.buffer);
 }

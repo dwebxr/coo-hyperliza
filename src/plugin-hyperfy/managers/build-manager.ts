@@ -18,53 +18,63 @@ export class BuildManager {
     const service = this.getService();
     const world = service.getWorld();
     const entity = world.entities.items.get(entityId);
-    if (entity) {
-      const controls = world.controls;
-      if (controls) {
-        await controls.goto(entity.root.position.x, entity.root.position.z);
-      }
-      entity.root.position.fromArray(position);
-      this.entityUpdate(entity);
+    if (!entity) {
+      console.warn(`[BuildManager] translate: entity ${entityId} not found`);
+      return;
     }
+    const controls = world.controls;
+    if (controls) {
+      await controls.goto(entity.root.position.x, entity.root.position.z);
+    }
+    entity.root.position.fromArray(position);
+    this.entityUpdate(entity);
   }
 
   async rotate(entityId, quaternion: [number, number, number, number]) {
     const service = this.getService();
     const world = service.getWorld();
     const entity = world.entities.items.get(entityId);
-    if (entity) {
-      const controls = world.controls;
-      if (controls) {
-        await controls.goto(entity.root.position.x, entity.root.position.z);
-      }
-      entity.root.quaternion.fromArray(quaternion);
-      this.entityUpdate(entity);
+    if (!entity) {
+      console.warn(`[BuildManager] rotate: entity ${entityId} not found`);
+      return;
     }
+    const controls = world.controls;
+    if (controls) {
+      await controls.goto(entity.root.position.x, entity.root.position.z);
+    }
+    entity.root.quaternion.fromArray(quaternion);
+    this.entityUpdate(entity);
   }
   
   async scale(entityId, scale: [number, number, number]) {
     const service = this.getService();
     const world = service.getWorld();
     const entity = world.entities.items.get(entityId);
-    if (entity) {
-      const controls = world.controls;
-      if (controls) {
-        await controls.goto(entity.root.position.x, entity.root.position.z);
-      }
-      entity.root.scale.fromArray(scale);
-      this.entityUpdate(entity);
+    if (!entity) {
+      console.warn(`[BuildManager] scale: entity ${entityId} not found`);
+      return;
     }
+    const controls = world.controls;
+    if (controls) {
+      await controls.goto(entity.root.position.x, entity.root.position.z);
+    }
+    entity.root.scale.fromArray(scale);
+    this.entityUpdate(entity);
   }
 
   async duplicate(entityId) {
     const service = this.getService();
     const world = service.getWorld();
     const entity = world.entities.items.get(entityId);
+    if (!entity) {
+      console.warn(`[BuildManager] duplicate: entity ${entityId} not found`);
+      return;
+    }
     const controls = world.controls;
     if (controls) {
       await controls.goto(entity.root.position.x, entity.root.position.z);
     }
-    if (entity?.isApp) {
+    if (entity.isApp) {
       let blueprintId = entity.data.blueprint
       // if unique, we also duplicate the blueprint
       if (entity.blueprint.unique) {
@@ -109,12 +119,16 @@ export class BuildManager {
     const service = this.getService();
     const world = service.getWorld();
     const entity = world.entities.items.get(entityId);
-    if (entity?.isApp && !entity.data.pinned) {
+    if (!entity) {
+      console.warn(`[BuildManager] delete: entity ${entityId} not found`);
+      return;
+    }
+    if (entity.isApp && !entity.data.pinned) {
       const controls = world.controls;
       if (controls) {
         await controls.goto(entity.root.position.x, entity.root.position.z);
       }
-      entity?.destroy(true)
+      entity.destroy(true)
       this.entityUpdate(entity);
     }
   }
@@ -124,15 +138,26 @@ export class BuildManager {
     position?: any,
     quaternion?: any
   ) {
+    if (typeof url !== 'string' || !/^(https?|asset):\/\//.test(url)) {
+      console.warn(`[BuildManager] importEntity: rejected url (only http://, https:// and asset:// are allowed): ${url}`)
+      return
+    }
     const service = this.getService();
     const world = service.getWorld();
-    const resolvedUrlurl = await resolveUrl(url, world);
+    const resolvedUrl = await resolveUrl(url, world, { allowLocal: false });
+    if (!resolvedUrl) {
+      console.warn(`[BuildManager] importEntity: could not resolve url: ${url}`)
+      return
+    }
     let file
     
-    const resp = await fetch(resolvedUrlurl)
+    const resp = await fetch(resolvedUrl)
+    if (!resp.ok) {
+      console.error(`[BuildManager] importEntity: fetch failed with ${resp.status} ${resp.statusText} for ${url}`)
+      return
+    }
     const blob = await resp.blob()
     file = new File([blob], url.split('/').pop(), { type: resp.headers.get('content-type') })
-    if (!file) return
     
     await new Promise(resolve => setTimeout(resolve, 100))
     
@@ -161,11 +186,15 @@ export class BuildManager {
       quaternion,
     };
     const ext = file.name.split('.').pop().toLowerCase()
-    if (ext === 'hyp') {
-      this.addApp(file, transform)
-    }
-    if (ext === 'glb' || ext === 'vrm') {
-      this.addModel(file, transform)
+    try {
+      if (ext === 'hyp') {
+        await this.addApp(file, transform)
+      }
+      if (ext === 'glb' || ext === 'vrm') {
+        await this.addModel(file, transform)
+      }
+    } catch (err) {
+      console.error(`[BuildManager] importEntity: failed to import ${file.name}:`, err)
     }
   }
 

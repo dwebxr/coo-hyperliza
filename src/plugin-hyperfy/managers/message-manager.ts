@@ -2,7 +2,8 @@ import { ChannelType, Entity, Content, HandlerCallback, IAgentRuntime, Memory, U
 import { HyperfyService } from "../service";
 import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
-import { generateElevenLabsTTS, generateOpenAITTS } from "../utils";
+import { countOtherPlayers } from "../utils";
+import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
 import moment from 'moment'
 import { uuid } from '../hyperfy/src/core/utils';
 
@@ -52,6 +53,7 @@ export class MessageManager {
         // Create the message memory
         const messageId = createUniqueUuid(this.runtime, msg.id.toString()) as UUID
         console.debug(`[Hyperfy Chat] Creating memory: ${messageId}`)
+        const agentNames = [this.runtime.character.name, ...parseAliases(process.env.HYPERFY_AGENT_ALIASES)]
         const memory: Memory = {
           id: messageId,
           entityId: entityId,
@@ -66,6 +68,9 @@ export class MessageManager {
               hyperfyMessageId: msg.id,
               hyperfyFromId: msg.fromId,
               hyperfyFromName: senderName,
+              // Let the handler skip the "should I respond?" LLM call when the answer is obvious
+              directlyAddressed: isDirectlyAddressed(messageBody, agentNames),
+              soloPlayer: countOtherPlayers(world) === 1,
             },
           },
           createdAt: Date.now(),
@@ -74,8 +79,6 @@ export class MessageManager {
         // Create a callback function to handle responses
         const callback: HandlerCallback = async (responseContent: Content): Promise<Memory[]> => {
           console.info(`[Hyperfy Chat Callback] Received response: ${JSON.stringify(responseContent)}`)
-
-          console.log(`[Hyperfy Chat Response] ${responseContent}`)
           const emote = responseContent.emote as string;
           // Send response back to Hyperfy
           const emoteManager = service.getEmoteManager();
@@ -84,33 +87,7 @@ export class MessageManager {
           }
           if (responseContent.text) {
             this.sendMessage(responseContent.text);
-
-            // Generate TTS audio and play via LiveKit (prefer ElevenLabs, fallback to OpenAI)
-            try {
-              console.log('[MessageManager] Starting TTS generation for:', responseContent.text.substring(0, 50) + '...');
-
-              // Try ElevenLabs first, then fallback to OpenAI
-              let audioBuffer = await generateElevenLabsTTS(responseContent.text);
-              if (!audioBuffer) {
-                console.log('[MessageManager] ElevenLabs failed, trying OpenAI TTS...');
-                audioBuffer = await generateOpenAITTS(responseContent.text);
-              }
-
-              console.log('[MessageManager] Audio buffer result:', audioBuffer ? `${audioBuffer.length} bytes` : 'null');
-              if (audioBuffer) {
-                const voiceManager = service.getVoiceManager();
-                console.log('[MessageManager] VoiceManager exists:', !!voiceManager);
-                if (voiceManager) {
-                  console.log('[MessageManager] Playing audio via LiveKit...');
-                  await voiceManager.playAudio(audioBuffer);
-                  logger.info('[MessageManager] TTS audio played successfully');
-                }
-              } else {
-                console.log('[MessageManager] No audio generated - check ELEVENLABS_XI_API_KEY or OPENAI_API_KEY in .env');
-              }
-            } catch (ttsError) {
-              logger.warn('[MessageManager] TTS generation failed, text-only response sent:', ttsError);
-            }
+            await service.getVoiceManager()?.speak(responseContent.text);
           }
           const callbackMemory: Memory = {
             id: createUniqueUuid(this.runtime, Date.now().toString()),
@@ -144,7 +121,7 @@ export class MessageManager {
               metadata: {
                 hyperfy: {
                   id: msg.fromId,
-                  username: senderName,
+                  userName: senderName,
                   name: senderName,
                 },
               },
@@ -154,17 +131,13 @@ export class MessageManager {
           console.error(`[Hyperfy Chat] Error checking/creating entity: ${error}`)
         }
 
-        // Emit the MESSAGE_RECEIVED event to trigger the message handler
+        // emitEvent awaits the handler, so the activity lock above covers the whole turn
         console.info(`[Hyperfy Chat] Emitting MESSAGE_RECEIVED event for message: ${messageId}`)
-        agentActivityLock.enter();
         await this.runtime.emitEvent(hyperfyEventType.MESSAGE_RECEIVED as string, {
             runtime: this.runtime,
             message: memory,
             callback: callback,
             source: 'hyperfy',
-            onComplete: () => {
-              agentActivityLock.exit();
-            }
           } as any,
         )
 
@@ -173,12 +146,15 @@ export class MessageManager {
     });
   }
 
-  async sendMessage(text: string): Promise<void> {
+  /**
+   * Posts to world chat. Never throws (callers fire and forget); returns false on failure.
+   */
+  async sendMessage(text: string): Promise<boolean> {
     const service = this.runtime.getService<HyperfyService>(HyperfyService.serviceType);
-    const world = service.getWorld();
-    if (!service.isConnected() || !world?.chat || !world?.entities?.player) {
+    const world = service?.getWorld();
+    if (!service?.isConnected() || !world?.chat || !world?.entities?.player) {
       console.error('HyperfyService: Cannot send message. Not ready.')
-      return
+      return false
     }
 
     try {
@@ -201,10 +177,10 @@ export class MessageManager {
         },
         true
       )
-
+      return true
     } catch (error: any) {
       console.error('Error sending Hyperfy message:', error.message, error.stack)
-      throw error
+      return false
     }
   }
 
@@ -243,7 +219,13 @@ export class MessageManager {
           }
         })();
 
-        const formattedId = entity ? JSON.parse(entity.data).hyperfy.id : "";
+        const formattedId = (() => {
+          try {
+            return JSON.parse(entity?.data || '{}')?.hyperfy?.id ?? "";
+          } catch {
+            return "";
+          }
+        })();
   
         const messageTime = new Date(message.createdAt);
         const hours = messageTime.getHours().toString().padStart(2, "0");

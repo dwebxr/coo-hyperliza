@@ -96,31 +96,24 @@ export class AgentActions extends System {
     }, 500);
   }
 
-  teleportToUser(userId: string) {
+  teleportToUser(userId?: string) {
     console.log(`[Actions] Teleporting to user: ${userId}`);
-    // Find the entity corresponding to the user ID
-    // Note: The userId passed here is usually the agent's internal ID or the sender's ID.
-    // We need to map it to the Hyperfy entity ID if possible, or search by name/owner.
 
-    // In Hyperfy, the 'player' entity is the local user (the agent itself).
-    // Other players are entities in world.entities.items.
-    // We need to find the entity that represents the user 'masia' or the sender.
-
-    // For now, let's search for an entity that is a player and not us.
-    // Or if we have the specific entity ID from the message context.
-
-    // If userId is provided and matches an entity ID directly:
-    if (this.world.entities.items.has(userId)) {
+    // userId is the Hyperfy entity id of the sender when known
+    if (userId && this.world.entities.items.has(userId)) {
       this.world.controls.teleportToEntity(userId);
       return;
     }
 
-    // Fallback: Search for any player entity that isn't us
-    // This is a bit hacky but works for 1-on-1 testing
+    // Fallback: the other player nearest to the agent
+    const agent = this.world.entities.player;
     let targetId = null;
+    let nearest = Infinity;
     this.world.entities.items.forEach((entity: any) => {
-      if (entity.isPlayer && entity !== this.world.entities.player) {
-        // Check if name matches or just pick the first one
+      if (!entity.isPlayer || entity === agent || !entity.base?.position) return;
+      const distance = entity.base.position.distanceTo(agent.base.position);
+      if (distance < nearest) {
+        nearest = distance;
         targetId = entity.data.id;
       }
     });

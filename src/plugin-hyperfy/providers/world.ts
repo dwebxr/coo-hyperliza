@@ -12,6 +12,10 @@ import { HyperfyService } from '../service';
 import * as THREE from 'three'
 import { Vector3Enhanced } from '../hyperfy/src/core/extras/Vector3Enhanced.js'
 
+// Per entity type, how many of the nearest entities get a full line. The rest are listed
+// compactly (name + id) so actions can still target them without flooding the prompt.
+const MAX_DETAILED_ENTITIES_PER_TYPE = 40;
+
 export const hyperfyProvider: Provider = {
     name: 'HYPERFY_WORLD_STATE',
     description: 'Provides current entity positions/rotations and agent state in the connected Hyperfy world.',
@@ -27,9 +31,10 @@ export const hyperfyProvider: Provider = {
       const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
 
       if (!service || !service.isConnected()) {
+        const text = '# Hyperfy World State\nConnection Status: Disconnected';
         return {
-          text: '# Hyperfy World State\nConnection Status: Disconnected',
-          values: { hyperfy_status: 'disconnected' },
+          text,
+          values: { hyperfyStatus: text },
           data: { status: 'disconnected' },
         };
       }
@@ -43,9 +48,10 @@ export const hyperfyProvider: Provider = {
         const agentId = world?.entities?.player?.data?.id;
 
         const allEntityIds: string[] = [];
-        const categorizedEntities: Record<string, string[]> = {};
+        const categorizedEntities: Record<string, { line: string; compact: string; distance: number }[]> = {};
         let agentText = '## Agent Info (You)\nUnable to find your own entity.';
         const nearbyPlayers: string[] = [];
+        const agentPos = world?.entities?.player?.base?.position;
 
         for (const [id, entity] of entities.entries()) {
           const name = entity?.data?.name || entity?.blueprint?.name || 'Unnamed';
@@ -86,12 +92,23 @@ export const hyperfyProvider: Provider = {
             categorizedEntities[type] = [];
           }
 
-          categorizedEntities[type].push(line);
+          const distance = pos && agentPos && typeof pos.distanceTo === 'function'
+            ? pos.distanceTo(agentPos)
+            : Number.POSITIVE_INFINITY;
+          categorizedEntities[type].push({ line, compact: `${name} (${id})`, distance });
         }
 
         let categorizedSummary = '';
-        for (const [type, lines] of Object.entries(categorizedEntities)) {
-          categorizedSummary += `\n\n## ${type[0].toUpperCase() + type.slice(1)} Entities (${lines.length})\n${lines.join('\n')}`;
+        for (const [type, items] of Object.entries(categorizedEntities)) {
+          items.sort((a, b) => a.distance - b.distance);
+          const limit = type === 'player' ? items.length : MAX_DETAILED_ENTITIES_PER_TYPE;
+          const detailed = items.slice(0, limit).map(item => item.line);
+          const rest = items.slice(limit).map(item => item.compact);
+          let section = `\n\n## ${type[0].toUpperCase() + type.slice(1)} Entities (${items.length})\n${detailed.join('\n')}`;
+          if (rest.length > 0) {
+            section += `\n- Farther away (${rest.length}, name and Entity ID only): ${rest.join(', ')}`;
+          }
+          categorizedSummary += section;
         }
 
         const actionsSystem = world?.actions;
@@ -139,9 +156,11 @@ export const hyperfyProvider: Provider = {
         if (messageText) {
           const senderId = _message.entityId;
           const senderEntity = await runtime.getEntityById(senderId);
+          const hyperfyMeta = senderEntity?.metadata?.hyperfy as { userName?: string; username?: string; name?: string } | undefined;
           const senderName =
-            senderEntity?.metadata?.hyperfy.username ||
-            senderEntity?.metadata?.hyperfy.name ||
+            hyperfyMeta?.userName ||
+            hyperfyMeta?.username ||
+            hyperfyMeta?.name ||
             (senderEntity?.names || []).find(n => n.toLowerCase() !== 'anonymous') ||
             'Unknown User';
 
@@ -186,9 +205,13 @@ export const hyperfyProvider: Provider = {
         };
       } catch (error: any) { // Add type annotation for error
          logger.error('Error getting Hyperfy state from service:', error);
+         // The incoming message only reaches the prompt through this provider, so keep it on errors.
+         const received = _message.content?.text?.trim();
+         const text = '# Hyperfy World State\nStatus: Error retrieving state.' +
+           (received ? `\n\n### Received Message\n${received}` : '');
          return {
-          text: '# Hyperfy World State\nStatus: Error retrieving state.',
-          values: { hyperfy_status: 'error' },
+          text,
+          values: { hyperfyStatus: text },
           data: { status: 'error', error: error.message },
         };
       }

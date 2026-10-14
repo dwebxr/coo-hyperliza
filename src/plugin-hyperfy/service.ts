@@ -24,12 +24,15 @@ import { VoiceManager } from './managers//voice-manager.js'
 import { PuppeteerManager } from './managers/puppeteer-manager.js'
 import { BuildManager } from './managers/build-manager.js'
 import { hashFileBuffer, getModuleDirectory } from './utils'
+import { ReconnectController } from './lib/reconnect'
 
 const moduleDirPath = getModuleDirectory();
 const LOCAL_AVATAR_PATH = `${moduleDirPath}/avatars/avatar.vrm`;
 
 const HYPERFY_WS_URL = process.env.WS_URL || 'wss://chill.hyperfy.xyz/ws'
 const HYPERFY_APPEARANCE_POLL_INTERVAL = 30000
+// Teardown must not hang a reconnect on a stuck native/CDP call
+const TEARDOWN_STEP_TIMEOUT_MS = 10000
 
 
 export class HyperfyService extends Service {
@@ -49,6 +52,14 @@ export class HyperfyService extends Service {
   private nameSet: boolean = false
 
   private connectionTime: number | null = null
+  private appearancePollInFlight: boolean = false
+  private lastConnectConfig: { wsUrl: string; authToken?: string; worldId: UUID } | null = null
+  private connectPromise: Promise<void> | null = null
+  private teardownPromise: Promise<void> | null = null
+  private isStopping: boolean = false
+  // Bumped by every teardown so an in-flight connect can tell its world was torn down
+  private connectionGeneration: number = 0
+  private reconnectController: ReconnectController
   private behaviorManager: BehaviorManager;
   private emoteManager: EmoteManager;
   private messageManager: MessageManager;
@@ -66,6 +77,14 @@ export class HyperfyService extends Service {
 
   constructor(protected runtime: IAgentRuntime) {
     super();
+    this.reconnectController = new ReconnectController(
+      async () => {
+        if (!this.lastConnectConfig) return
+        console.info(`[Hyperfy Reconnect] Reconnecting to ${this.lastConnectConfig.wsUrl} (attempt ${this.reconnectController.attemptCount})...`)
+        await this.connect(this.lastConnectConfig)
+      },
+      { onError: (error: any) => console.error(`[Hyperfy Reconnect] Reconnect failed: ${error?.message || error}`) }
+    )
     console.info('HyperfyService instance created')
   }
 
@@ -74,12 +93,14 @@ export class HyperfyService extends Service {
     const service = new HyperfyService(runtime)
     console.info(`Attempting automatic connection to default Hyperfy URL: ${HYPERFY_WS_URL}`)
     const defaultWorldId = createUniqueUuid(runtime, runtime.agentId + '-default-hyperfy') as UUID
-    const authToken: string | undefined = undefined
 
     service
-      .connect({ wsUrl: HYPERFY_WS_URL, worldId: defaultWorldId, authToken })
+      .connect({ wsUrl: HYPERFY_WS_URL, worldId: defaultWorldId })
       .then(() => console.info(`Automatic Hyperfy connection initiated.`))
-      .catch(err => console.error(`Automatic Hyperfy connection failed: ${err.message}`))
+      .catch(err => {
+        console.error(`Automatic Hyperfy connection failed: ${err.message}`)
+        service.scheduleReconnect()
+      })
 
     return service
   }
@@ -91,23 +112,66 @@ export class HyperfyService extends Service {
     else console.warn('Hyperfy service not found during stop.')
   }
 
-  async connect(config: { wsUrl: string; authToken?: string; worldId: UUID }): Promise<void> {
-    if (this.isConnectedState) {
-      console.warn(`HyperfyService already connected to world ${this._currentWorldId}. Disconnecting first.`)
-      await this.disconnect()
+  /**
+   * Connects to a Hyperfy world. Concurrent calls share the in-flight attempt.
+   * Note: the auth token comes from localstorage.json (ClientNetwork ignores initialAuthToken).
+   */
+  connect(config: { wsUrl: string; authToken?: string; worldId: UUID }): Promise<void> {
+    if (!this.connectPromise) {
+      this.connectPromise = this.doConnect(config).finally(() => {
+        this.connectPromise = null
+      })
     }
+    return this.connectPromise
+  }
+
+  private scheduleReconnect(): void {
+    if (this.isStopping || !this.lastConnectConfig) return
+    const delay = this.reconnectController.schedule()
+    if (delay !== null) {
+      console.info(`[Hyperfy Reconnect] Next attempt in ${Math.round(delay / 1000)}s`)
+    }
+  }
+
+  private async doConnect(config: { wsUrl: string; authToken?: string; worldId: UUID }): Promise<void> {
+    if (this.teardownPromise) await this.teardownPromise
+    if (this.isConnectedState || this.world) {
+      console.warn(`HyperfyService already connected to world ${this._currentWorldId}. Disconnecting first.`)
+      await this.handleDisconnect()
+    }
+    if (this.isStopping) throw new Error('HyperfyService is stopping')
+    // This attempt supersedes any retry that was waiting to fire
+    this.reconnectController.cancelPending()
 
     console.info(`Attempting to connect HyperfyService to ${config.wsUrl} for world ${config.worldId}`)
+    this.lastConnectConfig = config
     this.wsUrl = config.wsUrl
     this._currentWorldId = config.worldId
     this.appearanceSet = false
     this.nameSet = false
 
     try {
-      const world = createNodeClientWorld()
+      const world: any = createNodeClientWorld()
       this.world = world
+      const generation = this.connectionGeneration
 
-      this.puppeteerManager = new PuppeteerManager(this.runtime);
+      // Registered before init so a socket that closes during init is not missed.
+      let kickCode: string | null = null
+      world.on('kick', (code: string) => {
+        kickCode = code
+        console.warn(`[Hyperfy] Kicked by server: ${code}`)
+      })
+      world.on('disconnect', (reason: any) => {
+        this.onWorldDisconnect(world, reason, kickCode).catch(error => {
+          console.error('[Hyperfy] Error while handling disconnect:', error)
+        })
+      })
+      // The local player only spawns after a real session is established.
+      world.on('player', () => {
+        if (world === this.world) this.reconnectController.markEstablished()
+      })
+
+      this.puppeteerManager = PuppeteerManager.getOrCreate(this.runtime);
       this.emoteManager = new EmoteManager(this.runtime);
       this.messageManager = new MessageManager(this.runtime);
       this.voiceManager = new VoiceManager(this.runtime);
@@ -155,10 +219,10 @@ export class HyperfyService extends Service {
 
         // emit chat event
         const readOnly = Object.freeze({ ...msg })
-        this.world.events.emit('chat', readOnly)
+        world.events.emit('chat', readOnly)
         // maybe broadcast
         if (broadcast) {
-          this.world.network.send('chatAdded', msg)
+          world.network.send('chatAdded', msg)
         }
       };
 
@@ -183,7 +247,13 @@ export class HyperfyService extends Service {
       if (typeof this.world.init !== 'function') {
         throw new Error('world.init is not a function')
       }
-      await this.world.init(hyperfyConfig)
+      await world.init(hyperfyConfig)
+      // Everything after this point is synchronous, so one check is enough.
+      if (this.world !== world || this.connectionGeneration !== generation) {
+        // init may have started the tick loop / socket after teardown destroyed the world
+        world.destroy()
+        throw new Error('Hyperfy connection closed during initialization')
+      }
       console.info('Hyperfy world initialized.')
 
       this.processedMsgIds.clear()
@@ -217,23 +287,42 @@ export class HyperfyService extends Service {
     }
   }
 
+  private async onWorldDisconnect(world: any, reason: any, kickCode: string | null): Promise<void> {
+    // Ignore events from a world we already replaced or tore down
+    if (world !== this.world) return
+
+    // Classify before any await so every retry path (this one, a failed connect, a failed
+    // reconnect) sees the policy. A kick sent right before the close is still sitting in the
+    // network queue, which is only flushed on the next tick.
+    const kick = kickCode ?? findQueuedKick(world)
+    if (kick === 'duplicate_user') {
+      // The server rejects the newer connection, so retrying never disturbs the other session;
+      // it just lets us rejoin once that session leaves.
+      console.warn('[Hyperfy Reconnect] Another session is using this auth token. Retrying at the maximum delay.')
+      this.reconnectController.deferNextRetry()
+    } else if (kick === 'player_limit') {
+      console.warn('[Hyperfy Reconnect] World is full. Waiting the maximum delay before retrying.')
+      this.reconnectController.deferNextRetry()
+    }
+
+    // ClientNetwork passes the raw CloseEvent
+    reason = reason?.code ?? reason
+    console.warn(`Hyperfy world disconnected: ${reason}`)
+    this.runtime.emitEvent(EventType.WORLD_LEFT, {
+      runtime: this.runtime,
+      eventName: 'HYPERFY_DISCONNECTED',
+      data: { worldId: this._currentWorldId, reason: reason },
+    }).catch(error => console.warn('[Hyperfy] WORLD_LEFT handler failed:', error))
+
+    await this.handleDisconnect()
+    this.scheduleReconnect()
+  }
+
   private subscribeToHyperfyEvents(): void {
     if (!this.world || typeof this.world.on !== 'function') {
       console.warn("[Hyperfy Events] Cannot subscribe: World or world.on not available.")
       return
     }
-
-    this.world.off('disconnect')
-
-    this.world.on('disconnect', (reason: string) => {
-      console.warn(`Hyperfy world disconnected: ${reason}`)
-      this.runtime.emitEvent(EventType.WORLD_LEFT, {
-        runtime: this.runtime,
-        eventName: 'HYPERFY_DISCONNECTED',
-        data: { worldId: this._currentWorldId, reason: reason },
-      })
-      this.handleDisconnect()
-    })
 
     if (this.world.chat?.subscribe) {
       this.startChatSubscription()
@@ -382,7 +471,7 @@ export class HyperfyService extends Service {
     console.info(`[Appearance/Name Polling] Initializing interval every ${HYPERFY_APPEARANCE_POLL_INTERVAL}ms.`);
 
 
-    const f = async () => {
+    const poll = async () => {
       // Stop polling if both tasks are complete
       if (pollingTasks.avatar && pollingTasks.name) {
         if (this.appearanceIntervalId) clearInterval(this.appearanceIntervalId);
@@ -399,9 +488,6 @@ export class HyperfyService extends Service {
       const assetsUrlReady = !!this.world?.assetsUrl; // Needed for avatar
 
       // Condition checks player/ID/network readiness for name, adds assetsUrl for avatar
-      console.log('agentPlayerReady', agentPlayerReady)
-      console.log('agentPlayerIdReady', agentPlayerIdReady)
-      console.log('networkReady', networkReady)
       if (agentPlayerReady && agentPlayerIdReady && networkReady) {
         const entityId = createUniqueUuid(this.runtime, this.runtime.agentId);
         const entity = await this.runtime.getEntityById(entityId)
@@ -448,6 +534,18 @@ export class HyperfyService extends Service {
         console.debug(`[Appearance/Name Polling] Waiting for: Player (${agentPlayerReady}), Player ID (${agentPlayerIdReady}), Network (${networkReady})...`);
       }
     }
+    // An avatar upload can take longer than the interval; don't start a second one.
+    const f = async () => {
+      if (this.appearancePollInFlight) return;
+      this.appearancePollInFlight = true;
+      try {
+        await poll();
+      } catch (error) {
+        console.error('[Appearance/Name Polling] Unexpected error:', error);
+      } finally {
+        this.appearancePollInFlight = false;
+      }
+    }
     this.appearanceIntervalId = setInterval(f, HYPERFY_APPEARANCE_POLL_INTERVAL);
     f();
   }
@@ -476,27 +574,48 @@ export class HyperfyService extends Service {
     return entity?.data?.name || entity?.blueprint?.name || 'Unnamed';
   }
 
-  async handleDisconnect(): Promise<void> {
+  /**
+   * Tears down the current world. Concurrent calls share one teardown.
+   */
+  handleDisconnect(): Promise<void> {
+    if (!this.teardownPromise) {
+      this.teardownPromise = this.teardown().finally(() => {
+        this.teardownPromise = null
+      })
+    }
+    return this.teardownPromise
+  }
+
+  private async teardown(): Promise<void> {
     if (!this.isConnectedState && !this.world) return
     console.info('Handling Hyperfy disconnection...')
     this.isConnectedState = false
+    this.connectionGeneration++
 
     this.stopAppearancePolling()
     this.behaviorManager?.stop();
+    this.voiceManager?.stop();
+    this.emoteManager?.stop();
 
     if (this.world) {
       try {
-        if (this.world.network && typeof this.world.network.disconnect === 'function') {
-          console.info("[Hyperfy Cleanup] Calling network.disconnect()...")
-          await this.world.network.disconnect()
-        }
-        if (typeof this.world.destroy === 'function') {
-          console.info("[Hyperfy Cleanup] Calling world.destroy()...")
-          this.world.destroy()
-        }
+        // Navigation loops keep driving the player entity, which outlives Entities.destroy()
+        this.controls?.stopAllActions?.('disconnect')
       } catch (e: any) {
-        console.warn(`[Hyperfy Cleanup] Error during world network disconnect/destroy: ${e.message}`)
+        console.warn(`[Hyperfy Cleanup] Error stopping controls: ${e.message}`)
       }
+      const leavingRoom = this.world.livekit?.disconnectRoom?.()
+      try {
+        // Destroy before awaiting anything so the old world stops ticking (and loading assets
+        // into the Puppeteer page) while we wait for LiveKit and the page to close.
+        console.info("[Hyperfy Cleanup] Calling world.destroy()...")
+        this.world.destroy()
+      } catch (e: any) {
+        console.warn(`[Hyperfy Cleanup] Error during world destroy: ${e.message}`)
+      }
+      await settleWithin(leavingRoom, TEARDOWN_STEP_TIMEOUT_MS, 'leaving LiveKit room')
+      // Drop this session's textures/avatars; the browser itself is reused.
+      await settleWithin(this.puppeteerManager?.resetPage(), TEARDOWN_STEP_TIMEOUT_MS, 'resetting Puppeteer page')
     }
 
     this.world = null
@@ -516,6 +635,8 @@ export class HyperfyService extends Service {
 
   async disconnect(): Promise<void> {
     console.info(`Disconnecting HyperfyService from world ${this._currentWorldId}`)
+    // An explicit disconnect should not be undone by a retry that was already waiting
+    this.reconnectController.cancelPending()
     await this.handleDisconnect()
     console.info('HyperfyService disconnect complete.')
   }
@@ -562,7 +683,13 @@ export class HyperfyService extends Service {
 
   async stop(): Promise<void> {
     console.info('*** Stopping Hyperfy service instance ***')
+    this.isStopping = true
+    this.reconnectController.stop()
+    if (this.connectPromise) {
+      await this.connectPromise.catch(() => { })
+    }
     await this.disconnect()
+    await this.puppeteerManager?.close()
   }
 
   private startChatSubscription(): void {
@@ -572,13 +699,6 @@ export class HyperfyService extends Service {
     }
 
     console.info('[HyperfyService] Initializing chat subscription...')
-
-    // Pre-populate processed IDs with existing messages
-    this.world.chat.msgs?.forEach((msg: any) => {
-      if (msg && msg.id) { // Add null check for msg and msg.id
-        this.processedMsgIds.add(msg.id)
-      }
-    });
 
     this.world.chat.subscribe((msgs: any[]) => {
       // Wait for player entity (ensures world/chat exist too)
@@ -611,9 +731,11 @@ export class HyperfyService extends Service {
       if (newMessagesFound.length > 0) {
         console.info(`[Chat] Found ${newMessagesFound.length} new messages to process.`)
 
-        newMessagesFound.forEach(async (msg: any) => {
-          await this.messageManager.handleMessage(msg);
-        })
+        for (const msg of newMessagesFound) {
+          this.messageManager.handleMessage(msg).catch(error => {
+            console.error(`[Chat] Failed to handle message ${msg?.id}:`, error)
+          })
+        }
       }
     })
   }
@@ -640,5 +762,29 @@ export class HyperfyService extends Service {
 
   getBuildManager() {
     return this.buildManager;
+  }
+}
+
+export function findQueuedKick(world: any): string | null {
+  const queue: any[] = world?.network?.queue ?? []
+  const entry = queue.find(item => Array.isArray(item) && item[0] === 'onKick')
+  return entry ? entry[1] : null
+}
+
+async function settleWithin(promise: Promise<unknown> | undefined, ms: number, label: string): Promise<void> {
+  if (!promise) return
+  let timer: NodeJS.Timeout | undefined
+  const timeout = new Promise<void>(resolve => {
+    timer = setTimeout(() => {
+      console.warn(`[Hyperfy Cleanup] Gave up ${label} after ${ms}ms`)
+      resolve()
+    }, ms)
+  })
+  try {
+    await Promise.race([promise.then(() => { }, (e: any) => {
+      console.warn(`[Hyperfy Cleanup] Error ${label}: ${e?.message || e}`)
+    }), timeout])
+  } finally {
+    clearTimeout(timer)
   }
 }

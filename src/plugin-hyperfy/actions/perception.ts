@@ -171,15 +171,14 @@ export const hyperfyScenePerceptionAction: Action = {
     const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
     const world = service?.getWorld();
     const puppeteerManager = service?.getPuppeteerManager();
-    const controls = world.controls;
-
-    controls.stopAllActions();
 
     if (!service || !world || !puppeteerManager) {
       logger.error('Hyperfy service/world unavailable.');
       await callback({ text: 'Unable to observe environment. Hyperfy world not available.' });
       return;
     }
+
+    world.controls?.stopAllActions();
 
     state = await runtime.composeState(message);
 
@@ -198,7 +197,7 @@ export const hyperfyScenePerceptionAction: Action = {
     if (!selection || selection.snapshotType === 'NONE') {
       await callback({
         thought: 'The snapshot strategy was unclear.',
-        text: selection.parameter || 'Can you clarify what you want me to observe?',
+        text: selection?.parameter || 'Can you clarify what you want me to observe?',
         metadata: { error: 'unclear_snapshot_request' }
       });
       return;

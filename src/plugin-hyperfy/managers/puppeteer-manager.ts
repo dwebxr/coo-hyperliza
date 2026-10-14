@@ -16,7 +16,8 @@ export class PuppeteerManager {
   private runtime: IAgentRuntime
   private browser: puppeteer.Browser
   private page: puppeteer.Page
-  private initPromise: Promise<void> | null = null
+  private browserPromise: Promise<puppeteer.Browser> | null = null
+  private initPromise: Promise<puppeteer.Page> | null = null
   private readonly STRIP_SLOTS = [
     'map', 'aoMap', 'alphaMap',
     'bumpMap', 'normalMap',
@@ -26,14 +27,15 @@ export class PuppeteerManager {
 
 
   constructor(runtime: IAgentRuntime) {
-    this.runtime = runtime
-    this.init()
-
-    if (!PuppeteerManager.instance) {
-      PuppeteerManager.instance = this
-    } else {
+    if (PuppeteerManager.instance) {
       throw new Error('PuppeteerManager has already been instantiated.')
     }
+    this.runtime = runtime
+    PuppeteerManager.instance = this
+    // Warm up Chromium in the background; callers await init() themselves.
+    this.init().catch(error => {
+      console.error('[PuppeteerManager] Failed to launch browser:', error?.message || error)
+    })
   }
 
   public static getInstance(): PuppeteerManager {
@@ -43,51 +45,120 @@ export class PuppeteerManager {
     return this.instance
   }
 
-  private async init() {
-    // Only initialize once
-    if (!this.initPromise) {
-      this.initPromise = (async () => {
-        this.browser = await puppeteer.launch({
-          // headless: false,
-          defaultViewport: null,
-          slowMo: 50
-        })
-
-        this.page = await this.browser.newPage()
-        const moduleDirPath = getModuleDirectory();
-        const filePath = moduleDirPath + '/puppeteer/index.html';
-
-        await this.page.goto(`file://${filePath}`, { waitUntil: 'load' })
-
-        await this.injectScripts([
-          `${moduleDirPath}/scripts/createVRMFactory.js`,
-          `${moduleDirPath}/scripts/snapshotEquirectangular.js`,
-          `${moduleDirPath}/scripts/snapshotFacingDirection.js`,
-          `${moduleDirPath}/scripts/snapshotViewToTarget.js`
-        ]);
-
-        await this.page.waitForFunction(() =>
-          window.THREE !== undefined && 
-          window.scene !== undefined && 
-          window.camera !== undefined
-        )
-      })()
-    }
-    return this.initPromise
+  /**
+   * Returns the existing manager, so reconnects reuse one Chromium.
+   */
+  public static getOrCreate(runtime: IAgentRuntime): PuppeteerManager {
+    return this.instance ?? new PuppeteerManager(runtime)
   }
 
-  private async injectScripts(scriptPaths: string[]) {
+  public async close(): Promise<void> {
+    if (PuppeteerManager.instance === this) {
+      PuppeteerManager.instance = null
+    }
+    await this.resetPage()
+    const browserPromise = this.browserPromise
+    this.browserPromise = null
+    const browser = await browserPromise?.catch(() => null)
+    await browser?.close().catch(error => {
+      console.warn('[PuppeteerManager] Error while closing browser:', error?.message || error)
+    })
+    this.browser = null
+  }
+
+  /**
+   * Closes the current page so the next session starts with empty texture/avatar caches.
+   * The browser stays up and the next init() opens a fresh page.
+   */
+  public async resetPage(): Promise<void> {
+    const pending = this.initPromise
+    this.initPromise = null
+    const page = await pending?.catch(() => null)
+    if (this.page === page) this.page = null
+    await page?.close().catch(error => {
+      console.warn('[PuppeteerManager] Error while closing page:', error?.message || error)
+    })
+  }
+
+  private getBrowser(): Promise<puppeteer.Browser> {
+    if (!this.browserPromise) {
+      const browserPromise = puppeteer.launch({
+        // headless: false,
+        defaultViewport: null,
+        slowMo: 50
+      })
+      this.browserPromise = browserPromise
+      browserPromise.then(
+        browser => {
+          this.browser = browser
+          // If Chromium dies, relaunch on the next call instead of reusing a dead handle
+          browser.on('disconnected', () => {
+            if (this.browserPromise !== browserPromise) return
+            this.browserPromise = null
+            this.browser = null
+            this.initPromise = null
+            this.page = null
+          })
+        },
+        // Let a later call retry the launch
+        () => { if (this.browserPromise === browserPromise) this.browserPromise = null }
+      )
+    }
+    return this.browserPromise
+  }
+
+  private async init(): Promise<puppeteer.Page> {
+    // One page per session; reset by resetPage()
+    if (!this.initPromise) {
+      const initPromise = (async () => {
+        const browser = await this.getBrowser()
+        const page = await browser.newPage()
+        try {
+          const moduleDirPath = getModuleDirectory();
+          const filePath = moduleDirPath + '/puppeteer/index.html';
+
+          await page.goto(`file://${filePath}`, { waitUntil: 'load' })
+
+          await this.injectScripts(page, [
+            `${moduleDirPath}/scripts/createVRMFactory.js`,
+            `${moduleDirPath}/scripts/snapshotEquirectangular.js`,
+            `${moduleDirPath}/scripts/snapshotFacingDirection.js`,
+            `${moduleDirPath}/scripts/snapshotViewToTarget.js`
+          ]);
+
+          await page.waitForFunction(() =>
+            window.THREE !== undefined && 
+            window.scene !== undefined && 
+            window.camera !== undefined
+          )
+        } catch (error) {
+          await page.close().catch(() => { })
+          throw error
+        }
+        this.page = page
+        return page
+      })()
+      this.initPromise = initPromise
+      // Allow a later call to retry instead of rethrowing the same error forever.
+      initPromise.catch(() => {
+        if (this.initPromise === initPromise) this.initPromise = null
+      })
+    }
+    return await this.initPromise
+  }
+
+  private async injectScripts(page: puppeteer.Page, scriptPaths: string[]) {
     for (const relativePath of scriptPaths) {
       const absPath = path.resolve(relativePath);
       const content = await fsPromises.readFile(absPath, 'utf8');
-      await this.page.addScriptTag({ content });
+      await page.addScriptTag({ content });
     }
   }
 
   public async snapshotFacingDirection(
     direction: 'front' | 'back' | 'left' | 'right'
   ): Promise<string> {
-    await this.init();
+    const page = await this.init();
   
     const service = this.getService();
     const world = service.getWorld();
@@ -100,7 +171,7 @@ export class PuppeteerManager {
     await world.controls.rotateTo(direction, 500);
     world.controls.stopRotation();  
   
-    await this.rehydrateSceneAssets();
+    await this.rehydrateSceneAssets(page);
   
     const playerData = {
       position: player.base.position.toArray() as [number, number, number],
@@ -112,7 +183,7 @@ export class PuppeteerManager {
       ] as const
     };
 
-    const base64 = await this.page.evaluate(async (playerData) => {
+    const base64 = await page.evaluate(async (playerData) => {
       return await window.snapshotFacingDirection(playerData);
     }, playerData);
   
@@ -123,7 +194,7 @@ export class PuppeteerManager {
   }
   
   public async snapshotViewToTarget(targetPosition: [number, number, number]): Promise<string> {
-    await this.init();
+    const page = await this.init();
   
     const service = this.getService();
     const world = service.getWorld();
@@ -133,13 +204,13 @@ export class PuppeteerManager {
       throw new Error('Player entity not yet available');
     }
   
-    await this.rehydrateSceneAssets();
+    await this.rehydrateSceneAssets(page);
   
     const playerData = {
       position: player.base.position.toArray() as [number, number, number]
     };
 
-    const base64 = await this.page.evaluate(async (playerData, targetPosition) => {
+    const base64 = await page.evaluate(async (playerData, targetPosition) => {
       return await window.snapshotViewToTarget(playerData, targetPosition);
     }, playerData, targetPosition);
   
@@ -151,7 +222,7 @@ export class PuppeteerManager {
   
 
   public async snapshotEquirectangular(): Promise<string> {
-    await this.init();
+    const page = await this.init();
   
     const service = this.getService();
     const world = service.getWorld();
@@ -161,14 +232,14 @@ export class PuppeteerManager {
       throw new Error('Player entity not yet available');
     }
   
-    await this.rehydrateSceneAssets();
+    await this.rehydrateSceneAssets(page);
   
     const playerData = {
       position: player.base.position.toArray(),
       quaternion: [player.base.quaternion.x, player.base.quaternion.y, player.base.quaternion.z, player.base.quaternion.w] as const
     };
     
-    const base64 = await this.page.evaluate(async (playerData) => {
+    const base64 = await page.evaluate(async (playerData) => {
       return await window.snapshotEquirectangular(playerData);
     }, playerData);
   
@@ -181,10 +252,10 @@ export class PuppeteerManager {
   
   
   async loadGlbBytes(url: string): Promise<number[]> {
-    await this.init();
+    const page = await this.init();
     const STRIP_SLOTS = this.STRIP_SLOTS;
 
-    return this.page.evaluate(async (url, STRIP_SLOTS) => {
+    return page.evaluate(async (url, STRIP_SLOTS) => {
       const loader = new window.GLTFLoader();
       const gltf = await loader.loadAsync(url);
 
@@ -223,9 +294,9 @@ export class PuppeteerManager {
   }
 
   async loadVRMBytes(url: string): Promise<number[]> {
-    await this.init();
+    const page = await this.init();
     
-    return this.page.evaluate(async (url) => {
+    return page.evaluate(async (url) => {
       const loader = window.VRMLoader;
       const gltf = await loader.loadAsync(url);
       const factory = window.createVRMFactory(gltf, (m) => m);
@@ -245,9 +316,9 @@ export class PuppeteerManager {
   }
 
   async registerTexture(url: string, slot: string): Promise<string> {
-    await this.init();
+    const page = await this.init();
   
-    return this.page.evaluate(async (url, slot) => {
+    return page.evaluate(async (url, slot) => {
       if (!window.texturesMap) window.texturesMap = new Map();
   
       const loader = window.TextureLoader;
@@ -268,13 +339,13 @@ export class PuppeteerManager {
   }
   
   public async loadEnvironmentHDR(url: string): Promise<void> {
-    await this.init();
+    const page = await this.init();
     const service = this.getService()
     const world = service.getWorld()
 
     url = await resolveUrl(url, world);
 
-    await this.page.evaluate(async (url) => {
+    await page.evaluate(async (url) => {
       const loader = new window.RGBELoader();
       const hdrTexture = await new Promise((resolve, reject) => {
         loader.load(url, resolve, undefined, reject);
@@ -288,7 +359,7 @@ export class PuppeteerManager {
     }, url);
   }
 
-  private async rehydrateSceneAssets() {
+  private async rehydrateSceneAssets(page: puppeteer.Page) {
     const service = this.getService()
     const world = service.getWorld()
     const sceneJson = world.stage.scene.toJSON()
@@ -315,7 +386,7 @@ export class PuppeteerManager {
     );
     
     const STRIP_SLOTS = this.STRIP_SLOTS;
-    await this.page.evaluate(async (sceneJson, STRIP_SLOTS, players) => {
+    await page.evaluate(async (sceneJson, STRIP_SLOTS, players) => {
       const THREE = window.THREE;
       const loader = new window.THREE.ObjectLoader();
       const loadedScene = loader.parse(sceneJson);
@@ -398,7 +469,7 @@ export class PuppeteerManager {
    * @param weight - Expression weight from 0.0 to 1.0
    */
   async setAgentExpression(expressionName: string, weight: number): Promise<void> {
-    await this.init();
+    const page = await this.init();
 
     const service = this.getService();
     const world = service.getWorld();
@@ -409,7 +480,7 @@ export class PuppeteerManager {
 
     const resolvedUrl = await resolveUrl(avatarUrl, world);
 
-    await this.page.evaluate((url, name, w) => {
+    await page.evaluate((url, name, w) => {
       // Get or create the agent's VRM instance
       if (!window.agentVRMInstance) {
         const factory = window.avatarMap?.get(url);
