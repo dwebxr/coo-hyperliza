@@ -82,12 +82,15 @@ export const messageReceivedHandler = async ({
           `[Bootstrap] Processing message: ${truncateToCompleteSentence(message.content.text || '', 50)}...`
         );
 
-        // First, save the incoming message
+        // First, save the incoming message. Nothing in this agent searches memories by embedding,
+        // so a missing or failing embedding provider must not stop the reply.
         logger.debug('[Bootstrap] Saving message to memory and embeddings');
-        await Promise.all([
-          runtime.addEmbeddingToMemory(message),
-          runtime.createMemory(message, 'messages'),
-        ]);
+        const embedding = runtime.getModel(ModelType.TEXT_EMBEDDING)
+          ? runtime.addEmbeddingToMemory(message).catch((error) => {
+              logger.warn(`[Bootstrap] Embedding failed, continuing without it: ${error?.message || error}`);
+            })
+          : undefined;
+        await Promise.all([embedding, runtime.createMemory(message, 'messages')]);
 
         const agentUserState = await runtime.getParticipantUserState(
           message.roomId,
