@@ -19,7 +19,7 @@ import { AgentActions } from './systems/actions.js'
 import { loadPhysX } from './physx/loadPhysX.js'
 import { BehaviorManager } from "./managers/behavior-manager.js"
 import { EmoteManager } from './managers/emote-manager.js'
-import { MessageManager } from './managers/message-manager.js'
+import { MessageManager, type ChatTurn } from './managers/message-manager.js'
 import { VoiceManager } from './managers/voice-manager.js'
 import { PuppeteerManager } from './managers/puppeteer-manager.js'
 import { BuildManager } from './managers/build-manager.js'
@@ -33,6 +33,9 @@ const HYPERFY_WS_URL = process.env.WS_URL || 'wss://chill.hyperfy.xyz/ws'
 const HYPERFY_APPEARANCE_POLL_INTERVAL = 30000
 // Teardown must not hang a reconnect on a stuck native/CDP call
 const TEARDOWN_STEP_TIMEOUT_MS = 10000
+// Chat is handled one message at a time; a handler stuck longer than this (e.g. an action that
+// keeps navigating) stops holding up the next message, though it keeps running in the background.
+const CHAT_MESSAGE_SLOT_MS = 180000
 
 
 export class HyperfyService extends Service {
@@ -59,6 +62,7 @@ export class HyperfyService extends Service {
   private isStopping: boolean = false
   // Bumped by every teardown so an in-flight connect can tell its world was torn down
   private connectionGeneration: number = 0
+  private chatQueue: Promise<void> = Promise.resolve()
   private reconnectController: ReconnectController
   private behaviorManager: BehaviorManager;
   private emoteManager: EmoteManager;
@@ -596,6 +600,7 @@ export class HyperfyService extends Service {
     this.behaviorManager?.stop();
     this.voiceManager?.stop();
     this.emoteManager?.stop();
+    this.messageManager?.stop();
 
     if (this.world) {
       try {
@@ -699,6 +704,8 @@ export class HyperfyService extends Service {
     }
 
     console.info('[HyperfyService] Initializing chat subscription...')
+    const generation = this.connectionGeneration
+    this.chatQueue = Promise.resolve()
 
     this.world.chat.subscribe((msgs: any[]) => {
       // Wait for player entity (ensures world/chat exist too)
@@ -731,9 +738,20 @@ export class HyperfyService extends Service {
       if (newMessagesFound.length > 0) {
         console.info(`[Chat] Found ${newMessagesFound.length} new messages to process.`)
 
+        // In arrival order, one at a time. IDs are reserved above, so the listener re-running
+        // (e.g. when Coo posts its reply) cannot queue the same message twice.
         for (const msg of newMessagesFound) {
-          this.messageManager.handleMessage(msg).catch(error => {
-            console.error(`[Chat] Failed to handle message ${msg?.id}:`, error)
+          this.chatQueue = this.chatQueue.then(async () => {
+            if (generation !== this.connectionGeneration) return
+            if (!this.messageManager) return
+            const turn: ChatTurn = { cancelled: false }
+            // Logs and swallows failures, so one bad message never breaks the chain
+            const settled = await settleWithin(this.messageManager.handleMessage(msg, turn), CHAT_MESSAGE_SLOT_MS, `handling chat message ${msg?.id}`)
+            // Whatever the timed-out turn produces later is dropped instead of overlapping the next one
+            if (!settled) turn.cancelled = true
+          }).catch(error => {
+            // Never let one failure stop every later message on this connection
+            console.error('[Chat] Unexpected error in the chat queue:', error)
           })
         }
       }
@@ -771,18 +789,20 @@ export function findQueuedKick(world: any): string | null {
   return entry ? entry[1] : null
 }
 
-async function settleWithin(promise: Promise<unknown> | undefined, ms: number, label: string): Promise<void> {
-  if (!promise) return
+/** Waits for `promise` (logging, not throwing, its failure) at most `ms`. Returns false on timeout. */
+async function settleWithin(promise: Promise<unknown> | undefined, ms: number, label: string): Promise<boolean> {
+  if (!promise) return true
   let timer: NodeJS.Timeout | undefined
-  const timeout = new Promise<void>(resolve => {
+  const timeout = new Promise<boolean>(resolve => {
     timer = setTimeout(() => {
-      console.warn(`[Hyperfy Cleanup] Gave up ${label} after ${ms}ms`)
-      resolve()
+      console.warn(`[Hyperfy] Gave up ${label} after ${ms}ms`)
+      resolve(false)
     }, ms)
   })
   try {
-    await Promise.race([promise.then(() => { }, (e: any) => {
-      console.warn(`[Hyperfy Cleanup] Error ${label}: ${e?.message || e}`)
+    return await Promise.race([promise.then(() => true, (e: any) => {
+      console.warn(`[Hyperfy] Error ${label}: ${e?.message || e}`)
+      return true
     }), timeout])
   } finally {
     clearTimeout(timer)

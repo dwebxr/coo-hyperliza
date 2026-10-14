@@ -215,6 +215,8 @@ export class BehaviorManager {
 
     const callback: HandlerCallback = async (responseContent: Content): Promise<Memory[]> => {
       console.info(`[Hyperfy Auto Callback] Received response: ${JSON.stringify(responseContent)}`)
+      // Stopped (disconnect) while this tick was generating; don't act in a newer world
+      if (!this.isRunning || service.getWorld() !== world) return [];
       const emote = responseContent.emote as string;
       const callbackMemory: Memory = {
         id: createUniqueUuid(this.runtime, Date.now().toString()),

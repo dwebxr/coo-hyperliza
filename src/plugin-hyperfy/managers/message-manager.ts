@@ -7,8 +7,15 @@ import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
 import moment from 'moment'
 import { uuid } from '../hyperfy/src/core/utils';
 
+/** Set by the chat queue when a turn outlives its slot, so its late output is dropped. */
+export interface ChatTurn {
+  cancelled: boolean;
+}
+
 export class MessageManager {
   private runtime: IAgentRuntime;
+  // Managers are per connection; replies from turns that started before a teardown are dropped
+  private stopped = false;
   
   constructor(runtime: IAgentRuntime) {
     this.runtime = runtime;
@@ -17,7 +24,11 @@ export class MessageManager {
     }
   }
 
-  async handleMessage(msg): Promise<void> {
+  stop() {
+    this.stopped = true;
+  }
+
+  async handleMessage(msg, turn?: ChatTurn): Promise<void> {
     // maybe a thinking emote here?
     await agentActivityLock.run(async () => {
       const service = this.getService();
@@ -79,6 +90,10 @@ export class MessageManager {
         // Create a callback function to handle responses
         const callback: HandlerCallback = async (responseContent: Content): Promise<Memory[]> => {
           console.info(`[Hyperfy Chat Callback] Received response: ${JSON.stringify(responseContent)}`)
+          if (this.stopped || turn?.cancelled || service.getWorld() !== world) {
+            logger.info(`[Hyperfy Chat] Dropping a late reply to ${msg.id}: its turn timed out or the connection changed`);
+            return [];
+          }
           const emote = responseContent.emote as string;
           // Send response back to Hyperfy
           const emoteManager = service.getEmoteManager();

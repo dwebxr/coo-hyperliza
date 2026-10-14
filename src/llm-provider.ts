@@ -1,3 +1,5 @@
+type Env = Record<string, string | undefined>;
+
 export const TEXT_PROVIDERS = ['anthropic', 'openai', 'ollama', 'groq'] as const;
 export type TextProvider = (typeof TEXT_PROVIDERS)[number];
 
@@ -8,14 +10,22 @@ export const PROVIDER_PACKAGES: Record<Exclude<TextProvider, 'anthropic'>, strin
   groq: '@elizaos/plugin-groq',
 };
 
+/** Same rule plugin-twitter uses to start its discovery client. */
+export function isTwitterDiscoveryEnabled(env: Env): boolean {
+  if (!env.TWITTER_API_KEY) return false;
+  const discovery = env.TWITTER_ENABLE_DISCOVERY;
+  return discovery === 'true' || (env.TWITTER_ENABLE_ACTIONS === 'true' && discovery !== 'false');
+}
+
 export interface ModelPluginPlan {
   /** Plugin packages to load by name (character.plugins). */
   packages: string[];
   /** Provider whose text/object handlers must win; loaded as an object with raised priority. */
   textProvider: TextProvider | null;
+  /** Whether any loaded plugin can create embeddings (Claude, Groq and ElevenLabs cannot). */
+  hasEmbeddingProvider: boolean;
 }
 
-type Env = Record<string, string | undefined>;
 
 /**
  * Decides which model plugins to load. Several can be loaded at once (OpenAI for embeddings and
@@ -44,5 +54,9 @@ export function planModelPlugins(env: Env): ModelPluginPlan {
   // The preferred package is loaded as an object instead (see src/index.ts)
   if (textProvider && textProvider !== 'anthropic') loaded.delete(PROVIDER_PACKAGES[textProvider]);
 
-  return { packages: ['@elizaos/plugin-sql', ...loaded], textProvider };
+  const hasEmbeddingProvider =
+    loaded.has(PROVIDER_PACKAGES.openai) || loaded.has(PROVIDER_PACKAGES.ollama) ||
+    textProvider === 'openai' || textProvider === 'ollama';
+
+  return { packages: ['@elizaos/plugin-sql', ...loaded], textProvider, hasEmbeddingProvider };
 }

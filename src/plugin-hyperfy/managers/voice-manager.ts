@@ -1,6 +1,6 @@
 import { ChannelType, Content, HandlerCallback, IAgentRuntime, Memory, ModelType, UUID, createUniqueUuid, logger } from "@elizaos/core";
 import { HyperfyService } from "../service";
-import { countOtherPlayers, generateSpeech, getWavHeader, transcribeWithElevenLabs } from "../utils";
+import { countOtherPlayers, generateSpeech, getWavHeader } from "../utils";
 import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
 import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
@@ -51,6 +51,9 @@ export class VoiceManager {
     if (!world || !world.livekit) {
       console.error('[VoiceManager] Cannot start - world or livekit not available');
       return;
+    }
+    if (!this.runtime.getModel(ModelType.TRANSCRIPTION)) {
+      logger.warn('[VoiceManager] No TRANSCRIPTION model (set ELEVENLABS_XI_API_KEY with speech_to_text, or OPENAI_API_KEY): voice input is ignored');
     }
 
     this.audioListener = (data: LiveKitAudioData) => {
@@ -163,11 +166,10 @@ export class VoiceManager {
       const wavBuffer = Buffer.concat([wavHeader, inputBuffer]);
       logger.debug('Starting transcription...');
 
-      // ElevenLabs directly when configured; otherwise (or if that fails) a registered TRANSCRIPTION model
-      transcriptionText = await transcribeWithElevenLabs(wavBuffer);
-      if (transcriptionText === null && this.runtime.getModel(ModelType.TRANSCRIPTION)) {
-        transcriptionText = await this.runtime.useModel(ModelType.TRANSCRIPTION, wavBuffer);
-      }
+      // One attempt through the registered model: ElevenLabs (src/elevenlabs-speech.ts) when
+      // configured, otherwise e.g. OpenAI. Without any, voice input is simply unavailable.
+      if (!this.runtime.getModel(ModelType.TRANSCRIPTION)) return;
+      transcriptionText = await this.runtime.useModel(ModelType.TRANSCRIPTION, wavBuffer);
       console.log("[VOICE MANAGER] Transcription: ", transcriptionText)
     } catch (error) {
       console.error(`Error transcribing audio for user ${playerId}:`, error);
@@ -259,6 +261,8 @@ export class VoiceManager {
 
       const callback: HandlerCallback = async (content: Content, _files: any[] = []) => {
         console.info(`[Hyperfy Voice Chat Callback] Received response: ${JSON.stringify(content)}`)
+        // The connection this turn belonged to was torn down; don't act in a newer world
+        if (this.stopped || service.getWorld() !== world) return [];
         try {
           const responseMemory: Memory = {
             id: createUniqueUuid(this.runtime, `${memory.id}-voice-response-${Date.now()}`),

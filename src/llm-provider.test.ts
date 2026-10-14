@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { planModelPlugins } from './llm-provider';
+import { isTwitterDiscoveryEnabled, planModelPlugins } from './llm-provider';
 
 const SQL = '@elizaos/plugin-sql';
 const OPENAI = '@elizaos/plugin-openai';
@@ -12,6 +12,7 @@ describe('planModelPlugins', () => {
     expect(planModelPlugins({ LLM_PROVIDER: 'anthropic', ANTHROPIC_API_KEY: 'k', ELEVENLABS_XI_API_KEY: 'e' })).toEqual({
       packages: [SQL],
       textProvider: 'anthropic',
+      hasEmbeddingProvider: false,
     });
     expect(planModelPlugins({ ELEVENLABS_XI_API_KEY: 'e', OPENAI_API_KEY: 'o' }).packages).not.toContain(ELEVEN);
   });
@@ -20,6 +21,7 @@ describe('planModelPlugins', () => {
     expect(planModelPlugins({ ANTHROPIC_API_KEY: 'k', OPENAI_API_KEY: 'o' })).toEqual({
       packages: [SQL, OPENAI],
       textProvider: 'anthropic',
+      hasEmbeddingProvider: true,
     });
   });
 
@@ -39,12 +41,18 @@ describe('planModelPlugins', () => {
     expect(plan.packages).not.toContain(pkg);
   });
 
+  it('knows whether anything can create embeddings (X discovery needs them)', () => {
+    expect(planModelPlugins({ ANTHROPIC_API_KEY: 'k', GROQ_API_KEY: 'g' }).hasEmbeddingProvider).toBe(false);
+    expect(planModelPlugins({ ANTHROPIC_API_KEY: 'k', OLLAMA_API_ENDPOINT: 'http://x' }).hasEmbeddingProvider).toBe(true);
+    expect(planModelPlugins({ LLM_PROVIDER: 'ollama' }).hasEmbeddingProvider).toBe(true);
+  });
+
   it('is case and whitespace insensitive', () => {
     expect(planModelPlugins({ LLM_PROVIDER: ' Ollama ' }).textProvider).toBe('ollama');
   });
 
   it('leaves the choice to elizaOS when nothing selects a provider', () => {
-    expect(planModelPlugins({ OPENAI_API_KEY: 'o' })).toEqual({ packages: [SQL, OPENAI], textProvider: null });
+    expect(planModelPlugins({ OPENAI_API_KEY: 'o' })).toEqual({ packages: [SQL, OPENAI], textProvider: null, hasEmbeddingProvider: true });
   });
 
   it('rejects unknown providers and Claude without a key', () => {
@@ -69,5 +77,16 @@ describe('elizaOS honors plugin priority over init order', () => {
     // initialize registers every plugin, then stops for lack of a database adapter
     await runtime.initialize().catch(() => {});
     expect((runtime as any).models.get(ModelType.TEXT_LARGE).map((m: any) => m.provider)).toEqual(['preferred', 'fast']);
+  });
+});
+
+describe('isTwitterDiscoveryEnabled', () => {
+  it('matches plugin-twitter: explicit true, or actions on and not explicitly false', () => {
+    const key = { TWITTER_API_KEY: 'k' };
+    expect(isTwitterDiscoveryEnabled({ ...key, TWITTER_ENABLE_DISCOVERY: 'true' })).toBe(true);
+    expect(isTwitterDiscoveryEnabled({ ...key })).toBe(false);
+    expect(isTwitterDiscoveryEnabled({ ...key, TWITTER_ENABLE_ACTIONS: 'true' })).toBe(true);
+    expect(isTwitterDiscoveryEnabled({ ...key, TWITTER_ENABLE_ACTIONS: 'true', TWITTER_ENABLE_DISCOVERY: 'false' })).toBe(false);
+    expect(isTwitterDiscoveryEnabled({ TWITTER_ENABLE_DISCOVERY: 'true' })).toBe(false);
   });
 });

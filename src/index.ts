@@ -14,7 +14,8 @@ import {
 import hyperfyPlugin from './plugin-hyperfy';
 import { DiscordAutoPostManager } from './discord/discord-auto-post';
 import { anthropicModelsPlugin } from './anthropic-models';
-import { PROVIDER_PACKAGES, planModelPlugins } from './llm-provider';
+import { elevenLabsSpeechPlugin } from './elevenlabs-speech';
+import { PROVIDER_PACKAGES, isTwitterDiscoveryEnabled, planModelPlugins } from './llm-provider';
 
 let modelPlan: ReturnType<typeof planModelPlugins>;
 try {
@@ -24,6 +25,13 @@ try {
   logger.error((error as Error).message);
   process.exit(1);
 }
+// X discovery checks follow history with embeddings (plugin-twitter calls TEXT_EMBEDDING directly)
+if (isTwitterDiscoveryEnabled(process.env) && !modelPlan.hasEmbeddingProvider) {
+  logger.warn(
+    'TWITTER_ENABLE_DISCOVERY is on but no embedding provider is loaded (Claude has none): discovery cannot follow anyone. Set OPENAI_API_KEY or an Ollama server, or TWITTER_ENABLE_DISCOVERY=false.'
+  );
+}
+
 // The chosen text provider gets a higher priority than the other model plugins that stay loaded
 const textProviderPlugin =
   modelPlan.textProvider === 'anthropic'
@@ -249,7 +257,12 @@ const initCharacter = async ({ runtime }: { runtime: IAgentRuntime }) => {
 export const projectAgent: ProjectAgent = {
   character,
   init: async (runtime: IAgentRuntime) => await initCharacter({ runtime }),
-  plugins: [...(textProviderPlugin ? [textProviderPlugin] : []), hyperfyPlugin],
+  plugins: [
+    ...(textProviderPlugin ? [textProviderPlugin] : []),
+    // Speech for plugins that use runtime models (Discord voice); Hyperfy voice calls ElevenLabs directly
+    ...(process.env.ELEVENLABS_XI_API_KEY ? [elevenLabsSpeechPlugin] : []),
+    hyperfyPlugin,
+  ],
 };
 const project: Project = {
   agents: [projectAgent],

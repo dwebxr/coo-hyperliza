@@ -130,36 +130,30 @@ describe('VoiceManager.speak', () => {
   });
 });
 
-describe('VoiceManager transcription fallback', () => {
-  async function transcribeWith(direct: string | null, hasTranscriptionModel: boolean) {
-    const utils = await import('../utils');
-    const spy = vi.spyOn(utils, 'transcribeWithElevenLabs').mockResolvedValue(direct);
+describe('VoiceManager transcription', () => {
+  async function transcribeWith(hasTranscriptionModel: boolean) {
     const runtime: any = {
       getService: () => ({ getWorld: () => null }),
-      getModel: vi.fn(() => (hasTranscriptionModel ? () => 'fallback text' : undefined)),
-      useModel: vi.fn().mockResolvedValue('fallback text'),
+      getModel: vi.fn(() => (hasTranscriptionModel ? () => 'こんにちは' : undefined)),
+      useModel: vi.fn().mockResolvedValue('こんにちは'),
     };
     const manager = new VoiceManager(runtime);
     (manager as any).userStates.set('p1', { buffers: [Buffer.alloc(8)], totalLength: 8, lastActive: 0, transcriptionText: '' });
     (manager as any).handleMessage = vi.fn();
     await (manager as any).processTranscription('p1');
-    spy.mockRestore();
     return { runtime, handled: (manager as any).handleMessage };
   }
 
-  it('uses the direct ElevenLabs transcript without touching registered models', async () => {
-    const { runtime, handled } = await transcribeWith('こんにちは', true);
-    expect(runtime.useModel).not.toHaveBeenCalled();
+  it('asks the registered TRANSCRIPTION model exactly once', async () => {
+    const { runtime, handled } = await transcribeWith(true);
+    expect(runtime.useModel).toHaveBeenCalledTimes(1);
+    expect(runtime.useModel.mock.calls[0][0]).toBe('TRANSCRIPTION');
     expect(handled).toHaveBeenCalledWith('こんにちは', 'p1');
   });
 
-  it('falls back to a registered TRANSCRIPTION model only when one exists', async () => {
-    const withModel = await transcribeWith(null, true);
-    expect(withModel.runtime.useModel).toHaveBeenCalled();
-    expect(withModel.handled).toHaveBeenCalledWith('fallback text', 'p1');
-
-    const withoutModel = await transcribeWith(null, false);
-    expect(withoutModel.runtime.useModel).not.toHaveBeenCalled();
-    expect(withoutModel.handled).not.toHaveBeenCalled();
+  it('does nothing when no transcription model is registered', async () => {
+    const { runtime, handled } = await transcribeWith(false);
+    expect(runtime.useModel).not.toHaveBeenCalled();
+    expect(handled).not.toHaveBeenCalled();
   });
 });
