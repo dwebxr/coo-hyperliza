@@ -8,11 +8,12 @@ const GROQ = '@elizaos/plugin-groq';
 const ELEVEN = '@elizaos/plugin-elevenlabs';
 
 describe('planModelPlugins', () => {
-  it('this deployment: Claude writes text, ElevenLabs speaks, no OpenAI/Ollama', () => {
+  it('this deployment: Claude writes text, no OpenAI/Ollama, and never the broken ElevenLabs plugin', () => {
     expect(planModelPlugins({ LLM_PROVIDER: 'anthropic', ANTHROPIC_API_KEY: 'k', ELEVENLABS_XI_API_KEY: 'e' })).toEqual({
-      packages: [SQL, ELEVEN],
+      packages: [SQL],
       textProvider: 'anthropic',
     });
+    expect(planModelPlugins({ ELEVENLABS_XI_API_KEY: 'e', OPENAI_API_KEY: 'o' }).packages).not.toContain(ELEVEN);
   });
 
   it('defaults to Claude when its key is present', () => {

@@ -144,40 +144,54 @@ function balancedFrom(text: string, start: number): string | null {
   return null;
 }
 
-/** Places JSON could be: a fenced block, the whole reply, then each bracketed span in order. */
+/** Places JSON could be, most complete first: a fenced block, the whole reply, then top-level bracketed spans. */
 function jsonCandidates(text: string): string[] {
   const candidates: string[] = [];
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
   if (fenced) candidates.push(fenced);
   const whole = text.trim();
   if (/^[[{]/.test(whole)) candidates.push(whole);
+  // Only top-level spans: a valid nested object must not win over its (repairable) parent
   for (let i = 0; i < text.length && candidates.length < 20; i++) {
     if (text[i] === '{' || text[i] === '[') {
       const span = balancedFrom(text, i);
-      if (span) candidates.push(span);
+      if (span) {
+        candidates.push(span);
+        i += span.length - 1;
+      }
     }
   }
   return [...new Set(candidates)];
 }
 
+/** Whether a bracketed span starts like JSON rather than prose such as "[result]". */
+function looksLikeJson(candidate: string): boolean {
+  const body = candidate.slice(1).trimStart();
+  return candidate.startsWith('{')
+    ? /^["'}A-Za-z_$]/.test(body)
+    : /^(["'\[{\]\d-]|true\b|false\b|null\b)/.test(body);
+}
+
+const isObjectOrArray = (value: unknown): boolean => value !== null && typeof value === 'object';
+
 /**
- * Parses a JSON reply. Tolerates a markdown fence, prose around the JSON, and the small
- * mistakes models copy from prompt examples (comments, trailing commas).
+ * Parses a JSON object or array from a reply. Tolerates a markdown fence, prose around the JSON,
+ * and the small mistakes models copy from prompt examples (comments, trailing commas).
  */
 export function parseJsonResponse(text: string): any {
-  const candidates = jsonCandidates(text);
-  for (const candidate of candidates) {
+  for (const candidate of jsonCandidates(text)) {
     try {
-      return JSON.parse(candidate);
+      const parsed = JSON.parse(candidate);
+      if (isObjectOrArray(parsed)) return parsed;
+      continue;
     } catch {
-      // try the next candidate
+      // try repairing this candidate before moving on
     }
-  }
-  // jsonrepair turns almost any text into *some* JSON, so only accept repaired objects/arrays
-  for (const candidate of candidates) {
+    // jsonrepair turns almost any text into *some* JSON, so only repair JSON-looking spans
+    if (!looksLikeJson(candidate)) continue;
     try {
       const repaired = JSON.parse(jsonrepair(candidate));
-      if (repaired !== null && typeof repaired === 'object') return repaired;
+      if (isObjectOrArray(repaired)) return repaired;
     } catch {
       // try the next candidate
     }
@@ -236,6 +250,8 @@ async function generateObject(runtime: IAgentRuntime, size: Size, params: Object
     prompt,
     system,
     stopSequences: params.stopSequences,
+    // Not in ObjectGenerationParams, but core injects it from model settings
+    maxTokens: (params as ObjectGenerationParams & { maxTokens?: number }).maxTokens,
   });
   return parseJsonResponse(text);
 }

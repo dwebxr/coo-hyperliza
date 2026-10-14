@@ -110,6 +110,12 @@ describe('anthropicModelsPlugin', () => {
     expect(constructed[0].dangerouslyAllowBrowser).toBe(true);
   });
 
+  it('OBJECT_* forwards the maxTokens core injects from model settings', async () => {
+    create.mockResolvedValue(reply([{ type: 'text', text: '{"a":1}' }]));
+    await models[ModelType.OBJECT_SMALL](runtime(), { prompt: 'x', maxTokens: 256 });
+    expect(create.mock.calls[0][0].max_tokens).toBe(256);
+  });
+
   it('OBJECT_* asks for JSON and parses fenced output', async () => {
     create.mockResolvedValue(reply([{ type: 'text', text: '```json\n{"entity": "abc"}\n```' }]));
     await expect(models[ModelType.OBJECT_LARGE](runtime(), { prompt: 'Where?' })).resolves.toEqual({ entity: 'abc' });
@@ -158,8 +164,20 @@ describe('parseJsonResponse', () => {
     expect(parseJsonResponse('{"a": 1, "b": [1, 2,],}')).toEqual({ a: 1, b: [1, 2] });
   });
 
-  it('throws when there is no JSON object or array, even if repair could make a primitive', () => {
+  it('repairs the complete value instead of returning a valid nested fragment', () => {
+    // goto.ts needs navigationType + parameter, not just the inner object
+    expect(parseJsonResponse('{"navigationType":"entity","parameter":{"entityId":"abc"},}')).toEqual({
+      navigationType: 'entity',
+      parameter: { entityId: 'abc' },
+    });
+    expect(parseJsonResponse('[result] {"entityId":"abc",}')).toEqual({ entityId: 'abc' });
+  });
+
+  it('throws when there is no JSON object or array, even if a primitive parses or repair could make one', () => {
     expect(() => parseJsonResponse('no json here')).toThrow('did not return valid JSON');
     expect(() => parseJsonResponse('```\nhello\n```')).toThrow('did not return valid JSON');
+    expect(() => parseJsonResponse('```json\nnull\n```')).toThrow('did not return valid JSON');
+    expect(() => parseJsonResponse('```json\n"some text"\n```')).toThrow('did not return valid JSON');
+    expect(() => parseJsonResponse('[result]')).toThrow('did not return valid JSON');
   });
 });

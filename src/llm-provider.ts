@@ -39,7 +39,8 @@ export function planModelPlugins(env: Env): ModelPluginPlan {
   if (env.OPENAI_API_KEY) loaded.add(PROVIDER_PACKAGES.openai);
   // Ollama also provides embeddings, so it stays loaded when configured even if another provider writes text.
   if (env.OLLAMA_SERVER_URL || env.OLLAMA_MODEL || env.OLLAMA_API_ENDPOINT) loaded.add(PROVIDER_PACKAGES.ollama);
-  if (env.ELEVENLABS_XI_API_KEY) loaded.add('@elizaos/plugin-elevenlabs');
+  // @elizaos/plugin-elevenlabs is not loaded: its TRANSCRIPTION handler calls .../v1/v1/speech-to-text (404)
+  // and would outrank OpenAI. Speech goes to ElevenLabs directly (src/plugin-hyperfy/utils.ts).
   // The preferred package is loaded as an object instead (see src/index.ts)
   if (textProvider && textProvider !== 'anthropic') loaded.delete(PROVIDER_PACKAGES[textProvider]);
 

@@ -155,10 +155,11 @@ export class VoiceManager {
       const wavBuffer = Buffer.concat([wavHeader, inputBuffer]);
       logger.debug('Starting transcription...');
 
-      // ElevenLabs directly when configured, otherwise whatever TRANSCRIPTION model is registered
-      transcriptionText =
-        (await transcribeWithElevenLabs(wavBuffer)) ??
-        (await this.runtime.useModel(ModelType.TRANSCRIPTION, wavBuffer));
+      // ElevenLabs directly when configured; otherwise (or if that fails) a registered TRANSCRIPTION model
+      transcriptionText = await transcribeWithElevenLabs(wavBuffer);
+      if (transcriptionText === null && this.runtime.getModel(ModelType.TRANSCRIPTION)) {
+        transcriptionText = await this.runtime.useModel(ModelType.TRANSCRIPTION, wavBuffer);
+      }
       console.log("[VOICE MANAGER] Transcription: ", transcriptionText)
     } catch (error) {
       console.error(`Error transcribing audio for user ${playerId}:`, error);
