@@ -12,6 +12,7 @@ describe('planModelPlugins', () => {
     expect(planModelPlugins({ LLM_PROVIDER: 'anthropic', ANTHROPIC_API_KEY: 'k', ELEVENLABS_XI_API_KEY: 'e' })).toEqual({
       packages: [SQL],
       textProvider: 'anthropic',
+      hasEmbeddingProvider: false,
     });
     expect(planModelPlugins({ ELEVENLABS_XI_API_KEY: 'e', OPENAI_API_KEY: 'o' }).packages).not.toContain(ELEVEN);
   });
@@ -20,6 +21,7 @@ describe('planModelPlugins', () => {
     expect(planModelPlugins({ ANTHROPIC_API_KEY: 'k', OPENAI_API_KEY: 'o' })).toEqual({
       packages: [SQL, OPENAI],
       textProvider: 'anthropic',
+      hasEmbeddingProvider: true,
     });
   });
 
@@ -39,12 +41,18 @@ describe('planModelPlugins', () => {
     expect(plan.packages).not.toContain(pkg);
   });
 
+  it('knows whether anything can create embeddings (X discovery needs them)', () => {
+    expect(planModelPlugins({ ANTHROPIC_API_KEY: 'k', GROQ_API_KEY: 'g' }).hasEmbeddingProvider).toBe(false);
+    expect(planModelPlugins({ ANTHROPIC_API_KEY: 'k', OLLAMA_API_ENDPOINT: 'http://x' }).hasEmbeddingProvider).toBe(true);
+    expect(planModelPlugins({ LLM_PROVIDER: 'ollama' }).hasEmbeddingProvider).toBe(true);
+  });
+
   it('is case and whitespace insensitive', () => {
     expect(planModelPlugins({ LLM_PROVIDER: ' Ollama ' }).textProvider).toBe('ollama');
   });
 
   it('leaves the choice to elizaOS when nothing selects a provider', () => {
-    expect(planModelPlugins({ OPENAI_API_KEY: 'o' })).toEqual({ packages: [SQL, OPENAI], textProvider: null });
+    expect(planModelPlugins({ OPENAI_API_KEY: 'o' })).toEqual({ packages: [SQL, OPENAI], textProvider: null, hasEmbeddingProvider: true });
   });
 
   it('rejects unknown providers and Claude without a key', () => {

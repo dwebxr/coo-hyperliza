@@ -13,6 +13,8 @@ export interface ModelPluginPlan {
   packages: string[];
   /** Provider whose text/object handlers must win; loaded as an object with raised priority. */
   textProvider: TextProvider | null;
+  /** Whether any loaded plugin can create embeddings (Claude, Groq and ElevenLabs cannot). */
+  hasEmbeddingProvider: boolean;
 }
 
 type Env = Record<string, string | undefined>;
@@ -44,5 +46,9 @@ export function planModelPlugins(env: Env): ModelPluginPlan {
   // The preferred package is loaded as an object instead (see src/index.ts)
   if (textProvider && textProvider !== 'anthropic') loaded.delete(PROVIDER_PACKAGES[textProvider]);
 
-  return { packages: ['@elizaos/plugin-sql', ...loaded], textProvider };
+  const hasEmbeddingProvider =
+    loaded.has(PROVIDER_PACKAGES.openai) || loaded.has(PROVIDER_PACKAGES.ollama) ||
+    textProvider === 'openai' || textProvider === 'ollama';
+
+  return { packages: ['@elizaos/plugin-sql', ...loaded], textProvider, hasEmbeddingProvider };
 }

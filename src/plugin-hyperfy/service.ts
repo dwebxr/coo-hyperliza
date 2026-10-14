@@ -33,6 +33,9 @@ const HYPERFY_WS_URL = process.env.WS_URL || 'wss://chill.hyperfy.xyz/ws'
 const HYPERFY_APPEARANCE_POLL_INTERVAL = 30000
 // Teardown must not hang a reconnect on a stuck native/CDP call
 const TEARDOWN_STEP_TIMEOUT_MS = 10000
+// Chat is handled one message at a time; a handler stuck longer than this (e.g. an action that
+// keeps navigating) stops holding up the next message, though it keeps running in the background.
+const CHAT_MESSAGE_SLOT_MS = 180000
 
 
 export class HyperfyService extends Service {
@@ -59,6 +62,7 @@ export class HyperfyService extends Service {
   private isStopping: boolean = false
   // Bumped by every teardown so an in-flight connect can tell its world was torn down
   private connectionGeneration: number = 0
+  private chatQueue: Promise<void> = Promise.resolve()
   private reconnectController: ReconnectController
   private behaviorManager: BehaviorManager;
   private emoteManager: EmoteManager;
@@ -699,6 +703,8 @@ export class HyperfyService extends Service {
     }
 
     console.info('[HyperfyService] Initializing chat subscription...')
+    const generation = this.connectionGeneration
+    this.chatQueue = Promise.resolve()
 
     this.world.chat.subscribe((msgs: any[]) => {
       // Wait for player entity (ensures world/chat exist too)
@@ -731,9 +737,13 @@ export class HyperfyService extends Service {
       if (newMessagesFound.length > 0) {
         console.info(`[Chat] Found ${newMessagesFound.length} new messages to process.`)
 
+        // In arrival order, one at a time. IDs are reserved above, so the listener re-running
+        // (e.g. when Coo posts its reply) cannot queue the same message twice.
         for (const msg of newMessagesFound) {
-          this.messageManager.handleMessage(msg).catch(error => {
-            console.error(`[Chat] Failed to handle message ${msg?.id}:`, error)
+          this.chatQueue = this.chatQueue.then(async () => {
+            if (generation !== this.connectionGeneration) return
+            // Logs and swallows failures, so one bad message never breaks the chain
+            await settleWithin(this.messageManager.handleMessage(msg), CHAT_MESSAGE_SLOT_MS, `handling chat message ${msg?.id}`)
           })
         }
       }
@@ -776,13 +786,13 @@ async function settleWithin(promise: Promise<unknown> | undefined, ms: number, l
   let timer: NodeJS.Timeout | undefined
   const timeout = new Promise<void>(resolve => {
     timer = setTimeout(() => {
-      console.warn(`[Hyperfy Cleanup] Gave up ${label} after ${ms}ms`)
+      console.warn(`[Hyperfy] Gave up ${label} after ${ms}ms`)
       resolve()
     }, ms)
   })
   try {
     await Promise.race([promise.then(() => { }, (e: any) => {
-      console.warn(`[Hyperfy Cleanup] Error ${label}: ${e?.message || e}`)
+      console.warn(`[Hyperfy] Error ${label}: ${e?.message || e}`)
     }), timeout])
   } finally {
     clearTimeout(timer)
