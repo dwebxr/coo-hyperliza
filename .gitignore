@@ -7,3 +7,9 @@ bun.lock
 package-lock.json
 .env
 local.json
+# Hyperfy auth token (written at runtime) - never commit
+localstorage.json
+
+# Runtime snapshots and OS files
+scene_*.jpeg
+.DS_Store
