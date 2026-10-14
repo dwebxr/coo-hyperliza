@@ -33,6 +33,18 @@ describe('elevenLabsSpeechPlugin', () => {
     expect(transcribeWithElevenLabs).toHaveBeenCalledWith(wav);
   });
 
+  it('accepts Uint8Array and { audio } inputs too', async () => {
+    transcribeWithElevenLabs.mockResolvedValue('ok');
+    await models[ModelType.TRANSCRIPTION](runtime, new Uint8Array([1, 2]));
+    await models[ModelType.TRANSCRIPTION](runtime, { audio: new Uint8Array([3]) });
+    await models[ModelType.TRANSCRIPTION](runtime, { audio: new Blob([Buffer.from('xyz')]) });
+    expect(transcribeWithElevenLabs.mock.calls.map((c) => [...c[0]])).toEqual([[1, 2], [3], [...Buffer.from('xyz')]]);
+  });
+
+  it('outranks a text provider that also offers speech (e.g. plugin-openai at 100)', () => {
+    expect((elevenLabsSpeechPlugin as any).priority).toBeGreaterThan(100);
+  });
+
   it('fetches audio given as a URL or { audioUrl }', async () => {
     transcribeWithElevenLabs.mockResolvedValue('hi');
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(Buffer.from('audio')));

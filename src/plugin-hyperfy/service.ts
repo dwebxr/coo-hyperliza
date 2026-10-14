@@ -743,11 +743,15 @@ export class HyperfyService extends Service {
         for (const msg of newMessagesFound) {
           this.chatQueue = this.chatQueue.then(async () => {
             if (generation !== this.connectionGeneration) return
+            if (!this.messageManager) return
             const turn: ChatTurn = { cancelled: false }
             // Logs and swallows failures, so one bad message never breaks the chain
             const settled = await settleWithin(this.messageManager.handleMessage(msg, turn), CHAT_MESSAGE_SLOT_MS, `handling chat message ${msg?.id}`)
             // Whatever the timed-out turn produces later is dropped instead of overlapping the next one
             if (!settled) turn.cancelled = true
+          }).catch(error => {
+            // Never let one failure stop every later message on this connection
+            console.error('[Chat] Unexpected error in the chat queue:', error)
           })
         }
       }

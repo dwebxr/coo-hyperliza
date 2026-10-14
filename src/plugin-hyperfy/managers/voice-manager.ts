@@ -52,6 +52,9 @@ export class VoiceManager {
       console.error('[VoiceManager] Cannot start - world or livekit not available');
       return;
     }
+    if (!this.runtime.getModel(ModelType.TRANSCRIPTION)) {
+      logger.warn('[VoiceManager] No TRANSCRIPTION model (set ELEVENLABS_XI_API_KEY with speech_to_text, or OPENAI_API_KEY): voice input is ignored');
+    }
 
     this.audioListener = (data: LiveKitAudioData) => {
       function isLoudEnough(pcmBuffer: Buffer, threshold = 1000): boolean {

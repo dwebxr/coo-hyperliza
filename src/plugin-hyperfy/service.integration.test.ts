@@ -44,6 +44,7 @@ function createRuntime() {
     emitEvent: vi.fn().mockResolvedValue(undefined),
     getEntityById: vi.fn().mockResolvedValue(null),
     updateEntity: vi.fn(),
+    getModel: vi.fn(),
   };
   const service = new HyperfyService(runtime);
   runtime.getService = () => service;
@@ -187,5 +188,65 @@ describe('HyperfyService chat handling', () => {
 
     expect(handled).toEqual(['m1', 'm2', 'r1']);
     expect(maxActive).toBe(1);
+  });
+});
+
+describe('HyperfyService chat queue limits', () => {
+  function chatSetup() {
+    const { service } = createRuntime();
+    const s = service as any;
+    let listener!: (msgs: any[]) => void;
+    s.world = { chat: { msgs: [], subscribe: (fn: any) => (listener = fn) }, entities: { player: { data: { id: 'coo' } } } };
+    s.connectionTime = Date.now() - 1000;
+    const handled: string[] = [];
+    const turns: Record<string, any> = {};
+    const send = (...ids: string[]) =>
+      listener(ids.map((id) => ({ id, fromId: `from-${id}`, body: id, createdAt: new Date().toISOString() })));
+    return { s, handled, turns, send };
+  }
+
+  it('cancels a turn that outlives its slot and moves on to the next message', async () => {
+    vi.useFakeTimers();
+    try {
+      const { s, handled, turns, send } = chatSetup();
+      s.messageManager = {
+        handleMessage: (msg: any, turn: any) => {
+          handled.push(msg.id);
+          turns[msg.id] = turn;
+          return msg.id === 'slow' ? new Promise(() => {}) : Promise.resolve();
+        },
+      };
+      s.startChatSubscription();
+      send('slow', 'next');
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(handled).toEqual(['slow']);
+
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(turns.slow.cancelled).toBe(true);
+      expect(handled).toEqual(['slow', 'next']);
+      expect(turns.next.cancelled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('skips queued messages from a connection that has been torn down', async () => {
+    const { s, handled, send } = chatSetup();
+    let finishFirst!: () => void;
+    s.messageManager = {
+      handleMessage: (msg: any) => {
+        handled.push(msg.id);
+        return msg.id === 'first' ? new Promise<void>((resolve) => (finishFirst = resolve)) : Promise.resolve();
+      },
+    };
+    s.startChatSubscription();
+    send('first', 'queued');
+    await vi.waitFor(() => expect(handled).toEqual(['first']));
+
+    s.connectionGeneration++; // what teardown does
+    finishFirst();
+    await s.chatQueue;
+    expect(handled).toEqual(['first']);
   });
 });
