@@ -51,7 +51,7 @@ describe('VoiceManager playback queue', () => {
 
   it('times out a hung playback, aborts it, and moves on', async () => {
     let signal: AbortSignal | undefined;
-    const { manager, livekit, player } = setup((buf: Buffer, _lipSync, opts) => {
+    const { manager, livekit, player } = setup((buf: Buffer, opts) => {
       if (buf.toString() === 'hang') {
         signal = opts?.signal;
         return new Promise(() => {});
@@ -97,7 +97,7 @@ describe('VoiceManager playback queue', () => {
 
   it('stop() aborts the utterance that is currently playing', async () => {
     let signal: AbortSignal | undefined;
-    const { manager } = setup((_buf, _lipSync, opts) => {
+    const { manager } = setup((_buf, opts) => {
       signal = opts?.signal;
       return new Promise((r) => setTimeout(r, 10_000));
     });

@@ -21,7 +21,6 @@ type AvatarInstance = {
   move: (matrixWorld: THREE.Matrix4) => void
   destroy: () => void
   setEmote: (emote: string | null) => void
-  setExpression?: (name: string, weight: number) => void
   height?: number
   headToHeight?: number
   // getBoneTransform?: (boneName: string) => THREE.Matrix4
@@ -157,10 +156,6 @@ export class AgentAvatar extends Node {
     this.emote = url
   }
 
-  setExpression(name: string, weight: number) {
-    this.instance?.setExpression?.(name, weight)
-  }
-
   get height(): number | null {
     return this.getHeight()
   }
@@ -218,10 +213,6 @@ export class AgentAvatar extends Node {
   
         setEmote(url: string | null) {
           return self.setEmote(url)
-        },
-
-        setExpression(name: string, weight: number) {
-          return self.setExpression(name, weight)
         },
 
         get height() {

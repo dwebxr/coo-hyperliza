@@ -132,11 +132,7 @@ export class AgentLiveKit extends System {
   postTick() { }
   start() { }
 
-  async publishAudioStream(
-    audioBuffer: Buffer,
-    onLipSync?: (weight: number) => void,
-    { signal }: PublishAudioOptions = {}
-  ): Promise<void> {
+  async publishAudioStream(audioBuffer: Buffer, { signal }: PublishAudioOptions = {}): Promise<void> {
     console.log('[LiveKit] publishAudioStream called with buffer size:', audioBuffer.length);
     if (!this.room) {
       console.warn('[LiveKit] Not connected to a room - skipping audio playback');
@@ -198,31 +194,10 @@ export class AgentLiveKit extends System {
       const slice = int16.slice(i, i + samplesPerFrame);
       const frame = new AudioFrame(slice, sampleRate, numChannels, slice.length);
       await audioSource.captureFrame(frame);
-
-      // Lip sync: calculate RMS volume and call callback
-      if (onLipSync) {
-        const rms = this.calculateRMS(slice);
-        // Normalize RMS to 0-1 range (typical speech RMS is around 1000-5000 for int16)
-        const normalizedWeight = Math.min(1.0, rms / 4000);
-        onLipSync(normalizedWeight);
-      }
-    }
-
-    // Reset mouth to closed when done
-    if (onLipSync) {
-      onLipSync(0);
     }
 
     const actualDuration = Date.now() - startTime;
     console.log(`[LiveKit] Audio streaming complete (${totalFrames} frames, ${actualDuration}ms)`);
-  }
-
-  private calculateRMS(samples: Int16Array): number {
-    let sum = 0;
-    for (let i = 0; i < samples.length; i++) {
-      sum += samples[i] * samples[i];
-    }
-    return Math.sqrt(sum / samples.length);
   }
 
   private async convertToPcm(buffer: Buffer, sampleRate = 48000): Promise<Int16Array> {

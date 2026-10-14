@@ -1,3 +1,12 @@
+// Talking gesture shown while the agent speaks (Hyperfy has no lip sync; the mouth does not move).
+// Optional: put a clip at public/emotes/emote-talk.glb to use it instead of the world's own.
+export const TALK_EMOTE = {
+  name: "TALK",
+  path: "/emotes/emote-talk.glb",
+  duration: -1,
+  description: "Talking gesture while speaking"
+};
+
 // Locomotion emotes - these are special and update the Emotes object
 export const LOCOMOTION_EMOTES = [
     {

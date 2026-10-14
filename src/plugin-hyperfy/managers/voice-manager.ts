@@ -373,7 +373,7 @@ export class VoiceManager {
 
     try {
       await Promise.race([
-        world.livekit.publishAudioStream(audioBuffer, undefined, { signal: abort.signal }),
+        world.livekit.publishAudioStream(audioBuffer, { signal: abort.signal }),
         timeout,
       ]);
     } finally {
