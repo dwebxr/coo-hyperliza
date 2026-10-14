@@ -19,7 +19,7 @@ import { AgentActions } from './systems/actions.js'
 import { loadPhysX } from './physx/loadPhysX.js'
 import { BehaviorManager } from "./managers/behavior-manager.js"
 import { EmoteManager } from './managers/emote-manager.js'
-import { MessageManager } from './managers/message-manager.js'
+import { MessageManager, type ChatTurn } from './managers/message-manager.js'
 import { VoiceManager } from './managers/voice-manager.js'
 import { PuppeteerManager } from './managers/puppeteer-manager.js'
 import { BuildManager } from './managers/build-manager.js'
@@ -600,6 +600,7 @@ export class HyperfyService extends Service {
     this.behaviorManager?.stop();
     this.voiceManager?.stop();
     this.emoteManager?.stop();
+    this.messageManager?.stop();
 
     if (this.world) {
       try {
@@ -742,8 +743,11 @@ export class HyperfyService extends Service {
         for (const msg of newMessagesFound) {
           this.chatQueue = this.chatQueue.then(async () => {
             if (generation !== this.connectionGeneration) return
+            const turn: ChatTurn = { cancelled: false }
             // Logs and swallows failures, so one bad message never breaks the chain
-            await settleWithin(this.messageManager.handleMessage(msg), CHAT_MESSAGE_SLOT_MS, `handling chat message ${msg?.id}`)
+            const settled = await settleWithin(this.messageManager.handleMessage(msg, turn), CHAT_MESSAGE_SLOT_MS, `handling chat message ${msg?.id}`)
+            // Whatever the timed-out turn produces later is dropped instead of overlapping the next one
+            if (!settled) turn.cancelled = true
           })
         }
       }
@@ -781,18 +785,20 @@ export function findQueuedKick(world: any): string | null {
   return entry ? entry[1] : null
 }
 
-async function settleWithin(promise: Promise<unknown> | undefined, ms: number, label: string): Promise<void> {
-  if (!promise) return
+/** Waits for `promise` (logging, not throwing, its failure) at most `ms`. Returns false on timeout. */
+async function settleWithin(promise: Promise<unknown> | undefined, ms: number, label: string): Promise<boolean> {
+  if (!promise) return true
   let timer: NodeJS.Timeout | undefined
-  const timeout = new Promise<void>(resolve => {
+  const timeout = new Promise<boolean>(resolve => {
     timer = setTimeout(() => {
       console.warn(`[Hyperfy] Gave up ${label} after ${ms}ms`)
-      resolve()
+      resolve(false)
     }, ms)
   })
   try {
-    await Promise.race([promise.then(() => { }, (e: any) => {
+    return await Promise.race([promise.then(() => true, (e: any) => {
       console.warn(`[Hyperfy] Error ${label}: ${e?.message || e}`)
+      return true
     }), timeout])
   } finally {
     clearTimeout(timer)

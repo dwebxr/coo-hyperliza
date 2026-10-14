@@ -62,3 +62,30 @@ describe('elevenLabsSpeechPlugin', () => {
     await expect(models[ModelType.TEXT_TO_SPEECH](runtime, '  ')).rejects.toThrow('needs text');
   });
 });
+
+describe('elevenLabsSpeechPlugin through the real runtime', () => {
+  it('serves useModel(TEXT_TO_SPEECH, "text") as Discord calls it, despite core\'s string-param bug', async () => {
+    const { AgentRuntime } = await import('@elizaos/core');
+    generateElevenLabsTTS.mockResolvedValue(Buffer.from('mp3-bytes'));
+    const runtime = new AgentRuntime({ character: { name: 'probe', bio: [], plugins: [] } as any, plugins: [elevenLabsSpeechPlugin] });
+    // registers the plugin (running its init), then stops for lack of a database adapter
+    await runtime.initialize().catch(() => {});
+    // useModel records each call through the database adapter
+    (runtime as any).adapter = { log: vi.fn().mockResolvedValue(undefined) };
+
+    const stream = await runtime.useModel(ModelType.TEXT_TO_SPEECH, 'hello Discord' as any);
+    expect(generateElevenLabsTTS).toHaveBeenCalledWith('hello Discord');
+    expect((await readAll(stream as any)).toString()).toBe('mp3-bytes');
+  });
+});
+
+describe('core string-param bug the init shim works around', () => {
+  it('still breaks useModel(TEXT_TO_SPEECH, "text") without the shim (remove the shim once this fails)', async () => {
+    const { AgentRuntime } = await import('@elizaos/core');
+    const { init: _shim, ...withoutShim } = elevenLabsSpeechPlugin;
+    const runtime = new AgentRuntime({ character: { name: 'probe', bio: [], plugins: [] } as any, plugins: [withoutShim as any] });
+    await runtime.initialize().catch(() => {});
+    (runtime as any).adapter = { log: vi.fn().mockResolvedValue(undefined) };
+    await expect(runtime.useModel(ModelType.TEXT_TO_SPEECH, 'hello' as any)).rejects.toThrow("Cannot use 'in' operator");
+  });
+});

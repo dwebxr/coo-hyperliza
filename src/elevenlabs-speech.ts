@@ -34,9 +34,29 @@ async function textToSpeech(_runtime: IAgentRuntime, input: string | { text: str
   return Readable.from(audio);
 }
 
+const STRING_TTS_PATCHED = Symbol.for('coo.stringTtsParams');
+
+/**
+ * Core 1.7.2's useModel evaluates `"prompt" in params`, which throws a TypeError for a string,
+ * and Discord calls useModel(TEXT_TO_SPEECH, text). Box that string so the call reaches a handler.
+ */
+function acceptStringSpeechParams(runtime: IAgentRuntime): void {
+  const patched = runtime as IAgentRuntime & { [STRING_TTS_PATCHED]?: boolean };
+  if (patched[STRING_TTS_PATCHED]) return;
+  const useModel = runtime.useModel.bind(runtime);
+  runtime.useModel = ((modelType: any, params: any, ...rest: any[]) =>
+    useModel(
+      modelType,
+      modelType === ModelType.TEXT_TO_SPEECH && typeof params === 'string' ? { text: params } : params,
+      ...rest
+    )) as typeof runtime.useModel;
+  patched[STRING_TTS_PATCHED] = true;
+}
+
 export const elevenLabsSpeechPlugin: Plugin = {
   name: 'elevenlabs-speech',
   description: 'ElevenLabs speech-to-text and text-to-speech as runtime models',
+  init: async (_config, runtime) => acceptStringSpeechParams(runtime),
   // Preferred over other speech providers (e.g. plugin-openai) when ElevenLabs is configured
   priority: 100,
   models: {

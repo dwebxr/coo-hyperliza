@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { planModelPlugins } from './llm-provider';
+import { isTwitterDiscoveryEnabled, planModelPlugins } from './llm-provider';
 
 const SQL = '@elizaos/plugin-sql';
 const OPENAI = '@elizaos/plugin-openai';
@@ -77,5 +77,16 @@ describe('elizaOS honors plugin priority over init order', () => {
     // initialize registers every plugin, then stops for lack of a database adapter
     await runtime.initialize().catch(() => {});
     expect((runtime as any).models.get(ModelType.TEXT_LARGE).map((m: any) => m.provider)).toEqual(['preferred', 'fast']);
+  });
+});
+
+describe('isTwitterDiscoveryEnabled', () => {
+  it('matches plugin-twitter: explicit true, or actions on and not explicitly false', () => {
+    const key = { TWITTER_API_KEY: 'k' };
+    expect(isTwitterDiscoveryEnabled({ ...key, TWITTER_ENABLE_DISCOVERY: 'true' })).toBe(true);
+    expect(isTwitterDiscoveryEnabled({ ...key })).toBe(false);
+    expect(isTwitterDiscoveryEnabled({ ...key, TWITTER_ENABLE_ACTIONS: 'true' })).toBe(true);
+    expect(isTwitterDiscoveryEnabled({ ...key, TWITTER_ENABLE_ACTIONS: 'true', TWITTER_ENABLE_DISCOVERY: 'false' })).toBe(false);
+    expect(isTwitterDiscoveryEnabled({ TWITTER_ENABLE_DISCOVERY: 'true' })).toBe(false);
   });
 });

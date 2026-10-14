@@ -52,3 +52,53 @@ describe('MessageManager.sendMessage', () => {
     await expect(new MessageManager(runtime).sendMessage('hi')).resolves.toBe(false);
   });
 });
+
+describe('MessageManager stale turns', () => {
+  async function receiveAndCaptureCallback() {
+    let world: any = { entities: { player: { data: { id: 'coo' } } } };
+    const sendMessage = vi.fn();
+    const speak = vi.fn();
+    let callback: any;
+    const runtime: any = {
+      agentId: 'agent',
+      character: { name: 'Coo', templates: {} },
+      getService: () => ({
+        getWorld: () => world,
+        currentWorldId: 'w1',
+        getEmoteManager: () => ({ playEmote: vi.fn() }),
+        getVoiceManager: () => ({ speak }),
+      }),
+      ensureConnection: vi.fn(),
+      getEntityById: vi.fn().mockResolvedValue({ id: 'e' }),
+      createMemory: vi.fn(),
+      emitEvent: vi.fn(async (_event: string, payload: any) => {
+        callback = payload.callback;
+      }),
+    };
+    const manager = new MessageManager(runtime);
+    manager.sendMessage = sendMessage as any;
+    const turn = { cancelled: false };
+    await manager.handleMessage({ id: 'm1', fromId: 'p1', from: 'Alice', body: 'hi' }, turn);
+    return { manager, turn, callback, sendMessage, speak, runtime, replaceWorld: () => (world = { entities: world.entities }) };
+  }
+
+  it('delivers replies for a live turn', async () => {
+    const { callback, sendMessage, speak } = await receiveAndCaptureCallback();
+    await callback({ text: 'Hello!' });
+    expect(sendMessage).toHaveBeenCalledWith('Hello!');
+    expect(speak).toHaveBeenCalledWith('Hello!');
+  });
+
+  it.each([
+    ['the turn timed out', (ctx: any) => (ctx.turn.cancelled = true)],
+    ['the manager was stopped (disconnect)', (ctx: any) => ctx.manager.stop()],
+    ['the world was replaced (reconnect)', (ctx: any) => ctx.replaceWorld()],
+  ])('drops a late reply when %s', async (_label, invalidate) => {
+    const ctx = await receiveAndCaptureCallback();
+    invalidate(ctx);
+    await ctx.callback({ text: 'Too late' });
+    expect(ctx.sendMessage).not.toHaveBeenCalled();
+    expect(ctx.speak).not.toHaveBeenCalled();
+    expect(ctx.runtime.createMemory).not.toHaveBeenCalled();
+  });
+});

@@ -1,3 +1,5 @@
+type Env = Record<string, string | undefined>;
+
 export const TEXT_PROVIDERS = ['anthropic', 'openai', 'ollama', 'groq'] as const;
 export type TextProvider = (typeof TEXT_PROVIDERS)[number];
 
@@ -8,6 +10,13 @@ export const PROVIDER_PACKAGES: Record<Exclude<TextProvider, 'anthropic'>, strin
   groq: '@elizaos/plugin-groq',
 };
 
+/** Same rule plugin-twitter uses to start its discovery client. */
+export function isTwitterDiscoveryEnabled(env: Env): boolean {
+  if (!env.TWITTER_API_KEY) return false;
+  const discovery = env.TWITTER_ENABLE_DISCOVERY;
+  return discovery === 'true' || (env.TWITTER_ENABLE_ACTIONS === 'true' && discovery !== 'false');
+}
+
 export interface ModelPluginPlan {
   /** Plugin packages to load by name (character.plugins). */
   packages: string[];
@@ -17,7 +26,6 @@ export interface ModelPluginPlan {
   hasEmbeddingProvider: boolean;
 }
 
-type Env = Record<string, string | undefined>;
 
 /**
  * Decides which model plugins to load. Several can be loaded at once (OpenAI for embeddings and

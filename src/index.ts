@@ -15,7 +15,7 @@ import hyperfyPlugin from './plugin-hyperfy';
 import { DiscordAutoPostManager } from './discord/discord-auto-post';
 import { anthropicModelsPlugin } from './anthropic-models';
 import { elevenLabsSpeechPlugin } from './elevenlabs-speech';
-import { PROVIDER_PACKAGES, planModelPlugins } from './llm-provider';
+import { PROVIDER_PACKAGES, isTwitterDiscoveryEnabled, planModelPlugins } from './llm-provider';
 
 let modelPlan: ReturnType<typeof planModelPlugins>;
 try {
@@ -26,7 +26,7 @@ try {
   process.exit(1);
 }
 // X discovery checks follow history with embeddings (plugin-twitter calls TEXT_EMBEDDING directly)
-if (process.env.TWITTER_API_KEY && process.env.TWITTER_ENABLE_DISCOVERY !== 'false' && !modelPlan.hasEmbeddingProvider) {
+if (isTwitterDiscoveryEnabled(process.env) && !modelPlan.hasEmbeddingProvider) {
   logger.warn(
     'TWITTER_ENABLE_DISCOVERY is on but no embedding provider is loaded (Claude has none): discovery cannot follow anyone. Set OPENAI_API_KEY or an Ollama server, or TWITTER_ENABLE_DISCOVERY=false.'
   );
