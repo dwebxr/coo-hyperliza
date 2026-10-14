@@ -4,6 +4,7 @@ import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
 import { countOtherPlayers } from "../utils";
 import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
+import { isOpenPayLink } from "../../openpay-store";
 import moment from 'moment'
 import { uuid } from '../hyperfy/src/core/utils';
 
@@ -100,7 +101,10 @@ export class MessageManager {
           if (emote) {
             emoteManager.playEmote(emote);
           }
-          if (responseContent.text) {
+          if (responseContent.text && isOpenPayLink(responseContent)) {
+            // Shop links are posted, never read aloud
+            this.sendMessage(responseContent.text);
+          } else if (responseContent.text) {
             this.sendMessage(responseContent.text);
             await service.getVoiceManager()?.speak(responseContent.text);
           }

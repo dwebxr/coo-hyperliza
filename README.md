@@ -163,6 +163,18 @@ When using ElevenLabs, set the following in `.env`:
 
 **Ollama** - set `LLM_PROVIDER=ollama`; models come from `OLLAMA_API_ENDPOINT`, `OLLAMA_SMALL_MODEL` and `OLLAMA_LARGE_MODEL` (`OLLAMA_MODEL` is not read by the plugin). Requires a running Ollama server.
 
+### OpenPay Store Shop Clerk
+
+Coo can act as a shop clerk for [OpenPay Store](https://open-pay.jp/ja/store): it knows the configured products, recommends them when they fit the conversation (and now and then on its own), and when a player wants one it posts the product's purchase link to chat. Buyers pay from their own wallet; Coo holds no wallet or keys. Links are never read aloud.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `OPENPAY_STORE_HANDLES` | (off) | Comma-separated seller handles to sell (e.g. `alice,bob`), or `*` for every Store product |
+| `OPENPAY_STORE_LOCALE` | `ja` | Language of the purchase pages (`ja` / `en`) |
+| `OPENPAY_STORE_API_URL` | `https://open-pay.jp/api/store/listings` | Listings API (purchase links are only accepted on this origin) |
+
+Products are refreshed every 5 minutes in the background; prompts never wait on the API. In Hyperfy the reply names the product by id; on Discord (whose reply format has no product id) a link is shared only when the reply or message names the product unambiguously.
+
 ### Agent Aliases
 
 `HYPERFY_AGENT_ALIASES` is a comma-separated list of extra names the agent answers to (e.g. `クー`). A message containing the agent's name or one of these aliases skips the "should I respond?" LLM check. The check is also skipped when the agent is 1-on-1 with a single player.

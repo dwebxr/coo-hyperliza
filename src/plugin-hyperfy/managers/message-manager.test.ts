@@ -102,3 +102,28 @@ describe('MessageManager stale turns', () => {
     expect(ctx.runtime.createMemory).not.toHaveBeenCalled();
   });
 });
+
+describe('MessageManager shop links', () => {
+  it('posts a shop link to chat once and never reads it aloud', async () => {
+    let callback: any;
+    const sendMessage = vi.fn();
+    const speak = vi.fn();
+    const world = { entities: { player: { data: { id: 'coo' } } } };
+    const runtime: any = {
+      agentId: 'agent',
+      character: { name: 'Coo', templates: {} },
+      getService: () => ({ getWorld: () => world, currentWorldId: 'w1', getEmoteManager: () => ({ playEmote: vi.fn() }), getVoiceManager: () => ({ speak }) }),
+      ensureConnection: vi.fn(),
+      getEntityById: vi.fn().mockResolvedValue({ id: 'e' }),
+      createMemory: vi.fn(),
+      emitEvent: vi.fn(async (_e: string, payload: any) => { callback = payload.callback; }),
+    };
+    const manager = new MessageManager(runtime);
+    manager.sendMessage = sendMessage as any;
+    await manager.handleMessage({ id: 'm1', fromId: 'p1', from: 'Alice', body: 'link please' });
+    await callback({ text: '🛒 HoverBoard — 505 JPYC\nhttps://open-pay.jp/ja/@a?product=x', metadata: { openpayLink: true } });
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(speak).not.toHaveBeenCalled();
+    expect(runtime.createMemory).toHaveBeenCalled();
+  });
+});

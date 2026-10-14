@@ -157,3 +157,46 @@ describe('VoiceManager transcription', () => {
     expect(handled).not.toHaveBeenCalled();
   });
 });
+
+describe('VoiceManager.speak and links', () => {
+  it('never reads URLs aloud and skips text that is only a link', async () => {
+    const utils = await import('../utils');
+    const tts = vi.spyOn(utils, 'generateSpeech').mockResolvedValue(null);
+    const manager = new VoiceManager({ getService: () => ({ getWorld: () => null }) } as any);
+    await manager.speak('Here you go https://open-pay.jp/ja/@a?product=x');
+    expect(tts).toHaveBeenCalledWith('Here you go');
+    tts.mockClear();
+    await manager.speak('https://open-pay.jp/ja/@a?product=x');
+    expect(tts).not.toHaveBeenCalled();
+    tts.mockRestore();
+  });
+});
+
+describe('VoiceManager shop links', () => {
+  it('posts a shop link from a voice turn to chat (voice replies are otherwise only spoken) without speaking it', async () => {
+    let callback: any;
+    const sendMessage = vi.fn();
+    const world = { entities: { getPlayer: () => ({ data: { name: 'Alice' } }), items: new Map() } };
+    const service = {
+      getWorld: () => world,
+      currentWorldId: 'w1',
+      getEmoteManager: () => ({ playEmote: vi.fn() }),
+      getMessageManager: () => ({ sendMessage }),
+    };
+    const runtime: any = {
+      agentId: 'agent',
+      character: { name: 'Coo' },
+      getService: () => service,
+      ensureConnection: vi.fn(),
+      createMemory: vi.fn(),
+      emitEvent: vi.fn(async (_e: string, payload: any) => { callback = payload.callback; }),
+    };
+    const manager = new VoiceManager(runtime);
+    const speak = vi.spyOn(manager, 'speak');
+    await (manager as any).handleMessage('HoverBoardのリンクちょうだい', 'p1');
+    const link = '🛒 HoverBoard — 505 JPYC\nhttps://open-pay.jp/ja/@a?product=x';
+    await callback({ text: link, metadata: { openpayLink: true } });
+    expect(sendMessage).toHaveBeenCalledWith(link);
+    expect(speak).not.toHaveBeenCalled();
+  });
+});

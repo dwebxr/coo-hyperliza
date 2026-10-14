@@ -3,6 +3,7 @@ import { HyperfyService } from "../service";
 import { autoTemplate } from "../templates";
 import { agentActivityLock } from "./guards";
 import { getHyperfyActions, formatActions, countOtherPlayers } from "../utils";
+import { isOpenPayLink } from "../../openpay-store";
 
 const TIME_INTERVAL_MIN = 15000; // 15 seconds
 const TIME_INTERVAL_MAX = 30000; // 30 seconds
@@ -238,7 +239,7 @@ export class BehaviorManager {
         emoteManager.playEmote(emote);
       }
 
-      if (responseContent.text) {
+      if (responseContent.text && !isOpenPayLink(responseContent)) {
         service.getMessageManager().sendMessage(responseContent.text);
         await service.getVoiceManager()?.speak(responseContent.text);
       }
