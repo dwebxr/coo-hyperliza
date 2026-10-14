@@ -15,6 +15,7 @@ import hyperfyPlugin from './plugin-hyperfy';
 import { DiscordAutoPostManager } from './discord/discord-auto-post';
 import { anthropicModelsPlugin } from './anthropic-models';
 import { elevenLabsSpeechPlugin } from './elevenlabs-speech';
+import { createOpenPayStorePlugin } from './openpay-store';
 import { PROVIDER_PACKAGES, isTwitterDiscoveryEnabled, planModelPlugins } from './llm-provider';
 
 let modelPlan: ReturnType<typeof planModelPlugins>;
@@ -254,6 +255,8 @@ const initCharacter = async ({ runtime }: { runtime: IAgentRuntime }) => {
   }
 };
 
+const openPayStorePlugin = createOpenPayStorePlugin(process.env);
+
 export const projectAgent: ProjectAgent = {
   character,
   init: async (runtime: IAgentRuntime) => await initCharacter({ runtime }),
@@ -261,6 +264,8 @@ export const projectAgent: ProjectAgent = {
     ...(textProviderPlugin ? [textProviderPlugin] : []),
     // Speech for plugins that use runtime models (Discord voice); Hyperfy voice calls ElevenLabs directly
     ...(process.env.ELEVENLABS_XI_API_KEY ? [elevenLabsSpeechPlugin] : []),
+    // Shop clerk for OpenPay Store when OPENPAY_STORE_HANDLES is set
+    ...(openPayStorePlugin ? [openPayStorePlugin] : []),
     hyperfyPlugin,
   ],
 };

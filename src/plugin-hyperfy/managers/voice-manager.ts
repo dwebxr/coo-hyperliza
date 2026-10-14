@@ -4,6 +4,7 @@ import { countOtherPlayers, generateSpeech, getWavHeader } from "../utils";
 import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
 import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
+import { isOpenPayLink } from "../../openpay-store";
 
 type LiveKitAudioData = {
   participant: string;
@@ -281,7 +282,8 @@ export class VoiceManager {
 
           await this.runtime.createMemory(responseMemory, 'messages');
 
-          if (responseMemory.content.text?.trim()) {
+          // A shop link is posted to chat by its action and is not spoken
+          if (responseMemory.content.text?.trim() && !isOpenPayLink(content)) {
             const emoteManager = service.getEmoteManager();
             const emote = content.emote as string || "TALK";
             emoteManager.playEmote(emote);
@@ -311,7 +313,9 @@ export class VoiceManager {
    * Synthesizes text and plays it in the world. Never throws.
    */
   async speak(text: string): Promise<void> {
-    if (!text?.trim() || this.stopped) return;
+    // Never read URLs aloud
+    text = text?.replace(/https?:\/\/\S+/g, '').trim();
+    if (!text || this.stopped) return;
     // Captured before synthesis so a stop() during the TTS request discards the result
     const generation = this.playbackGeneration;
     try {

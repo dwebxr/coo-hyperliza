@@ -4,6 +4,7 @@ import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
 import { countOtherPlayers } from "../utils";
 import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
+import { isOpenPayLink } from "../../openpay-store";
 import moment from 'moment'
 import { uuid } from '../hyperfy/src/core/utils';
 
@@ -100,7 +101,8 @@ export class MessageManager {
           if (emote) {
             emoteManager.playEmote(emote);
           }
-          if (responseContent.text) {
+          // A shop link was already posted by its action; don't post it twice or read it aloud
+          if (responseContent.text && !isOpenPayLink(responseContent)) {
             this.sendMessage(responseContent.text);
             await service.getVoiceManager()?.speak(responseContent.text);
           }

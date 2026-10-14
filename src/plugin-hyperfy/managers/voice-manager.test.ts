@@ -157,3 +157,17 @@ describe('VoiceManager transcription', () => {
     expect(handled).not.toHaveBeenCalled();
   });
 });
+
+describe('VoiceManager.speak and links', () => {
+  it('never reads URLs aloud and skips text that is only a link', async () => {
+    const utils = await import('../utils');
+    const tts = vi.spyOn(utils, 'generateSpeech').mockResolvedValue(null);
+    const manager = new VoiceManager({ getService: () => ({ getWorld: () => null }) } as any);
+    await manager.speak('Here you go https://open-pay.jp/ja/@a?product=x');
+    expect(tts).toHaveBeenCalledWith('Here you go');
+    tts.mockClear();
+    await manager.speak('https://open-pay.jp/ja/@a?product=x');
+    expect(tts).not.toHaveBeenCalled();
+    tts.mockRestore();
+  });
+});
