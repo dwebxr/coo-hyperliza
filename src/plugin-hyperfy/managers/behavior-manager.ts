@@ -185,6 +185,7 @@ export class BehaviorManager {
       logger.warn("[BehaviorManager] Could not parse model response; skipping this tick.");
       return hasOtherPlayers;
     }
+    logger.debug(`[BehaviorManager] Response: ${JSON.stringify(parsedXml)}`)
 
     const responseMemory: Memory = {
       id: createUniqueUuid(this.runtime, Date.now().toString()),

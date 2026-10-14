@@ -1,6 +1,6 @@
 # Coo Hyperliza
 
-An ElizaOS + Hyperfy 3D world integration agent. An AI agent that autonomously acts and can have voice conversations within Hyperfy VR worlds.
+An ElizaOS + Hyperfy 3D world integration agent. An AI agent that autonomously acts and can have voice conversations within Hyperfy VR worlds, with Discord integration for community engagement.
 
 ## Features
 
@@ -25,6 +25,16 @@ An ElizaOS + Hyperfy 3D world integration agent. An AI agent that autonomously a
 - **Approaching Players**: Walk towards nearby players
 - **Item Usage**: Interact with objects in the world
 - **Conversation**: Text chat and voice conversations
+
+### Discord Integration
+- **Auto-Reply**: Automatically responds to mentions and messages
+- **Scheduled Posts**: Posts daily updates to a configured channel
+- **Community Engagement**: Participates in server conversations
+
+### Twitter/X Integration
+- **Daily Posts**: Posts once per day automatically
+- **Reply to Mentions**: Responds to mentions and replies
+- **Free Plan Optimized**: Conservative API usage for Twitter Free tier
 
 ## Setup
 
@@ -58,6 +68,22 @@ ELEVENLABS_XI_API_KEY=your-elevenlabs-api-key
 ELEVENLABS_VOICE_ID=your-voice-id
 ELEVENLABS_MODEL_ID=eleven_flash_v2_5
 ELEVENLABS_OUTPUT_FORMAT=mp3_44100_128
+
+# Discord (optional)
+DISCORD_APPLICATION_ID=your-application-id
+DISCORD_API_TOKEN=your-bot-token
+DISCORD_POST_CHANNEL_ID=channel-id-for-auto-posts
+DISCORD_POST_INTERVAL_HOURS=24
+DISCORD_ENABLE_AUTO_POST=true
+
+# Twitter/X (optional - OAuth 1.0a credentials)
+TWITTER_API_KEY=your-api-key
+TWITTER_API_SECRET_KEY=your-api-secret
+TWITTER_ACCESS_TOKEN=your-access-token
+TWITTER_ACCESS_TOKEN_SECRET=your-access-token-secret
+TWITTER_ENABLE_POST=true
+TWITTER_ENABLE_REPLIES=true
+TWITTER_POST_INTERVAL=1440
 
 # Server Settings
 SERVER_PORT=3001
@@ -141,6 +167,31 @@ When using ElevenLabs, set the following in `.env`:
 
 `HYPERFY_AGENT_ALIASES` is a comma-separated list of extra names the agent answers to (e.g. `クー`). A message containing the agent's name or one of these aliases skips the "should I respond?" LLM check. The check is also skipped when the agent is 1-on-1 with a single player.
 
+### Discord Settings
+
+| Environment Variable | Description | Default |
+|---------------------|-------------|---------|
+| `DISCORD_APPLICATION_ID` | Discord application ID | - |
+| `DISCORD_API_TOKEN` | Discord bot token | - |
+| `DISCORD_POST_CHANNEL_ID` | Channel ID for auto-posts | - |
+| `DISCORD_POST_INTERVAL_HOURS` | Hours between auto-posts | `24` |
+| `DISCORD_ENABLE_AUTO_POST` | Enable auto-posting | `true` |
+
+### Twitter/X Settings (Free Plan Optimized)
+
+| Environment Variable | Description | Default |
+|---------------------|-------------|---------|
+| `TWITTER_API_KEY` | OAuth 1.0a API Key | - |
+| `TWITTER_API_SECRET_KEY` | OAuth 1.0a API Secret | - |
+| `TWITTER_ACCESS_TOKEN` | OAuth 1.0a Access Token | - |
+| `TWITTER_ACCESS_TOKEN_SECRET` | OAuth 1.0a Access Secret | - |
+| `TWITTER_ENABLE_POST` | Enable posting | `true` |
+| `TWITTER_ENABLE_REPLIES` | Enable reply to mentions | `true` |
+| `TWITTER_ENABLE_ACTIONS` | Enable likes/retweets | `false` |
+| `TWITTER_POST_INTERVAL` | Minutes between posts | `1440` (24h) |
+| `TWITTER_MAX_ENGAGEMENTS_PER_RUN` | Max replies per cycle | `3` |
+| `TWITTER_DRY_RUN` | Test without posting | `false` |
+
 ### Adjusting Autonomous Behavior
 
 You can adjust action intervals in `src/plugin-hyperfy/managers/behavior-manager.ts`:
@@ -155,23 +206,27 @@ const TIME_INTERVAL_IDLE_MAX = 120000;// Max interval in idle mode (ms)
 ## Architecture
 
 ```
-src/plugin-hyperfy/
-├── managers/
-│   ├── behavior-manager.ts  # Autonomous behavior loop
-│   ├── message-manager.ts   # Chat message handling
-│   ├── voice-manager.ts     # Voice input/output
-│   ├── emote-manager.ts     # Emote control
-│   └── puppeteer-manager.ts # Screenshots & VRM control
-├── systems/
-│   ├── liveKit.ts          # LiveKit audio streaming
-│   ├── avatar.ts           # VRM avatar management
-│   ├── controls.ts         # Agent movement control
-│   └── loader.ts           # Asset loader
-├── providers/
-│   └── world.ts            # World state provider
-├── templates.ts            # Prompt templates
-├── service.ts              # Main service
-└── utils.ts                # Utilities (TTS generation, etc.)
+src/
+├── discord/
+│   └── discord-auto-post.ts    # Discord scheduled posting
+├── plugin-hyperfy/
+│   ├── managers/
+│   │   ├── behavior-manager.ts  # Autonomous behavior loop
+│   │   ├── message-manager.ts   # Chat message handling
+│   │   ├── voice-manager.ts     # Voice input/output
+│   │   ├── emote-manager.ts     # Emote control
+│   │   └── puppeteer-manager.ts # Screenshots & VRM control
+│   ├── systems/
+│   │   ├── liveKit.ts          # LiveKit audio streaming
+│   │   ├── avatar.ts           # VRM avatar management
+│   │   ├── controls.ts         # Agent movement control
+│   │   └── loader.ts           # Asset loader
+│   ├── providers/
+│   │   └── world.ts            # World state provider
+│   ├── templates.ts            # Prompt templates
+│   ├── service.ts              # Main service
+│   └── utils.ts                # Utilities (TTS generation, etc.)
+└── index.ts                     # Main entry point & character config
 ```
 
 ## Key Modifications
@@ -184,6 +239,8 @@ src/plugin-hyperfy/
 4. **Lip Sync**: TALK emote playback during voice output
 5. **Improved Player Detection**: Accurate player counting via entity iteration
 6. **PostgreSQL Support**: Local PostgreSQL database usage
+7. **Discord Integration**: Auto-reply and scheduled daily posts
+8. **Twitter/X Integration**: Daily posts and mention replies (Free Plan optimized)
 
 ## Troubleshooting
 
@@ -202,6 +259,26 @@ src/plugin-hyperfy/
 - Set `ELEVENLABS_OUTPUT_FORMAT=mp3_44100_128`
 - Check ffmpeg version
 
+### Discord Bot Not Responding
+- Verify `DISCORD_API_TOKEN` is correct
+- Check bot has proper permissions in the server
+- Ensure bot is invited to the server with correct scopes
+
+### Discord Auto-Post Not Working
+- Set `DISCORD_ENABLE_AUTO_POST=true`
+- Verify `DISCORD_POST_CHANNEL_ID` is set correctly
+- Check bot has permission to send messages in the channel
+
+### Twitter 403 Forbidden Error
+- Ensure app has "Read and write" permissions (not just Read)
+- Regenerate Access Token & Secret after changing permissions
+- Verify using OAuth 1.0a credentials (not OAuth 2.0)
+
+### Twitter Not Posting
+- Check `TWITTER_ENABLE_POST=true`
+- Verify all 4 OAuth credentials are set correctly
+- Try `TWITTER_DRY_RUN=true` first to test
+
 ## License
 
 MIT License
@@ -212,3 +289,4 @@ MIT License
 - [Hyperfy](https://github.com/hyperfy-xyz/hyperfy) - 3D Virtual World Platform
 - [ElevenLabs](https://elevenlabs.io/) - Voice Synthesis API
 - [LiveKit](https://livekit.io/) - Real-time Audio/Video
+- [Discord.js](https://discord.js.org/) - Discord API Library

@@ -43,7 +43,15 @@ export class VoiceManager {
 
   start() {
     const service = this.getService();
+    if (!service) {
+      console.error('[VoiceManager] Cannot start - service not available');
+      return;
+    }
     const world = service.getWorld();
+    if (!world || !world.livekit) {
+      console.error('[VoiceManager] Cannot start - world or livekit not available');
+      return;
+    }
 
     this.audioListener = (data: LiveKitAudioData) => {
       function isLoudEnough(pcmBuffer: Buffer, threshold = 1000): boolean {
