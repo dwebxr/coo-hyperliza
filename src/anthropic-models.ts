@@ -58,7 +58,10 @@ function getClient(runtime: IAgentRuntime): Anthropic {
 }
 
 function getSetting(runtime: IAgentRuntime, key: string, fallback: string): string {
-  const value = runtime.getSetting(key);
+  // .env wins: elizaOS stores a copy of the environment in the agent's database record and
+  // runtime.getSetting prefers that copy, so a key changed in .env would otherwise be ignored
+  // (an old, revoked Anthropic key kept failing with 401 invalid x-api-key).
+  const value = process.env[key]?.trim() || runtime.getSetting(key);
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
 }
 

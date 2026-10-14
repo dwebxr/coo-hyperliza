@@ -104,6 +104,20 @@ describe('anthropicModelsPlugin', () => {
     expect(constructed.map((o) => o.apiKey)).toEqual(['key-a', 'key-b']);
   });
 
+  it('prefers .env over the copy of the settings elizaOS keeps in its database', async () => {
+    constructed.length = 0;
+    process.env.ANTHROPIC_API_KEY = 'key-from-env';
+    process.env.ANTHROPIC_LARGE_MODEL = 'claude-sonnet-5-5';
+    try {
+      await models[ModelType.TEXT_LARGE](runtime({ ANTHROPIC_API_KEY: 'stale-key-in-db', ANTHROPIC_LARGE_MODEL: 'old-model' }), { prompt: 'x' });
+      expect(constructed[0].apiKey).toBe('key-from-env');
+      expect(create.mock.calls[0][0].model).toBe('claude-sonnet-5-5');
+    } finally {
+      delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.ANTHROPIC_LARGE_MODEL;
+    }
+  });
+
   it('works next to the fake window/document the Hyperfy loader installs', async () => {
     constructed.length = 0;
     await models[ModelType.TEXT_SMALL](runtime({ ANTHROPIC_API_KEY: 'key-c' }), { prompt: 'x' });

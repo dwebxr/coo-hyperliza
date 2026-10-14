@@ -3,7 +3,8 @@ import { Buffer } from 'buffer';
 
 import dotenv from 'dotenv';
 
-dotenv.config();
+// Values from the .env file, applied as character secrets below
+const envFile = dotenv.config().parsed ?? {};
 import {
   logger,
   type Character,
@@ -56,7 +57,10 @@ export const character: Character = {
     ...(process.env.MCP_GATEWAY_URL ? ['@elizaos/plugin-mcp'] : []),
   ],
   settings: {
-    secrets: {},
+    // .env is authoritative. elizaOS keeps a copy of the environment from earlier runs in the agent's
+    // database record and prefers it over the current environment; secrets set here override that copy
+    // (an old, revoked API key stored there made every model call fail with 401).
+    secrets: { ...envFile },
     avatar: 'https://dwebxr.xyz/images/coo.jpg',
     voice: {
       model: 'tts-1',
