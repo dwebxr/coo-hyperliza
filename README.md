@@ -18,7 +18,7 @@ An ElizaOS + Hyperfy 3D world integration agent. An AI agent that autonomously a
 ### Avatar Features
 - **VRM Avatar Support**: Use custom VRM avatars
 - **Emote System**: Play animations based on emotions
-- **Talking Gesture**: Plays the TALK animation while speaking. The mouth does not move: Hyperfy clients have no lip sync. A custom clip at `src/plugin-hyperfy/public/emotes/emote-talk.glb` replaces the world's own
+- **Talking Gesture**: Plays the TALK animation while speaking. The mouth does not move: Hyperfy clients have no lip sync. A custom clip at `src/plugin-hyperfy/public/emotes/emote-talk.glb` replaces the world's own.
 
 ### Autonomous Actions
 - **Walking Around**: Freely move around the world

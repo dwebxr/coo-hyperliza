@@ -17,12 +17,14 @@ const original = { ...(Emotes as Record<string, string>) };
 
 /** HEAD responses by file name; anything not listed is 404. */
 function serveAssets(available: (file: string) => boolean) {
-  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any, init?: any) => {
-    expect(init?.method).toBe('HEAD');
+  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
     const file = String(url).split('/').pop()!;
     return new Response(null, { status: available(file) ? 200 : 404 });
   });
 }
+
+const onlyHeadRequests = (fetchSpy: ReturnType<typeof serveAssets>) =>
+  fetchSpy.mock.calls.every(([, init]) => (init as RequestInit | undefined)?.method === 'HEAD');
 
 function newManager(upload = vi.fn().mockResolvedValue(undefined)) {
   const world = { assetsUrl: 'https://world.test/assets/', network: { upload } };
@@ -47,6 +49,7 @@ describe('EmoteManager talking gesture', () => {
     expect(upload).toHaveBeenCalledTimes(1);
     expect((Emotes as any).TALK).toMatch(HASHED);
     expect(String(fetchSpy.mock.calls[0][0])).toMatch(/^https:\/\/world\.test\/assets\/[0-9a-f]{64}\.glb$/);
+    expect(onlyHeadRequests(fetchSpy)).toBe(true);
   });
 
   it("keeps the world's clip when a custom upload resolves but the asset never appears", async () => {
@@ -79,6 +82,18 @@ describe('EmoteManager talking gesture', () => {
     await (manager as any).ensureTalkEmote();
     expect(upload).not.toHaveBeenCalled();
     expect(warn.mock.calls[0][0]).toContain('emote-talk.glb');
+  });
+
+  it("does not claim the world lacks the clip when it simply couldn't be checked", async () => {
+    access.mockRejectedValue(new Error('ENOENT'));
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('network down'));
+    const warn = vi.spyOn(logger, 'warn');
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { manager } = newManager();
+    await (manager as any).ensureTalkEmote();
+    expect(warn).not.toHaveBeenCalled();
+    expect(String(consoleWarn.mock.calls[0][0])).toContain('Could not check');
+    expect((Emotes as any).TALK).toBe(DEFAULT_TALK);
   });
 
   it('does not carry an override from a previous world into the next one', async () => {

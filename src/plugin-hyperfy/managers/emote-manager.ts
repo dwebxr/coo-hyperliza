@@ -2,7 +2,7 @@ import fs from 'fs/promises'
 import path from 'path'
 import { EMOTES_LIST, LOCOMOTION_EMOTES, TALK_EMOTE } from '../constants.js'
 import { Emotes } from '../hyperfy/src/core/extras/playerEmotes.js'
-import { hashFileBuffer, getModuleDirectory } from '../utils'
+import { hashFileBuffer, getModuleDirectory, resolveUrl } from '../utils'
 import { IAgentRuntime, logger } from '@elizaos/core'
 import { HyperfyService } from '../service.js'
 
@@ -145,12 +145,20 @@ export class EmoteManager {
     return this.runtime.getService<HyperfyService>(HyperfyService.serviceType);
   }
 
-  /** Whether the world's asset server serves `fileName` (asset:// names resolve there). */
-  private async assetExists(fileName: string): Promise<boolean> {
-    const assetsUrl: string | undefined = this.getService()?.getWorld()?.assetsUrl;
-    if (!assetsUrl) return false;
-    const url = `${assetsUrl.replace(/\/$/, "")}/${fileName}`;
-    return fetch(url, { method: "HEAD", signal: AbortSignal.timeout(10000) }).then((resp) => resp.ok, () => false);
+  /**
+   * Whether the world's asset server serves `fileName`, as clients resolve asset:// names.
+   * null when that could not be checked (cause already logged).
+   */
+  private async assetExists(fileName: string): Promise<boolean | null> {
+    const url = await resolveUrl(`asset://${fileName}`, this.getService()?.getWorld() ?? {});
+    if (!url) return null;
+    try {
+      const resp = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(5000) });
+      return resp.ok;
+    } catch (error: any) {
+      console.warn(`[Emote] Could not check ${url}: ${error?.message || error}`);
+      return null;
+    }
   }
 
   private async uploadLocomotionEmotes() {
@@ -185,15 +193,20 @@ export class EmoteManager {
       const service = this.getService();
       const world = service.getWorld();
       const emoteUploadPromise = world.network.upload(emoteFile);
-      const emoteTimeout = new Promise((_resolve, reject) =>
-        setTimeout(() => reject(new Error("Upload timed out")), 30000)
-      );
+      let uploadTimer: NodeJS.Timeout | undefined;
+      const emoteTimeout = new Promise((_resolve, reject) => {
+        uploadTimer = setTimeout(() => reject(new Error("Upload timed out")), 30000);
+      });
 
-      await Promise.race([emoteUploadPromise, emoteTimeout]);
+      try {
+        await Promise.race([emoteUploadPromise, emoteTimeout]);
+      } finally {
+        clearTimeout(uploadTimer);
+      }
 
       // ClientNetwork.upload doesn't check the response, so confirm the asset is really there
       // before pointing everyone at it (a failed upload would otherwise break the animation)
-      if (!(await this.assetExists(emoteFullName))) {
+      if ((await this.assetExists(emoteFullName)) !== true) {
         console.error(`[Locomotion] '${emote.name}' upload could not be verified; keeping ${(Emotes as Record<string, string>)[emote.name]}`);
         return false;
       }
@@ -222,7 +235,7 @@ export class EmoteManager {
     const hasBundled = await fs.access(bundled).then(() => true, () => false);
     if (hasBundled && (await this.uploadLocomotionEmote(TALK_EMOTE))) return;
 
-    if (!(await this.assetExists("emote-talk.glb"))) {
+    if ((await this.assetExists("emote-talk.glb")) === false) {
       logger.warn(
         `[Emote] The world does not serve emote-talk.glb, so no talking gesture is shown while speaking. Put a clip at public/emotes/emote-talk.glb to upload one.`
       );
