@@ -2,12 +2,28 @@ import fs from 'fs/promises'
 import path from 'path'
 import { EMOTES_LIST, LOCOMOTION_EMOTES, TALK_EMOTE } from '../constants.js'
 import { Emotes } from '../hyperfy/src/core/extras/playerEmotes.js'
-import { hashFileBuffer, getModuleDirectory, resolveUrl } from '../utils'
+import { getModuleDirectory, resolveUrl } from '../utils'
+import { AssetUploadError, assetServed, ensureAsset } from '../lib/asset-upload'
 import { IAgentRuntime, logger } from '@elizaos/core'
 import { HyperfyService } from '../service.js'
 
 // Emotes is shared process-wide and overridden per world below; keep the engine defaults to reset to
 const DEFAULT_EMOTES: Record<string, string> = { ...(Emotes as Record<string, string>) };
+// Rounds (one per appearance poll) before clips that keep failing are left out for this connection
+const MAX_EMOTE_ROUNDS = 5;
+
+/**
+ * The world's own locomotion clips, for when the agent cannot use its own and the world does not
+ * serve the engine's emote-*.glb (newer Hyperfy worlds such as coo-world ship Hyperfy's mp-* set).
+ * ?s= is the playback speed other clients apply. Those worlds tune it for walking at 3 m/s
+ * (s=1.5) and running at 6 m/s (s=1.4); the agent's engine moves at 4 and 8, so the clips play
+ * proportionally faster to keep the feet in step.
+ */
+const WORLD_LOCOMOTION_FALLBACKS: Record<string, string> = {
+  IDLE: 'asset://mp-idle.glb',
+  WALK: 'asset://mp-walk.glb?s=2',
+  RUN: 'asset://mp-jog.glb?s=1.87',
+};
 
 export class EmoteManager {
   private emoteHashMap: Map<string, string>
@@ -21,50 +37,39 @@ export class EmoteManager {
     this.currentEmoteTimeout = null
   }
 
-  async uploadEmotes() {
-    // Upload locomotion emotes first and update Emotes object
-    await this.uploadLocomotionEmotes();
+  /** Clips settled for this connection: in use, or unavailable for a reason that will not pass. */
+  private settled = new Set<string>()
+  private emotesReset = false
+  private rounds = 0
+  /** Set when the world refuses this session's uploads; the remaining clips are only looked up. */
+  private uploadRefusal: string | null = null
 
-    // Upload custom emotes
+  /**
+   * Makes the agent's clips available in the current world. false while some clip failed for a
+   * reason that may pass (network, server error); calling again retries only those.
+   */
+  async uploadEmotes(): Promise<boolean> {
+    const world = this.getService()?.getWorld();
+    if (!world) return false;
+    // Locomotion emotes first: they update the shared Emotes object
+    let complete = await this.uploadLocomotionEmotes(world);
+    if (!this.isCurrent(world)) return false;
+
     for (const emote of EMOTES_LIST) {
-      try {
-        const moduleDirPath = getModuleDirectory();
-        const emoteBuffer = await fs.readFile(moduleDirPath + emote.path);
-        const emoteMimeType = "model/gltf-binary";
-
-        const emoteHash = await hashFileBuffer(emoteBuffer);
-        const emoteExt = emote.path.split(".").pop()?.toLowerCase() || "glb";
-        const emoteFullName = `${emoteHash}.${emoteExt}`;
-        const emoteUrl = `asset://${emoteFullName}`;
-
-        console.info(
-          `[Appearance] Uploading emote '${emote.name}' as ${emoteFullName} (${(emoteBuffer.length / 1024).toFixed(2)} KB)`
-        );
-
-        const emoteFile = new File([emoteBuffer], path.basename(emote.path), {
-          type: emoteMimeType,
-        });
-
-        const service = this.getService();
-        const world = service.getWorld();
-        const emoteUploadPromise = world.network.upload(emoteFile);
-        const emoteTimeout = new Promise((_resolve, reject) =>
-          setTimeout(() => reject(new Error("Upload timed out")), 30000)
-        );
-
-        await Promise.race([emoteUploadPromise, emoteTimeout]);
-
-        this.emoteHashMap.set(emote.name, emoteFullName);
-        console.info(
-          `[Appearance] Emote '${emote.name}' uploaded: ${emoteUrl}`
-        );
-      } catch (err: any) {
-        console.error(
-          `[Appearance] Failed to upload emote '${emote.name}': ${err.message}`,
-          err.stack
-        );
-      }
+      if (this.settled.has(emote.name)) continue;
+      const result = await this.ensureClip(world, emote, '[Appearance]');
+      if (!this.isCurrent(world)) return false;
+      if ('fileName' in result) this.emoteHashMap.set(emote.name, result.fileName);
+      if ('fileName' in result || !result.retry) this.settled.add(emote.name);
+      else complete = false;
     }
+    if (complete) return true;
+
+    if (++this.rounds < MAX_EMOTE_ROUNDS) return false;
+    // Stop retrying: what is in use stays, the rest keeps its default until the next connection
+    for (const emote of [...LOCOMOTION_EMOTES, TALK_EMOTE, ...EMOTES_LIST]) this.settled.add(emote.name);
+    console.warn(`[Emote] Some emotes are still not available after ${MAX_EMOTE_ROUNDS} attempts; giving up on them for this connection.`);
+    return true;
   }
 
   playEmote(name: string) {
@@ -145,100 +150,145 @@ export class EmoteManager {
     return this.runtime.getService<HyperfyService>(HyperfyService.serviceType);
   }
 
+  private isCurrent(world: any): boolean {
+    return this.getService()?.getWorld() === world;
+  }
+
   /**
    * Whether the world's asset server serves `fileName`, as clients resolve asset:// names.
    * null when that could not be checked (cause already logged).
    */
-  private async assetExists(fileName: string): Promise<boolean | null> {
-    const url = await resolveUrl(`asset://${fileName}`, this.getService()?.getWorld() ?? {});
-    if (!url) return null;
-    try {
-      const resp = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(5000) });
-      return resp.ok;
-    } catch (error: any) {
-      console.warn(`[Emote] Could not check ${url}: ${error?.message || error}`);
-      return null;
-    }
+  private async assetExists(fileName: string, world: any = this.getService()?.getWorld()): Promise<boolean | null> {
+    const url = await resolveUrl(`asset://${fileName}`, world ?? {});
+    return url ? assetServed(url) : null;
   }
 
-  private async uploadLocomotionEmotes() {
-    // Don't carry another world's uploaded hashes into this one
-    Object.assign(Emotes as Record<string, string>, DEFAULT_EMOTES);
-    for (const emote of LOCOMOTION_EMOTES) {
-      await this.uploadLocomotionEmote(emote);
-    }
-    await this.ensureTalkEmote();
-  }
-
-  /** Uploads a clip and points the shared Emotes entry at it. */
-  private async uploadLocomotionEmote(emote: { name: string; path: string }): Promise<boolean> {
+  /**
+   * The hashed name the world serves this clip under, uploading it when the world does not have it
+   * yet; otherwise whether it is worth trying again (cause logged).
+   */
+  private async ensureClip(
+    world: any,
+    emote: { name: string; path: string },
+    tag: string
+  ): Promise<{ fileName: string } | { retry: boolean }> {
+    if (!world) return { retry: true };
+    let buffer: Buffer;
     try {
-      const moduleDirPath = getModuleDirectory();
-      const emoteBuffer = await fs.readFile(moduleDirPath + emote.path);
-      const emoteMimeType = "model/gltf-binary";
-
-      const emoteHash = await hashFileBuffer(emoteBuffer);
-      const emoteExt = emote.path.split(".").pop()?.toLowerCase() || "glb";
-      const emoteFullName = `${emoteHash}.${emoteExt}`;
-      const emoteUrl = `asset://${emoteFullName}`;
-
-      console.info(
-        `[Locomotion] Uploading '${emote.name}' as ${emoteFullName} (${(emoteBuffer.length / 1024).toFixed(2)} KB)`
-      );
-
-      const emoteFile = new File([emoteBuffer], path.basename(emote.path), {
-        type: emoteMimeType,
-      });
-
-      const service = this.getService();
-      const world = service.getWorld();
-      const emoteUploadPromise = world.network.upload(emoteFile);
-      let uploadTimer: NodeJS.Timeout | undefined;
-      const emoteTimeout = new Promise((_resolve, reject) => {
-        uploadTimer = setTimeout(() => reject(new Error("Upload timed out")), 30000);
-      });
-
-      try {
-        await Promise.race([emoteUploadPromise, emoteTimeout]);
-      } finally {
-        clearTimeout(uploadTimer);
-      }
-
-      // ClientNetwork.upload doesn't check the response, so confirm the asset is really there
-      // before pointing everyone at it (a failed upload would otherwise break the animation)
-      if ((await this.assetExists(emoteFullName)) !== true) {
-        console.error(`[Locomotion] '${emote.name}' upload could not be verified; keeping ${(Emotes as Record<string, string>)[emote.name]}`);
-        return false;
-      }
-
-      // Update the Emotes object with the uploaded URL
-      (Emotes as Record<string, string>)[emote.name] = emoteUrl;
-      console.info(
-        `[Locomotion] Emote '${emote.name}' uploaded and registered: ${emoteUrl}`
-      );
-      return true;
+      buffer = await fs.readFile(getModuleDirectory() + emote.path);
     } catch (err: any) {
-      console.error(
-        `[Locomotion] Failed to upload emote '${emote.name}': ${err.message}`,
-        err.stack
-      );
-      return false;
+      console.error(`${tag} Cannot read emote '${emote.name}': ${err.message}`);
+      return { retry: false };
     }
+    const result = await ensureAsset(
+      world,
+      { buffer, name: path.basename(emote.path), type: "model/gltf-binary" },
+      { upload: !this.uploadRefusal }
+    );
+    if (result.ok === true) {
+      console.info(`${tag} Emote '${emote.name}' ${result.uploaded ? 'uploaded' : 'already on the server'}: asset://${result.fileName}`);
+      return { fileName: result.fileName };
+    }
+
+    const { error } = result;
+    if (this.uploadRefusal && !result.retryable) {
+      console.debug(`${tag} Emote '${emote.name}' is not on the server; skipped`);
+    } else if (error instanceof AssetUploadError && (error.status === 401 || error.status === 403)) {
+      // Every other clip would be refused the same way
+      this.uploadRefusal = error.message;
+      console.warn(
+        `${tag} The world refused the emote upload (${error.message}); only builders can upload .glb clips. Clips the world already serves are still used; missing ones are skipped until a builder uploads them.`
+      );
+    } else if (result.retryable) {
+      console.warn(`${tag} Emote '${emote.name}' is not available yet: ${error.message}`);
+    } else {
+      console.error(`${tag} Emote '${emote.name}' is not available: ${error.message}`);
+    }
+    return { retry: result.retryable };
+  }
+
+  private async uploadLocomotionEmotes(world: any = this.getService()?.getWorld()): Promise<boolean> {
+    if (!this.emotesReset) {
+      // Don't carry another world's uploaded hashes into this one
+      Object.assign(Emotes as Record<string, string>, DEFAULT_EMOTES);
+      this.emotesReset = true;
+    }
+    let complete = true;
+    for (const emote of LOCOMOTION_EMOTES) {
+      if (this.settled.has(emote.name)) continue;
+      const result = await this.uploadLocomotionEmote(world, emote);
+      if (result === 'stale') return false;
+      if (result === 'retry') complete = false;
+      else this.settled.add(emote.name);
+    }
+    if (!this.settled.has(TALK_EMOTE.name)) {
+      if (await this.ensureTalkEmote(world)) this.settled.add(TALK_EMOTE.name);
+      else complete = false;
+    }
+    return complete && this.isCurrent(world);
+  }
+
+  /** Points the shared Emotes entry at the clip once the world serves it; 'kept' leaves the default for good. */
+  private async uploadLocomotionEmote(
+    world: any,
+    emote: { name: string; path: string }
+  ): Promise<'ok' | 'kept' | 'retry' | 'stale'> {
+    const result = await this.ensureClip(world, emote, '[Locomotion]');
+    // Emotes is shared: a world that was replaced meanwhile must not overwrite the new one's entries
+    if (!this.isCurrent(world)) return 'stale';
+    if ('fileName' in result) {
+      (Emotes as Record<string, string>)[emote.name] = `asset://${result.fileName}`;
+      return 'ok';
+    }
+    const fallback = await this.useWorldFallback(world, emote.name);
+    if (!this.isCurrent(world)) return 'stale';
+    const retry = result.retry || fallback === 'unknown';
+    console.info(`[Locomotion] Keeping ${(Emotes as Record<string, string>)[emote.name]} for '${emote.name}'${retry ? ' for now' : ''}`);
+    return retry ? 'retry' : 'kept';
+  }
+
+  /**
+   * Without the agent's own clip: the engine default if the world serves it, else the world's own
+   * clip. 'unknown' when a lookup failed, so a later round checks again.
+   */
+  private async useWorldFallback(world: any, name: string): Promise<'done' | 'unknown'> {
+    const fallback = WORLD_LOCOMOTION_FALLBACKS[name];
+    if (!fallback) return 'done';
+    const fileOf = (url: string) => url.replace('asset://', '').split('?')[0];
+    const current = (Emotes as Record<string, string>)[name];
+    const currentServed = await this.assetExists(fileOf(current), world);
+    if (currentServed !== false) return currentServed === true ? 'done' : 'unknown';
+    const fallbackServed = await this.assetExists(fileOf(fallback), world);
+    if (fallbackServed === null) return 'unknown';
+    if (fallbackServed === false) {
+      console.warn(`[Locomotion] The world serves neither ${current} nor ${fallback}; '${name}' will not animate for other players.`);
+      return 'done';
+    }
+    if (!this.isCurrent(world)) return 'done';
+    (Emotes as Record<string, string>)[name] = fallback;
+    console.info(`[Locomotion] The world does not serve ${current}; using its own ${fallback} for '${name}'`);
+    return 'done';
   }
 
   /**
    * Speaking shows Emotes.TALK. A clip at public/emotes/emote-talk.glb takes precedence;
    * otherwise the world's own emote-talk.glb is used, with a warning if it has none.
+   * false when the bundled clip should be tried again.
    */
-  private async ensureTalkEmote() {
+  private async ensureTalkEmote(world: any = this.getService()?.getWorld()): Promise<boolean> {
     const bundled = getModuleDirectory() + TALK_EMOTE.path;
     const hasBundled = await fs.access(bundled).then(() => true, () => false);
-    if (hasBundled && (await this.uploadLocomotionEmote(TALK_EMOTE))) return;
+    if (hasBundled) {
+      const result = await this.uploadLocomotionEmote(world, TALK_EMOTE);
+      if (result === 'ok') return true;
+      if (result === 'retry' || result === 'stale') return false;
+    }
 
-    if ((await this.assetExists("emote-talk.glb")) === false) {
+    if ((await this.assetExists("emote-talk.glb", world)) === false) {
       logger.warn(
         `[Emote] The world does not serve emote-talk.glb, so no talking gesture is shown while speaking. Put a clip at public/emotes/emote-talk.glb to upload one.`
       );
     }
+    return true;
   }
 }
