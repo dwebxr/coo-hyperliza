@@ -7,7 +7,6 @@ import {
   type IAgentRuntime,
   Service,
 } from '@elizaos/core'
-import crypto from 'crypto'
 import fs from 'fs/promises'
 import path from 'path'
 import { createNodeClientWorld } from './hyperfy/src/core/createNodeClientWorld.js'
@@ -23,14 +22,18 @@ import { MessageManager, type ChatTurn } from './managers/message-manager.js'
 import { VoiceManager } from './managers/voice-manager.js'
 import { PuppeteerManager } from './managers/puppeteer-manager.js'
 import { BuildManager } from './managers/build-manager.js'
-import { hashFileBuffer, getModuleDirectory } from './utils'
+import { getModuleDirectory } from './utils'
 import { ReconnectController } from './lib/reconnect'
+import { type AssetUploadError, ensureAsset, uploadAsset } from './lib/asset-upload'
+import { storage } from './hyperfy/src/core/storage.js'
 
 const moduleDirPath = getModuleDirectory();
 const LOCAL_AVATAR_PATH = `${moduleDirPath}/avatars/avatar.vrm`;
 
 const HYPERFY_WS_URL = process.env.WS_URL || 'wss://chill.hyperfy.xyz/ws'
 const HYPERFY_APPEARANCE_POLL_INTERVAL = 30000
+
+type AvatarResult = { outcome: 'applied' | 'gave-up'; error?: string } | { outcome: 'retry'; error?: string }
 // Teardown must not hang a reconnect on a stuck native/CDP call
 const TEARDOWN_STEP_TIMEOUT_MS = 10000
 // Chat is handled one message at a time; a handler stuck longer than this (e.g. an action that
@@ -52,6 +55,8 @@ export class HyperfyService extends Service {
   private playerNamesMap: Map<string, string> = new Map()
   private appearanceIntervalId: NodeJS.Timeout | null = null
   private appearanceSet: boolean = false
+  /** How the avatar ended for this connection; emotes may still be retried after it is settled. */
+  private avatarOutcome: { outcome: 'applied' | 'gave-up'; error?: string } | null = null
   private nameSet: boolean = false
 
   private connectionTime: number | null = null
@@ -152,12 +157,19 @@ export class HyperfyService extends Service {
     this.wsUrl = config.wsUrl
     this._currentWorldId = config.worldId
     this.appearanceSet = false
+    this.avatarOutcome = null
     this.nameSet = false
 
     try {
       const world: any = createNodeClientWorld()
       this.world = world
       const generation = this.connectionGeneration
+
+      // The engine's upload sends no session token and ignores the response, but the world only
+      // accepts uploads from an authenticated session. The token is read per call: the snapshot
+      // may issue a new one.
+      world.network.upload = (file: File) =>
+        uploadAsset(world.network, file, { authToken: storage.get('authToken') })
 
       // Registered before init so a socket that closes during init is not missed.
       let kickCode: string | null = null
@@ -336,132 +348,82 @@ export class HyperfyService extends Service {
   }
 
   /**
-   * Uploads the character's avatar model and associated emote animations,
-   * sets the avatar URL locally, updates emote hash mappings,
-   * and notifies the server of the new avatar.
-   * 
-   * This function handles all assets required for character expression and animation.
+   * Shows the agent's VRM (uploading it when the world does not have it yet) and prepares its emotes.
+   * 'gave-up' when retrying cannot help, e.g. the world only lets builders upload and custom avatars
+   * are off: the world's default avatar stays until the next connection. (The engine does not expose
+   * the customAvatars setting, so a later change in the world is only noticed on reconnect.)
+   * 'retry' also covers emotes that failed for a reason that may pass; the avatar is not redone then.
    */
-  private async uploadCharacterAssets(): Promise<{
-    success: boolean;
-    error?: string;
-  }> {
-    if (
-      !this.world ||
-      !this.world.entities?.player ||
-      !this.world.network ||
-      !this.world.assetsUrl
-    ) {
+  private async uploadCharacterAssets(): Promise<{ outcome: 'applied' | 'gave-up' | 'retry'; error?: string }> {
+    const world = this.world
+    const emoteManager = this.emoteManager
+    if (!world || !world.entities?.player || !world.network || !world.assetsUrl) {
       console.warn(
         "[Appearance] Cannot set avatar: World, player, network, or assetsUrl not ready."
       );
-      return { success: false, error: "Prerequisites not met" };
+      return { outcome: 'retry', error: "Prerequisites not met" };
+    }
+    const replaced = { outcome: 'retry', error: 'the connection was replaced' } as const
+
+    if (!this.avatarOutcome) {
+      const avatar = await this.applyAvatar(world);
+      if (this.world !== world) return replaced;
+      if (avatar.outcome === 'retry') return avatar;
+      this.avatarOutcome = avatar;
     }
 
-    const agentPlayer = this.world.entities.player;
-    const localAvatarPath = path.resolve(LOCAL_AVATAR_PATH);
-    let fileName = "";
-
-    try {
-      console.info(`[Appearance] Reading avatar file from: ${localAvatarPath}`);
-      const fileBuffer: Buffer = await fs.readFile(localAvatarPath);
-      fileName = path.basename(localAvatarPath);
-      const mimeType = fileName.endsWith(".vrm")
-        ? "model/gltf-binary"
-        : "application/octet-stream";
-
-      console.info(
-        `[Appearance] Uploading ${fileName} (${(fileBuffer.length / 1024).toFixed(2)} KB, Type: ${mimeType})...`
-      );
-
-      if (!crypto.subtle || typeof crypto.subtle.digest !== "function") {
-        throw new Error(
-          "crypto.subtle.digest is not available. Ensure Node.js version supports Web Crypto API."
-        );
-      }
-
-      const hash = await hashFileBuffer(fileBuffer);
-      const ext = fileName.split(".").pop()?.toLowerCase() || "vrm";
-      const fullFileNameWithHash = `${hash}.${ext}`;
-      const baseUrl = this.world.assetsUrl.replace(/\/$/, "");
-      const constructedHttpUrl = `${baseUrl}/${fullFileNameWithHash}`;
-
-      if (typeof this.world.network.upload !== "function") {
-        console.warn(
-          "[Appearance] world.network.upload function not found. Cannot upload."
-        );
-        return { success: false, error: "Upload function unavailable" };
-      }
-
-      try {
-        console.info(
-          `[Appearance] Uploading avatar to ${constructedHttpUrl}...`
-        );
-        const fileForUpload = new File([fileBuffer], fileName, {
-          type: mimeType,
-        });
-
-        const uploadPromise = this.world.network.upload(fileForUpload);
-        const timeoutPromise = new Promise((_resolve, reject) =>
-          setTimeout(() => reject(new Error("Upload timed out")), 30000)
-        );
-
-        await Promise.race([uploadPromise, timeoutPromise]);
-        console.info(`[Appearance] Avatar uploaded successfully.`);
-      } catch (uploadError: any) {
-        console.error(
-          `[Appearance] Avatar upload failed: ${uploadError.message}`,
-          uploadError.stack
-        );
-        return {
-          success: false,
-          error: `Upload failed: ${uploadError.message}`,
-        };
-      }
-
-      // Apply avatar locally
-      if (agentPlayer && typeof agentPlayer.setSessionAvatar === "function") {
-        agentPlayer.setSessionAvatar(constructedHttpUrl);
-      } else {
-        console.warn(
-          "[Appearance] agentPlayer.setSessionAvatar not available."
-        );
-      }
-
-      // Upload emotes
-      await this.emoteManager.uploadEmotes();
-
-      // Notify server
-      if (typeof this.world.network.send === "function") {
-        this.world.network.send("playerSessionAvatar", {
-          avatar: constructedHttpUrl,
-        });
-        console.info(
-          `[Appearance] Sent playerSessionAvatar with: ${constructedHttpUrl}`
-        );
-      } else {
-        console.error(
-          "[Appearance] Upload succeeded but world.network.send is not available."
-        );
-      }
-
-      return { success: true };
-    } catch (error: any) {
-      if (error.code === "ENOENT") {
-        console.error(
-          `[Appearance] Avatar file not found at ${localAvatarPath}. CWD: ${process.cwd()}`
-        );
-      } else {
-        console.error(
-          "[Appearance] Unexpected error during avatar process:",
-          error.message,
-          error.stack
-        );
-      }
-      return { success: false, error: error.message };
-    }
+    const emotesReady = await emoteManager.uploadEmotes();
+    if (this.world !== world) return replaced;
+    if (!emotesReady) return { outcome: 'retry', error: "some emotes are not available yet" };
+    return this.avatarOutcome;
   }
 
+  private async applyAvatar(world: any): Promise<AvatarResult> {
+    const localAvatarPath = path.resolve(LOCAL_AVATAR_PATH);
+    const fileName = path.basename(localAvatarPath);
+    let buffer: Buffer;
+    try {
+      buffer = await fs.readFile(localAvatarPath);
+    } catch (error: any) {
+      console.error(
+        `[Appearance] Cannot read the avatar file at ${localAvatarPath} (CWD: ${process.cwd()}): ${error.message}`
+      );
+      return { outcome: 'gave-up', error: error.message };
+    }
+
+    console.info(`[Appearance] Preparing avatar ${fileName} (${(buffer.length / 1024).toFixed(2)} KB)...`);
+    const result = await ensureAsset(world, {
+      buffer,
+      name: fileName,
+      type: fileName.endsWith(".vrm") ? "model/gltf-binary" : "application/octet-stream",
+    });
+    if (result.ok === false) {
+      const { error } = result;
+      if (!result.retryable) {
+        const hint = (error as AssetUploadError).status === 403
+          ? " A world admin can allow it by turning on custom avatars in the world settings."
+          : "";
+        console.warn(
+          `[Appearance] The world refused the avatar upload (${error.message}). Keeping the default avatar for this connection.${hint}`
+        );
+        return { outcome: 'gave-up', error: error.message };
+      }
+      console.error(`[Appearance] Avatar not available yet: ${error.message}`);
+      return { outcome: 'retry', error: error.message };
+    }
+    console.info(`[Appearance] Avatar ${result.uploaded ? "uploaded" : "already on the server"}: ${result.url}`);
+
+    // A destroyed world has no socket to send it on
+    if (this.world !== world) return { outcome: 'retry', error: 'the connection was replaced' };
+    const agentPlayer = world.entities.player;
+    if (typeof agentPlayer?.setSessionAvatar !== "function") {
+      console.warn("[Appearance] agentPlayer.setSessionAvatar not available.");
+      return { outcome: 'gave-up', error: "setSessionAvatar unavailable" };
+    }
+    // Applies it locally and sends it to the world as this session's avatar
+    agentPlayer.setSessionAvatar(result.url);
+    return { outcome: 'applied' };
+  }
 
   private startAppearancePolling(): void {
     if (this.appearanceIntervalId) clearInterval(this.appearanceIntervalId);
@@ -484,7 +446,9 @@ export class HyperfyService extends Service {
         return;
       }
 
-      const agentPlayer = this.world?.entities?.player; // Get player once
+      // Results that arrive after this connection was replaced must not touch the new one
+      const world = this.world;
+      const agentPlayer = world?.entities?.player; // Get player once
       const agentPlayerReady = !!agentPlayer;
       const agentPlayerId = agentPlayer?.data?.id;
       const agentPlayerIdReady = !!agentPlayerId;
@@ -504,12 +468,14 @@ export class HyperfyService extends Service {
 
           await this.runtime.updateEntity(entity)
         }
+        if (this.world !== world) return;
 
         // --- Set Name (if not already done) ---
         if (!pollingTasks.name) {
           console.info(`[Name Polling] Player (ID: ${agentPlayerId}), network ready. Attempting name...`);
           try {
             await this.changeName(this.runtime.character.name);
+            if (this.world !== world) return;
             this.nameSet = true; // Update global state
             pollingTasks.name = true; // Update local task tracker
             console.info(`[Name Polling] Initial name successfully set to "${this.runtime.character.name}".`);
@@ -522,13 +488,18 @@ export class HyperfyService extends Service {
         if (!pollingTasks.avatar && assetsUrlReady) {
           console.info(`[Appearance Polling] Player (ID: ${agentPlayerId}), network, assetsUrl ready. Attempting avatar upload and set...`);
           const result = await this.uploadCharacterAssets();
+          if (this.world !== world) return;
 
-          if (result.success) {
+          if (result.outcome !== 'retry') {
             this.appearanceSet = true; // Update global state
             pollingTasks.avatar = true; // Update local task tracker
-            console.info(`[Appearance Polling] Avatar setting process successfully completed.`);
+            console.info(
+              result.outcome === 'applied'
+                ? `[Appearance Polling] Avatar setting process successfully completed.`
+                : `[Appearance Polling] Keeping the default avatar for this connection: ${result.error}`
+            );
           } else {
-            console.warn(`[Appearance Polling] Avatar setting process failed: ${result.error || 'Unknown reason'}. Will retry...`);
+            console.warn(`[Appearance Polling] Not done yet: ${result.error || 'Unknown reason'}. Will retry...`);
           }
         } else if (!pollingTasks.avatar) {
           console.debug(`[Appearance Polling] Waiting for: Assets URL (${assetsUrlReady})...`);
@@ -628,6 +599,7 @@ export class HyperfyService extends Service {
     this.playerNamesMap.clear()
     this.wsUrl = null
     this.appearanceSet = false
+    this.avatarOutcome = null
 
     this.processedMsgIds.clear()
 

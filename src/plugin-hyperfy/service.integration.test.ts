@@ -250,3 +250,54 @@ describe('HyperfyService chat queue limits', () => {
     expect(handled).toEqual(['first']);
   });
 });
+
+describe('HyperfyService appearance', () => {
+  const fakeWorld = () => ({ entities: { player: {} }, network: {}, assetsUrl: 'https://world.test/assets' });
+
+  it('ignores an avatar result from a connection that was replaced meanwhile', async () => {
+    const { service } = createRuntime();
+    let finish!: (result: unknown) => void;
+    vi.spyOn(service as any, 'applyAvatar').mockImplementation(() => new Promise((resolve) => (finish = resolve)));
+    const uploadEmotes = vi.fn().mockResolvedValue(true);
+    (service as any).world = fakeWorld();
+    (service as any).emoteManager = { uploadEmotes };
+
+    const pending = (service as any).uploadCharacterAssets();
+    (service as any).world = fakeWorld(); // reconnected while the old upload was still running
+    finish({ outcome: 'gave-up', error: 'upload requires a connected session' });
+
+    expect(await pending).toMatchObject({ outcome: 'retry' });
+    expect((service as any).avatarOutcome).toBeNull();
+    expect(uploadEmotes).not.toHaveBeenCalled();
+  });
+
+  it('retries only the emotes once the avatar is settled', async () => {
+    const { service } = createRuntime();
+    const applyAvatar = vi.spyOn(service as any, 'applyAvatar').mockResolvedValue({ outcome: 'applied' });
+    const uploadEmotes = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    (service as any).world = fakeWorld();
+    (service as any).emoteManager = { uploadEmotes };
+
+    expect(await (service as any).uploadCharacterAssets()).toMatchObject({ outcome: 'retry' });
+    expect(await (service as any).uploadCharacterAssets()).toEqual({ outcome: 'applied' });
+    expect(applyAvatar).toHaveBeenCalledTimes(1);
+    expect(uploadEmotes).toHaveBeenCalledTimes(2);
+  });
+
+  it('stops polling once the world has refused the avatar for good', async () => {
+    const { service } = createRuntime();
+    const player = { data: { id: 'p1', name: 'Coo' }, modify: vi.fn() };
+    (service as any).world = { entities: { player }, network: { id: 'n1', send: vi.fn() }, assetsUrl: 'https://world.test/assets' };
+    const upload = vi
+      .spyOn(service as any, 'uploadCharacterAssets')
+      .mockResolvedValue({ outcome: 'gave-up', error: 'builder rank required' });
+
+    (service as any).startAppearancePolling();
+    try {
+      await vi.waitFor(() => expect((service as any).appearanceSet).toBe(true));
+      expect(upload).toHaveBeenCalledTimes(1);
+    } finally {
+      (service as any).stopAppearancePolling();
+    }
+  });
+});
