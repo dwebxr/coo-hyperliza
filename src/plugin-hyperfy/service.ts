@@ -25,6 +25,7 @@ import { BuildManager } from './managers/build-manager.js'
 import { getModuleDirectory } from './utils'
 import { ReconnectController } from './lib/reconnect'
 import { type AssetUploadError, ensureAsset, uploadAsset } from './lib/asset-upload'
+import { PROTOCOL_VERSION, adaptToWorldProtocol } from './lib/world-protocol'
 import { storage } from './hyperfy/src/core/storage.js'
 
 const moduleDirPath = getModuleDirectory();
@@ -164,6 +165,9 @@ export class HyperfyService extends Service {
       const world: any = createNodeClientWorld()
       this.world = world
       const generation = this.connectionGeneration
+
+      // The engine's packet table, encoding and socket URL predate the world's protocol version
+      adaptToWorldProtocol(world.network, () => storage.get('authToken'))
 
       // The engine's upload sends no session token and ignores the response, but the world only
       // accepts uploads from an authenticated session. The token is read per call: the snapshot
@@ -310,7 +314,8 @@ export class HyperfyService extends Service {
     // Classify before any await so every retry path (this one, a failed connect, a failed
     // reconnect) sees the policy. A kick sent right before the close is still sitting in the
     // network queue, which is only flushed on the next tick.
-    const kick = kickCode ?? findQueuedKick(world)
+    // The close reason also carries 'outdated', in case the kick packet itself was unreadable
+    const kick = kickCode ?? findQueuedKick(world) ?? (reason?.reason === 'outdated' ? 'outdated' : null)
     if (kick === 'duplicate_user') {
       // The server rejects the newer connection, so retrying never disturbs the other session;
       // it just lets us rejoin once that session leaves.
@@ -318,6 +323,13 @@ export class HyperfyService extends Service {
       this.reconnectController.deferNextRetry()
     } else if (kick === 'player_limit') {
       console.warn('[Hyperfy Reconnect] World is full. Waiting the maximum delay before retrying.')
+      this.reconnectController.deferNextRetry()
+    } else if (kick === 'outdated') {
+      // Retrying cannot help until the agent is updated; keep it slow
+      console.error(
+        `[Hyperfy Reconnect] The world requires a newer protocol than this agent speaks (v${PROTOCOL_VERSION}). ` +
+        `Update src/plugin-hyperfy/lib/world-protocol.ts to match the world's src/core/packets.js. Retrying at the maximum delay.`
+      )
       this.reconnectController.deferNextRetry()
     }
 
