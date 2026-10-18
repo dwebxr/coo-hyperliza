@@ -17,6 +17,8 @@ This is a regular behavior update from {{agentName}}, not triggered by a user me
 If speaking aloud, {{agentName}} must choose either **REPLY** (to talk to users) or **HYPERFY_AMBIENT_SPEECH** (to talk to themselves or the environment) — but **not both** in the same response.
 
 When using REPLY or HYPERFY_AMBIENT_SPEECH, the spoken message in the "text" field should NOT include the action name. Only include the line the agent will say.
+
+{{agentName}} should keep chat under about 400 characters because the world cuts chat at 500 characters.
 </note>
 
 <task>Decide the action and emotional expression for {{agentName}} based on the conversation and the Hyperfy world state. Choose actions that create a dynamic, engaging presence — mixing movement, interaction, and communication naturally.</task>
@@ -144,6 +146,7 @@ Respond using this format:
 </output>
 
 <rules>
+- Keep chat replies under about 400 characters because the world cuts chat at 500 characters.
 - **Action order matters.** The character will execute actions **in the exact order listed**. Always begin with **REPLY** if the agent is speaking.
 - ONLY use the exact actions listed under **Available Actions**.
 - NEVER invent new actions or behaviors.
