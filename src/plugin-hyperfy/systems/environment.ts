@@ -52,7 +52,7 @@ export class AgentEnvironment extends System {
       fogColor: null,
     }
     this.buildCSM()
-    this.updateSky()
+    this.refreshSky()
 
     this.world.settings.on('change', this.onSettingsChange)
     // this.world.prefs.on('change', this.onPrefsChange)
@@ -75,16 +75,30 @@ export class AgentEnvironment extends System {
         const idx = this.skys.indexOf(handle)
         if (idx === -1) return
         this.skys.splice(idx, 1)
-        this.updateSky()
+        this.refreshSky()
       },
     }
     this.skys.push(handle)
-    this.updateSky()
+    this.refreshSky()
     return handle
   }
 
   getSky() {
     return this.sky
+  }
+
+  /** updateSky without an unhandled rejection: a disconnect closes the page it draws on mid-call. */
+  private refreshSky() {
+    this.updateSky().catch(error => this.reportRenderError('sky', error))
+  }
+
+  private reportRenderError(what: string, error: any) {
+    // Expected while the connection is torn down; anything else is worth a warning
+    if (error?.name === 'TargetCloseError') {
+      console.debug(`[Environment] ${what} update stopped: the render page was closed`)
+    } else {
+      console.warn(`[Environment] Could not update the ${what}:`, error?.message || error)
+    }
   }
 
   async updateSky() {
@@ -210,14 +224,14 @@ export class AgentEnvironment extends System {
 
   onSettingsChange = (changes: Record<string, any>) => {
     if (changes.model) {
-      this.updateModel()
+      this.updateModel().catch(error => this.reportRenderError('model', error))
     }
   }
 
   onPrefsChange = (changes: Record<string, any>) => {
     if (changes.shadows) {
       this.buildCSM()
-      this.updateSky()
+      this.refreshSky()
     }
   }
 

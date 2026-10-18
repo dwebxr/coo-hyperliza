@@ -1,4 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { inspect } from 'node:util';
+
+const { TOKEN } = vi.hoisted(() => ({ TOKEN: 'test-protocol-session-token' }));
+// Never read the agent's saved session during connection tests.
+vi.mock('./hyperfy/src/core/storage.js', () => ({
+  storage: { get: (key: string) => key === 'authToken' ? TOKEN : null, set: () => {}, remove: () => {} },
+}));
 
 // Chromium is not needed to exercise the connection lifecycle.
 vi.mock('./managers/puppeteer-manager', () => {
@@ -55,8 +62,62 @@ describe('HyperfyService connection lifecycle (offline)', () => {
   let service: HyperfyService | null = null;
 
   afterEach(async () => {
-    await service?.stop();
-    service = null;
+    try {
+      await service?.stop();
+    } finally {
+      service = null;
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('installs the world protocol before init and safely defers an outdated disconnect', async () => {
+    const logs = (['log', 'warn', 'error', 'info', 'debug'] as const)
+      .map((method) => vi.spyOn(console, method).mockImplementation(() => {}));
+    const sockets: FakeWebSocket[] = [];
+    class FakeWebSocket {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      readyState = FakeWebSocket.CONNECTING;
+      binaryType = '';
+      listeners = new Map<string, Set<(event: any) => void>>();
+      constructor(readonly url: string) {
+        sockets.push(this);
+        queueMicrotask(() => {
+          this.readyState = 3;
+          const event = { code: 1008, reason: 'outdated', wasClean: false, target: this };
+          for (const listener of this.listeners.get('close') ?? []) listener(event);
+        });
+      }
+      addEventListener(type: string, listener: (event: any) => void) {
+        if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+        this.listeners.get(type)!.add(listener);
+      }
+      removeEventListener(type: string, listener: (event: any) => void) {
+        this.listeners.get(type)?.delete(listener);
+      }
+      close() {
+        this.readyState = 3;
+      }
+    }
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    vi.stubGlobal('self', globalThis.self);
+    ({ service } = createRuntime());
+    const controller = (service as any).reconnectController;
+    const schedule = vi.spyOn(controller, 'schedule');
+
+    await service.connect({ ...UNREACHABLE, wsUrl: 'wss://world.test/ws?v=1&v=0#hash' }).catch(() => {});
+    await vi.waitFor(() => expect(controller.isPending).toBe(true), { timeout: 15_000, interval: 50 });
+
+    expect(sockets).toHaveLength(1);
+    const url = new URL(sockets[0].url);
+    expect(url.searchParams.getAll('v')).toEqual(['2']);
+    expect(url.searchParams.getAll('authToken')).toEqual([TOKEN]);
+    expect(schedule).toHaveReturnedWith(RECONNECT_MAX_DELAY_MS);
+    expect(controller.isStopped).toBe(false);
+    expect(service.getWorld()).toBeNull();
+    await service.stop();
+    for (const log of logs) expect(inspect(log.mock.calls, { depth: null })).not.toContain(TOKEN);
   });
 
   it('tears down and schedules a backoff reconnect when the socket closes', async () => {
@@ -112,7 +173,7 @@ describe('HyperfyService kick policy', () => {
     return { service, controller: (service as any).reconnectController };
   }
 
-  it.each(['duplicate_user', 'player_limit'])('keeps retrying, at the maximum delay, after a %s kick', async (code) => {
+  it.each(['duplicate_user', 'player_limit', 'outdated'])('keeps retrying, at the maximum delay, after a %s kick', async (code) => {
     const { service, controller } = await disconnectWithQueuedKick(code);
     expect(controller.isStopped).toBe(false);
     expect(controller.isPending).toBe(true);
@@ -122,7 +183,23 @@ describe('HyperfyService kick policy', () => {
     await service.stop();
   });
 
-  it.each(['duplicate_user', 'player_limit'])('applies the %s delay even when another path schedules first', async (code) => {
+  it("treats a close with reason 'outdated' as that kick even when the kick packet was not read", async () => {
+    const { service } = createRuntime();
+    const controller = (service as any).reconnectController;
+    const world = { network: { queue: [] }, livekit: null, destroy: vi.fn() };
+    (service as any).world = world;
+    (service as any).lastConnectConfig = UNREACHABLE;
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const handling = (service as any).onWorldDisconnect(world, { code: 1008, reason: 'outdated', wasClean: false }, null);
+    expect(controller.schedule()).toBe(RECONNECT_MAX_DELAY_MS);
+    await handling;
+    expect(String(error.mock.calls[0]?.[0])).toContain('newer protocol');
+    error.mockRestore();
+    await service.stop();
+  });
+
+  it.each(['duplicate_user', 'player_limit', 'outdated'])('applies the %s delay even when another path schedules first', async (code) => {
     const { service } = createRuntime();
     const controller = (service as any).reconnectController;
     const world = { network: { queue: [['onKick', code]] }, livekit: null, destroy: vi.fn() };
