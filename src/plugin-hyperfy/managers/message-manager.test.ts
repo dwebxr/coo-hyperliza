@@ -32,6 +32,48 @@ describe('MessageManager.formatMessages', () => {
 });
 
 describe('MessageManager.sendMessage', () => {
+  function createChat() {
+    const send = vi.fn();
+    const add = vi.fn((msg, broadcast) => {
+      if (broadcast) send('chatAdded', msg);
+    });
+    const world = {
+      chat: { add },
+      entities: { player: { data: { id: 'me', name: 'Coo' } } },
+    };
+    const runtime: any = {
+      character: { templates: {} },
+      getService: () => ({ isConnected: () => true, getWorld: () => world, getEntityName: () => 'Coo' }),
+    };
+    return { manager: new MessageManager(runtime), add, send };
+  }
+
+  it('broadcasts a long reply as separate chatAdded messages in order', async () => {
+    const { manager, add, send } = createChat();
+    const parts = ['a'.repeat(500), 'b'.repeat(500), 'c'.repeat(250)];
+    await expect(manager.sendMessage(parts.join(''))).resolves.toBe(true);
+    expect(add).toHaveBeenCalledTimes(3);
+    expect(send).toHaveBeenCalledTimes(3);
+    const messages = send.mock.calls.map(([event, msg], index) => {
+      expect(event).toBe('chatAdded');
+      expect(msg.body).toBe(parts[index]);
+      expect(msg.body.length).toBeLessThanOrEqual(500);
+      expect(msg.fromId).toBe('me');
+      expect(msg.from).toBe('Coo');
+      expect(Number.isNaN(Date.parse(msg.createdAt))).toBe(false);
+      expect(add).toHaveBeenNthCalledWith(index + 1, msg, true);
+      return msg;
+    });
+    expect(new Set(messages.map((msg) => msg.id)).size).toBe(3);
+  });
+
+  it.each(['', ' \t\r\n　'])('does not post an empty or whitespace reply (%j)', async (text) => {
+    const { manager, add, send } = createChat();
+    await expect(manager.sendMessage(text)).resolves.toBe(false);
+    expect(add).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it('returns false instead of throwing when not connected', async () => {
     const runtime: any = {
       character: { templates: {} },
@@ -50,6 +92,21 @@ describe('MessageManager.sendMessage', () => {
       getService: () => ({ isConnected: () => true, getWorld: () => world, getEntityName: () => 'Coo' }),
     };
     await expect(new MessageManager(runtime).sendMessage('hi')).resolves.toBe(false);
+  });
+
+  it('leaves the first chunk posted and returns false when chat.add throws on the second', async () => {
+    const { manager, add, send } = createChat();
+    add.mockImplementationOnce((msg, broadcast) => {
+      if (broadcast) send('chatAdded', msg);
+    }).mockImplementationOnce(() => { throw new Error('second chunk failed'); });
+    const parts = ['a'.repeat(500), 'b'.repeat(500), 'c'.repeat(250)];
+
+    await expect(manager.sendMessage(parts.join(''))).resolves.toBe(false);
+
+    expect(add).toHaveBeenCalledTimes(2);
+    expect(add).toHaveBeenNthCalledWith(2, expect.objectContaining({ body: parts[1] }), true);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith('chatAdded', expect.objectContaining({ body: parts[0] }));
   });
 });
 
@@ -87,6 +144,15 @@ describe('MessageManager stale turns', () => {
     await callback({ text: 'Hello!' });
     expect(sendMessage).toHaveBeenCalledWith('Hello!');
     expect(speak).toHaveBeenCalledWith('Hello!');
+  });
+
+  it('passes the full original reply to voice even when chat needs splitting', async () => {
+    const { callback, sendMessage, speak } = await receiveAndCaptureCallback();
+    const text = 'Hello! '.repeat(400);
+    await callback({ text });
+    expect(sendMessage).toHaveBeenCalledWith(text);
+    expect(speak).toHaveBeenCalledTimes(1);
+    expect(speak).toHaveBeenCalledWith(text);
   });
 
   it.each([

@@ -4,6 +4,7 @@ import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
 import { countOtherPlayers } from "../utils";
 import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
+import { splitChatText } from "../lib/chat-chunks";
 import { isOpenPayLink } from "../../openpay-store";
 import moment from 'moment'
 import { uuid } from '../hyperfy/src/core/utils';
@@ -166,17 +167,21 @@ export class MessageManager {
   }
 
   /**
-   * Posts to world chat. Never throws (callers fire and forget); returns false on failure.
+   * Posts to world chat. Never throws (callers fire and forget); returns false if empty or on failure.
+   * If posting fails partway through, earlier chunks have already been posted and are not rolled back.
    */
   async sendMessage(text: string): Promise<boolean> {
-    const service = this.runtime.getService<HyperfyService>(HyperfyService.serviceType);
-    const world = service?.getWorld();
-    if (!service?.isConnected() || !world?.chat || !world?.entities?.player) {
-      console.error('HyperfyService: Cannot send message. Not ready.')
-      return false
-    }
-
     try {
+      const chunks = splitChatText(text);
+      if (!chunks.length) return false;
+
+      const service = this.runtime.getService<HyperfyService>(HyperfyService.serviceType);
+      const world = service?.getWorld();
+      if (!service?.isConnected() || !world?.chat || !world?.entities?.player) {
+        console.error('HyperfyService: Cannot send message. Not ready.')
+        return false
+      }
+
       const agentPlayerId = world.entities.player.data.id
       const agentPlayerName = service.getEntityName(agentPlayerId) || world.entities.player.data?.name || 'Hyperliza'
 
@@ -186,16 +191,18 @@ export class MessageManager {
         throw new Error('world.chat.add is not a function')
       }
 
-      world.chat.add(
-        {
-          id: uuid(),
-          body: text,
-          fromId: agentPlayerId,
-          from: agentPlayerName,
-          createdAt: moment().toISOString()
-        },
-        true
-      )
+      for (const body of chunks) {
+        world.chat.add(
+          {
+            id: uuid(),
+            body,
+            fromId: agentPlayerId,
+            from: agentPlayerName,
+            createdAt: moment().toISOString()
+          },
+          true
+        )
+      }
       return true
     } catch (error: any) {
       console.error('Error sending Hyperfy message:', error.message, error.stack)
