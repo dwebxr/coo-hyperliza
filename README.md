@@ -1,6 +1,6 @@
 # Coo Hyperliza
 
-An ElizaOS + Hyperfy 3D world integration agent. An AI agent that autonomously acts and can have voice conversations within Hyperfy VR worlds, with Discord integration for community engagement.
+An ElizaOS + Hyperfy 3D world integration agent. An AI agent that autonomously acts and can have voice conversations within Hyperfy VR worlds, writes with Claude, and can work as a shop clerk for OpenPay Store.
 
 ## Features
 
@@ -11,37 +11,28 @@ An ElizaOS + Hyperfy 3D world integration agent. An AI agent that autonomously a
 - **Cheaper Reply Decisions**: Messages that mention the agent's name or an alias (see `HYPERFY_AGENT_ALIASES`) skip the "should I respond?" LLM check
 
 ### Voice Features
-- **ElevenLabs TTS**: High-quality voice synthesis for agent speech
-- **OpenAI TTS Fallback**: Uses OpenAI TTS when ElevenLabs is unavailable
-- **LiveKit Audio Streaming**: Real-time audio delivery to Hyperfy world
+- **ElevenLabs TTS and speech-to-text**: High-quality voice output, and voice input from players
+- **OpenAI TTS Fallback**: Uses OpenAI TTS when ElevenLabs is unavailable (optional)
+- **LiveKit Audio Streaming**: Real-time audio delivery to the Hyperfy world
 
 ### Avatar Features
-- **VRM Avatar Support**: Use custom VRM avatars
+- **VRM Avatar Support**: Use a custom VRM avatar (`src/plugin-hyperfy/public/avatars/avatar.vrm`). The world must allow it: see "Avatar Not Shown" below
 - **Emote System**: Play animations based on emotions
-- **Talking Gesture**: Plays the TALK animation while speaking. The mouth does not move: Hyperfy clients have no lip sync. A custom clip at `src/plugin-hyperfy/public/emotes/emote-talk.glb` replaces the world's own.
+- **Talking Gesture and Lip Sync**: Plays the TALK animation while speaking. The mouth is moved by the world's own client from the agent's voice (coo-world supports this); nothing is needed on the agent side. A custom clip at `src/plugin-hyperfy/public/emotes/emote-talk.glb` replaces the world's talking gesture
+- **Walking Animations**: Uses the agent's own walk/run/idle clips when the world has them or lets the agent upload them; otherwise the world's own clips (Hyperfy's `mp-*` set), sped up to match the agent's movement
 
 ### Autonomous Actions
 - **Walking Around**: Freely move around the world
 - **Approaching Players**: Walk towards nearby players
 - **Item Usage**: Interact with objects in the world
-- **Conversation**: Text chat and voice conversations
-
-### Discord Integration
-- **Auto-Reply**: Automatically responds to mentions and messages
-- **Scheduled Posts**: Posts daily updates to a configured channel
-- **Community Engagement**: Participates in server conversations
-
-### Twitter/X Integration
-- **Daily Posts**: Posts once per day automatically
-- **Reply to Mentions**: Responds to mentions and replies
-- **Free Plan Optimized**: Conservative API usage for Twitter Free tier
+- **Conversation**: Text chat and voice conversations. The world cuts chat messages at 500 characters, so longer replies are posted as up to four messages; text beyond that ends with an ellipsis
 
 ## Setup
 
 ### 1. Clone the Repository
 
 ```bash
-git clone --recurse-submodules https://github.com/your-repo/coo-hyperliza.git
+git clone --recurse-submodules https://github.com/dwebxr/coo-hyperliza.git
 cd coo-hyperliza
 ```
 
@@ -57,43 +48,29 @@ Edit the `.env` file and set the required values:
 # Hyperfy Connection
 WS_URL=wss://your-hyperfy-world.xyz/ws
 
-# Database (PostgreSQL recommended)
+# Database (PostgreSQL, required)
 POSTGRES_URL=postgresql://localhost:5432/eliza_hyperfy
 
-# LLM API (Claude by default; see "Model Selection")
+# Claude (required; see "Model Selection")
 ANTHROPIC_API_KEY=your-anthropic-api-key
 
-# ElevenLabs TTS (optional)
+# ElevenLabs voice (optional)
 ELEVENLABS_XI_API_KEY=your-elevenlabs-api-key
 ELEVENLABS_VOICE_ID=your-voice-id
 ELEVENLABS_MODEL_ID=eleven_flash_v2_5
 ELEVENLABS_OUTPUT_FORMAT=mp3_44100_128
 
-# Discord (optional)
-DISCORD_APPLICATION_ID=your-application-id
-DISCORD_API_TOKEN=your-bot-token
-DISCORD_POST_CHANNEL_ID=channel-id-for-auto-posts
-DISCORD_POST_INTERVAL_HOURS=24
-DISCORD_ENABLE_AUTO_POST=true
-
-# Twitter/X (optional - OAuth 1.0a credentials)
-TWITTER_API_KEY=your-api-key
-TWITTER_API_SECRET_KEY=your-api-secret
-TWITTER_ACCESS_TOKEN=your-access-token
-TWITTER_ACCESS_TOKEN_SECRET=your-access-token-secret
-TWITTER_ENABLE_POST=true
-TWITTER_ENABLE_REPLIES=true
-TWITTER_POST_INTERVAL=1440
-
-# Server Settings
+# Server Settings (127.0.0.1 = reachable from this machine only)
 SERVER_PORT=3001
+SERVER_HOST=127.0.0.1
 ```
 
-> **Security**: `localstorage.json` holds the agent's Hyperfy auth token. Never commit it.
+> **Security**: `localstorage.json` holds the agent's Hyperfy auth token. Never commit it, and never paste logs that contain it.
+> The web UI / API has no authentication unless `ELIZA_SERVER_AUTH_TOKEN` is set (clients send it as `X-API-KEY`). Keep `SERVER_HOST=127.0.0.1` unless remote access is needed; before binding to `0.0.0.0`, set the token and restrict network access.
 
-### 3. Setup PostgreSQL (Optional)
+### 3. Set Up PostgreSQL (Required)
 
-To use PostgreSQL locally:
+The embedded PGLite database does not start alongside the Hyperfy engine (the engine's browser-like globals make PGLite think it runs in a browser), so use PostgreSQL:
 
 ```bash
 # For macOS
@@ -107,9 +84,10 @@ createdb eliza_hyperfy
 ### 4. Install Dependencies
 
 ```bash
-bun install
-bun install  # Run twice to ensure postinstall scripts execute correctly
+bun install --frozen-lockfile
 ```
+
+`bun.lock` is committed so installs get exactly the audited dependency versions (Bun 1.2 or newer reads it). The project's own postinstall step (custom CSS for the web UI) runs automatically; rerun it with `bun run postinstall` if needed. Bun runs dependencies' install scripts only for [trusted packages](https://bun.sh/docs/pm/lifecycle).
 
 ### 5. Install ffmpeg (Required for Voice Features)
 
@@ -141,27 +119,28 @@ When using ElevenLabs, set the following in `.env`:
 | `ELEVENLABS_VOICE_SIMILARITY_BOOST` | Similarity boost (0-1) | `0.9` |
 | `ELEVENLABS_VOICE_STYLE` | Style (0-1) | `0.66` |
 | `ELEVENLABS_VOICE_USE_SPEAKER_BOOST` | Speaker boost (enabled only when set to exactly `true`) | off |
+| `ELEVENLABS_STT_MODEL_ID` | Speech-to-text model for voice input | `scribe_v2` |
+| `ELEVENLABS_STT_LANGUAGE_CODE` | Speech-to-text language (e.g. `ja`) | auto-detect |
+| `OPENAI_API_KEY`, `OPENAI_TTS_MODEL`, `OPENAI_TTS_VOICE` | Optional OpenAI TTS fallback (called directly) | -, `tts-1`, `nova` |
 
 ### Model Selection
 
-`LLM_PROVIDER` picks which plugin generates text: `anthropic`, `openai`, `ollama` or `groq` (an unknown value stops startup with an error). Left empty, Claude is used when `ANTHROPIC_API_KEY` is set. Other model plugins stay loaded for what they provide, but never take over text generation from the chosen one.
+Coo writes with Claude only. `ANTHROPIC_API_KEY` is required, and `LLM_PROVIDER`, if set, must be `anthropic`; anything else stops startup with a clear error instead of starting an agent that cannot reply.
 
 | Job | Provided by |
 |---|---|
-| Replies, decisions, JSON extraction, describing what the agent sees | The `LLM_PROVIDER` (Claude by default) |
-| Speech output (TTS) | ElevenLabs (`ELEVENLABS_XI_API_KEY`), with OpenAI as an optional fallback |
-| Voice input (speech-to-text) | ElevenLabs, called directly (the key needs the `speech_to_text` permission; model `ELEVENLABS_STT_MODEL_ID`, default `scribe_v2`, optional `ELEVENLABS_STT_LANGUAGE_CODE`), else the registered TRANSCRIPTION model |
-| Embeddings | Optional (OpenAI or Ollama). Nothing in this agent searches memories by embedding, so replies work without them |
+| Replies, decisions, JSON extraction, describing what the agent sees | Claude |
+| Speech output (TTS) | ElevenLabs (`ELEVENLABS_XI_API_KEY`), with OpenAI TTS as an optional fallback |
+| Voice input (speech-to-text) | ElevenLabs (the key needs the `speech_to_text` permission) |
+| Embeddings | None. Nothing in this agent searches memories by embedding, so replies work without them |
 
-**Anthropic (default when `ANTHROPIC_API_KEY` is set and `LLM_PROVIDER` is unset)** - handled by `src/anthropic-models.ts` with the official SDK, because `@elizaos/plugin-anthropic` sends `temperature` (rejected by current Claude models) and defaults to retired model IDs.
+Claude is called by `src/anthropic-models.ts` with the official SDK, because `@elizaos/plugin-anthropic` sends `temperature` (rejected by current Claude models) and defaults to retired model IDs.
 
 | Variable | Default | Notes |
 |---|---|---|
 | `ANTHROPIC_SMALL_MODEL` | `claude-haiku-5-5` | "Should I respond?" checks, small JSON extractions |
 | `ANTHROPIC_LARGE_MODEL` | `claude-haiku-5-5` | Replies and autonomous actions; `claude-sonnet-5-5` for higher quality at ~20x the cost |
-| `ANTHROPIC_EFFORT` | `low` | `low` / `medium` / `high`; higher is slower and more expensive |
-
-**Ollama** - set `LLM_PROVIDER=ollama`; models come from `OLLAMA_API_ENDPOINT`, `OLLAMA_SMALL_MODEL` and `OLLAMA_LARGE_MODEL` (`OLLAMA_MODEL` is not read by the plugin). Requires a running Ollama server.
+| `ANTHROPIC_EFFORT` | `low` | `low` / `medium` / `high` / `xhigh` / `max`; higher is slower and more expensive |
 
 ### OpenPay Store Shop Clerk
 
@@ -169,40 +148,19 @@ Coo can act as a shop clerk for [OpenPay Store](https://open-pay.jp/ja/store): i
 
 | Variable | Default | Notes |
 |---|---|---|
-| `OPENPAY_STORE_HANDLES` | (off) | Comma-separated seller handles to sell (e.g. `alice,bob`), or `*` for every Store product |
+| `OPENPAY_STORE_HANDLES` | (off) | Comma-separated seller handles to sell (e.g. `alice,bob`; up to 100 products each), or `*` for products from every seller (up to 100 in total) |
 | `OPENPAY_STORE_LOCALE` | `ja` | Language of the purchase pages (`ja` / `en`) |
 | `OPENPAY_STORE_API_URL` | `https://open-pay.jp/api/store/listings` | Listings API (purchase links are only accepted on this origin) |
 
-Products are refreshed every 5 minutes in the background; prompts never wait on the API. In Hyperfy the reply names the product by id; on Discord (whose reply format has no product id) a link is shared only when the reply or message names the product unambiguously.
+The catalog loads at startup and, once it is more than 5 minutes old, refreshes in the background the next time it is used (with retry backoff after failures); prompts never wait on the API. Prompts show up to 12 products. The reply names the product by id or an unambiguous title, and the `OPENPAY_SHARE_PRODUCT` action posts the purchase URL from the validated catalog record (only URLs on the API's origin are accepted).
 
 ### Agent Aliases
 
 `HYPERFY_AGENT_ALIASES` is a comma-separated list of extra names the agent answers to (e.g. `クー`). A message containing the agent's name or one of these aliases skips the "should I respond?" LLM check. The check is also skipped when the agent is 1-on-1 with a single player.
 
-### Discord Settings
+### World Compatibility
 
-| Environment Variable | Description | Default |
-|---------------------|-------------|---------|
-| `DISCORD_APPLICATION_ID` | Discord application ID | - |
-| `DISCORD_API_TOKEN` | Discord bot token | - |
-| `DISCORD_POST_CHANNEL_ID` | Channel ID for auto-posts | - |
-| `DISCORD_POST_INTERVAL_HOURS` | Hours between auto-posts | `24` |
-| `DISCORD_ENABLE_AUTO_POST` | Enable auto-posting | `true` |
-
-### Twitter/X Settings (Free Plan Optimized)
-
-| Environment Variable | Description | Default |
-|---------------------|-------------|---------|
-| `TWITTER_API_KEY` | OAuth 1.0a API Key | - |
-| `TWITTER_API_SECRET_KEY` | OAuth 1.0a API Secret | - |
-| `TWITTER_ACCESS_TOKEN` | OAuth 1.0a Access Token | - |
-| `TWITTER_ACCESS_TOKEN_SECRET` | OAuth 1.0a Access Secret | - |
-| `TWITTER_ENABLE_POST` | Enable posting | `true` |
-| `TWITTER_ENABLE_REPLIES` | Enable reply to mentions | `true` |
-| `TWITTER_ENABLE_ACTIONS` | Enable likes/retweets | `false` |
-| `TWITTER_POST_INTERVAL` | Minutes between posts | `1440` (24h) |
-| `TWITTER_MAX_ENGAGEMENTS_PER_RUN` | Max replies per cycle | `3` |
-| `TWITTER_DRY_RUN` | Test without posting | `false` |
+The agent's Hyperfy engine (the `src/plugin-hyperfy/hyperfy` submodule) is older than coo-world, so `src/plugin-hyperfy/lib/world-protocol.ts` makes it speak coo-world's network protocol (protocol version, packet table, plain msgpack encoding), and `src/plugin-hyperfy/lib/asset-upload.ts` uploads assets with the session token the world requires.
 
 ### Adjusting Autonomous Behavior
 
@@ -219,9 +177,12 @@ const TIME_INTERVAL_IDLE_MAX = 120000;// Max interval in idle mode (ms)
 
 ```
 src/
-├── discord/
-│   └── discord-auto-post.ts    # Discord scheduled posting
 ├── plugin-hyperfy/
+│   ├── lib/
+│   │   ├── world-protocol.ts    # coo-world network protocol for the older engine
+│   │   ├── asset-upload.ts      # Authenticated avatar/emote uploads
+│   │   ├── chat-chunks.ts       # Splits replies into world-sized chat messages
+│   │   └── reconnect.ts         # Reconnect backoff
 │   ├── managers/
 │   │   ├── behavior-manager.ts  # Autonomous behavior loop
 │   │   ├── message-manager.ts   # Chat message handling
@@ -238,7 +199,12 @@ src/
 │   ├── templates.ts            # Prompt templates
 │   ├── service.ts              # Main service
 │   └── utils.ts                # Utilities (TTS generation, etc.)
-└── index.ts                     # Main entry point & character config
+├── openpay-store/              # OpenPay Store shop clerk
+├── anthropic-models.ts         # Claude through the official SDK
+├── elevenlabs-speech.ts        # ElevenLabs speech-to-text / text-to-speech models
+├── llm-provider.ts             # Model plugin selection (Claude only)
+└── index.ts                    # Main entry point & character config
+stubs/unused-elizaos-plugin/    # Stands in for plugins @elizaos/cli lists but never loads
 ```
 
 ## Key Modifications
@@ -246,13 +212,15 @@ src/
 ### Changes from Original (eliza-3d-hyperfy-starter)
 
 1. **Cost Optimization**: Reduced autonomous action frequency when no players present
-2. **ElevenLabs TTS Integration**: High-quality voice synthesis support
-3. **Audio Format Conversion**: Proper MP3 to PCM conversion (using ffmpeg)
-4. **Talking Gesture**: TALK animation playback during voice output
-5. **Improved Player Detection**: Accurate player counting via entity iteration
-6. **PostgreSQL Support**: Local PostgreSQL database usage
-7. **Discord Integration**: Auto-reply and scheduled daily posts
-8. **Twitter/X Integration**: Daily posts and mention replies (Free Plan optimized)
+2. **Claude via the Official SDK**: Text, JSON and image description with current Claude models
+3. **ElevenLabs Voice**: Speech output and voice input
+4. **Audio Format Conversion**: Proper MP3 to PCM conversion (using ffmpeg)
+5. **Talking Gesture**: TALK animation playback during voice output
+6. **Improved Player Detection**: Accurate player counting via entity iteration
+7. **PostgreSQL Support**: Local PostgreSQL database usage
+8. **OpenPay Store Shop Clerk**: Product recommendations and purchase links
+9. **coo-world Compatibility**: Current network protocol, authenticated uploads, the world's walking clips, chat split to the world's length limit
+10. **Lean, Pinned Dependencies**: Unused integrations removed and `bun.lock` committed (`bun audit` to check)
 
 ## Troubleshooting
 
@@ -261,35 +229,28 @@ src/
 - Verify ElevenLabs API key is correct
 - Check LiveKit connection logs
 
+### Voice Input Ignored
+- The log says `No TRANSCRIPTION model`: set `ELEVENLABS_XI_API_KEY`, and give the key the `speech_to_text` permission
+
 ### Agent Not Moving
 - Verify `WS_URL` is correct
 - Check if Hyperfy world is running
 - Check console error logs
 - The agent auto-reconnects to the Hyperfy world with exponential backoff (5s up to a maximum of 5 minutes). If the world is full or another session is already using the same auth token (`localstorage.json`), it retries every 5 minutes; the other session is not disturbed.
 
+### Disconnected as "outdated"
+- The log says the world `requires a newer protocol`: the world changed its network protocol. Update `src/plugin-hyperfy/lib/world-protocol.ts` to match the world's `src/core/packets.js` (protocol version and packet table); the agent retries every 5 minutes meanwhile.
+
+### Avatar Not Shown
+- The world only accepts uploads from builders, or `.vrm` avatars when **custom avatars** is turned on in the world settings. Turn it on, then restart the agent (it does not notice the setting change on its own). Until then it keeps the world's default avatar.
+- Custom `.glb` emotes need builder rank to upload; the agent uses the clips the world already serves.
+
+### Database Does Not Start
+- Use PostgreSQL (`POSTGRES_URL`); PGLite does not start alongside the Hyperfy engine.
+
 ### Audio Distorted / Wrong Speed
 - Set `ELEVENLABS_OUTPUT_FORMAT=mp3_44100_128`
 - Check ffmpeg version
-
-### Discord Bot Not Responding
-- Verify `DISCORD_API_TOKEN` is correct
-- Check bot has proper permissions in the server
-- Ensure bot is invited to the server with correct scopes
-
-### Discord Auto-Post Not Working
-- Set `DISCORD_ENABLE_AUTO_POST=true`
-- Verify `DISCORD_POST_CHANNEL_ID` is set correctly
-- Check bot has permission to send messages in the channel
-
-### Twitter 403 Forbidden Error
-- Ensure app has "Read and write" permissions (not just Read)
-- Regenerate Access Token & Secret after changing permissions
-- Verify using OAuth 1.0a credentials (not OAuth 2.0)
-
-### Twitter Not Posting
-- Check `TWITTER_ENABLE_POST=true`
-- Verify all 4 OAuth credentials are set correctly
-- Try `TWITTER_DRY_RUN=true` first to test
 
 ## License
 
@@ -299,6 +260,6 @@ MIT License
 
 - [ElizaOS](https://github.com/elizaOS/eliza) - AI Agent Framework
 - [Hyperfy](https://github.com/hyperfy-xyz/hyperfy) - 3D Virtual World Platform
+- [Anthropic Claude](https://www.anthropic.com/) - Language Model
 - [ElevenLabs](https://elevenlabs.io/) - Voice Synthesis API
 - [LiveKit](https://livekit.io/) - Real-time Audio/Video
-- [Discord.js](https://discord.js.org/) - Discord API Library
