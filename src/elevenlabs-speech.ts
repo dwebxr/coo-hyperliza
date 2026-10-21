@@ -61,7 +61,7 @@ export const elevenLabsSpeechPlugin: Plugin = {
   name: 'elevenlabs-speech',
   description: 'ElevenLabs speech-to-text and text-to-speech as runtime models',
   init: async (_config, runtime) => acceptStringSpeechParams(runtime),
-  // Above the chosen text provider's 100, so ElevenLabs wins speech even when plugin-openai writes text
+  // Above the text provider's 100, so ElevenLabs wins speech over any other plugin that registers it
   priority: 200,
   models: {
     [ModelType.TRANSCRIPTION]: (runtime: IAgentRuntime, input: unknown) => transcribe(runtime, input),

@@ -134,7 +134,7 @@ export async function ensureAsset(
   }
 
   try {
-    await world.network.upload(new File([buffer], name, { type }));
+    await world.network.upload(new File([new Uint8Array(buffer)], name, { type }));
   } catch (error: any) {
     const err = error instanceof Error ? error : new Error(String(error));
     return { ok: false, fileName, error: err, retryable: !isPermanentRefusal(err) };
