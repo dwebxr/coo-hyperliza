@@ -7,7 +7,8 @@ import path from 'path';
 
 
 export async function hashFileBuffer(buffer: Buffer): Promise<string> {
-  const hashBuf = await crypto.subtle.digest('SHA-256', buffer)
+  // A copy on its own ArrayBuffer, which the Web Crypto types require (Node's Buffer may share one)
+  const hashBuf = await crypto.subtle.digest('SHA-256', new Uint8Array(buffer))
   const hash = Array.from(new Uint8Array(hashBuf))
     .map(b => b.toString(16).padStart(2, '0'))
     .join('')
@@ -337,7 +338,7 @@ export async function transcribeWithElevenLabs(audio: Buffer, fileName = 'speech
   if (process.env.ELEVENLABS_STT_LANGUAGE_CODE) {
     form.append('language_code', process.env.ELEVENLABS_STT_LANGUAGE_CODE);
   }
-  form.append('file', new Blob([audio]), fileName);
+  form.append('file', new Blob([new Uint8Array(audio)]), fileName);
 
   try {
     const response = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {

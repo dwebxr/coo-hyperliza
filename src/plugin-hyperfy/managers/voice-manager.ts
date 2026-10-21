@@ -54,7 +54,7 @@ export class VoiceManager {
       return;
     }
     if (!this.runtime.getModel(ModelType.TRANSCRIPTION)) {
-      logger.warn('[VoiceManager] No TRANSCRIPTION model (set ELEVENLABS_XI_API_KEY with speech_to_text, or OPENAI_API_KEY): voice input is ignored');
+      logger.warn('[VoiceManager] No TRANSCRIPTION model (set ELEVENLABS_XI_API_KEY with the speech_to_text permission): voice input is ignored');
     }
 
     this.audioListener = (data: LiveKitAudioData) => {

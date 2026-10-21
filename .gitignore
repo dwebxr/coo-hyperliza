@@ -3,7 +3,6 @@ knowledge
 generatedIMages
 dist
 data
-bun.lock
 package-lock.json
 .env
 local.json
@@ -13,3 +12,4 @@ localstorage.json
 # Runtime snapshots and OS files
 scene_*.jpeg
 .DS_Store
+coverage

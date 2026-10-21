@@ -1,0 +1,8 @@
+{
+  "name": "unused-elizaos-plugin",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Stands in for elizaOS plugins that @elizaos/cli lists as dependencies but `elizaos start` never loads",
+  "type": "module",
+  "main": "index.js"
+}

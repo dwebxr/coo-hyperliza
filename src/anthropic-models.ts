@@ -262,7 +262,7 @@ async function generateObject(runtime: IAgentRuntime, size: Size, params: Object
 export const anthropicModelsPlugin: Plugin = {
   name: 'anthropic-models',
   description: 'Claude text and JSON generation through the official Anthropic SDK',
-  // Outranks other providers of the same model types that stay loaded for others (e.g. plugin-openai for embeddings).
+  // Outranks any other plugin that registers the same model types (elizaOS otherwise picks by init order).
   priority: 100,
   models: {
     [ModelType.TEXT_SMALL]: (runtime: IAgentRuntime, params: GenerateTextParams) => generateText(runtime, 'SMALL', params),
