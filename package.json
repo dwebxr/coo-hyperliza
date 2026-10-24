@@ -45,7 +45,7 @@
   "devDependencies": {
     "@vitest/coverage-v8": "4.1.12",
     "prettier": "3.5.3",
-    "tsup": "8.5.1",
+    "tsup": "9.0.0",
     "typescript": "5.9.3",
     "vitest": "4.1.12"
   },
@@ -70,6 +70,7 @@
     "@elizaos/plugin-openai": "file:./stubs/unused-elizaos-plugin",
     "@elizaos/plugin-ollama": "file:./stubs/unused-elizaos-plugin",
     "basic-ftp": "6.2.3",
-    "pdfjs-dist": "6.4.299"
+    "pdfjs-dist": "6.4.299",
+    "zod": "^4.6.6"
   }
 }
