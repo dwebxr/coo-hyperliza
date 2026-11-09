@@ -17,6 +17,19 @@ describe('AgentActivityLock', () => {
     expect(lock.isActive()).toBe(false);
   });
 
+  it('remembers when activity last ended', async () => {
+    let t = 1000;
+    const lock = new AgentActivityLock(() => t);
+    expect(lock.lastActivityAt()).toBe(Number.NEGATIVE_INFINITY);
+    await lock.run(async () => {
+      t = 2000;
+      expect(lock.lastActivityAt()).toBe(2000);
+      t = 3000;
+    });
+    t = 5000;
+    expect(lock.lastActivityAt()).toBe(3000);
+  });
+
   it('never goes negative', () => {
     const lock = new AgentActivityLock();
     lock.exit();

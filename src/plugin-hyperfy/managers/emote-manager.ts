@@ -72,6 +72,11 @@ export class EmoteManager {
     return true;
   }
 
+  /** Whether playEmote(name) has a clip to play in this world (some worlds refuse emote uploads). */
+  hasEmote(name: string): boolean {
+    return this.emoteHashMap.has(name) || !!(Emotes as Record<string, string>)[name];
+  }
+
   playEmote(name: string) {
     const fallback = (Emotes as Record<string, string>)[name];
     const hashName = this.emoteHashMap.get(name) || fallback;

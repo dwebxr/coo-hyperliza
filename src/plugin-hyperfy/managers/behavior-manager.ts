@@ -4,21 +4,40 @@ import { autoTemplate } from "../templates";
 import { agentActivityLock } from "./guards";
 import { getHyperfyActions, formatActions, countOtherPlayers } from "../utils";
 import { isOpenPayLink } from "../../openpay-store";
+import { AiBudgetExceededError, forPurpose, getUsageBudget, runWithOrigin } from "../../usage-budget";
+import {
+  type AutonomyConfig,
+  type Point,
+  GREET_APPROACH_MAX_M,
+  IDLE_EMOTES,
+  STAY_AFTER_CONVERSATION_MS,
+  chooseIdleStep,
+  readAutonomyConfig,
+} from "../lib/idle-behavior";
 
-const TIME_INTERVAL_MIN = 15000; // 15 seconds
-const TIME_INTERVAL_MAX = 30000; // 30 seconds
 const TIME_INTERVAL_IDLE_MIN = 60000; // 60 seconds when no players around
 const TIME_INTERVAL_IDLE_MAX = 120000; // 120 seconds when no players around
 
-
+/**
+ * Autonomous behavior while other players are around. Most ticks are scripted (patrol or wander,
+ * wave at newcomers, look around) and cost nothing; Claude decides a tick only within the
+ * autonomous budget (AUTONOMY_AI_MIN_INTERVAL_SEC / AUTONOMY_AI_MAX_PER_HOUR, and never right after
+ * a conversation), and the scripts carry on when the Claude budget is used up.
+ */
 export class BehaviorManager {
   private isRunning: boolean = false;
   private runtime: IAgentRuntime;
   private sleepTimer: NodeJS.Timeout | null = null;
   private wakeSleep: (() => void) | null = null;
+  private readonly config: AutonomyConfig;
+  private home: Point | null = null;
+  private patrolIndex = 0;
+  /** Players already greeted on this connection; someone who leaves and comes back is greeted again. */
+  private seenPlayers = new Set<string>();
 
-  constructor(runtime: IAgentRuntime) {
+  constructor(runtime: IAgentRuntime, config: AutonomyConfig = readAutonomyConfig()) {
     this.runtime = runtime;
+    this.config = config;
   }
 
   /**
@@ -74,7 +93,7 @@ export class BehaviorManager {
       // Adjust delay based on whether other players are present
       // Longer delay when alone to save costs
       const [minDelay, maxDelay] = hasOtherPlayers
-        ? [TIME_INTERVAL_MIN, TIME_INTERVAL_MAX]
+        ? [this.config.tickMinMs, this.config.tickMaxMs]
         : [TIME_INTERVAL_IDLE_MIN, TIME_INTERVAL_IDLE_MAX];
 
       const delay = minDelay + Math.floor(Math.random() * (maxDelay - minDelay));
@@ -139,6 +158,125 @@ export class BehaviorManager {
       return hasOtherPlayers;
     }
 
+    const budget = getUsageBudget();
+    if (budget.autonomyAiAvailable(agentActivityLock.lastActivityAt())) {
+      // Counted up front, so a failing tick cannot be retried on every loop
+      budget.recordAutonomyAiTick();
+      try {
+        await runWithOrigin('autonomous', () => this.runAiBehavior(service, world));
+        return hasOtherPlayers;
+      } catch (error) {
+        if (!(error instanceof AiBudgetExceededError)) throw error;
+        logger.info(`[BehaviorManager] ${error.message}; using scripted behavior`);
+      }
+    }
+
+    budget.recordScriptedTick();
+    this.runScriptedBehavior(service, world);
+    return hasOtherPlayers;
+  }
+
+  /** One scripted step; movement and emotes are started, not awaited. */
+  private runScriptedBehavior(service: HyperfyService, world: any): void {
+    const self = world.entities.player;
+    const position = self?.base?.position;
+    if (!this.home && position) this.home = { x: position.x, z: position.z };
+
+    const controls = world.controls;
+    const navigating = !!(controls?.getIsNavigating?.() || controls?.getIsWalkingRandomly?.());
+    const recentlyTalked = Date.now() - agentActivityLock.lastActivityAt() < STAY_AFTER_CONVERSATION_MS;
+    const step = chooseIdleStep({
+      newcomer: this.findNewcomer(world),
+      canMove: !!controls && !navigating && !recentlyTalked,
+      patrolPoints: this.config.patrolPoints,
+      patrolIndex: this.patrolIndex,
+      home: this.home,
+      wanderRadius: this.config.wanderRadius,
+    });
+    logger.debug(`[BehaviorManager] Scripted step: ${JSON.stringify(step)}`);
+
+    const emotes = service.getEmoteManager();
+    const ignore = (what: string) => (error: unknown) => logger.debug(`[BehaviorManager] ${what} failed: ${error}`);
+    // Worlds that refuse emote uploads have no wave / look-around clips: turn instead, which
+    // everyone sees
+    const wave = (playerId: string) => {
+      if (emotes?.hasEmote(IDLE_EMOTES.wave)) emotes.playEmote(IDLE_EMOTES.wave);
+      else controls?.faceEntity?.(playerId).catch(ignore('Turning to a player'));
+    };
+    switch (step.kind) {
+      case 'greet': {
+        if (!step.approach) {
+          wave(step.playerId);
+          break;
+        }
+        // Emotes stop while walking, so wave once there
+        controls
+          .followEntity(step.playerId)
+          .then(() => {
+            if (this.isRunning && service.getWorld() === world) wave(step.playerId);
+          })
+          .catch(ignore('Greeting walk'));
+        break;
+      }
+      case 'walk':
+        this.patrolIndex = step.nextPatrolIndex;
+        controls.goto(step.target.x, step.target.z).catch(ignore('Idle walk'));
+        break;
+      case 'emote': {
+        if (emotes?.hasEmote(step.name)) {
+          emotes.playEmote(step.name);
+          break;
+        }
+        // Walking already shows movement (and sets the facing every step)
+        if (navigating) break;
+        const nearest = this.nearestPlayerId(world);
+        // Waving, or just after talking with someone: face them rather than look away
+        if (nearest && (step.name === IDLE_EMOTES.wave || recentlyTalked)) wave(nearest);
+        else controls?.rotateTo?.(Math.random() < 0.5 ? 'left' : 'right', 900).catch(ignore('Looking around'));
+        break;
+      }
+      case 'rest':
+        break;
+    }
+  }
+
+  private nearestPlayerId(world: any): string | null {
+    const self = world.entities.player;
+    const mine = self?.base?.position;
+    let best: string | null = null;
+    let bestDistance = Infinity;
+    for (const [id, entity] of world.entities.items.entries()) {
+      if (entity?.data?.type !== 'player' || id === self?.data?.id || !entity.base?.position || !mine) continue;
+      const distance = entity.base.position.distanceTo(mine);
+      if (distance < bestDistance) {
+        best = id;
+        bestDistance = distance;
+      }
+    }
+    return best;
+  }
+
+  /** The first player not seen before on this connection, with their distance from the agent. */
+  private findNewcomer(world: any): { id: string; distance: number } | null {
+    const self = world.entities.player;
+    const present = new Set<string>();
+    let newcomer: { id: string; distance: number } | null = null;
+    for (const [id, entity] of world.entities.items.entries()) {
+      if (entity?.data?.type !== 'player' || id === self?.data?.id) continue;
+      present.add(id);
+      if (newcomer || this.seenPlayers.has(id)) continue;
+      const theirs = entity.base?.position;
+      const mine = self?.base?.position;
+      const distance = theirs && mine ? theirs.distanceTo(mine) : GREET_APPROACH_MAX_M + 1;
+      newcomer = { id, distance };
+    }
+    for (const id of this.seenPlayers) if (!present.has(id)) this.seenPlayers.delete(id);
+    if (newcomer) this.seenPlayers.add(newcomer.id);
+    return newcomer;
+  }
+
+  /** Lets Claude choose the next action. Throws AiBudgetExceededError when the budget ran out. */
+  private async runAiBehavior(service: HyperfyService, world: any): Promise<void> {
     const _currentWorldId = service.currentWorldId;
 
     const elizaRoomId = createUniqueUuid(this.runtime, _currentWorldId || 'hyperfy-unknown-world')
@@ -177,14 +315,14 @@ export class BehaviorManager {
     const responsePrompt = composePromptFromState({ state, template: autoTemplate(actionsText) });
 
     // decide
-    const response = await this.runtime.useModel(ModelType.TEXT_LARGE, {
+    const response = await this.runtime.useModel(ModelType.TEXT_LARGE, forPurpose('autonomous', {
       prompt: responsePrompt,
-    });
+    }));
 
     const parsedXml = parseKeyValueXml(response);
     if (!parsedXml) {
       logger.warn("[BehaviorManager] Could not parse model response; skipping this tick.");
-      return hasOtherPlayers;
+      return;
     }
     logger.debug(`[BehaviorManager] Response: ${JSON.stringify(parsedXml)}`)
 
@@ -257,7 +395,5 @@ export class BehaviorManager {
     await this.runtime.evaluate(newMessage, state, true, callback, [
       responseMemory,
     ]);
-
-    return hasOtherPlayers;
   }
 }

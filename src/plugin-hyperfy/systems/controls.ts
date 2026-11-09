@@ -394,7 +394,31 @@ export class AgentControls extends System {
     const yawQuat = q2.setFromEuler(
       new THREE.Euler(0, rotationOffsetY[direction], 0, 'YXZ')
     );
-    this._rotationTarget = baseQuat.clone().multiply(yawQuat);
+    await this._rotateToward(baseQuat.clone().multiply(yawQuat), duration, token);
+  }
+
+  /**
+   * Turns in place to face an entity (e.g. a player). Visible to others without any emote clip.
+   */
+  public async faceEntity(entityId: string, duration: number = 600): Promise<void> {
+    const player = this.world?.entities?.player;
+    const target = this.world?.entities?.items?.get(entityId);
+    const targetPos = target?.base?.position || target?.root?.position;
+    if (!player?.base || !targetPos) return;
+
+    const direction = targetPos.clone().sub(player.base.position).setY(0);
+    if (direction.lengthSq() < 1e-6) return;
+
+    this.stopRotation();
+    this._isRotating = true;
+    const token = new ControlsToken();
+    this._rotationAbortController = token;
+    await this._rotateToward(new THREE.Quaternion().setFromUnitVectors(FORWARD, direction.normalize()), duration, token);
+  }
+
+  private async _rotateToward(target: THREE.Quaternion, duration: number, token: ControlsToken): Promise<void> {
+    const player = this.world.entities.player;
+    this._rotationTarget = target;
 
     const startQuat = player.base.quaternion.clone();
     const totalSteps = Math.ceil(duration / CONTROLS_TICK_INTERVAL);
@@ -413,7 +437,11 @@ export class AgentControls extends System {
       step++;
     }
 
-    this._isRotating = false;
+    // A newer rotation may have started meanwhile; leave its state alone
+    if (this._rotationAbortController === token) {
+      this._isRotating = false;
+      this._rotationAbortController = null;
+    }
   }
 
   /**

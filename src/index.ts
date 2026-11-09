@@ -17,6 +17,7 @@ import { anthropicModelsPlugin } from './anthropic-models';
 import { elevenLabsSpeechPlugin } from './elevenlabs-speech';
 import { createOpenPayStorePlugin } from './openpay-store';
 import { planModelPlugins } from './llm-provider';
+import { startUsageReports } from './usage-budget';
 
 let modelPlan: ReturnType<typeof planModelPlugins>;
 try {
@@ -222,6 +223,8 @@ export const character: Character = {
 const initCharacter = async ({ runtime }: { runtime: IAgentRuntime }) => {
   logger.info('Initializing character');
   logger.info('Name: ', character.name);
+  // Claude / vision / voice usage per purpose, to tune the limits in .env
+  startUsageReports();
 };
 
 const openPayStorePlugin = createOpenPayStorePlugin(process.env);

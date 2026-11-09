@@ -13,6 +13,7 @@ vi.mock('@anthropic-ai/sdk', () => ({
 }));
 
 import { AnthropicRefusalError, anthropicModelsPlugin, parseJsonResponse, toImageSource } from './anthropic-models';
+import { AiBudgetExceededError, UsageBudget, resetUsageBudget, runWithOrigin } from './usage-budget';
 
 function runtime(settings: Record<string, string> = {}): any {
   return {
@@ -145,6 +146,61 @@ describe('anthropicModelsPlugin', () => {
     const content = create.mock.calls[0][0].messages[0].content;
     expect(content[0]).toEqual({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: '/9j/4AAQSkZJRg==' } });
     expect(content[1]).toEqual({ type: 'text', text: 'What do you see?' });
+  });
+
+  it('caps output per purpose, over any value core injected from model settings', async () => {
+    await models[ModelType.TEXT_LARGE](runtime(), { prompt: 'x', purpose: 'chat', maxTokens: 9000 });
+    create.mockResolvedValue(reply([{ type: 'text', text: '{"navigationType":"entity"}' }]));
+    await models[ModelType.OBJECT_LARGE](runtime(), { prompt: 'x', purpose: 'navigation' });
+    create.mockResolvedValue(reply([{ type: 'text', text: '<response/>' }]));
+    await models[ModelType.IMAGE_DESCRIPTION](runtime(), { imageUrl: 'https://x.test/a.png', prompt: 'p', purpose: 'vision' });
+    expect(create.mock.calls.map((c) => c[0].max_tokens)).toEqual([2048, 1024, 2048]);
+    // The purpose tag is never sent to the API
+    expect(create.mock.calls[0][0]).not.toHaveProperty('purpose');
+  });
+
+  it('meters each call by purpose and origin', async () => {
+    const budget = new UsageBudget({
+      aiCallsPerHour: null,
+      aiTokensPerDay: null,
+      visionPerHour: null,
+      ttsCharsPerDay: null,
+      sttSecondsPerDay: null,
+      autonomyAiPerHour: null,
+      autonomyAiMinIntervalMs: 0,
+    });
+    resetUsageBudget(budget);
+    try {
+      await runWithOrigin('autonomous', () => models[ModelType.TEXT_LARGE](runtime(), { prompt: 'x', purpose: 'autonomous' }));
+      await models[ModelType.TEXT_SMALL](runtime(), { prompt: 'x' });
+      const s = budget.snapshot(60_000);
+      expect(s.ai.byPurpose.autonomous).toMatchObject({ calls: 1, inputTokens: 12, outputTokens: 3 });
+      expect(s.ai.byPurpose[ModelType.TEXT_SMALL]).toMatchObject({ calls: 1 });
+      expect(s.ai.byOrigin).toEqual({ autonomous: 1, other: 1 });
+    } finally {
+      resetUsageBudget();
+    }
+  });
+
+  it('refuses calls without contacting the API once the Claude budget is used up', async () => {
+    const budget = new UsageBudget({
+      aiCallsPerHour: 1,
+      aiTokensPerDay: null,
+      visionPerHour: null,
+      ttsCharsPerDay: null,
+      sttSecondsPerDay: null,
+      autonomyAiPerHour: null,
+      autonomyAiMinIntervalMs: 0,
+    });
+    resetUsageBudget(budget);
+    try {
+      await models[ModelType.TEXT_LARGE](runtime(), { prompt: 'x', purpose: 'chat' });
+      await expect(models[ModelType.TEXT_LARGE](runtime(), { prompt: 'x', purpose: 'chat' })).rejects.toBeInstanceOf(AiBudgetExceededError);
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(budget.snapshot(60_000).skipped['ai-call']).toBe(1);
+    } finally {
+      resetUsageBudget();
+    }
   });
 
   it('IMAGE_DESCRIPTION also accepts a bare image string', async () => {

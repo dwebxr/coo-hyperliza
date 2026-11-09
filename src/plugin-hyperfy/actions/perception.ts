@@ -11,74 +11,17 @@ import {
 } from '@elizaos/core';
 
 import { HyperfyService } from '../service';
+import { AiBudgetExceededError, forPurpose, getUsageBudget } from '../../usage-budget';
+import { chooseSnapshot, type NamedEntity } from '../lib/snapshot-choice';
+import { isJapanese } from '../lib/simple-commands';
+
 export enum SnapshotType {
   LOOK_AROUND     = 'LOOK_AROUND',
   LOOK_DIRECTION  = 'LOOK_DIRECTION',
   LOOK_AT_ENTITY  = 'LOOK_AT_ENTITY'
 }
 
-const sceneSnapshotSelectionTemplate = `
-<task>
-You are a visual reasoning module that helps an in-world agent decide **how** to capture a visual snapshot of the scene.
-
-Based on the **recent in-world messages** and the **current Hyperfy World State**, choose the most suitable snapshot strategy.
-</task>
-
-<providers>
-{{hyperfyStatus}}
-</providers>
-
-<instructions>
-Select the strategy that best matches the latest user request and the known game context:
-
-• <snapshotType>${SnapshotType.LOOK_AROUND}</snapshotType> — choose this when the user asks for a broad view or to "look around", "scan", or "check surroundings".
-
-• <snapshotType>${SnapshotType.LOOK_DIRECTION}</snapshotType> — choose this when the user clearly asks to look **left**, **right**, **front**, or **back**. Place that direction word in <parameter>.
-
-• <snapshotType>${SnapshotType.LOOK_AT_ENTITY}</snapshotType> — choose this when the user refers to a specific object, character, or item that exists in the Hyperfy World State. Place the target entity’s **entityId** in <parameter>.
-
-If you are **not absolutely confident** about which strategy fits best — or if the request is **ambiguous, vague, or could match multiple strategies** — you **MUST NOT guess**.
-
-Instead, generate a response that politely asks the user for clarification.
-
-Use the following format:
-<response>
-  <snapshotType>NONE</snapshotType>
-  <parameter>Your clarification question here</parameter>
-</response>
-
-Example:
-<response>
-  <snapshotType>NONE</snapshotType>
-  <parameter>Your in-character clarification question here (e.g., "Do you mean that glowing statue over there?" or "Which direction should I look — left, right...?")</parameter>
-</response>
-
-DO NOT invent a snapshotType unless it is clearly and directly supported by the user’s message.
-
-<output>
-<response>
-  <snapshotType>...</snapshotType>
-  <parameter>...</parameter>
-</response>
-</output>`;
-
-const detailedImageDescriptionTemplate = `
-<task>
-You are an expert perception module inside a Hyperfy world. Carefully examine the snapshot and describe everything you can see.
-</task>
-
-<instructions>
-- List every notable object, character, or feature.
-- For each, state its approximate position relative to the camera (e.g. "left‑front, 3 m", "above and slightly behind").
-- Mention colours, sizes, spatial relationships, lighting and motion cues.
-- Conclude with a brief note that the scene takes place in a Hyperfy world.
-</instructions>
-
-<output>
-Return a paragraph or bullet list. No XML tags.
-</output>`;
-
-const responseGenerationTemplate = (sceneDescription: string) => `
+const responseGenerationTemplate = (viewHeader: string) => `
 <task>
 You are {{agentName}}, a visible in-world AI character in Hyperfy — a real-time, multiplayer 3D simulation.
 
@@ -106,10 +49,9 @@ Your task is to observe, interpret, and respond to the current moment as a fully
 
 {{hyperfyAnimations}}
 
-## In-World Visual Report (what you currently see)
-This is your live visual understanding of the environment based on a recent in-world snapshot. Treat it as your own sensory input — as if you're looking at the scene right now:
-
-${sceneDescription}
+## What you see right now
+The attached image is a snapshot you just took in the world. Treat it as your own eyes — you are looking at the scene right now.
+${viewHeader}
 
 
 </providers>
@@ -142,7 +84,8 @@ Respond using this format:
 <rules>
 - The **emote** is a visible in-game animation. Use it to express tone (joy, frustration, sarcasm, etc.) or to enhance immersion.
 - Use ONLY the provided Hyperfy World State to decide what exists now. Forget earlier messages.
-- Treat the "Visual Perception" section as your direct visual input.
+- Keep the reply under about 400 characters because the world cuts chat at 500 characters.
+- Treat the attached image as your direct visual input. Mention only what you can actually see in it; you may note positions (left, ahead, far away) and colors when they help.
 - You are responding live, not narrating. Always behave like you are *in* the game.
 - **Nearby Interactable Objects** section lists interactive entities that are both nearby and currently interactable — like items that can be picked up or activated.
 </rules>
@@ -178,55 +121,55 @@ export const hyperfyScenePerceptionAction: Action = {
       return;
     }
 
-    world.controls?.stopAllActions();
-
-    state = await runtime.composeState(message);
-
-    /* Decide snapshot strategy */
-    const selectionPrompt = composePromptFromState({ state, template: sceneSnapshotSelectionTemplate });
-    let selectionRaw: string;
-    try {
-      selectionRaw = await runtime.useModel(ModelType.TEXT_LARGE, { prompt: selectionPrompt });
-    } catch (err) {
-      logger.error('Snapshot‑selector model failed:', err);
-      await callback({ thought: 'Cannot decide how to look.', metadata: { error: 'selector_failure' } });
-      return;
-    }
-
-    const selection = parseKeyValueXml(selectionRaw);
-    if (!selection || selection.snapshotType === 'NONE') {
+    const text = message.content?.text ?? '';
+    const japanese = isJapanese(text);
+    const budget = getUsageBudget();
+    if (!budget.visionAvailable() || !budget.aiAvailable()) {
+      budget.recordSkip('vision');
       await callback({
-        thought: 'The snapshot strategy was unclear.',
-        text: selection?.parameter || 'Can you clarify what you want me to observe?',
-        metadata: { error: 'unclear_snapshot_request' }
+        thought: 'The vision budget is used up for now.',
+        text: japanese
+          ? 'ごめんなさい、今はちょっと目を休めています。また少ししてから声をかけてくださいね。'
+          : "Sorry, I'm resting my eyes for a bit. Ask me again a little later!",
+        metadata: { error: 'vision_budget' },
       });
       return;
     }
 
-    const { snapshotType, parameter } = selection;
+    world.controls?.stopAllActions();
 
-    
+    /* Decide how to look, from the player's words (no model call) */
+    const selfId = world.entities?.player?.data?.id;
+    const entities: NamedEntity[] = [];
+    for (const [id, entity] of world.entities?.items?.entries?.() ?? []) {
+      if (id === selfId) continue;
+      const name = entity?.data?.name || entity?.blueprint?.name;
+      if (typeof name === 'string') entities.push({ id, name });
+    }
+    const senderId = (message.content?.metadata as { hyperfyFromId?: string } | undefined)?.hyperfyFromId;
+    const choice = chooseSnapshot(text, { senderId, entities });
+    const snapshotType = choice.type as SnapshotType;
+    const parameter = choice.type === 'LOOK_DIRECTION' ? choice.direction : choice.type === 'LOOK_AT_ENTITY' ? choice.entityId : undefined;
+    logger.info(`[Perception] ${snapshotType}${parameter ? ` (${parameter})` : ''}`);
+
     /* Capture snapshot */
     let imgBase64: string;
     try {
-      switch (snapshotType) {
-        case SnapshotType.LOOK_AROUND:
+      switch (choice.type) {
+        case 'LOOK_AROUND':
           imgBase64 = await puppeteerManager.snapshotEquirectangular();
           break;
-        case SnapshotType.LOOK_DIRECTION:
-          if (!parameter || !['front', 'back', 'left', 'right'].includes(parameter)) throw new Error('Bad direction');
-          imgBase64 = await puppeteerManager.snapshotFacingDirection(parameter);
+        case 'LOOK_DIRECTION':
+          imgBase64 = await puppeteerManager.snapshotFacingDirection(choice.direction);
           break;
-        case SnapshotType.LOOK_AT_ENTITY:
-          if (!parameter) throw new Error('Missing entityId');
-          const ent = world.entities.items.get(parameter);
+        case 'LOOK_AT_ENTITY': {
+          const ent = world.entities.items.get(choice.entityId);
           const pos = ent?.base?.position || ent?.root?.position;
           if (!pos) throw new Error('No position');
-          await world.controls.followEntity(parameter);
+          await world.controls.followEntity(choice.entityId);
           imgBase64 = await puppeteerManager.snapshotViewToTarget([pos.x, pos.y, pos.z]);
           break;
-        default:
-          throw new Error('Unknown snapshotType');
+        }
       }
     } catch (err) {
       logger.error('Snapshot failed:', err);
@@ -234,45 +177,40 @@ export const hyperfyScenePerceptionAction: Action = {
       return;
     }
 
-    /* IMAGE_DESCRIPTION – detailed scene analysis */
-    const imgDescPrompt = composePromptFromState({ state, template: detailedImageDescriptionTemplate });
-    let sceneDescription: string;
-    try {
-      const res = await runtime.useModel(ModelType.IMAGE_DESCRIPTION, { imageUrl: imgBase64, prompt: imgDescPrompt });
-      sceneDescription = typeof res === 'string' ? res : res.description;
-    } catch (err) {
-      logger.error('IMAGE_DESCRIPTION failed:', err);
-      await callback({ thought: 'Cannot understand the scene.', metadata: { error: 'vision_failure' } });
-      return;
+    let viewHeader: string;
+    switch (choice.type) {
+      case 'LOOK_AROUND':
+        viewHeader = `It is a 360° (equirectangular) view all around {{agentName}}'s current position.`;
+        break;
+      case 'LOOK_DIRECTION':
+        viewHeader = `It shows the view toward {{agentName}}'s **${choice.direction}** side.`;
+        break;
+      case 'LOOK_AT_ENTITY': {
+        const name = entities.find((e) => e.id === choice.entityId)?.name ?? choice.entityId;
+        viewHeader = `It is focused on “${name}” (entity ${choice.entityId}).`;
+        break;
+      }
     }
 
-    //  Add dynamic header for scene perception
-    let scenePerceptionHeader: string;
-
-    switch (snapshotType) {
-      case SnapshotType.LOOK_AROUND:
-        scenePerceptionHeader = `Here is a broad visual capture of the area as seen from the {{agentName}} current position. The following is a detailed description of what the {{agentName}} can observe all around:`;
-        break;
-      case SnapshotType.LOOK_DIRECTION:
-        scenePerceptionHeader = `Here is the visual capture looking toward the **${parameter}** side. The following is a detailed description of what the {{agentName}} sees in that direction:`;
-        break;
-      case SnapshotType.LOOK_AT_ENTITY:
-        scenePerceptionHeader = `Here is the visual capture focused on the target entity (“${parameter}”). The following is a detailed description of what the {{agentName}} observes when looking at it:`;
-        break;
-      default:
-        scenePerceptionHeader = `Here is a scene snapshot for contextual understanding:`;
-    }
-
-    const fullSceneDescription = `${scenePerceptionHeader}\n\n${sceneDescription}`;
-
-    /* generate final XML response */
-    const responsePrompt = composePromptFromState({ state, template: responseGenerationTemplate(fullSceneDescription) });
+    /* One multimodal call: look at the snapshot and answer in character */
+    state = await runtime.composeState(message);
+    const responsePrompt = composePromptFromState({ state, template: responseGenerationTemplate(viewHeader) });
+    budget.recordVision();
     let xmlRaw: string;
     try {
-      xmlRaw = await runtime.useModel(ModelType.TEXT_LARGE, { prompt: responsePrompt });
+      const res = await runtime.useModel(ModelType.IMAGE_DESCRIPTION, forPurpose('vision', { imageUrl: imgBase64, prompt: responsePrompt }));
+      xmlRaw = typeof res === 'string' ? res : res.description;
     } catch (err) {
-      logger.error('Response generator failed:', err);
-      await callback({ thought: 'No response generated.', metadata: { error: 'text_large_failure' } });
+      if (err instanceof AiBudgetExceededError) {
+        await callback({
+          thought: 'The Claude budget is used up for now.',
+          text: japanese ? 'ごめんなさい、今はよく見られないみたいです。' : "Sorry, I can't take a proper look right now.",
+          metadata: { error: 'ai_budget' },
+        });
+        return;
+      }
+      logger.error('Vision response failed:', err);
+      await callback({ thought: 'Cannot understand the scene.', metadata: { error: 'vision_failure' } });
       return;
     }
 
@@ -288,7 +226,7 @@ export const hyperfyScenePerceptionAction: Action = {
       thought: parsed.thought || '',
       text: parsed.text || '',
       emote: parsed.emote || '',
-      metadata: { snapshotType, sceneDescription }
+      metadata: { snapshotType, ...(parameter ? { parameter } : {}) }
     });
   },
 

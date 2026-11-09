@@ -11,6 +11,7 @@ import {
     type EventHandler
 } from '@elizaos/core';
 import { HyperfyService } from '../service';
+import { forPurpose } from '../../usage-budget';
 import { AgentControls } from '../systems/controls'; // Import AgentControls type
 // Import THREE types if needed, e.g., for metadata typing
 // import type * as THREE from 'three';
@@ -110,7 +111,7 @@ export const hyperfyGotoEntityAction: Action = {
           template: navigationTargetExtractionTemplate(thoughtSnippets),
         });
 
-        navigationResult = await runtime.useModel(ModelType.OBJECT_LARGE, { prompt });
+        navigationResult = await runtime.useModel(ModelType.OBJECT_LARGE, forPurpose('navigation', { prompt }));
         logger.info('[GOTO Action] Navigation target extracted:', navigationResult);
       } catch (error) {
         logger.error(`[GOTO Action] Error during navigation target extraction:`, error);

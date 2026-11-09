@@ -4,6 +4,7 @@ vi.mock('../service', () => ({ HyperfyService: { serviceType: 'hyperfy' } }));
 vi.mock('../events', () => ({ hyperfyEventType: { VOICE_MESSAGE_RECEIVED: 'HYPERFY_VOICE_MESSAGE_RECEIVED' } }));
 
 import { VoiceManager } from './voice-manager';
+import { UsageBudget, resetUsageBudget } from '../../usage-budget';
 
 function setup(publishAudioStream: (...args: any[]) => Promise<void>) {
   const player = { setSpeaking: vi.fn() };
@@ -198,5 +199,31 @@ describe('VoiceManager shop links', () => {
     await callback({ text: link, metadata: { openpayLink: true } });
     expect(sendMessage).toHaveBeenCalledWith(link);
     expect(speak).not.toHaveBeenCalled();
+  });
+});
+
+describe('VoiceManager voice limits', () => {
+  afterEach(() => resetUsageBudget());
+
+  it('skips text-to-speech once the daily character limit is reached', async () => {
+    const budget = new UsageBudget({
+      aiCallsPerHour: null,
+      aiTokensPerDay: null,
+      visionPerHour: null,
+      ttsCharsPerDay: 0,
+      sttSecondsPerDay: null,
+      autonomyAiPerHour: null,
+      autonomyAiMinIntervalMs: 0,
+    });
+    resetUsageBudget(budget);
+    const { manager, livekit } = setup(async () => {});
+    await expect(manager.speak('Hello there')).resolves.toBe(false);
+    expect(livekit.publishAudioStream).not.toHaveBeenCalled();
+    expect(budget.snapshot(60_000).skipped.tts).toBe(1);
+  });
+
+  it('reports that nothing was spoken for empty text', async () => {
+    const { manager } = setup(async () => {});
+    await expect(manager.speak('https://only.a/link')).resolves.toBe(false);
   });
 });
