@@ -5,6 +5,7 @@ import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
 import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
 import { isOpenPayLink } from "../../openpay-store";
+import { getUsageBudget, runWithOrigin } from "../../usage-budget";
 
 type LiveKitAudioData = {
   participant: string;
@@ -14,6 +15,10 @@ type LiveKitAudioData = {
 // One utterance playing plus a couple queued; older replies beyond that are stale.
 const MAX_PENDING_PLAYBACKS = 3;
 const PLAYBACK_TIMEOUT_MS = 120_000;
+// LiveKit delivers 48 kHz 16-bit mono PCM
+const PCM_BYTES_PER_SECOND = 48000 * 2;
+// How often the "voice is paused" chat notice / log may repeat
+const VOICE_LIMIT_NOTICE_INTERVAL_MS = 10 * 60_000;
 
 export class VoiceManager {
   private runtime: IAgentRuntime;
@@ -37,6 +42,8 @@ export class VoiceManager {
   private activePlayback: AbortController | null = null;
   // Managers are per connection; once stopped, late async work must not touch the next world.
   private stopped = false;
+  private lastSttLimitNoticeAt = Number.NEGATIVE_INFINITY;
+  private lastTtsLimitLogAt = Number.NEGATIVE_INFINITY;
 
   constructor(runtime: IAgentRuntime) {
     this.runtime = runtime;
@@ -146,7 +153,7 @@ export class VoiceManager {
     this.transcriptionTimeout = setTimeout(() => {
       this.transcriptionTimeout = null;
       agentActivityLock
-        .run(() => this.processTranscription(playerId))
+        .run(() => runWithOrigin('voice', () => this.processTranscription(playerId)))
         .catch((error) => console.error(`Error handling voice from ${playerId}:`, error));
     }, DEBOUNCE_TRANSCRIPTION_THRESHOLD) as unknown as NodeJS.Timeout;
   }
@@ -170,6 +177,14 @@ export class VoiceManager {
       // One attempt through the registered model: ElevenLabs (src/elevenlabs-speech.ts) when
       // configured, otherwise e.g. OpenAI. Without any, voice input is simply unavailable.
       if (!this.runtime.getModel(ModelType.TRANSCRIPTION)) return;
+      const budget = getUsageBudget();
+      if (!budget.sttAvailable()) {
+        budget.recordSkip('stt');
+        this.noticeVoiceInputPaused();
+        return;
+      }
+      // Billed by audio length, whatever the result
+      budget.recordStt(inputBuffer.length / PCM_BYTES_PER_SECOND);
       transcriptionText = await this.runtime.useModel(ModelType.TRANSCRIPTION, wavBuffer);
       console.log("[VOICE MANAGER] Transcription: ", transcriptionText)
     } catch (error) {
@@ -289,7 +304,11 @@ export class VoiceManager {
             const emoteManager = service.getEmoteManager();
             const emote = content.emote as string || "TALK";
             emoteManager.playEmote(emote);
-            await this.speak(content.text);
+            // Voice replies are normally only spoken; when they can't be (voice limit, TTS
+            // failure), post them so the player still gets an answer
+            if (!(await this.speak(content.text))) {
+              service.getMessageManager()?.sendMessage(content.text);
+            }
           }
 
           return [responseMemory];
@@ -312,24 +331,47 @@ export class VoiceManager {
   }
 
   /**
-   * Synthesizes text and plays it in the world. Never throws.
+   * Synthesizes text and plays it in the world. Never throws. Resolves to whether speech was
+   * produced: false when there is nothing to say, the voice limit is reached, or TTS failed.
    */
-  async speak(text: string): Promise<void> {
+  async speak(text: string): Promise<boolean> {
     // Never read URLs aloud
     text = text?.replace(/https?:\/\/\S+/g, '').trim();
-    if (!text || this.stopped) return;
+    if (!text || this.stopped) return false;
+    const budget = getUsageBudget();
+    if (!budget.ttsAvailable()) {
+      budget.recordSkip('tts');
+      if (Date.now() - this.lastTtsLimitLogAt >= VOICE_LIMIT_NOTICE_INTERVAL_MS) {
+        this.lastTtsLimitLogAt = Date.now();
+        logger.info(`[VoiceManager] VOICE_TTS_MAX_CHARS_PER_DAY=${budget.limits.ttsCharsPerDay} reached; replying in text only`);
+      }
+      return false;
+    }
     // Captured before synthesis so a stop() during the TTS request discards the result
     const generation = this.playbackGeneration;
     try {
       const audioBuffer = await generateSpeech(text);
       if (!audioBuffer) {
         console.log('[VoiceManager] No audio generated - check ELEVENLABS_XI_API_KEY or OPENAI_API_KEY in .env');
-        return;
+        return false;
       }
+      budget.recordTts(text.length);
       await this.playAudio(audioBuffer, generation);
+      return true;
     } catch (error) {
       logger.warn('[VoiceManager] TTS failed, text-only response sent:', error);
+      return false;
     }
+  }
+
+  /** Tells players (at most every 10 minutes) to type, while voice input is over its limit. */
+  private noticeVoiceInputPaused(): void {
+    if (Date.now() - this.lastSttLimitNoticeAt < VOICE_LIMIT_NOTICE_INTERVAL_MS) return;
+    this.lastSttLimitNoticeAt = Date.now();
+    logger.info(`[VoiceManager] VOICE_STT_MAX_SECONDS_PER_DAY=${getUsageBudget().limits.sttSecondsPerDay} reached; ignoring voice input`);
+    this.getService()
+      ?.getMessageManager()
+      ?.sendMessage('🎙️ Voice input is paused for now — please type in chat. / 音声入力は一時停止中です。チャットで話しかけてください。');
   }
 
   /**

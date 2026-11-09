@@ -9,6 +9,7 @@ import {
   ModelType,
   type State,
 } from '@elizaos/core';
+import { forPurpose } from '../../usage-budget';
 
 const ambientTemplate = `# Task: Generate ambient speech for the character {{agentName}}.
 {{providers}}
@@ -83,7 +84,7 @@ export const hyperfyAmbientSpeechAction = {
       template: ambientTemplate,
     });
 
-    const response = await runtime.useModel(ModelType.OBJECT_LARGE, { prompt });
+    const response = await runtime.useModel(ModelType.OBJECT_LARGE, forPurpose('ambient', { prompt }));
 
     await callback({
       thought: response.thought,

@@ -6,6 +6,7 @@ import { countOtherPlayers } from "../utils";
 import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
 import { splitChatText } from "../lib/chat-chunks";
 import { isOpenPayLink } from "../../openpay-store";
+import { runWithOrigin } from "../../usage-budget";
 import moment from 'moment'
 import { uuid } from '../hyperfy/src/core/utils';
 
@@ -32,7 +33,7 @@ export class MessageManager {
 
   async handleMessage(msg, turn?: ChatTurn): Promise<void> {
     // maybe a thinking emote here?
-    await agentActivityLock.run(async () => {
+    await runWithOrigin('chat', () => agentActivityLock.run(async () => {
       const service = this.getService();
       const world = service.getWorld();
       const agentPlayerId = world.entities.player.data.id // Get agent's ID
@@ -163,7 +164,7 @@ export class MessageManager {
 
         console.info(`[Hyperfy Chat] Successfully emitted event for message: ${messageId}`)
       }
-    });
+    }));
   }
 
   /**

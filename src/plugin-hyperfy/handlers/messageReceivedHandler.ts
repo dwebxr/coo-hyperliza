@@ -1,8 +1,72 @@
-import { Content, EventType, Memory, MessageReceivedHandlerParams, ModelType, asUUID, composePromptFromState, createUniqueUuid, logger, parseKeyValueXml, truncateToCompleteSentence } from "@elizaos/core";
+import { Content, EventType, HandlerCallback, IAgentRuntime, Memory, MessageReceivedHandlerParams, ModelType, asUUID, composePromptFromState, createUniqueUuid, logger, parseKeyValueXml, truncateToCompleteSentence } from "@elizaos/core";
 import { v4 } from 'uuid';
 import { hyperfyShouldRespondTemplate, hyperfyMessageHandlerTemplate } from "../templates";
+import { AiBudgetExceededError, forPurpose, getUsageBudget } from "../../usage-budget";
+import { getShopProducts } from "../../openpay-store";
+import { parseAliases } from "../lib/addressing";
+import { isJapanese, matchSimpleCommand, simpleCommandReply } from "../lib/simple-commands";
+import { NoticeThrottle, composeOfflineReply } from "../lib/offline-reply";
 
 const latestResponseIds = new Map<string, Map<string, string>>();
+
+// Beyond this the agent teleports to a player who asks it to come, instead of walking
+const COME_TELEPORT_BEYOND_M = 30;
+// One full reply attempt plus one retry when the reply could not be parsed at all
+const MAX_REPLY_ATTEMPTS = 2;
+
+const offlineNotices = new NoticeThrottle();
+
+/**
+ * "Come here" / "stop" from the player talking to the agent, done without Claude.
+ * Returns false when the message is not such a command or it cannot be carried out here.
+ */
+async function handleSimpleCommand(runtime: IAgentRuntime, message: Memory, callback: HandlerCallback): Promise<boolean> {
+  const names = [runtime.character.name, ...parseAliases(process.env.HYPERFY_AGENT_ALIASES)];
+  const command = matchSimpleCommand(message.content.text, names);
+  if (!command) return false;
+
+  const world = (runtime.getService?.('hyperfy') as { getWorld?: () => any } | null)?.getWorld?.();
+  const controls = world?.controls;
+  if (!controls) return false;
+
+  if (command === 'come') {
+    const senderId = (message.content.metadata as { hyperfyFromId?: string } | undefined)?.hyperfyFromId;
+    const theirs = senderId ? world.entities?.items?.get(senderId)?.base?.position : null;
+    const mine = world.entities?.player?.base?.position;
+    if (!theirs || !mine) return false;
+    if (theirs.distanceTo(mine) > COME_TELEPORT_BEYOND_M) {
+      controls.teleportToEntity(senderId);
+    } else {
+      // Not awaited: the reply goes out while walking
+      controls.followEntity(senderId).catch((error: unknown) => logger.debug(`[Bootstrap] Walking to the speaker failed: ${error}`));
+    }
+  } else {
+    controls.stopAllActions('asked to stop');
+  }
+
+  logger.info(`[Bootstrap] Simple command "${command}" handled without a model call`);
+  await callback({
+    thought: `Simple request (${command}), handled directly.`,
+    text: simpleCommandReply(command, isJapanese(message.content.text)),
+    actions: [command === 'come' ? 'HYPERFY_GOTO_ENTITY' : 'HYPERFY_STOP_MOVING'],
+    source: 'hyperfy',
+    ...(message.id ? { inReplyTo: createUniqueUuid(runtime, message.id) } : {}),
+  });
+  return true;
+}
+
+/** Answers a player who talks to the agent while the Claude budget is used up. */
+async function replyWithoutAi(runtime: IAgentRuntime, message: Memory, callback: HandlerCallback): Promise<void> {
+  const text = message.content.text ?? '';
+  const reply = composeOfflineReply({ text, products: getShopProducts(runtime), japanese: isJapanese(text) });
+  if (reply.kind === 'notice' && !offlineNotices.allow(`${message.roomId}:${message.entityId}`)) return;
+  getUsageBudget().recordSkip('offline-reply');
+  logger.info(`[Bootstrap] Claude budget reached; answering with a ${reply.kind} instead`);
+  await callback({
+    ...reply.content,
+    ...(message.id ? { inReplyTo: createUniqueUuid(runtime, message.id) } : {}),
+  });
+}
 
 /**
  * Handles incoming messages and generates responses based on the provided runtime and message information.
@@ -72,6 +136,10 @@ export const messageReceivedHandler = async ({
 
     const processingPromise = (async () => {
       let runError: string | undefined;
+      // Set by the Hyperfy message/voice managers
+      const metadata = (message.content?.metadata ?? {}) as { directlyAddressed?: boolean; soloPlayer?: boolean };
+      const addressed = !!(metadata.directlyAddressed || metadata.soloPlayer);
+      let replied = false;
       try {
         if (message.entityId === runtime.agentId) {
           logger.debug(`[Bootstrap] Skipping message from self (${runtime.agentId})`);
@@ -105,16 +173,28 @@ export const messageReceivedHandler = async ({
           return;
         }
 
+        // Simple requests from the player talking to the agent need no model call
+        if (addressed && (await handleSimpleCommand(runtime, message, callback))) {
+          replied = true;
+          return;
+        }
+
+        if (!getUsageBudget().aiAvailable()) {
+          if (addressed) {
+            replied = true;
+            await replyWithoutAi(runtime, message, callback);
+          }
+          return;
+        }
+
         // Composed once and reused for the response prompt; recomposing re-runs every provider.
         let state = await runtime.composeState(
           message,
         );
 
-        // Set by the Hyperfy message/voice managers
-        const metadata = (message.content?.metadata ?? {}) as { directlyAddressed?: boolean; soloPlayer?: boolean };
         let shouldRespond = false;
 
-        if (metadata.directlyAddressed || metadata.soloPlayer) {
+        if (addressed) {
           logger.debug(
             `[Bootstrap] Skipping shouldRespond check for ${runtime.character.name} (directlyAddressed=${!!metadata.directlyAddressed}, soloPlayer=${!!metadata.soloPlayer})`
           );
@@ -129,9 +209,9 @@ export const messageReceivedHandler = async ({
             `[Bootstrap] Evaluating response for ${runtime.character.name}\nPrompt: ${shouldRespondPrompt}`
           );
 
-          const response = await runtime.useModel(ModelType.TEXT_SMALL, {
+          const response = await runtime.useModel(ModelType.TEXT_SMALL, forPurpose('should-respond', {
             prompt: shouldRespondPrompt,
-          });
+          }));
 
           logger.debug(
             `[Bootstrap] Response evaluation for ${runtime.character.name}:\n${response}`
@@ -153,14 +233,13 @@ export const messageReceivedHandler = async ({
 
           let responseContent: Content | null = null;
 
-          // Retry if missing required fields
-          let retries = 0;
-          const maxRetries = 3;
+          // Retried only when the reply could not be parsed; an empty thought is fine
+          let attempts = 0;
 
-          while (retries < maxRetries && (!responseContent?.thought || !responseContent?.actions)) {
-            let response = await runtime.useModel(ModelType.TEXT_LARGE, {
+          while (attempts < MAX_REPLY_ATTEMPTS && !responseContent) {
+            let response = await runtime.useModel(ModelType.TEXT_LARGE, forPurpose('chat', {
               prompt,
-            });
+            }));
 
             logger.debug('[Bootstrap] *** Raw LLM Response ***\n', response);
 
@@ -193,11 +272,9 @@ export const messageReceivedHandler = async ({
               responseContent = null;
             }
 
-            retries++;
-            if (!responseContent?.thought || !responseContent?.actions) {
-              logger.warn(
-                '[Bootstrap] *** Missing required fields (thought or actions), retrying... ***'
-              );
+            attempts++;
+            if (!responseContent && attempts < MAX_REPLY_ATTEMPTS) {
+              logger.warn('[Bootstrap] *** Could not parse the reply, retrying once... ***');
             }
           }
 
@@ -235,6 +312,9 @@ export const messageReceivedHandler = async ({
             state = await runtime.composeState(message, responseContent?.providers || []);
           }
 
+          // From here the player gets the generated reply; a budget error in a later action
+          // (e.g. navigation) must not add the offline notice on top
+          replied = responseMessages.length > 0;
           await runtime.processActions(message, responseMessages, state, callback);
           
           await runtime.evaluate(message, state, shouldRespond, callback, responseMessages);
@@ -279,6 +359,10 @@ export const messageReceivedHandler = async ({
 
       } catch (error: any) {
         runError = error?.message || String(error);
+        // The budget ran out partway through this turn: still answer the player
+        if (error instanceof AiBudgetExceededError && addressed && !replied) {
+          await replyWithoutAi(runtime, message, callback).catch((e) => logger.warn('[Bootstrap] Offline reply failed:', e));
+        }
       } finally {
         // Emitted on every path, including early returns (muted room, superseded response)
         await runtime.emitEvent(EventType.RUN_ENDED, {

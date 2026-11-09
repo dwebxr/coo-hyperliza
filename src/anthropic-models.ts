@@ -11,6 +11,7 @@ import {
   ModelType,
   logger,
 } from '@elizaos/core';
+import { AiBudgetExceededError, currentOrigin, getUsageBudget, isAiPurpose, maxTokensFor, purposeEnvKey } from './usage-budget';
 
 /**
  * Text/JSON generation with current Claude models.
@@ -83,17 +84,36 @@ async function generate(
     system,
     stopSequences,
     maxTokens,
-  }: { prompt: string; content?: Anthropic.ContentBlockParam[]; system?: string; stopSequences?: string[]; maxTokens?: number }
+    purpose,
+  }: {
+    prompt: string;
+    content?: Anthropic.ContentBlockParam[];
+    system?: string;
+    stopSequences?: string[];
+    maxTokens?: number;
+    /** Set by this project's callers (see usage-budget.ts); picks the output cap and labels usage. */
+    purpose?: unknown;
+  }
 ): Promise<string> {
+  const budget = getUsageBudget();
+  const blocked = budget.aiBlockedReason();
+  if (blocked) {
+    budget.recordSkip('ai-call');
+    throw new AiBudgetExceededError(blocked);
+  }
+
   const model = getSetting(runtime, `ANTHROPIC_${size}_MODEL`, DEFAULT_MODEL);
   const effort = getEffort(runtime);
   // The API rejects empty or whitespace-only stop sequences
   const stops = (stopSequences ?? []).filter((s) => s.trim());
+  // A tagged call's own cap wins over the caller's value, which may be a global model setting
+  const maxOutput = maxTokensFor(purpose) ?? maxTokens ?? DEFAULT_MAX_TOKENS;
+  const label = isAiPurpose(purpose) ? purpose : modelType;
 
   const response = await getClient(runtime).messages.create(
     {
       model,
-      max_tokens: maxTokens ?? DEFAULT_MAX_TOKENS,
+      max_tokens: maxOutput,
       ...(system ? { system } : {}),
       ...(stops.length ? { stop_sequences: stops } : {}),
       output_config: { effort },
@@ -103,6 +123,20 @@ async function generate(
   );
 
   // Billed even when the output turns out unusable
+  budget.recordAi({
+    purpose: label,
+    origin: currentOrigin(),
+    inputTokens: response.usage.input_tokens,
+    outputTokens: response.usage.output_tokens,
+    cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
+    cacheWriteTokens: response.usage.cache_creation_input_tokens ?? 0,
+  });
+  if (response.stop_reason === 'max_tokens') {
+    logger.warn(
+      `[Anthropic] ${label} reply was cut off at max_tokens=${maxOutput}` +
+        (isAiPurpose(purpose) ? `; raise ${purposeEnvKey(purpose)} if this keeps happening` : '')
+    );
+  }
   runtime
     .emitEvent(EventType.MODEL_USED, {
       provider: 'anthropic',
@@ -212,6 +246,7 @@ async function generateText(runtime: IAgentRuntime, size: Size, params: Generate
     system: runtime.character.system ?? undefined,
     stopSequences: params.stopSequences,
     maxTokens: params.maxTokens,
+    purpose: (params as GenerateTextParams & { purpose?: unknown }).purpose,
   });
 }
 
@@ -230,7 +265,8 @@ async function describeImage(
   runtime: IAgentRuntime,
   params: ImageDescriptionParams | string
 ): Promise<{ title: string; description: string }> {
-  const { imageUrl, prompt } = typeof params === 'string' ? { imageUrl: params, prompt: undefined } : params;
+  const { imageUrl, prompt, purpose } =
+    typeof params === 'string' ? { imageUrl: params, prompt: undefined, purpose: undefined } : (params as ImageDescriptionParams & { purpose?: unknown });
   const instruction = prompt || 'Describe this image in detail.';
   const description = await generate(runtime, 'LARGE', ModelType.IMAGE_DESCRIPTION, {
     prompt: instruction,
@@ -239,6 +275,7 @@ async function describeImage(
       { type: 'text', text: instruction },
     ],
     maxTokens: IMAGE_DESCRIPTION_MAX_TOKENS,
+    purpose,
   });
   return { title: 'Image description', description };
 }
@@ -255,6 +292,7 @@ async function generateObject(runtime: IAgentRuntime, size: Size, params: Object
     stopSequences: params.stopSequences,
     // Not in ObjectGenerationParams, but core injects it from model settings
     maxTokens: (params as ObjectGenerationParams & { maxTokens?: number }).maxTokens,
+    purpose: (params as ObjectGenerationParams & { purpose?: unknown }).purpose,
   });
   return parseJsonResponse(text);
 }

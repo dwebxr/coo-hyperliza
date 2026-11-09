@@ -9,6 +9,7 @@ import {
   ModelType
 } from '@elizaos/core';
 import { HyperfyService } from '../service';
+import { forPurpose } from '../../usage-budget';
 import { AgentActions } from '../systems/actions';
 import { AgentControls } from '../systems/controls';
 
@@ -65,7 +66,7 @@ export const hyperfyUseItemAction: Action = {
       try {
         const useState = await runtime.composeState(message, ['HYPERFY_WORLD_STATE', 'RECENT_MESSAGES'], true);
         const prompt = composePromptFromState({ state: useState, template: useItemTemplate });
-        const response = await runtime.useModel(ModelType.OBJECT_SMALL, { prompt });
+        const response = await runtime.useModel(ModelType.OBJECT_SMALL, forPurpose('use-item', { prompt }));
 
         if (response?.entityId && typeof response.entityId === 'string') {
           targetEntityId = response.entityId;

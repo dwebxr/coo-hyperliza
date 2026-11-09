@@ -5,10 +5,15 @@ An ElizaOS + Hyperfy 3D world integration agent. An AI agent that autonomously a
 ## Features
 
 ### Cost Optimization
-- **Idle Mode Energy Saving**: When no other players are in the world, autonomous actions are skipped entirely (no LLM call is made) and the loop only re-checks for players every 60-120 seconds
-  - With players present: autonomous actions every 15-30 seconds
-  - Without players: skipped, re-check every 60-120 seconds (idle mode)
+See "Cost Controls and Usage Limits" for the settings.
+- **Scripted Idle Behavior**: Between Claude decisions the agent patrols or wanders around its post, waves at players who arrive and looks around, with no API calls. Claude decides an autonomous action at most every 2 minutes and 20 times an hour by default (both configurable), and never right after a conversation
+- **Idle Mode Energy Saving**: When no other players are in the world, autonomous actions are skipped entirely (no API call is made) and the loop only re-checks for players every 60-120 seconds
+- **Simple Requests Without Claude**: "Come here" / "follow me" / "stop" (English or Japanese) from the player talking to the agent are carried out directly, using the speaker's position
+- **One Call per Look**: Asking the agent to look at something takes one Claude call with the snapshot (how to look is chosen from the player's words)
 - **Cheaper Reply Decisions**: Messages that mention the agent's name or an alias (see `HYPERFY_AGENT_ALIASES`) skip the "should I respond?" LLM check
+- **Output Caps per Purpose**: Each kind of call (reply, decision, extraction, vision) has its own `max_tokens`
+- **Separate Budgets**: Claude, vision, speech output and voice input each have their own optional limit. When the Claude budget is used up the agent keeps patrolling and waving, and still posts a product's purchase link when a player names it
+- **Usage Reports**: Calls, tokens and voice usage per purpose and origin are logged every hour
 
 ### Voice Features
 - **ElevenLabs TTS and speech-to-text**: High-quality voice output, and voice input from players
@@ -22,7 +27,8 @@ An ElizaOS + Hyperfy 3D world integration agent. An AI agent that autonomously a
 - **Walking Animations**: Uses the agent's own walk/run/idle clips when the world has them or lets the agent upload them; otherwise the world's own clips (Hyperfy's `mp-*` set), sped up to match the agent's movement
 
 ### Autonomous Actions
-- **Walking Around**: Freely move around the world
+- **Walking Around**: Patrol a fixed route (`PATROL_POINTS`) or wander around its post
+- **Greeting Players**: Walk over to and wave at players who arrive
 - **Approaching Players**: Walk towards nearby players
 - **Item Usage**: Interact with objects in the world
 - **Conversation**: Text chat and voice conversations. The world cuts chat messages at 500 characters, so longer replies are posted as up to four messages; text beyond that ends with an ellipsis
@@ -162,16 +168,42 @@ The catalog loads at startup and, once it is more than 5 minutes old, refreshes 
 
 The agent's Hyperfy engine (the `src/plugin-hyperfy/hyperfy` submodule) is older than coo-world, so `src/plugin-hyperfy/lib/world-protocol.ts` makes it speak coo-world's network protocol (protocol version, packet table, plain msgpack encoding), and `src/plugin-hyperfy/lib/asset-upload.ts` uploads assets with the session token the world requires.
 
-### Adjusting Autonomous Behavior
+### Cost Controls and Usage Limits
 
-You can adjust action intervals in `src/plugin-hyperfy/managers/behavior-manager.ts`:
+What costs money is Claude (every reply, decision and look), ElevenLabs text-to-speech (per character) and speech-to-text (per audio second). Each is limited separately in `.env`, so running out of one leaves the others working.
 
-```typescript
-const TIME_INTERVAL_MIN = 15000;      // Min interval with players (ms)
-const TIME_INTERVAL_MAX = 30000;      // Max interval with players (ms)
-const TIME_INTERVAL_IDLE_MIN = 60000; // Min interval in idle mode (ms)
-const TIME_INTERVAL_IDLE_MAX = 120000;// Max interval in idle mode (ms)
+**Autonomous behavior** (only while other players are in the world):
+
+| Variable | Default | Notes |
+|---|---|---|
+| `AUTONOMY_TICK_MIN_SEC`, `AUTONOMY_TICK_MAX_SEC` | `15`, `30` | Time between autonomous steps. Most steps are scripted (patrol/wander, wave at newcomers, look around) and cost nothing |
+| `AUTONOMY_AI_MIN_INTERVAL_SEC` | `120` | Least time between steps where Claude decides what to do (talk to someone, mention a product). Also counted from the end of the last conversation |
+| `AUTONOMY_AI_MAX_PER_HOUR` | `20` | Claude-decided steps per hour; `0` = scripted behavior only |
+| `PATROL_POINTS` | (wander) | Patrol route as `x,z; x,z; ...` world coordinates. Without it the agent wanders within 6 m of where it spawned |
+
+After a conversation the agent stays where it is for 90 seconds instead of walking off. Without other players the loop only re-checks every 60-120 seconds.
+
+**Usage limits** (empty = no limit, `0` = that use is off; rolling windows over the last hour / 24 hours):
+
+| Variable | Limits | When reached |
+|---|---|---|
+| `AI_MAX_CALLS_PER_HOUR` | Claude calls (everything) | No Claude calls. Patrol, waves, "come here" / "stop" carry on. A player who names a product gets its purchase link; other players who talk to the agent get a short "on a break" notice (once per 5 minutes each) |
+| `AI_MAX_TOKENS_PER_DAY` | Claude tokens (input + output + cache) | Same as above |
+| `VISION_MAX_PER_HOUR` | Looks at the world (one Claude call with an image each) | The agent says it can't look right now |
+| `VOICE_TTS_MAX_CHARS_PER_DAY` | Characters sent to text-to-speech | Replies are posted to chat without voice (voice-chat replies too) |
+| `VOICE_STT_MAX_SECONDS_PER_DAY` | Seconds of voice input transcribed | Voice input is ignored; chat says to type (at most every 10 minutes) |
+
+Each limit may go over by one call or utterance. Counts are kept in memory and start from zero when the agent restarts.
+
+**Output caps per purpose**: every Claude call this agent makes is tagged with what it is for, which sets its `max_tokens` (room for the model's thinking included): `chat` 2048, `autonomous` 1536, `should-respond` 1024, `navigation` 1024, `use-item` 1024, `vision` 2048, `reply` 1536, `ambient` 1024, `build` 2048. Override one with `AI_MAX_TOKENS_<PURPOSE>` (e.g. `AI_MAX_TOKENS_CHAT=3000`, `AI_MAX_TOKENS_SHOULD_RESPOND=800`). A reply cut off at its cap is logged with the variable to raise.
+
+**Usage reports**: every `USAGE_REPORT_INTERVAL_MIN` minutes (default `60`, `0` = off) the log shows the last interval and the last 24 hours, e.g.
+
 ```
+[Usage 1h] Claude 34 calls (98k in / 6.1k out) | by origin: chat 20, autonomous 10, voice 4 | by purpose: chat 18 (61k in / 3.9k out), autonomous 10 (30k in / 1.2k out), ... | autonomous ticks: 10 AI / 112 scripted | vision 2 | TTS 3.4k chars (chat 2.2k, autonomous 1.2k) | STT 210 s
+```
+
+`origin` is where a call started (a chat message, voice input, or an autonomous step), so navigation triggered by an autonomous step counts as autonomous. Start without limits, read a few days of reports, then set limits from what you see.
 
 ## Architecture
 
@@ -179,6 +211,10 @@ const TIME_INTERVAL_IDLE_MAX = 120000;// Max interval in idle mode (ms)
 src/
 ├── plugin-hyperfy/
 │   ├── lib/
+│   │   ├── idle-behavior.ts     # Scripted patrol / wander / greeting steps
+│   │   ├── simple-commands.ts   # "Come here" / "stop" handled without Claude
+│   │   ├── offline-reply.ts     # Replies when the Claude budget is used up
+│   │   ├── snapshot-choice.ts   # How to look, chosen from the player's words
 │   │   ├── world-protocol.ts    # coo-world network protocol for the older engine
 │   │   ├── asset-upload.ts      # Authenticated avatar/emote uploads
 │   │   ├── chat-chunks.ts       # Splits replies into world-sized chat messages
@@ -201,6 +237,7 @@ src/
 │   └── utils.ts                # Utilities (TTS generation, etc.)
 ├── openpay-store/              # OpenPay Store shop clerk
 ├── anthropic-models.ts         # Claude through the official SDK
+├── usage-budget.ts             # Usage meter, limits and reports
 ├── elevenlabs-speech.ts        # ElevenLabs speech-to-text / text-to-speech models
 ├── llm-provider.ts             # Model plugin selection (Claude only)
 └── index.ts                    # Main entry point & character config
@@ -211,7 +248,7 @@ stubs/unused-elizaos-plugin/    # Stands in for plugins @elizaos/cli lists but n
 
 ### Changes from Original (eliza-3d-hyperfy-starter)
 
-1. **Cost Optimization**: Reduced autonomous action frequency when no players present
+1. **Cost Optimization**: Scripted idle behavior with a limited Claude budget for autonomous actions, nothing when no players are present, separate limits for Claude, vision and voice, and hourly usage reports
 2. **Claude via the Official SDK**: Text, JSON and image description with current Claude models
 3. **ElevenLabs Voice**: Speech output and voice input
 4. **Audio Format Conversion**: Proper MP3 to PCM conversion (using ffmpeg)

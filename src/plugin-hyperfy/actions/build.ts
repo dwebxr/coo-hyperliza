@@ -10,6 +10,7 @@ import {
     parseKeyValueXml
   } from '@elizaos/core';
   import { HyperfyService } from '../service';
+  import { forPurpose } from '../../usage-budget';
   import { AgentControls } from '../systems/controls';
   const MAX_RETRIES = 3;
 
@@ -199,7 +200,7 @@ ${summary}
             template: sceneEditOperationExtractionTemplate,
           });
     
-          operationResults = await runtime.useModel(ModelType.OBJECT_LARGE, { prompt });
+          operationResults = await runtime.useModel(ModelType.OBJECT_LARGE, forPurpose('build', { prompt }));
     
           if (Array.isArray(operationResults?.operations)) break;
     
@@ -283,7 +284,7 @@ ${summary}
       
       let finalXml: string;
       try {
-        finalXml = await runtime.useModel(ModelType.TEXT_SMALL, { prompt: agentResponsePrompt });
+        finalXml = await runtime.useModel(ModelType.TEXT_SMALL, forPurpose('build', { prompt: agentResponsePrompt }));
       } catch (err) {
         logger.error('[EDIT_ENTITY Action] Final summarization failed:', err);
         await callback({

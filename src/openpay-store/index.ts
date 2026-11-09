@@ -34,6 +34,14 @@ export function isOpenPayLink(content: object | undefined): boolean {
   return !!(metadata as Record<string, unknown> | undefined)?.[OPENPAY_LINK_FLAG];
 }
 
+// Shelves by agent, for replies that must work without Claude (see plugin-hyperfy/lib/offline-reply.ts)
+const catalogsByAgent = new Map<string, StoreCatalog>();
+
+/** The cached products of the agent's shop; empty when the shop is off or not loaded yet. */
+export function getShopProducts(runtime: Pick<IAgentRuntime, 'agentId'>): StoreProduct[] {
+  return catalogsByAgent.get(runtime.agentId)?.list() ?? [];
+}
+
 /** Autonomous behavior ticks use the agent's own id as the sender and have no text. */
 function isAutonomous(runtime: IAgentRuntime, message: Memory): boolean {
   return message.entityId === runtime.agentId || !message.content?.text?.trim();
@@ -193,7 +201,8 @@ export function createOpenPayStorePlugin(env: Record<string, string | undefined>
     name: 'openpay-store',
     description: 'Recommends OpenPay Store products and shares their purchase links',
     // Warm the cache without delaying startup
-    init: async () => {
+    init: async (_config, runtime) => {
+      if (runtime?.agentId) catalogsByAgent.set(runtime.agentId, catalog);
       void catalog.refresh();
     },
     providers: [provider],

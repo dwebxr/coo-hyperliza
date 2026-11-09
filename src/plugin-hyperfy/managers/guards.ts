@@ -6,19 +6,28 @@
 
 export class AgentActivityLock {
     private count = 0;
-  
+    private lastExitAt = Number.NEGATIVE_INFINITY;
+
+    constructor(private readonly now: () => number = Date.now) {}
+
     isActive(): boolean {
       return this.count > 0;
     }
-  
+
+    /** When message activity last ended: now while it is in progress, -Infinity if there was none. */
+    lastActivityAt(): number {
+      return this.isActive() ? this.now() : this.lastExitAt;
+    }
+
     enter() {
       this.count++;
     }
-  
+
     exit() {
       this.count = Math.max(0, this.count - 1);
+      this.lastExitAt = this.now();
     }
-  
+
     async run<T>(fn: () => Promise<T>): Promise<T> {
       this.enter();
       try {
@@ -28,8 +37,7 @@ export class AgentActivityLock {
       }
     }
   }
-  
+
 
 
 export const agentActivityLock = new AgentActivityLock();
-  

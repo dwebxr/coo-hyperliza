@@ -9,6 +9,7 @@ import {
   ModelType,
   type State,
 } from '@elizaos/core';
+import { forPurpose } from '../../usage-budget';
 
 /**
  * Template for generating dialog and actions for a character.
@@ -109,9 +110,9 @@ export const replyAction = {
       template: replyTemplate,
     });
 
-    const response = await runtime.useModel(ModelType.OBJECT_LARGE, {
+    const response = await runtime.useModel(ModelType.OBJECT_LARGE, forPurpose('reply', {
       prompt,
-    });
+    }));
 
     const responseContent = {
       thought: response.thought,
