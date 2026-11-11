@@ -422,12 +422,19 @@ describe('gltfStorageProblem: what the page would allocate', () => {
     expect(problem(glb({ ...json([]), meshes: [{ primitives: [{ attributes: { POSITION: 0 }, targets: [{ POSITION: 2 }, { POSITION: 3 }] }, { attributes: { POSITION: 0 }, targets: [{ POSITION: 3 }, { POSITION: 2 }] }] }] }))).toContain('declares other morph targets');
   });
 
-  it("refuses a material's texture that does not exist, wherever the material names it", () => {
+  it("refuses a material's texture that does not exist where glTF or an extension the page reads names one, and reads nothing else as one", () => {
     const base = { images: [{ uri: 'x.png' }], textures: [{ source: 0 }] };
     expect(problem(glb({ ...base, materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 } }, normalTexture: { index: 0 } }] }))).toBeNull();
     expect(problem(glb({ ...base, materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 999 } } }] }))).toBe('material 0 names no texture (baseColorTexture)');
     expect(problem(glb({ ...base, materials: [{}, { extensions: { KHR_materials_clearcoat: { clearcoatTexture: { index: 2 } } } }] }))).toBe('material 1 names no texture (clearcoatTexture)');
     expect(problem(glb({ ...base, materials: [{ extensions: { VRMC_materials_mtoon: { shadeMultiplyTexture: { index: -1 } } } }] }))).toContain('names no texture');
+    expect(problem(glb({ ...base, materials: [{ normalTexture: 'not an object' }] }))).toBe('material 0 names no texture (normalTexture)');
+    // An application's own metadata, and extensions the page does not read, are not texture references
+    expect(problem(glb({ ...base, materials: [{ extras: { previewTexture: { index: 12 } } }] }))).toBeNull();
+    expect(problem(glb({ ...base, materials: [{ extensions: { EXT_someone_elses: { overlayTexture: { index: 12 } } } }] }))).toBeNull();
+    expect(problem(glb({ ...base, materials: [{ pbrMetallicRoughness: { extras: { bakedTexture: { index: 12 } } } }] }))).toBeNull();
+    // A texture transform sits inside a textureInfo and names no texture of its own
+    expect(problem(glb({ ...base, materials: [{ emissiveTexture: { index: 0, extensions: { KHR_texture_transform: { texCoord: 1, offset: [0, 0] } } } }] }))).toBeNull();
   });
 
   it('refuses a sparse part that runs past the end of its buffer view', () => {

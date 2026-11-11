@@ -23,8 +23,9 @@
  *
  * Checked after parsing: asset.version 2.x; the references between buffers, buffer views,
  * accessors (sparse indices and values included), images, samplers, textures (also those a
- * material names, in any "...Texture" entry), materials, meshes, nodes, skins, cameras, lights,
- * scenes and animations name something that exists; buffer views lie within their buffers, and
+ * material names where glTF or a supported extension defines one: MATERIAL_TEXTURES), materials,
+ * meshes, nodes, skins, cameras, lights, scenes and animations name something that exists (extras
+ * and other extensions are not read as references); buffer views lie within their buffers, and
  * accessors and their sparse parts within their views (byteStride included); the node graph is a
  * forest; primitives the loader would share one geometry for (same indices, attributes and mode)
  * declare the same morph targets (compared by content, not by the order of their members).
@@ -54,6 +55,23 @@
  * three.js objects per node or mesh beyond the caps above. The watchdog is what bounds those.
  */
 import { MAX_EMOTE_BYTES, MAX_MODEL_BYTES } from './net-policy';
+
+/**
+ * Where a material names a texture (a textureInfo with an index): the core material, its
+ * pbrMetallicRoughness, and the material extensions the page's loaders read (three's GLTFLoader:
+ * KHR_materials_*; three-vrm: VRMC_materials_mtoon). KHR_texture_transform sits inside a
+ * textureInfo and names no texture itself.
+ */
+const MATERIAL_TEXTURES: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ['', ['normalTexture', 'occlusionTexture', 'emissiveTexture']],
+  ['pbrMetallicRoughness', ['baseColorTexture', 'metallicRoughnessTexture']],
+  ['KHR_materials_clearcoat', ['clearcoatTexture', 'clearcoatRoughnessTexture', 'clearcoatNormalTexture']],
+  ['KHR_materials_transmission', ['transmissionTexture']],
+  ['KHR_materials_volume', ['thicknessTexture']],
+  ['KHR_materials_specular', ['specularTexture', 'specularColorTexture']],
+  ['KHR_materials_pbrSpecularGlossiness', ['diffuseTexture', 'specularGlossinessTexture']],
+  ['VRMC_materials_mtoon', ['shadeMultiplyTexture', 'shadingShiftTexture', 'matcapTexture', 'rimMultiplyTexture', 'outlineWidthMultiplyTexture', 'uvAnimationMaskTexture']],
+];
 
 export type ModelKind = 'model' | 'avatar' | 'emote';
 
@@ -406,15 +424,19 @@ function charge(bytes: Uint8Array, budget: ModelBudget): ModelCharge {
     }
   }
   const materials = list(gltf, 'materials', MODEL_LIMITS.materials);
-  // Every texture a material names: an object under a key ending in "Texture" with an index (core, KHR_ and VRMC_ ones alike)
-  const textureRefs = (value: unknown, what: string, depth = 0): void => {
-    if (depth > MODEL_LIMITS.jsonDepth || value === null || typeof value !== 'object') return;
-    for (const [name, entry] of Object.entries(value as Record<string, unknown>)) {
-      if (/Texture$/.test(name) && isObject(entry) && 'index' in entry && !isIndex(entry.index, textures.length)) refuse(`${what} names no texture (${name})`);
-      textureRefs(entry, what, depth + 1);
+  // Every texture a material names where glTF or an extension the page reads defines one
+  // (MATERIAL_TEXTURES); extras and other extensions are not read as texture references
+  for (const [index, material] of materials.entries()) {
+    if (!isObject(material)) continue;
+    for (const [carrier, names] of MATERIAL_TEXTURES) {
+      const holder = carrier === '' ? material : carrier === 'pbrMetallicRoughness' ? material.pbrMetallicRoughness : material.extensions?.[carrier];
+      if (!isObject(holder)) continue;
+      for (const name of names) {
+        const info = holder[name];
+        if (info !== undefined && !(isObject(info) && isIndex(info.index, textures.length))) refuse(`material ${index} names no texture (${name})`);
+      }
     }
-  };
-  for (const [index, material] of materials.entries()) textureRefs(material, `material ${index}`);
+  }
   const cameras = list(gltf, 'cameras', MODEL_LIMITS.cameras);
   const lights = gltf.extensions?.KHR_lights_punctual?.lights;
   if (lights !== undefined && !Array.isArray(lights)) refuse("the model's lights are not a list");

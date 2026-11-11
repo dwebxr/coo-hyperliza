@@ -4,8 +4,9 @@
  * filter for the known cheap amplifiers, not a limit).
  *
  * Each browser the manager launches is one generation. For as long as it exists, the resident
- * memory of the processes it owns is sampled: every RENDER_SAMPLE_INTERVAL_MS while a page call
- * runs, every RENDER_IDLE_SAMPLE_INTERVAL_MS otherwise (timers that do not keep the process up).
+ * memory of the processes it owns is sampled: the next sample starts RENDER_SAMPLE_INTERVAL_MS
+ * after the previous one finished while a page call runs, RENDER_IDLE_SAMPLE_INTERVAL_MS after it
+ * otherwise (timers that do not keep the process up), so the time `ps` takes adds to the gap.
  * It owns the browser, its descendants by parent pid, every process in its process group (puppeteer
  * starts Chromium detached, so the browser leads a group of its own, which a helper keeps when its
  * parent exits), and every process seen in an earlier sample whose group has not changed since.
@@ -13,12 +14,15 @@
  * Over RENDER_MEMORY_LIMIT_BYTES, or with one page call past its deadline (RENDER_CALL_DEADLINE_MS;
  * page initialisation has RENDER_INIT_DEADLINE_MS), the generation is torn down at once: it is
  * marked dead, every call in flight fails with RenderPageKilled, every later call on it fails the
- * same way, the owner is told (and starts the next browser on next use), and its group and its
- * processes are killed (SIGKILL), once from the latest sample and again from a fresh one.
+ * same way (with callsInFlight 0: it was not in flight, so it is not blamed), the owner is told
+ * (and starts the next browser on next use), and its group and its processes are killed
+ * (SIGKILL), once from the latest sample and again from a fresh one.
  *
  * Kills are counted process-wide (renderBreaker): after RENDER_KILLS_PER_WINDOW within
  * RENDER_KILL_WINDOW_MS the render page stays down for RENDER_COOLDOWN_MS, and page calls fail at
- * once with RenderPageUnavailable. One line is logged when that starts and one when it ends.
+ * once with RenderPageUnavailable (the manager checks before it admits page work, also when a
+ * launch or a page build it waited for completes). One line is logged when that starts and one
+ * when it ends.
  *
  * What this cannot do:
  *   - Memory can overshoot the limit by what the page allocates within one sampling interval
@@ -138,13 +142,18 @@ export class RenderPageKilled extends Error {
     readonly measuredBytes: number | null,
     /** The browser generation it belonged to */
     readonly generation: number,
-    /** How many page calls were in flight on that generation when it was torn down */
+    /** How many page calls were in flight on that generation when it was torn down (0 for a call that came later) */
     readonly callsInFlight: number,
     /** Whether building the page was among them (then no asset's call was alone) */
     readonly initInFlight = false
   ) {
     super(message);
     this.name = 'RenderPageKilled';
+  }
+
+  /** The same kill, as a call that came after it sees it: it was not in flight, so it is no one's to blame */
+  forLaterCall(): RenderPageKilled {
+    return new RenderPageKilled(this.reason, this.message, this.measuredBytes, this.generation, 0, false);
   }
 }
 
@@ -348,7 +357,7 @@ export class RenderWatchdog {
       this.started(generation, null);
       state = this.#generations.get(generation) as Generation;
     }
-    if (state.killed) throw state.killed;
+    if (state.killed) throw state.killed.forLaterCall();
     if (state.ended) throw new Error(`[RenderWatchdog] The browser of generation ${generation} is gone`);
     const live = state;
     let call!: Call;

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { TurnCancelled, neverAbortedSignal, runTurn } from './lib/turn-context';
 import { MAX_SPEECH_AUDIO_BYTES, MAX_TRANSCRIPT_RESPONSE_BYTES, TtsLimitReached, countOtherPlayers, generateElevenLabsTTS, generateOpenAITTS, generateSpeech, resolveUrl, transcribeWithElevenLabs } from './utils';
 import { UsageBudget, resetUsageBudget } from '../usage-budget';
 
@@ -308,6 +309,21 @@ describe('generateSpeech: each provider request is reserved on its own', () => {
     await expect(generateSpeech(TEXT)).rejects.toBeInstanceOf(TtsLimitReached);
     expect(hosts()).toEqual([]);
     expect(budget.snapshot(60_000)).toMatchObject({ ttsChars: 0, skipped: { tts: 1 } });
+  });
+
+  it('makes no fallback request, and reserves nothing more, for a turn cancelled while the first request was pending', async () => {
+    const budget = budgetOf(1000);
+    let fail!: () => void;
+    const { hosts } = providers(() => new Promise<Response>((resolve) => (fail = () => resolve(new Response('busy', { status: 503 })))));
+    const slot = new AbortController();
+    const speaking = runTurn({ origin: 'voice', world: {}, generation: 1, signal: neverAbortedSignal(), cancel: slot.signal }, () => generateSpeech(TEXT));
+    await vi.waitFor(() => expect(hosts()).toEqual(['elevenlabs']));
+    slot.abort();
+    fail();
+    await expect(speaking).rejects.toBeInstanceOf(TurnCancelled);
+    expect(hosts()).toEqual(['elevenlabs']);
+    // The request already sent stays counted
+    expect(budget.snapshot(60_000).ttsChars).toBe(100);
   });
 
   it('counts nothing for a provider without a key: no request is made to it', async () => {

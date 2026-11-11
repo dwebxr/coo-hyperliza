@@ -20,6 +20,8 @@ import { Events } from '../hyperfy/src/core/systems/Events.js';
 import { UsageBudget, resetUsageBudget } from '../../usage-budget';
 import { currentTurn, turnDelivered } from '../lib/turn-context';
 import { AgentLiveKit } from '../systems/liveKit';
+import { deliverReply } from '../session/deliver-reply';
+import { reportsPrivilegedAction } from '../lib/authorization';
 
 const PLAYED = { played: 'all' } as const;
 
@@ -165,6 +167,125 @@ describe('VoiceManager.speak and the turn it speaks for', () => {
   });
 });
 
+describe('a voice reply through the real delivery and voice', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  /** deliverReply for a voice turn over the real VoiceManager; posts and memories are recorded */
+  function delivering(publishAudioStream: (...args: any[]) => Promise<unknown> = async () => PLAYED) {
+    const { manager, session, livekit } = setup(publishAudioStream);
+    const posted: string[] = [];
+    const stored: string[] = [];
+    const deliver = (content: any, cancel?: AbortSignal) =>
+      session.runTurn({ origin: 'voice', requesterId: 'p1', cancel }, () =>
+        deliverReply(
+          {
+            turn: currentTurn()!,
+            session: { ended: false, emotes: { playEmote: () => {} }, messages: { sendMessage: async (text: string) => (posted.push(text), true) }, voice: manager },
+            runtime: { agentId: '00000000-0000-0000-0000-0000000000aa' as any, createMemory: async (memory: any) => (stored.push(memory.content.text), 'id' as any) },
+            roomId: '00000000-0000-0000-0000-0000000000bb' as any,
+          },
+          content
+        )
+      );
+    const played = () => livekit.publishAudioStream.mock.calls.map(([buf]) => buf.toString());
+    return { manager, deliver, posted, stored, played, livekit };
+  }
+
+  it('plays, posts and stores the neutral line, and none of the report, when the requester loses the right while the report is synthesized', async () => {
+    const utils = await import('../utils');
+    let finishSynthesis: (() => void) | undefined;
+    vi.spyOn(utils, 'generateSpeech').mockImplementation((text: string) =>
+      text.includes('moved') ? new Promise((resolve) => (finishSynthesis = () => resolve(Buffer.from(text)))) : Promise.resolve(Buffer.from(text))
+    );
+    const { deliver, posted, stored, played } = delivering();
+    let allowed = true;
+    const report = reportsPrivilegedAction({ text: 'I moved the box up!' } as any, {
+      refusal: () => (allowed ? null : 'the requester is no longer a builder'),
+      instead: { text: 'I cannot go any further with that request.' },
+    });
+    const delivery = deliver(report);
+    await vi.waitFor(() => expect(finishSynthesis).toBeDefined());
+    allowed = false;
+    finishSynthesis!();
+    expect(await delivery).toMatchObject({ spoken: 'all', posted: false, stored: true });
+    expect(played()).toEqual(['I cannot go any further with that request.']);
+    expect(posted).toEqual([]);
+    expect(stored).toEqual(['I cannot go any further with that request.']);
+  });
+
+  it('posts the neutral line, not the report, when synthesis failed and the right went meanwhile', async () => {
+    const utils = await import('../utils');
+    let allowed = true;
+    vi.spyOn(utils, 'generateSpeech').mockImplementation(async () => {
+      allowed = false;
+      return null;
+    });
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { deliver, posted, stored, played } = delivering();
+    const report = reportsPrivilegedAction({ text: 'I moved the box up!' } as any, { refusal: () => (allowed ? null : 'demoted'), instead: { text: 'I cannot go any further with that request.' } });
+    await deliver(report);
+    expect(played()).toEqual([]);
+    expect([posted, stored]).toEqual([['I cannot go any further with that request.'], ['I cannot go any further with that request.']]);
+  });
+
+  it('asks for no speech of a report whose requester lost the right while it was posted (a chat turn posts, then speaks)', async () => {
+    const utils = await import('../utils');
+    const synthesize = vi.spyOn(utils, 'generateSpeech').mockImplementation(async (text: string) => Buffer.from(text));
+    const { manager, session, livekit } = setup(async () => PLAYED);
+    let allowed = true;
+    const posted: string[] = [];
+    const report = reportsPrivilegedAction({ text: 'I moved the box up!' } as any, { refusal: () => (allowed ? null : 'demoted'), instead: { text: 'I cannot go any further with that request.' } });
+    await session.runTurn({ origin: 'chat', requesterId: 'p1' }, () =>
+      deliverReply(
+        {
+          turn: currentTurn()!,
+          session: { ended: false, emotes: { playEmote: () => {} }, messages: { sendMessage: async (text: string) => (posted.push(text), (allowed = false), true) }, voice: manager },
+          runtime: { agentId: '00000000-0000-0000-0000-0000000000aa' as any, createMemory: async () => 'id' as any },
+          roomId: '00000000-0000-0000-0000-0000000000bb' as any,
+        },
+        report
+      )
+    );
+    expect(posted).toEqual(['I moved the box up!']);
+    expect(synthesize).not.toHaveBeenCalled();
+    expect(livekit.publishAudioStream).not.toHaveBeenCalled();
+  });
+
+  it('says a reply with a link without the link, posts all of it once as text, and remembers it once', async () => {
+    const utils = await import('../utils');
+    const synthesized: string[] = [];
+    vi.spyOn(utils, 'generateSpeech').mockImplementation(async (text: string) => (synthesized.push(text), Buffer.from(text)));
+    const { deliver, posted, stored } = delivering();
+    const delivery = await deliver({ text: 'Documentation is here https://example.test/guide' });
+    expect(synthesized).toEqual(['Documentation is here']);
+    expect(delivery).toMatchObject({ spoken: 'partial', posted: true, stored: true });
+    expect(posted).toEqual(['Documentation is here https://example.test/guide']);
+    expect(stored).toEqual(['Documentation is here https://example.test/guide']);
+  });
+
+  it('cuts an utterance that is playing when its turn is cancelled, hears voices again, and posts nothing more for that turn', async () => {
+    const utils = await import('../utils');
+    vi.spyOn(utils, 'generateSpeech').mockImplementation(async (text: string) => Buffer.from(text));
+    let publishSignal: AbortSignal | undefined;
+    const { manager, deliver, posted, stored } = delivering((_buf: Buffer, opts: any) => {
+      publishSignal = opts?.signal;
+      opts.progress.frames = 10;
+      return new Promise((resolve) => opts.signal.addEventListener('abort', () => resolve({ played: 'partial', reason: 'stopped' })));
+    });
+    const slot = new AbortController();
+    const delivery = deliver({ text: 'A very long answer that takes a minute to say' }, slot.signal);
+    await vi.waitFor(() => expect(publishSignal).toBeDefined());
+    expect((manager as any).isSpeaking).toBe(true);
+    slot.abort();
+    expect(publishSignal!.aborted).toBe(true);
+    expect(await delivery).toMatchObject({ spoken: 'partial', posted: false });
+    expect((manager as any).isSpeaking).toBe(false);
+    expect(posted).toEqual([]);
+    // What went out is remembered
+    expect(stored).toEqual(['A very long answer that takes a minute to say']);
+  });
+});
+
 describe('VoiceManager.speak', () => {
   it('discards speech synthesized after stop()', async () => {
     const utils = await import('../utils');
@@ -215,6 +336,8 @@ function listening({
     gone.add(playerId);
     events.emit('leave', { playerId });
   };
+  /** The same account joining again: an entity with the same id */
+  const rejoin = (playerId: string) => void gone.delete(playerId);
   const sendMessage = vi.fn();
   const useModel = vi.fn((_type: string, wav: Buffer) => transcribe(wav));
   const runtime: any = sessionRuntime({
@@ -231,7 +354,7 @@ function listening({
   const state = () => ({ speakers: (manager as any).speakers.size, transcribing: (manager as any).transcribing.size, held: (manager as any).heldVoiceBytes });
   /** PCM seconds in each transcription request so far */
   const requests = () => useModel.mock.calls.map(([, wav]) => (wav.length - 44) / 96_000);
-  return { manager, session, budget, runtime, useModel, emit, say, state, requests, heard, sendMessage, world, leave, events };
+  return { manager, session, budget, runtime, useModel, emit, say, state, requests, heard, sendMessage, world, leave, rejoin, events };
 }
 
 describe('VoiceManager voice input', () => {
@@ -366,6 +489,63 @@ describe('VoiceManager voice input', () => {
     await session.conversation.idle();
     const answered = runtime.emitEvent.mock.calls.map(([, payload]: [string, any]) => payload.message.content.metadata.hyperfyFromId);
     expect(answered).toEqual(['p2']);
+  });
+
+  it('starts no turn for a transcript whose speaker left and came back under the same id while it was being transcribed', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    let finish!: (text: string) => void;
+    const { session, say, heard, leave, rejoin } = listening({ transcribe: () => new Promise((resolve) => (finish = resolve)) });
+    say('p1', loud(300));
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS);
+    leave('p1');
+    rejoin('p1');
+    finish('said before leaving');
+    await vi.advanceTimersByTimeAsync(0);
+    // Not even queued: it takes no place in the queue and nothing acts on it when it is admitted
+    expect(session.conversation.stats().queued).toBe(0);
+    expect(heard).toEqual([]);
+    // What they say after coming back is theirs again
+    finish = undefined as any;
+    say('p1', loud(300));
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS);
+    finish('said after coming back');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(heard.map(({ text }) => text)).toEqual(['said after coming back']);
+  });
+
+  it('starts no turn for a queued transcript whose speaker left and came back under the same id before its turn', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const { manager, session, runtime, say, leave, rejoin } = listening();
+    delete (manager as any).handleMessage;
+    runtime.ensureConnection = vi.fn().mockResolvedValue(undefined);
+    runtime.emitEvent = vi.fn().mockResolvedValue(undefined);
+    let finishChat!: () => void;
+    (session.messages as any).handleMessage = () => new Promise<void>((resolve) => (finishChat = resolve));
+    session.conversation.accept({ id: 'c1', body: 'hello', fromId: 'p9', from: 'P9', createdAt: '' });
+    say('p1', loud(300));
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS);
+    expect(session.conversation.waiting).toBe(1);
+    leave('p1');
+    rejoin('p1');
+    finishChat();
+    await vi.advanceTimersByTimeAsync(0);
+    await session.conversation.idle();
+    expect(runtime.emitEvent).not.toHaveBeenCalled();
+  });
+
+  it('stops the agent the moment a transcript that is a stop command addressed to it is admitted, before its turn', async () => {
+    const { session, say, world } = listening({ transcribe: async () => 'Coo, stop!' });
+    const stopAllActions = vi.fn();
+    (world as any).controls = { stopAllActions };
+    // A chat turn in progress: the transcript waits behind it, but its stop does not
+    let finishChat!: () => void;
+    (session.messages as any).handleMessage = () => new Promise<void>((resolve) => (finishChat = resolve));
+    session.conversation.accept({ id: 'c1', body: 'hello', fromId: 'p9', from: 'P9', createdAt: '' });
+    say('p1', loud(300));
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS);
+    expect(session.conversation.waiting).toBe(1);
+    expect(stopAllActions).toHaveBeenCalledWith('asked to stop');
+    finishChat();
   });
 
   it('does not transcribe a voice that is not a player in the world', async () => {

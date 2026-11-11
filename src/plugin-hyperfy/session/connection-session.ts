@@ -5,7 +5,10 @@ import { EmoteManager } from '../managers/emote-manager'
 import { MessageManager } from '../managers/message-manager'
 import { VoiceManager } from '../managers/voice-manager'
 import type { CaptureView } from '../managers/puppeteer-manager'
-import { ChatIntake } from '../lib/chat-intake'
+import { CHAT_QUEUE_MAX, ChatIntake } from '../lib/chat-intake'
+import { isDirectlyAddressed, parseAliases } from '../lib/addressing'
+import { matchSimpleCommand } from '../lib/simple-commands'
+import { countOtherPlayers } from '../utils'
 import type { UploadOptions } from '../lib/asset-upload'
 import { describeUrl } from '../lib/log-url'
 import { ScopedLock } from '../lib/scoped-lock'
@@ -46,6 +49,9 @@ export interface SessionEvents {
   /** The world's socket closed. `kickCode`: the kick the server sent before it, if it was read. */
   onDisconnect?(session: ConnectionSession, reason: unknown, kickCode: string | null): void
 }
+
+// Stop commands remembered until their turn: more than the queue holds
+const STOPS_TAKEN_KEPT = 2 * CHAT_QUEUE_MAX
 
 let lastGeneration = 0
 const sessions = new WeakMap<object, ConnectionSession>()
@@ -94,6 +100,8 @@ export class ConnectionSession {
   private readonly abort = new AbortController()
   private readonly subscriptions: Array<() => void> = []
   private ending: Promise<void> | null = null
+  /** Ids of stop commands that took effect on arrival, until their turn asks (stoppedOnArrival) */
+  private readonly stopsTaken = new Set<string>()
   private started = false
   private init: ((authToken?: string) => Promise<void>) | null = null
 
@@ -113,6 +121,7 @@ export class ConnectionSession {
     // Stops with the session (its signal): what waits is dropped and the turn in progress is cancelled
     this.conversation = new ChatIntake({
       signal: this.signal,
+      admitted: (msg) => this.stopOnArrival(msg),
       handle: async (msg, turn) => {
         // Before the agent's own player exists there is nobody to answer as
         if (!this.world.entities?.player) return
@@ -237,6 +246,33 @@ export class ConnectionSession {
     // Only what the world's server sent on this connection: not app scripts' chat (any fromId),
     // not the agent's own posts, not the snapshot's history (lib/world-chat.ts)
     this.subscriptions.push(chat.onLive((msg) => void this.conversation.accept(msg)))
+  }
+
+  /**
+   * "Stop" does not wait its turn: an admitted chat message or transcript (lib/chat-intake.ts
+   * admitted) that the message handler would take as a stop command addressed to the agent
+   * (lib/simple-commands.ts matchSimpleCommand; addressed by name, or the only other player present,
+   * as handlers/messageReceivedHandler.ts decides) stops walking, following and wandering at once,
+   * as the stop command does (controls.stopAllActions). Its turn comes later as usual and only
+   * acknowledges it (stoppedOnArrival), so it never stops what was asked for after it.
+   */
+  private stopOnArrival(msg: { id: string; body: string; fromId: string | null }): void {
+    if (this.ended || !msg.fromId || msg.fromId === this.world.entities?.player?.data?.id) return
+    const names = [this.runtime.character.name, ...parseAliases(process.env.HYPERFY_AGENT_ALIASES)]
+    if (matchSimpleCommand(msg.body, names) !== 'stop') return
+    if (!isDirectlyAddressed(msg.body, names) && countOtherPlayers(this.world) !== 1) return
+    const controls = this.world.controls
+    if (typeof controls?.stopAllActions !== 'function') return
+    controls.stopAllActions('asked to stop')
+    this.stopsTaken.add(msg.id)
+    // Bounded: a stop whose turn never comes (dropped as stale) is forgotten in time
+    if (this.stopsTaken.size > STOPS_TAKEN_KEPT) this.stopsTaken.delete(this.stopsTaken.values().next().value as string)
+    console.info('[Hyperfy] Stopped on arrival of a stop command; its turn will acknowledge it')
+  }
+
+  /** Whether the stop command `msgId` already took effect on arrival (asked once, by its turn). */
+  stoppedOnArrival(msgId: string): boolean {
+    return this.stopsTaken.delete(msgId)
   }
 
   /** Runs `fn` as a turn of this session (lib/turn-context.ts). `cancel`: the turn's slot in the conversation queue. */

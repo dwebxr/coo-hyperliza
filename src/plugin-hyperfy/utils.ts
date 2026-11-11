@@ -5,6 +5,7 @@ import { dirname } from 'path';
 import path from 'path';
 import { describeUrl } from './lib/log-url';
 import { getUsageBudget } from '../usage-budget';
+import { assertTurnLive } from './lib/turn-context';
 
 
 export async function hashFileBuffer(buffer: Buffer): Promise<string> {
@@ -418,14 +419,18 @@ const SPEECH_PROVIDERS = [
  * Speech audio for `text`: ElevenLabs, then OpenAI when that gave none. Each request is reserved
  * against VOICE_TTS_MAX_CHARS_PER_DAY on its own, before it is sent. A request the provider refused
  * (a 4xx answer) is given back; any other failed one stays counted, as it may have been billed. A
- * fallback the limit does not admit is not made. Resolves to null when no provider gave audio;
- * throws TtsLimitReached when the limit admits not even the first request.
+ * fallback the limit does not admit is not made, and neither is one for a turn that may no longer
+ * act (lib/turn-context.ts: TurnCancelled is thrown, the requests already sent stay counted).
+ * Resolves to null when no provider gave audio; throws TtsLimitReached when the limit admits not
+ * even the first request.
  */
 export async function generateSpeech(text: string): Promise<Buffer | null> {
   const budget = getUsageBudget();
   let sent = false;
   for (const provider of SPEECH_PROVIDERS) {
     if (!process.env[provider.key]) continue;
+    // Before each reservation and request, the fallback's included
+    assertTurnLive();
     const reservation = budget.reserveTts(text.length);
     if (!reservation) {
       budget.recordSkip('tts');

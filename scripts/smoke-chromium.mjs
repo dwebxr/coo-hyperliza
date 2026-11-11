@@ -77,8 +77,17 @@ export function fakeWorld({ environment, skyTextureId }) {
 
 /** Bundles managers/puppeteer-manager.ts alone (no service, no engine) into `outFile`. */
 export async function bundleManager(outFile) {
+  return bundle(path.join(repo, 'src/plugin-hyperfy/managers/puppeteer-manager.ts'), outFile);
+}
+
+/** Bundles the engine's glbToNodes (what systems/loader.ts converts a model with) into `outFile`. */
+export async function bundleGlbToNodes(outFile) {
+  return bundle(path.join(repo, 'src/plugin-hyperfy/hyperfy/src/core/extras/glbToNodes.js'), outFile);
+}
+
+async function bundle(entryPoint, outFile) {
   await build({
-    entryPoints: [path.join(repo, 'src/plugin-hyperfy/managers/puppeteer-manager.ts')],
+    entryPoints: [entryPoint],
     outfile: outFile,
     bundle: true,
     format: 'esm',
@@ -146,9 +155,10 @@ function processTable() {
 
 /**
  * A GLB of one mesh with two primitives: the first material has a texture (a 1x1 PNG), the second
- * brings `extras` as given. Built here, in memory.
+ * brings `extras` as given. With `secondExtras` null, one primitive with the textured material
+ * (its node is then the mesh itself, and `nodeExtras` reach it). Built here, in memory.
  */
-function twoMaterialGlb(secondExtras) {
+function twoMaterialGlb(secondExtras, nodeExtras) {
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
   const positions = Buffer.from(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]).buffer);
   const imageBytes = Math.ceil(png.length / 4) * 4;
@@ -162,9 +172,9 @@ function twoMaterialGlb(secondExtras) {
     accessors: [{ bufferView: 1, count: 3, type: 'VEC3', componentType: 5126, min: [0, 0, 0], max: [1, 1, 0] }],
     images: [{ bufferView: 0, mimeType: 'image/png' }],
     textures: [{ source: 0 }],
-    materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 } } }, { extras: secondExtras }],
-    meshes: [{ primitives: [{ attributes: { POSITION: 0 }, material: 0 }, { attributes: { POSITION: 0 }, material: 1 }] }],
-    nodes: [{ mesh: 0 }],
+    materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 } } }, ...(secondExtras === null ? [] : [{ extras: secondExtras }])],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0 }, material: 0 }, ...(secondExtras === null ? [] : [{ attributes: { POSITION: 0 }, material: 1 }])] }],
+    nodes: [nodeExtras ? { mesh: 0, extras: nodeExtras } : { mesh: 0 }],
     scenes: [{ nodes: [0] }],
     scene: 0,
   };
@@ -349,20 +359,37 @@ async function main() {
     for (let i = 0; i < 5; i++) await manager.loadGlbBytes(environmentSource, { signal: new AbortController().signal });
     const pendingAfterLoads = await page.evaluate(() => window.agentPage.pendingSettlements());
     check('after five successful model loads with a signal, the page holds no load waiting to be settled', pendingAfterLoads === 0, `${pendingAfterLoads} pending`);
-    // A commit keeps the record: a world that goes away while the commit is acknowledged still gets the load taken back
-    const commitThenRollback = await page.evaluate(async () => {
+    // A load stays on record until it is settled: taken back before that, what it kept goes
+    const takenBack = await page.evaluate(async () => {
       const pixel = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
-      const id = await window.agentPage.registerTexture(pixel, 'image/png', 'smoke', 'https://world.invalid/c.png', 'op-smoke-commit');
-      window.agentPage.settle('op-smoke-commit', 'commit');
-      const afterCommit = { pending: window.agentPage.pendingSettlements(), kept: window.texturesMap.has(`${id}:smoke`) };
-      window.agentPage.settle('op-smoke-commit', 'rollback');
-      return { afterCommit, gone: !window.texturesMap.has(`${id}:smoke`), pending: window.agentPage.pendingSettlements() };
+      const id = await window.agentPage.registerTexture(pixel, 'image/png', 'smoke', 'https://world.invalid/c.png', 'op-smoke-settle');
+      const before = { pending: window.agentPage.pendingSettlements(), kept: window.texturesMap.has(`${id}:smoke`) };
+      window.agentPage.settle('op-smoke-settle', 'rollback');
+      return { before, gone: !window.texturesMap.has(`${id}:smoke`), pending: window.agentPage.pendingSettlements() };
     });
     check(
-      'a committed load stays on record until it is forgotten: taken back after its commit, its texture goes',
-      commitThenRollback.afterCommit.pending === 1 && commitThenRollback.afterCommit.kept && commitThenRollback.gone && commitThenRollback.pending === 0,
-      JSON.stringify(commitThenRollback)
+      'a load stays on record until it is settled: taken back, its texture goes',
+      takenBack.before.pending === 1 && takenBack.before.kept && takenBack.gone && takenBack.pending === 0,
+      JSON.stringify(takenBack)
     );
+    // The agent's own conversion of a model fails after the page kept its texture (the engine's
+    // Mesh refuses a castShadow that is not a boolean): the load is not accepted, and the page keeps nothing of it
+    const { glbToNodes } = await bundleGlbToNodes(path.join(dir, 'glb-to-nodes.mjs'));
+    const texturesBeforeConversion = await page.evaluate(() => window.texturesMap.size);
+    const converted = await manager
+      .loadGlbBytes(twoMaterialGlb(null, { castShadow: 'yes' }), { signal: new AbortController().signal, accept: async (bytes) => glbToNodes(await parseStrippedGlb(bytes), {}) })
+      .then(() => 'loaded', (error) => String(error?.message ?? error));
+    const afterConversion = await page.evaluate(() => ({ textures: window.texturesMap.size, pending: window.agentPage.pendingSettlements() }));
+    check(
+      'a model whose conversion in the agent fails (a node with extras castShadow: "yes") leaves nothing in the page: its texture is taken back',
+      /castShadow not a boolean/.test(converted) && afterConversion.textures === texturesBeforeConversion && afterConversion.pending === 0,
+      `${converted.slice(0, 80)}; textures ${texturesBeforeConversion} -> ${afterConversion.textures}, ${afterConversion.pending} pending`
+    );
+    // A texture accepted and then of no use (a sky replaced during its acknowledgment) is released by its id
+    const releasedId = await manager.registerTexture({ bytes: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64'), contentType: 'image/png', url: 'https://world.invalid/r.png' }, 'map', { signal: new AbortController().signal });
+    const keptBeforeRelease = await page.evaluate((id) => window.texturesMap.has(`${id}:map`), releasedId);
+    await manager.releaseTexture(releasedId, 'map');
+    check('releaseTexture drops an accepted texture from the page', keptBeforeRelease && !(await page.evaluate((id) => window.texturesMap.has(`${id}:map`), releasedId)));
     // Their textures would change which one the texture-limit check below finds least recently used
     await page.evaluate((before) => {
       for (const key of [...window.texturesMap.keys()]) if (!before.includes(key)) window.texturesMap.delete(key);

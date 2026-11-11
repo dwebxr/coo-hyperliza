@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // The real PuppeteerManager methods, over a stand-in page whose agentPage records what it keeps.
-// `ready` holds the page's init(); `gate` holds registerTexture inside the page.
+// `ready` holds the page's init(); `gate` holds registerTexture inside the page; `acknowledge`
+// holds the answer to a settlement step while set.
 const page = vi.hoisted(() => ({
   calls: [] as string[],
   textures: new Map<string, string>(),
@@ -13,6 +14,8 @@ const page = vi.hoisted(() => ({
   gate: null as Promise<void> | null,
   /** What registerTexture fails with, while set */
   fail: null as Error | null,
+  acknowledge: null as Promise<void> | null,
+  released: [] as string[],
 }));
 vi.mock('../managers/puppeteer-manager.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../managers/puppeteer-manager.js')>();
@@ -32,8 +35,7 @@ vi.mock('../managers/puppeteer-manager.js', async (importOriginal) => {
       page.environment = base64;
       if (op) page.undo.set(op, () => (page.environment = null));
     },
-    settle(op: string, step: 'commit' | 'rollback' | 'forget') {
-      if (step === 'commit') return;
+    settle(op: string, step: 'rollback' | 'forget') {
       const undo = page.undo.get(op);
       page.undo.delete(op);
       if (step === 'forget') page.committed.push(op);
@@ -42,11 +44,18 @@ vi.mock('../managers/puppeteer-manager.js', async (importOriginal) => {
         undo?.();
       }
     },
+    releaseTexture(id: string, slot: string) {
+      page.released.push(`${id}:${slot}`);
+      page.textures.delete(`${id}:${slot}`);
+    },
   };
   const fakePage = {
     evaluate: async (fn: (...args: unknown[]) => unknown, ...args: unknown[]) => {
       (globalThis as any).window = { agentPage };
-      return fn(...args);
+      const out = await fn(...args);
+      // A settlement step's answer, held while `acknowledge` is set
+      if (args.length === 2 && (args[1] === 'forget' || args[1] === 'rollback')) await page.acknowledge;
+      return out;
     },
   };
   const { RenderWatchdog } = await import('../lib/render-watchdog');
@@ -56,6 +65,7 @@ vi.mock('../managers/puppeteer-manager.js', async (importOriginal) => {
   manager.pageGeneration = new WeakMap();
   // No browser here: nothing to sample or kill
   manager.watchdog = new RenderWatchdog({ kill: () => {}, table: async () => [] });
+  manager.page = fakePage;
   manager.init = async () => {
     await page.ready;
     return fakePage;
@@ -130,6 +140,8 @@ describe('AgentEnvironment sky updates', () => {
     page.ready = null;
     page.gate = null;
     page.fail = null;
+    page.acknowledge = null;
+    page.released.length = 0;
     await closeServers();
   });
 
@@ -197,14 +209,33 @@ describe('AgentEnvironment sky updates', () => {
     expect([page.textures.size, page.environment, env.sky.material.userData.materialId, env.sky.visible, world.stage.scene.fog]).toEqual([0, null, undefined, false, 'untouched']);
   });
 
+  it('releases a sky texture the page had already been told was accepted when a newer sky came during that acknowledgment', async () => {
+    const { env, origin } = await environment();
+    let acknowledge!: () => void;
+    page.acknowledge = new Promise<void>((resolve) => (acknowledge = resolve));
+    env.addSky(sky('asset://first.jpg'));
+    // The page has dropped its record (forget); its answer is on the way
+    await expect.poll(() => page.committed.length).toBe(1);
+    const [first] = [...page.textures.keys()];
+    page.acknowledge = null;
+    env.addSky(sky('asset://second.jpg'));
+    acknowledge();
+    await expect.poll(() => env.csm.lightDirection).toBe('direction of asset://second.jpg');
+    await expect.poll(() => page.released).toEqual([first]);
+    // Only the newer sky's texture is left, and it is the one the sky shows
+    const [second] = [...page.textures.keys()];
+    expect([...page.textures.values()]).toEqual([`${origin}/assets/second.jpg`]);
+    expect(`${env.sky.material.userData.materialId}:map`).toBe(second);
+  });
+
   it("holds the agent's memory reservation for a sky image while it is on its way, and gives it back", async () => {
     const { env } = await environment();
     let release!: () => void;
     page.gate = new Promise<void>((resolve) => (release = resolve));
     env.addSky(sky('asset://a.jpg'));
     await expect.poll(() => page.calls.length).toBe(1);
-    // In the page: the download was exchanged for 4 x its 11 bytes of work
-    expect(assetMemory.held).toEqual({ downloads: 0, work: 44 });
+    // In the page: the download was exchanged for 6 x its 11 bytes of work (lib/asset-memory.ts SEND_COPIES)
+    expect(assetMemory.held).toEqual({ downloads: 0, work: 66 });
     release();
     await expect.poll(() => page.committed.length).toBe(1);
     expect(assetMemory.held).toEqual({ downloads: 0, work: 0 });

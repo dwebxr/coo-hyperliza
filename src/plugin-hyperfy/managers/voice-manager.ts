@@ -6,7 +6,7 @@ import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
 import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
 import { getUsageBudget, runWithOrigin } from "../../usage-budget";
-import { currentTurn, noteDelivered } from "../lib/turn-context";
+import { TurnCancelled, currentTurn, noteDelivered } from "../lib/turn-context";
 import type { PlaybackOutcome } from "../systems/liveKit";
 import type { Played } from "../lib/playback";
 import { oneLine, shownName, truncateCodePoints } from "../lib/text";
@@ -90,6 +90,13 @@ export class VoiceManager {
   private transcribing: Set<string> = new Set();
   private leaveListener: ((data: unknown) => void) | null = null;
   private leaveSource: any = null;
+  /**
+   * Each speaker's presence since they last left (the engine's 'leave'): a token taken when an
+   * utterance goes to transcription, which must still be the speaker's when the transcript comes
+   * back and again when its turn starts. Leaving drops it, so the same id rejoining is a new
+   * presence. One entry per speaker heard and not gone since.
+   */
+  private presence = new Map<string, object>();
   /** PCM bytes held: buffered for all speakers, plus what is being transcribed. */
   private heldVoiceBytes = 0;
   private ingressGate = { checkedAt: Number.NEGATIVE_INFINITY, open: false };
@@ -134,7 +141,9 @@ export class VoiceManager {
     // someone no longer in the world starts no turn (processTranscription).
     this.leaveListener = (data: unknown) => {
       const playerId = (data as { playerId?: unknown } | null)?.playerId;
-      if (typeof playerId === 'string') this.discard(playerId);
+      if (typeof playerId !== 'string') return;
+      this.discard(playerId);
+      this.presence.delete(playerId);
     };
     this.leaveSource = world.events;
     this.leaveSource?.on?.('leave', this.leaveListener);
@@ -153,6 +162,7 @@ export class VoiceManager {
     this.leaveSource = null;
     this.leaveListener = null;
     for (const participant of [...this.speakers.keys()]) this.discard(participant);
+    this.presence.clear();
     this.isSpeaking = false;
     this.halted = true;
     this.playbackGeneration++;
@@ -299,12 +309,25 @@ export class VoiceManager {
       return;
     }
     this.transcribing.add(participant);
+    const presence = this.presenceOf(participant);
     // Not a turn yet: the transcript is queued as one below. Its cost counts as voice.
-    runWithOrigin('voice', () => this.processTranscription(participant, utterance))
+    runWithOrigin('voice', () => this.processTranscription(participant, utterance, presence))
       .catch((error) => console.error(`Error handling voice from ${participant}:`, error));
   }
 
-  private async processTranscription(participant: string, utterance: Utterance) {
+  /** The speaker's presence token, taken on first use */
+  private presenceOf(participant: string): object {
+    let token = this.presence.get(participant);
+    if (!token) this.presence.set(participant, (token = {}));
+    return token;
+  }
+
+  /** Whether `participant` is the same presence that `token` was taken from, and in the world */
+  private stillPresent(participant: string, token: object): boolean {
+    return this.presence.get(participant) === token && !!this.session.world?.entities?.getPlayer?.(participant);
+  }
+
+  private async processTranscription(participant: string, utterance: Utterance, presence: object) {
     let transcript: unknown;
     try {
       // One attempt through the registered model
@@ -336,10 +359,11 @@ export class VoiceManager {
     // What was said enters memory and prompts like a chat message: one line, at most 500 code points
     const text = oneLine(transcript, CHAT_BODY_MAX_CODE_POINTS);
     if (!text || text.length < 3) return;
-    // Only someone who is in the world now: a speaker who left while being transcribed starts no turn
+    // Only someone who is in the world now, and has been since they said it: a speaker who left
+    // while being transcribed starts no turn, also when they have come back under the same id
     const speaker = this.session.world?.entities?.getPlayer?.(participant);
-    if (!speaker) {
-      logger.info('[VoiceManager] Dropping a transcript: its speaker is not in the world (any more)');
+    if (!speaker || !this.stillPresent(participant, presence)) {
+      logger.info('[VoiceManager] Dropping a transcript: its speaker left after saying it');
       return;
     }
     console.log("[VOICE MANAGER] Transcription: ", text)
@@ -355,25 +379,32 @@ export class VoiceManager {
         from: shownName(speaker.data?.name) || null,
         createdAt: new Date().toISOString(),
       },
-      (msg, slot) => this.handleTranscript(msg, slot)
+      (msg, slot) => this.handleTranscript(msg, slot, presence)
     );
     if (admission !== 'queued') logger.info(`[VoiceManager] Not answering a transcript: ${admission}`);
   }
 
   /** One transcript as a voice turn of its speaker. `slot`: the queue's turn (see MessageManager.handleMessage). */
-  private async handleTranscript(msg: ReceivedChatMessage, slot: ChatTurn): Promise<void> {
+  private async handleTranscript(msg: ReceivedChatMessage, slot: ChatTurn, presence: object): Promise<void> {
     const playerId = msg.fromId as UUID;
+    // Someone who left while their transcript waited in the queue is not answered, back or not
+    if (!this.stillPresent(playerId, presence)) {
+      logger.info('[VoiceManager] Dropping a transcript: its speaker left after saying it');
+      return;
+    }
     await this.session.runTurn(
       // The LiveKit participant identity, which the world's server sets to the player id
       { origin: 'voice', requesterId: playerId, cancel: slot.signal },
       // Inside the activity lock, so the behavior loop stays paused until the reply has been spoken
-      () => agentActivityLock.run(() => this.handleMessage(msg.body, playerId))
+      () => agentActivityLock.run(() => this.handleMessage(msg.body, playerId, this.session.stoppedOnArrival(msg.id)))
     );
   }
 
   private async handleMessage(
     message: string,
     playerId: UUID,
+    /** A stop command that already stopped the agent when it was admitted: the turn only acknowledges it */
+    stopTaken = false,
   ) {
     try {
       const session = this.session;
@@ -430,6 +461,7 @@ export class VoiceManager {
             hyperfyFromName: userName,
             directlyAddressed: isDirectlyAddressed(message, agentNames),
             soloPlayer: countOtherPlayers(world) === 1,
+            ...(stopTaken ? { hyperfyStopTaken: true } : {}),
           },
         },
         createdAt: Date.now(),
@@ -455,16 +487,22 @@ export class VoiceManager {
 
   /**
    * Synthesizes text and plays it in the world. Never throws. Resolves to how much of it was
-   * played: 'none' when there is nothing to say, the voice limit is reached, TTS failed, or no
-   * audio went out; 'partial' when the playback stopped, failed or timed out after some of it
-   * went out. An utterance some of which was played counts as delivered for the turn.
+   * played: 'none' when there is nothing to say, the voice limit is reached, TTS failed, `admit`
+   * said no, or no audio went out; 'partial' when the playback stopped, failed, timed out or was
+   * cut by the end of its turn after some of it went out, and also when all of it played but not
+   * all of the reply was said (it was longer than what is said aloud, or it had links, which are
+   * never read aloud). An utterance some of which was played counts as delivered for the turn.
+   * `admit`, when given, is asked before synthesis and again right before playback (a reply that
+   * reports a privileged action: deliver-reply.ts).
    */
-  async speak(text: string): Promise<Played> {
+  async speak(text: string, { admit }: { admit?: () => boolean } = {}): Promise<Played> {
     // Never read URLs aloud
+    const hadLinks = /https?:\/\/\S+/.test(text ?? '');
     text = text?.replace(/https?:\/\/\S+/g, '').trim();
     // Nothing is synthesized (it costs money) or said for a turn that may no longer act
     const turn = currentTurn();
     if (!text || this.stopped || (turn && !turn.live)) return 'none';
+    if (admit && !admit()) return 'none';
     // Capped before anything is synthesized or counted
     const spoken = spokenPart(text);
     text = spoken.text;
@@ -477,11 +515,15 @@ export class VoiceManager {
         console.log('[VoiceManager] No audio generated - check ELEVENLABS_XI_API_KEY or OPENAI_API_KEY in .env');
         return 'none';
       }
-      const played = await this.playAudio(audioBuffer, generation);
+      const played = await this.playAudio(audioBuffer, generation, admit);
       if (played !== 'none') noteDelivered();
       // All of the capped text was played, but not all of the reply
-      return played === 'all' && spoken.cut ? 'partial' : played;
+      return played === 'all' && (spoken.cut || hadLinks) ? 'partial' : played;
     } catch (error) {
+      if (error instanceof TurnCancelled) {
+        logger.info(`[VoiceManager] Not speaking: ${error.message}`);
+        return 'none';
+      }
       if (error instanceof TtsLimitReached) {
         if (Date.now() - this.lastTtsLimitLogAt >= VOICE_LIMIT_NOTICE_INTERVAL_MS) {
           this.lastTtsLimitLogAt = Date.now();
@@ -508,7 +550,7 @@ export class VoiceManager {
    * to the room (AgentLiveKit.publishAudioStream counts the frames as they go): 'partial' also when
    * the playback failed or timed out after some of it had played.
    */
-  async playAudio(audioBuffer: Buffer, generation: number = this.playbackGeneration): Promise<Played> {
+  async playAudio(audioBuffer: Buffer, generation: number = this.playbackGeneration, admit?: () => boolean): Promise<Played> {
     if (this.stopped || generation !== this.playbackGeneration) return 'none';
     if (this.pendingPlaybacks >= MAX_PENDING_PLAYBACKS) {
       logger.warn(`[VoiceManager] ${this.pendingPlaybacks} utterances already queued, dropping audio`);
@@ -517,7 +559,7 @@ export class VoiceManager {
 
     this.pendingPlaybacks++;
     const current = this.playbackChain.then((): Played | Promise<Played> =>
-      generation === this.playbackGeneration ? this.playNow(audioBuffer) : 'none'
+      generation === this.playbackGeneration ? this.playNow(audioBuffer, admit) : 'none'
     );
     this.playbackChain = current.then(() => { }, () => { });
 
@@ -531,13 +573,17 @@ export class VoiceManager {
     }
   }
 
-  private async playNow(audioBuffer: Buffer): Promise<Played> {
+  private async playNow(audioBuffer: Buffer, admit?: () => boolean): Promise<Played> {
     const world = this.session.world;
     if (this.stopped || !world?.livekit) return 'none';
-    // Cancelled while it was synthesized or waited behind another utterance: it is not said into what came after.
-    // (One that is already playing when its turn is cancelled is not cut off; stop() does that.)
+    // Cancelled while it was synthesized or waited behind another utterance: it is not said into what came after
     const turn = currentTurn();
     if (turn && !turn.live) return 'none';
+    // No longer admitted (a privileged report whose requester lost the right meanwhile): the audio is discarded
+    if (admit && !admit()) {
+      logger.info('[VoiceManager] Not playing an utterance that is no longer admitted');
+      return 'none';
+    }
 
     // Speaking state makes the engine play the TALK emote
     const player = world.entities?.player;
@@ -546,6 +592,9 @@ export class VoiceManager {
 
     const abort = new AbortController();
     this.activePlayback = abort;
+    // One that is playing when its turn is cancelled is cut there (and stop() cuts any)
+    const cut = () => abort.abort();
+    turn?.signal.addEventListener('abort', cut, { once: true });
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
@@ -570,6 +619,7 @@ export class VoiceManager {
       return played;
     } finally {
       clearTimeout(timer);
+      turn?.signal.removeEventListener('abort', cut);
       if (this.activePlayback === abort) this.activePlayback = null;
       this.isSpeaking = false;
       player?.setSpeaking?.(false);

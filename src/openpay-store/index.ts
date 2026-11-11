@@ -20,7 +20,9 @@ import {
   parseHandles,
   parseLocale,
   sanitizeText,
+  shownText,
 } from './catalog';
+import { findAddresses } from './addresses';
 
 export { formatLinkMessage, isShareable };
 
@@ -33,6 +35,8 @@ export { formatLinkMessage, isShareable };
 export const SHARE_ACTION = 'OPENPAY_SHARE_PRODUCT';
 const SHELF_LIMIT = 12;
 const SHELF_MAX_CHARS = 1500;
+// What the shelf shows of a description
+const SHELF_DESC_MAX_CODE_POINTS = 80;
 
 /** Marks a link message: Hyperfy callbacks post it to chat (also for voice turns) and never speak it. */
 export const OPENPAY_LINK_FLAG = 'openpayLink';
@@ -66,7 +70,10 @@ export function formatShelf(all: StoreProduct[], { autonomous }: { autonomous: b
   let size = 0;
   for (const p of products.slice(0, SHELF_LIMIT)) {
     const meta = [p.category, shownHandle(p.handle)].filter(Boolean).join(', ');
-    const line = `- [${p.id}] ${p.emoji ? `${p.emoji} ` : ''}${p.title} — ${p.totalJpyc} JPYC (${meta})${p.desc ? `: ${p.desc.slice(0, 80)}` : ''}`;
+    // Cut as it is shown: never into an address, never through a surrogate pair (shownText)
+    const line = `- [${p.id}] ${p.emoji ? `${p.emoji} ` : ''}${p.title} — ${p.totalJpyc} JPYC (${meta})${p.desc ? `: ${shownText(p.desc, SHELF_DESC_MAX_CODE_POINTS)}` : ''}`;
+    // The shelf holds no address: not one in a field the catalog did not clean, nor one fields form together
+    if (findAddresses(line).length) continue;
     if (size + line.length > SHELF_MAX_CHARS) break;
     lines.push(line);
     size += line.length;

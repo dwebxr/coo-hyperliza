@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-// The loader hands model bytes to the render page and gets them back without textures; here they
-// come back as they are, and what the page was given is recorded.
+// The loader hands model bytes to the render page and gets them back without textures; here the
+// real PuppeteerManager page calls (settlement included) run over a stand-in page whose loads hand
+// the bytes back as they are and keep one "texture" each until it is taken back or accepted.
 // `returns` replaces what the page hands back; `gate` holds the page's answer until it resolves.
 const page = vi.hoisted(() => ({
   glb: [] as number[],
@@ -12,27 +13,71 @@ const page = vi.hoisted(() => ({
   gate: null as Promise<void> | null,
   afterFetch: null as (() => void) | null,
   fail: null as Error | null,
+  /** What the page keeps, by load: the op it was filed under */
+  kept: new Map<string, string>(),
+  undo: new Map<string, () => void>(),
+  steps: [] as string[],
 }));
-vi.mock('../managers/puppeteer-manager.js', () => ({
-  PuppeteerManager: {
-    getInstance: () => ({
-      loadGlbBytes: async (bytes: Uint8Array, { maxExportBytes, signal }: { maxExportBytes: number; signal?: AbortSignal }) => {
-        page.glb.push(bytes.byteLength);
-        page.budgets.push(maxExportBytes);
-        page.signals.push(signal);
-        await page.gate;
-        if (page.fail) throw page.fail;
-        return page.returns ?? bytes;
-      },
-      loadVRMBytes: async (bytes: Uint8Array, url: string, { maxExportBytes, signal }: { maxExportBytes: number; signal?: AbortSignal }) => {
-        page.vrm.push([bytes.byteLength, url]);
-        page.budgets.push(maxExportBytes);
-        page.signals.push(signal);
-        return page.returns ?? bytes;
-      },
-    }),
-  },
-}));
+vi.mock('../managers/puppeteer-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../managers/puppeteer-manager.js')>();
+  const { RenderWatchdog, RenderBreaker } = await import('../lib/render-watchdog');
+  let loads = 0;
+  const keep = (op: string | undefined) => {
+    const key = `load-${++loads}`;
+    page.kept.set(key, op ?? '');
+    if (op) page.undo.set(op, () => page.kept.delete(key));
+  };
+  const answer = async (base64: string, op?: string) => {
+    await page.gate;
+    if (page.fail) throw page.fail;
+    keep(op);
+    return page.returns ? Buffer.from(page.returns).toString('base64') : base64;
+  };
+  const agentPage = {
+    loadGlb: async (base64: string, _slots: string[], maxExportBytes: number, op?: string) => {
+      page.glb.push(Buffer.from(base64, 'base64').byteLength);
+      page.budgets.push(maxExportBytes);
+      return answer(base64, op);
+    },
+    loadVrm: async (url: string, base64: string, maxExportBytes: number, op?: string) => {
+      page.vrm.push([Buffer.from(base64, 'base64').byteLength, url]);
+      page.budgets.push(maxExportBytes);
+      return answer(base64, op);
+    },
+    settle(op: string, step: 'rollback' | 'forget') {
+      page.steps.push(step);
+      const undo = page.undo.get(op);
+      page.undo.delete(op);
+      if (step === 'rollback') undo?.();
+    },
+  };
+  const fakePage = {
+    evaluate: async (fn: (...args: unknown[]) => unknown, ...args: unknown[]) => {
+      (globalThis as any).window = { agentPage };
+      try {
+        return await fn(...args);
+      } finally {
+        delete (globalThis as any).window;
+      }
+    },
+  };
+  const manager = Object.create(actual.PuppeteerManager.prototype);
+  manager.operations = 0;
+  manager.generation = 1;
+  manager.pageGeneration = new WeakMap();
+  manager.page = fakePage;
+  // No browser here: nothing to sample or kill
+  manager.watchdog = new RenderWatchdog({ kill: () => {}, table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) });
+  manager.init = async () => fakePage;
+  for (const name of ['loadGlbBytes', 'loadVRMBytes'] as const) {
+    const real = manager[name];
+    manager[name] = (...args: any[]) => {
+      page.signals.push(args.at(-1)?.signal);
+      return real.apply(manager, args);
+    };
+  }
+  return { ...actual, PuppeteerManager: { getInstance: () => manager } };
+});
 
 // The real fetchAssetBytes; `page.afterFetch` runs as it resolves (before the loader continues)
 vi.mock('../lib/asset-bytes', async (importOriginal) => {
@@ -49,7 +94,8 @@ vi.mock('../lib/asset-bytes', async (importOriginal) => {
 
 import { AgentLoader, LOADER_LIMITS, type LoaderLimits } from './loader';
 import { RenderPageKilled } from '../lib/render-watchdog';
-import { assetMemory } from '../lib/asset-memory';
+import { assetMemory, modelReservation } from '../lib/asset-memory';
+import { gltfCharge, modelBudget } from '../lib/gltf-budget';
 import { NetPolicy, installWorldNet } from '../lib/net-policy';
 import { type Handler, type TestServer, closeServers, startServer } from '../test-support/net';
 
@@ -69,6 +115,9 @@ afterEach(async () => {
   page.gate = null;
   page.afterFetch = null;
   page.fail = null;
+  page.kept.clear();
+  page.undo.clear();
+  page.steps.length = 0;
   await closeServers();
 });
 
@@ -392,9 +441,28 @@ describe('AgentLoader', () => {
     expect(page.glb).toEqual([]);
     await loader.load('model', 'asset://ok.glb');
     await loader.load('avatar', 'asset://ok.vrm');
-    // An emote's is smaller (lib/gltf-budget.test.ts); a model with no animation is no emote
+    // A model with no animation is no emote
     await expect(loader.load('emote', 'asset://ok-emote.glb')).rejects.toThrow();
-    expect(page.budgets).toEqual([200 * 1024 * 1024, 200 * 1024 * 1024, 64 * 1024 * 1024]);
+    // The ceiling for this load, which its reservation is sized from (lib/asset-memory.ts): for a
+    // file this small, the 1 MiB floor; an emote's export budget is smaller (lib/gltf-budget.test.ts)
+    const glb = minimalGlb();
+    const ceiling = (type: 'model' | 'avatar' | 'emote') => {
+      const reservation = modelReservation(type, glb.byteLength, (gltfCharge(glb, modelBudget(type)) as any).charge.exportBytes, modelBudget(type).exportBytes);
+      return 'problem' in reservation ? null : reservation.exportBytes;
+    };
+    expect(page.budgets).toEqual([ceiling('model'), ceiling('avatar'), ceiling('emote')]);
+    expect(page.budgets).toEqual([1024 * 1024, 1024 * 1024, 1024 * 1024]);
+  });
+
+  it("gives the page, for a large model, a ceiling lowered so that the reservation fits the pool, and refuses one whose estimated export cannot fit", () => {
+    const MiB = 1024 * 1024;
+    // 50 MB: 6 x 50 MB sent, the rest of 768 MiB over 7 per returned byte
+    const fitted = modelReservation('model', 50 * 1000 * 1000, MiB, modelBudget('model').exportBytes) as { exportBytes: number; workBytes: number };
+    expect(fitted.exportBytes).toBe(Math.floor((768 * MiB - 6 * 50 * 1000 * 1000) / 7));
+    expect(fitted.workBytes).toBeLessThanOrEqual(768 * MiB);
+    expect(modelReservation('model', 50 * 1000 * 1000, 150 * MiB, modelBudget('model').exportBytes)).toMatchObject({ problem: expect.stringContaining("bytes of the agent's memory for assets on their way") });
+    // An avatar keeps its textures: room for 8 x its download, up to its export budget
+    expect(modelReservation('avatar', 2 * MiB, MiB, modelBudget('avatar').exportBytes)).toEqual({ exportBytes: 16 * MiB, workBytes: 6 * 2 * MiB + 7 * 16 * MiB });
   });
 
   it('keeps nothing and builds nothing from a model whose page answer came after the world was destroyed', async () => {
@@ -409,11 +477,37 @@ describe('AgentLoader', () => {
     loader.destroy();
     release();
 
-    await expect(loading).rejects.toThrow('The world was destroyed');
-    // The page call itself was told (PuppeteerManager takes back what it kept)
+    await expect(loading).rejects.toMatchObject({ name: 'AbortError' });
+    // The page call itself was told: what the page kept was taken back
     expect(page.signals[0]?.aborted).toBe(true);
+    expect([page.steps, page.kept.size]).toEqual([['rollback'], 0]);
     expect(parse).not.toHaveBeenCalled();
     expect(loader.results.size).toBe(0);
+  });
+
+  it('takes back what the page kept when converting its answer fails here (a node whose extras say castShadow: "yes")', async () => {
+    const positions = new Uint8Array(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]).buffer);
+    const glb = glbOfChunks([
+      jsonChunk({
+        asset: { version: '2.0' },
+        buffers: [{ byteLength: positions.length }],
+        bufferViews: [{ buffer: 0, byteLength: positions.length }],
+        accessors: [{ bufferView: 0, count: 3, type: 'VEC3', componentType: 5126, min: [0, 0, 0], max: [1, 1, 0] }],
+        meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }],
+        nodes: [{ name: 'Box', mesh: 0, extras: { castShadow: 'yes' } }],
+        scenes: [{ nodes: [0] }],
+        scene: 0,
+      }),
+      [0x004e4942, positions],
+    ]);
+    const { loader } = await setup({ handler: (request, response) => response.end(Buffer.from(request.url?.includes('box') ? glb : minimalGlb())) });
+    await expect(loader.load('model', 'asset://box.glb')).rejects.toThrow('castShadow not a boolean');
+    // The page parsed it and kept what it keeps; the agent's conversion failed, so all of it went
+    expect(page.glb).toHaveLength(1);
+    expect([page.steps, page.kept.size, loader.results.size]).toEqual([['rollback'], 0, 0]);
+    // A model that converts is accepted: the page keeps it
+    await loader.load('model', 'asset://ok.glb');
+    expect([page.steps, page.kept.size]).toEqual([['rollback', 'forget'], 1]);
   });
 
   it('does not load again, for this world, a model that got the render page killed, and says so once', async () => {

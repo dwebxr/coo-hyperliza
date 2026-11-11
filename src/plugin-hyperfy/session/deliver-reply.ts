@@ -14,13 +14,17 @@ import type { TurnContext } from '../lib/turn-context';
  *  2. Authorization at delivery, for a reply that reports what a privileged action did
  *     (lib/authorization.ts reportsPrivilegedAction): elizaOS core holds an action's replies until
  *     the action has returned, so the requester's right is checked again here, and one who lost it
- *     gets the action's neutral line instead.
+ *     gets the action's neutral line instead. It is checked once more right before such a reply is
+ *     played (after its synthesis) and right before its text fallback; one who lost the right by
+ *     then gets the neutral line instead, by the same path, once, and the report's audio is
+ *     discarded.
  *  3. Emote, when the reply names one (a voice reply with words shows TALK otherwise). A name that
  *     is no emote, or an emote that fails, never stops the reply.
  *  4. Words. A chat turn, an autonomous tick and a tip thanks are posted to chat and then spoken. A
  *     voice turn is spoken, and posted only when not all of it was played ('none' or 'partial':
- *     the voice limit, a failed or cut playback, or a reply longer than what is said aloud), so it
- *     is never posted twice and never lost. A shop link is posted and never read aloud; an
+ *     the voice limit, a failed or cut playback, a reply longer than what is said aloud, or one with
+ *     a link, which is never read aloud), so it is never posted twice and never lost; a turn that
+ *     was cancelled meanwhile posts nothing more. A shop link is posted and never read aloud; an
  *     autonomous tick does not post one at all.
  *  5. Memory: the reply (the neutral line, where step 2 replaced it). Not written for a turn that
  *     died before any of it went out. A reply whose words reached nobody while its turn was live
@@ -37,7 +41,7 @@ export interface ReplyChannels {
   readonly ended: boolean;
   readonly emotes: { playEmote(name: string): void };
   readonly messages: { sendMessage(text: string): Promise<boolean> };
-  readonly voice: { speak(text: string): Promise<Played> };
+  readonly voice: { speak(text: string, options?: { admit?: () => boolean }): Promise<Played> };
 }
 
 export interface ReplyContext {
@@ -81,12 +85,19 @@ export async function deliverReply(ctx: ReplyContext, content: Content): Promise
 
   logger.info(`[Reply] ${turn.origin} turn: ${JSON.stringify(content)}`);
 
-  const report = privilegedReport(content);
-  const refusal = report?.refusal() ?? null;
-  if (report && refusal) {
-    logger.warn(`[Reply] Not reporting what a privileged action did: ${refusal}`);
+  let report = privilegedReport(content);
+  /** Whether a privileged report may still go out; when not, `content` becomes its neutral line (once) */
+  const stillReportable = (when: string): boolean => {
+    const refusal = report?.refusal() ?? null;
+    if (!report || !refusal) return true;
+    logger.warn(`[Reply] Not reporting what a privileged action did (${when}): ${refusal}`);
     content = report.instead;
-  }
+    report = undefined;
+    return false;
+  };
+  stillReportable('at delivery');
+  // Asked by the voice right before it plays a report: no answer changes `content` from there
+  const admit = () => !report || report.refusal() === null;
 
   const text = typeof content.text === 'string' ? content.text : '';
   const words = text.trim() !== '';
@@ -108,14 +119,30 @@ export async function deliverReply(ctx: ReplyContext, content: Content): Promise
     if (link) {
       delivery.posted = await session.messages.sendMessage(text);
     } else if (turn.origin === 'voice') {
-      delivery.spoken = await session.voice.speak(text);
-      if (delivery.spoken !== 'all') {
+      // Spoken, then posted when not all of it was played, unless the turn ended meanwhile. A
+      // privileged report whose requester lost the right meanwhile is replaced by its neutral line,
+      // which goes the same way (once: the neutral line is no report).
+      const voiced = async (text: string, reporting: boolean): Promise<void> => {
+        delivery.spoken = await (reporting ? session.voice.speak(text, { admit }) : session.voice.speak(text));
+        if (delivery.spoken === 'all') return;
+        if (reporting && !stillReportable('before its text fallback')) {
+          if (delivery.spoken !== 'none') logger.warn('[Reply] Part of a privileged report had been played when its requester lost the right');
+          const neutral = typeof content.text === 'string' ? content.text : '';
+          if (neutral.trim()) await voiced(neutral, false);
+          return;
+        }
+        const dead = deadReason(ctx);
+        if (dead) {
+          logger.info(`[Reply] Not posting the rest of a voice reply as text: ${dead}`);
+          return;
+        }
         if (delivery.spoken === 'partial') logger.info('[Reply] Reply partly spoken, then posted as text');
         delivery.posted = await session.messages.sendMessage(text);
-      }
+      };
+      await voiced(text, !!report);
     } else {
       delivery.posted = await session.messages.sendMessage(text);
-      delivery.spoken = await session.voice.speak(text);
+      delivery.spoken = await (report ? session.voice.speak(text, { admit }) : session.voice.speak(text));
     }
     if (!delivery.posted && delivery.spoken === 'none') {
       logger.warn(`[Reply] A reply of a ${turn.origin} turn reached nobody: ${deadReason(ctx) ?? 'it could be neither posted nor spoken'}`);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { TIP_THANKS_TRACKED_NAMES, TipThanksLimiter, announcedName, namesakeOf, parseTipNotice, tipThanks, tipThought } from './tip-notice';
+import { TIP_THANKS_TRACKED_NAMES, TipThanksLimiter, announcedName, namesakeOf, parseTipNotice, privateLookalikeOf, tipThanks, tipThought } from './tip-notice';
 
 describe('parseTipNotice', () => {
   it('reads public announcements of tips to the agent', () => {
@@ -57,6 +57,20 @@ describe('namesakeOf', () => {
     expect(namesakeOf(`Coo ${'o'.repeat(40)}`, players(['p4', `Coo ${'o'.repeat(50)}`]), 'coo')).toBe('p4');
     // Not a player
     expect(namesakeOf('Coo', players(['app1', 'Coo', 'app']), 'coo')).toBeNull();
+  });
+});
+
+describe('privateLookalikeOf', () => {
+  const players = (...entries: [string, string, string?][]) => entries.map(([id, name, type = 'player']): [string, { data: { id: string; type: string; name: string } }] => [id, { data: { id, type, name } }]);
+
+  it('finds a player present whose name, as the world writes it, could make a public announcement read as the private notice', () => {
+    expect(privateLookalikeOf(players(['coo', 'Coo'], ['p1', 'Alice'], ['p2', 'your friend']), 'coo')).toBeNull();
+    expect(privateLookalikeOf(players(['p3', '(only you) Mallory']), 'coo')).toBe('p3');
+    expect(privateLookalikeOf(players(['p4', '\u200b(only you)\nM']), 'coo')).toBe('p4');
+    expect(privateLookalikeOf(players(['p5', '(only you)']), 'coo')).toBe('p5');
+    expect(privateLookalikeOf(players(['p6', ' you\u202e ']), 'coo')).toBe('p6');
+    // Not the agent itself, and not an app
+    expect(privateLookalikeOf(players(['coo', 'you'], ['app1', '(only you) x', 'app']), 'coo')).toBeNull();
   });
 });
 

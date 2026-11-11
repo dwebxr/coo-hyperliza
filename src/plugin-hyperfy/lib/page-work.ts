@@ -37,9 +37,16 @@ export class PageWork {
 
   /** Runs `work` (one page call for the asset `key`, described as `what` in the log) under the rules above. */
   run<T>(key: string, what: string, work: () => Promise<T>): Promise<T> {
-    const refused = this.#refused.get(key);
-    if (refused) return Promise.reject(new Error(`[PageWork] Not handing ${what} to the render page again: ${refused}`));
+    const refusedError = () => {
+      const refused = this.#refused.get(key);
+      return refused ? new Error(`[PageWork] Not handing ${what} to the render page again: ${refused}`) : null;
+    };
+    const early = refusedError();
+    if (early) return Promise.reject(early);
     const attempt = async () => {
+      // Again right before the work: a call queued behind the one that got it refused does not run
+      const late = refusedError();
+      if (late) throw late;
       try {
         return await work();
       } catch (error) {

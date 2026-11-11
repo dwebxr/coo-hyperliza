@@ -19,16 +19,16 @@ const avatarMap = (window.avatarMap = new Map()); // avatar URL -> VRM factory
 window.activeVRMInstances = [];
 
 // How to take back what a load kept, by the operation id the agent passed with it. The agent
-// settles every such load as soon as it returns (managers/puppeteer-manager.ts pageCall):
-// "rollback" takes it back (the call failed, or the world it was for went away), "commit" keeps
-// the record while the agent checks once more, "forget" drops it. A record lives only between a
-// load's return and its last settlement; there is no expiry.
+// settles every such load once it has done its own work on the result
+// (managers/puppeteer-manager.ts pageCall): "rollback" takes it back (the call or the agent's work
+// failed, or the world it was for went away), "forget" drops the record (the agent accepted it).
+// A record lives only between a load's return and its settlement; there is no expiry.
 const undoable = new Map();
 function keepUndo(op, undoIt) {
   if (op !== undefined) undoable.set(op, undoIt);
 }
+/** Settles load `op`: 'rollback' takes back what it kept, 'forget' (its acceptance) keeps it for good. */
 function settle(op, step) {
-  if (step === 'commit') return;
   const undoIt = undoable.get(op);
   undoable.delete(op);
   if (undoIt && step === 'rollback') undoIt();
@@ -397,4 +397,11 @@ function rehydrate(sceneJson, stripSlots, players) {
   window.renderer.render(window.scene, window.camera);
 }
 
-window.agentPage = { LIMITS, loadGlb, loadVrm, registerTexture, loadEnvironmentHDR, hdrTexture, rehydrate, settle, pendingSettlements };
+/** Drops a texture registerTexture kept, for an agent that accepted it and then had no use for it */
+function releaseTexture(id, slot) {
+  const key = `${id}:${slot}`;
+  const texture = texturesMap.get(key);
+  if (texture) forgetTexture(key, texture);
+}
+
+window.agentPage = { LIMITS, loadGlb, loadVrm, registerTexture, releaseTexture, loadEnvironmentHDR, hdrTexture, rehydrate, settle, pendingSettlements };

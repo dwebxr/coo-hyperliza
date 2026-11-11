@@ -10,7 +10,7 @@ import { currentTurn, noteDelivered } from "../lib/turn-context";
 import { postAgentChat, worldChat } from "../lib/world-chat";
 import type { ChatMessage, ChatTurn } from "../lib/chat-intake";
 import { isJapanese } from "../lib/simple-commands";
-import { type TipNotice, TipThanksLimiter, announcedName, namesakeOf, parseTipNotice, tipThanks, tipThought } from "../lib/tip-notice";
+import { type TipNotice, TipThanksLimiter, announcedName, namesakeOf, parseTipNotice, privateLookalikeOf, tipThanks, tipThought } from "../lib/tip-notice";
 import { oneLine, shownName, shownNames } from "../lib/text";
 import moment from 'moment'
 import { uuid } from '../hyperfy/src/core/utils';
@@ -83,8 +83,11 @@ export class MessageManager {
         if (!tip) return
         if (!worldChat(world)?.isLiveFromNetwork(msg)) {
           logger.warn(`[Tips] Ignoring a tip announcement that did not come from the world's server`)
-        } else if (tip.addressed === 'by-name' && namesakeOf(agentName, world.entities.items?.entries?.() ?? [], agentPlayerId)) {
-          // The world names the recipient only by display name: this one may be the namesake's
+        } else if (tip.addressed === 'privately' && privateLookalikeOf(world.entities.items?.entries?.() ?? [], agentPlayerId)) {
+          // Someone here could have produced this text as a public announcement to another player
+          logger.info(`[Tips] Ignoring a private-looking tip notice: a player here has a name that makes public announcements read like one`)
+        } else if (namesakeOf(agentName, world.entities.items?.entries?.() ?? [], agentPlayerId)) {
+          // The world names the recipient only by text: this one may be the namesake's
           logger.info(`[Tips] Ignoring a tip announcement to "${announcedName(agentName)}": another player here has that name`)
         } else if (!session.tipWallet?.receivedOnThisConnection) {
           logger.info(`[Tips] Ignoring a tip announcement: the agent has not been receiving tips on this connection`)
@@ -140,6 +143,8 @@ export class MessageManager {
               // Let the handler skip the "should I respond?" LLM call when the answer is obvious
               directlyAddressed: isDirectlyAddressed(messageBody, agentNames),
               soloPlayer: countOtherPlayers(world) === 1,
+              // A stop command that already stopped the agent when it arrived: this turn only acknowledges it
+              ...(session.stoppedOnArrival(msg.id) ? { hyperfyStopTaken: true } : {}),
             },
           },
           createdAt: Date.now(),

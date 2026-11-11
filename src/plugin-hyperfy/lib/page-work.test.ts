@@ -34,6 +34,21 @@ describe('PageWork', () => {
     expect(most).toBe(1);
   });
 
+  it('does not run a call queued behind the one that got its asset refused', async () => {
+    const work = new PageWork({ log: () => {} });
+    // Serial already: an earlier kill with others in flight
+    await work.run('other', 'other', async () => Promise.reject(killed(2))).catch(() => {});
+    let finish!: (error: Error) => void;
+    const first = work.run('image/x', 'the image x', () => new Promise<never>((_, reject) => (finish = reject))).catch((e: Error) => e);
+    const queued = vi.fn(async () => 'ran');
+    const second = work.run('image/x', 'the image x', queued).catch((e: Error) => e.message);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    finish(killed(1));
+    expect(await first).toBeInstanceOf(RenderPageKilled);
+    expect(await second).toContain('Not handing the image x to the render page again');
+    expect(queued).not.toHaveBeenCalled();
+  });
+
   it('keeps at most REFUSED_KEPT refusals, the oldest dropped first', async () => {
     const work = new PageWork({ log: () => {} });
     for (let i = 0; i <= REFUSED_KEPT; i++) await work.run(`model/${i}`, `${i}`, async () => Promise.reject(killed(1))).catch(() => {});

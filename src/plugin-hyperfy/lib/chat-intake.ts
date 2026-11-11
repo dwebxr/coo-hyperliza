@@ -131,6 +131,12 @@ type DropKind = 'rate-limited' | 'sender-waiting' | 'queue-full' | 'stale';
 export interface ChatIntakeOptions {
   /** Handles one message as a turn. Its failure is logged and never stops later messages. */
   handle: ChatHandler;
+  /**
+   * Told, synchronously, of each message the moment it is queued (past de-duplication and its
+   * sender's rate limit; not one turned away): what must not wait for its turn (an addressed
+   * "stop": session/connection-session.ts). Its failure is logged and changes nothing here.
+   */
+  admitted?: (msg: ReceivedChatMessage) => void;
   /** Fires when the connection this intake serves ends: the intake stops (see stop). */
   signal?: AbortSignal;
   now?: () => number;
@@ -171,6 +177,7 @@ const DROP_TEXT: Record<DropKind, string> = {
 
 export class ChatIntake {
   readonly #handle: ChatHandler;
+  readonly #admitted?: (msg: ReceivedChatMessage) => void;
   /** The turn in progress */
   #current: AbortController | null = null;
   readonly #now: () => number;
@@ -187,8 +194,9 @@ export class ChatIntake {
   readonly #stats: ChatIntakeStats = { queued: 0, handled: 0, duplicate: 0, rateLimited: 0, senderWaiting: 0, queueFull: 0, stale: 0 };
   readonly #reports: Record<DropKind, RateLimitedLog>;
 
-  constructor({ handle, signal, now = Date.now, log = (line) => console.warn(line) }: ChatIntakeOptions) {
+  constructor({ handle, admitted, signal, now = Date.now, log = (line) => console.warn(line) }: ChatIntakeOptions) {
     this.#handle = handle;
+    this.#admitted = admitted;
     if (signal?.aborted) this.#stopped = true;
     else signal?.addEventListener('abort', () => this.stop(), { once: true });
     this.#now = now;
@@ -234,6 +242,11 @@ export class ChatIntake {
       this.#reports['queue-full'].note();
     }
     if (dropped?.msg === msg) return 'queue-full';
+    try {
+      this.#admitted?.(msg);
+    } catch (error) {
+      this.#log(`[Chat] Acting on message ${msg.id} on arrival failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     this.#start();
     return 'queued';
   }

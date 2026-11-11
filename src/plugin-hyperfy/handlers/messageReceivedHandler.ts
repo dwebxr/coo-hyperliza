@@ -57,10 +57,12 @@ async function handleSimpleCommand(runtime: IAgentRuntime, message: Memory, call
         controls.followEntity(senderId, undefined, { signal }).catch((error: unknown) => logger.debug(`[Bootstrap] Walking to the speaker failed: ${error}`));
       }
     });
-  } else {
+  } else if (!(message.content.metadata as { hyperfyStopTaken?: boolean } | undefined)?.hyperfyStopTaken) {
     // Waits for nobody: it ends whatever walk is in progress
     controls.stopAllActions('asked to stop');
   }
+  // else: it stopped the agent when it arrived (ConnectionSession.stopOnArrival); this turn only
+  // acknowledges it, and stops nothing asked for since
 
   logger.info(`[Bootstrap] Simple command "${command}" handled without a model call`);
   await callback({

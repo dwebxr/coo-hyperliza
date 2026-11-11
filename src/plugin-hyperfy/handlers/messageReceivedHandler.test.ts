@@ -147,6 +147,21 @@ describe('messageReceivedHandler cost controls', () => {
     expect(callback).toHaveBeenCalledWith(expect.objectContaining({ text: 'On my way!', actions: ['HYPERFY_GOTO_ENTITY'] }));
   });
 
+  it('stops on "stop" without a model call; one that already stopped the agent when it arrived is only acknowledged', async () => {
+    const { runtime, message } = setup({ embeddingModel: false });
+    const w = world();
+    runtime.getService = vi.fn(() => serviceFor(sessionFor(w)));
+    const callback = vi.fn();
+    message.content = { text: 'Coo, stop!', metadata: { directlyAddressed: true, hyperfyFromId: 'player-bob' } };
+    await messageReceivedHandler({ runtime, message, callback } as any);
+    expect(w.controls.stopAllActions).toHaveBeenCalledTimes(1);
+    message.content = { text: 'Coo, stop!', metadata: { directlyAddressed: true, hyperfyFromId: 'player-bob', hyperfyStopTaken: true } };
+    await messageReceivedHandler({ runtime, message: { ...message, id: '00000000-0000-0000-0000-000000000003' }, callback } as any);
+    expect(w.controls.stopAllActions).toHaveBeenCalledTimes(1);
+    expect(runtime.useModel).not.toHaveBeenCalled();
+    expect(callback.mock.calls.map(([content]) => content.actions)).toEqual([['HYPERFY_STOP_MOVING'], ['HYPERFY_STOP_MOVING']]);
+  });
+
   it('leaves "come here" to the model when it is not addressed to the agent', async () => {
     const { runtime, message } = setup({ embeddingModel: false });
     runtime.getService = vi.fn(() => serviceFor(sessionFor(world())));

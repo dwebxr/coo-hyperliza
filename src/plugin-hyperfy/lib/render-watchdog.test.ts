@@ -107,9 +107,12 @@ describe('RenderWatchdog', () => {
     expect(tornDown).toEqual([1]);
     // From what it knew (the browser itself), at once
     expect(kills).toEqual([[[100], null]]);
-    // A call arriving now, on the torn-down generation, fails the same way, and its work is not started
+    // A call arriving now, on the torn-down generation, fails the same way, and its work is not
+    // started; it was not in flight, so its kill blames no one (callsInFlight 0)
     const late = vi.fn(async () => 'too late');
-    await expect(watchdog.watch(1, late)).rejects.toBeInstanceOf(RenderPageKilled);
+    const lateError = await watchdog.watch(1, late).catch((e: unknown) => e);
+    expect(lateError).toBeInstanceOf(RenderPageKilled);
+    expect(lateError).toMatchObject({ reason: 'deadline', generation: 1, callsInFlight: 0, initInFlight: false, message: (await a as Error).message });
     expect(late).not.toHaveBeenCalled();
     // The fresh sample sweeps again, with the group it shows
     for (const answer of answers.splice(0)) answer(rows(100, 100, 100));

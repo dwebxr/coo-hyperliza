@@ -82,7 +82,8 @@ vi.mock('fs', async (importOriginal) => {
 });
 
 import { OFFLINE_CHROMIUM_ARGS, PageOperationCancelled, PuppeteerManager } from './puppeteer-manager';
-import { RenderBreaker, RenderPageUnavailable } from '../lib/render-watchdog';
+import { RenderBreaker, RenderPageKilled, RenderPageUnavailable } from '../lib/render-watchdog';
+import { PageWork } from '../lib/page-work';
 
 const text = (bytes: Uint8Array) => Buffer.from(bytes).toString();
 
@@ -256,14 +257,14 @@ describe('PuppeteerManager', () => {
     expect(settled).toEqual([[op, 'rollback']]);
   });
 
-  it('commits every page call that succeeded with its signal unfired, checks the signal again, then forgets it; and takes back one that failed', async () => {
+  it('forgets a page call once it is accepted (its signal unfired), and takes back one that failed', async () => {
     const manager = PuppeteerManager.getOrCreate() as any;
     const page = await manager.init();
     const signal = new AbortController().signal;
 
     await manager.registerTexture({ bytes: new Uint8Array([1]), contentType: 'image/png', url: 'https://world.test/a.png' }, 'map', { signal });
-    const [committedLoad, commit, forget] = page.evaluate.mock.calls.slice(-3);
-    expect([commit.slice(1), forget.slice(1)]).toEqual([[committedLoad.at(-1), 'commit'], [committedLoad.at(-1), 'forget']]);
+    const [acceptedLoad, forget] = page.evaluate.mock.calls.slice(-2);
+    expect(forget.slice(1)).toEqual([acceptedLoad.at(-1), 'forget']);
 
     page.evaluate.mockImplementationOnce(async () => {
       throw new Error('decode failed');
@@ -273,28 +274,68 @@ describe('PuppeteerManager', () => {
     expect(takeBack.slice(1)).toEqual([failedLoad.at(-1), 'rollback']);
   });
 
-  it('takes back what a page call kept when the signal fires while its commit is acknowledged', async () => {
+  it("takes back what a page call kept when the caller's own work on the result fails, or the signal fires while it runs", async () => {
+    const manager = PuppeteerManager.getOrCreate() as any;
+    const page = await manager.init();
+    const steps: string[] = [];
+    page.evaluate.mockImplementation(async (_fn: unknown, ...args: any[]) => {
+      if (['rollback', 'forget'].includes(args.at(-1))) steps.push(args.at(-1));
+      return Buffer.from('glb').toString('base64');
+    });
+    const signal = new AbortController().signal;
+    await expect(manager.loadGlbBytes(new Uint8Array([1]), { signal, accept: () => { throw new Error('conversion failed'); } })).rejects.toThrow('conversion failed');
+    const stop = new AbortController();
+    const accepting = manager.loadGlbBytes(new Uint8Array([1]), {
+      signal: stop.signal,
+      accept: async (bytes: Uint8Array) => {
+        stop.abort();
+        return text(bytes);
+      },
+    });
+    await expect(accepting).rejects.toBeInstanceOf(PageOperationCancelled);
+    // Accepted: what accept made of it is returned, and the record is dropped
+    await expect(manager.loadGlbBytes(new Uint8Array([1]), { signal, accept: (bytes: Uint8Array) => `parsed ${text(bytes)}` })).resolves.toBe('parsed glb');
+    expect(steps).toEqual(['rollback', 'rollback', 'forget']);
+  });
+
+  it('returns an accepted result whatever its signal does while the record is being dropped: from the acceptance on it is the caller\'s', async () => {
     const manager = PuppeteerManager.getOrCreate() as any;
     const page = await manager.init();
     const stop = new AbortController();
+    let acknowledge!: () => void;
     const steps: string[] = [];
     page.evaluate.mockImplementation(async (_fn: unknown, ...args: any[]) => {
-      if (args.at(-1) === 'commit') stop.abort();
-      if (['commit', 'rollback', 'forget'].includes(args.at(-1))) steps.push(args.at(-1));
+      if (['rollback', 'forget'].includes(args.at(-1))) steps.push(args.at(-1));
+      if (args.at(-1) === 'forget') await new Promise<void>((resolve) => (acknowledge = resolve));
       return 'texture-id';
     });
-    await expect(manager.registerTexture({ bytes: new Uint8Array([1]), contentType: 'image/png', url: 'https://world.test/a.png' }, 'map', { signal: stop.signal })).rejects.toBeInstanceOf(PageOperationCancelled);
-    expect(steps).toEqual(['commit', 'rollback']);
+    const registering = manager.registerTexture({ bytes: new Uint8Array([1]), contentType: 'image/png', url: 'https://world.test/a.png' }, 'map', { signal: stop.signal });
+    await vi.waitFor(() => expect(steps).toEqual(['forget']));
+    stop.abort();
+    acknowledge();
+    // The caller has it (environment.ts releases a sky texture it no longer needs: environment.test.ts)
+    await expect(registering).resolves.toBe('texture-id');
+    expect(steps).toEqual(['forget']);
   });
 
-  it('fails the page call when its settlement fails, with that error (a kill among them)', async () => {
-    const manager = PuppeteerManager.getOrCreate() as any;
+  it.each(['forget', 'rollback'])('fails the page call with the very RenderPageKilled that ends its "%s" step, and PageWork counts it', async (step) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const manager = new PuppeteerManager({ watchdog: { deadlineMs: 100, table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
     const page = await manager.init();
-    page.evaluate.mockImplementation(async (_fn: unknown, ...args: any[]) => {
-      if (args.at(-1) === 'commit') throw new Error('Target closed');
-      return 'texture-id';
+    const stop = new AbortController();
+    page.evaluate.mockImplementation((_fn: unknown, ...args: any[]) => {
+      // This step never answers: the watchdog's deadline tears the browser down while it is the only call
+      if (args.at(-1) === step) return new Promise(() => {});
+      if (step === 'rollback') stop.abort();
+      return Promise.resolve('texture-id');
     });
-    await expect(manager.registerTexture({ bytes: new Uint8Array([1]), contentType: 'image/png', url: 'https://world.test/a.png' }, 'map', { signal: new AbortController().signal })).rejects.toThrow('Target closed');
+    const work = new PageWork({ log: () => {} });
+    const error = await work.run('image/a.png', 'the image a.png', () => manager.registerTexture({ bytes: new Uint8Array([1]), contentType: 'image/png', url: 'https://world.test/a.png' }, 'map', { signal: stop.signal })).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(RenderPageKilled);
+    expect(error).toMatchObject({ reason: 'deadline', callsInFlight: 1, initInFlight: false });
+    expect(work.refusal('image/a.png')).toBe((error as Error).message);
+    vi.restoreAllMocks();
   });
 
   it('fails a cancelled page call with the error of its take-back when that fails', async () => {
@@ -335,6 +376,39 @@ describe('PuppeteerManager', () => {
     built();
     for (let i = 0; i < 3; i++) breaker.recordKill();
     await expect(manager.capture(scene(), { kind: 'around' })).rejects.toBeInstanceOf(RenderPageUnavailable);
+  });
+
+  it('builds no page and runs no page work when a launch it waited for completes after the render page went down for a cooldown', async () => {
+    let launch!: () => void;
+    launchGate = new Promise<void>((resolve) => (launch = resolve));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const breaker = new RenderBreaker({ log: { warn: () => {} } });
+    const manager = new PuppeteerManager({ watchdog: { breaker, table: async () => [] } }) as any;
+    await vi.waitFor(() => expect(launchOptions).toHaveLength(1));
+    // Admitted while the render page was up
+    const call = manager.registerTexture({ bytes: new Uint8Array([1]), contentType: 'image/png', url: 'https://world.test/a.png' }, 'map', { signal: new AbortController().signal }).catch((error: unknown) => error);
+    for (let i = 0; i < 3; i++) breaker.recordKill();
+    launchGate = null;
+    launch();
+    expect(await call).toBeInstanceOf(RenderPageUnavailable);
+    expect(launched[0].pages).toEqual([]);
+    vi.restoreAllMocks();
+  });
+
+  it('runs no page work for a call whose page finished building after the render page went down for a cooldown', async () => {
+    let built!: () => void;
+    newPageGate = new Promise<void>((resolve) => (built = resolve));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const breaker = new RenderBreaker({ log: { warn: () => {} } });
+    const manager = new PuppeteerManager({ watchdog: { breaker, table: async () => [] } }) as any;
+    await vi.waitFor(() => expect(launched[0]?.newPage).toHaveBeenCalled());
+    const call = manager.registerTexture({ bytes: new Uint8Array([1]), contentType: 'image/png', url: 'https://world.test/a.png' }, 'map', { signal: new AbortController().signal }).catch((error: unknown) => error);
+    for (let i = 0; i < 3; i++) breaker.recordKill();
+    newPageGate = null;
+    built();
+    expect(await call).toBeInstanceOf(RenderPageUnavailable);
+    expect(launched[0].pages[0].evaluate).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
   });
 
   it('runs page calls under its watchdog: a call past the deadline fails with RenderPageKilled, and the next use starts a new browser', async () => {

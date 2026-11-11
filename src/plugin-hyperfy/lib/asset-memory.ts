@@ -8,28 +8,74 @@
  *   - downloads (ASSET_DOWNLOAD_POOL_BYTES): a load reserves 2 × the kind's download cap before it
  *     asks (the chunks and the one copy they are joined into), 2 × the declared Content-Length once
  *     the answer says it is smaller, and 2 × the actual size once the bytes are in;
- *   - work (ASSET_WORK_POOL_BYTES): the download is then exchanged for what the rest costs, a
- *     weight from the actual bytes (workBytes): for a model, 4 × its bytes (the bytes, their base64
- *     and the message that carries it) plus 4 × the export the filter estimates (the returned
- *     base64, the decoded copy, and the engine's copies of its BIN chunk and buffer views); for a
- *     script 3 ×, for an image or HDR 4 × its bytes. Holders of work never wait on anything else.
- * A reservation larger than its pool is cut to the pool: such a load runs alone. Small files keep
- * the loader's concurrency; large ones serialise. The worst case stays at the two pools, 1 GiB,
- * plus what is not counted: three.js objects and the decoded scene graph, and the transient
- * buffers of a single step.
+ *   - work (ASSET_WORK_POOL_BYTES): the download is then exchanged, once, for what the rest costs
+ *     (workBytes). For a model, avatar or emote that is sized from the ceiling the render page is
+ *     held to for this load (modelReservation), which the page is passed as its maxExportBytes and
+ *     refuses to exceed, not from an estimate. Holders of work never wait on anything else.
+ * After the exchange a reservation only shrinks; one that does not fit its pool is refused, never
+ * cut (a model's ceiling is lowered to fit first, and the model refused when even its estimated
+ * export would not fit). So what the pools hold is never less than what these copies take, and the
+ * agent's memory for assets on their way stays within the two pools, 1 GiB. Not counted: three.js
+ * objects and the scene graph the engine builds from a parsed model, the transient buffers of a
+ * single step beyond the copies above, and the loader's cache of finished loads (bounded by
+ * itself, systems/loader.ts LOADER_LIMITS).
  */
 
 const MiB = 1024 * 1024;
 export const ASSET_DOWNLOAD_POOL_BYTES = 256 * MiB;
 export const ASSET_WORK_POOL_BYTES = 768 * MiB;
 
+/**
+ * Copies per byte sent to the render page: the bytes, and three copies of their base64 (the
+ * string, the message that carries it, the frame written to the socket), 1 + 3 × 4/3 = 5, rounded
+ * up for what the message adds.
+ */
+export const SEND_COPIES = 6;
+/**
+ * Copies per byte the page returns: three copies of its base64 (the frame, the message, the
+ * string; 3 × 4/3 = 4), the decoded copy, and the engine's copies of its BIN chunk and of its
+ * buffer views (an export's views do not overlap): 7.
+ */
+export const RETURN_COPIES = 7;
+/** What is left of a model's reservation per returned byte once the page's answer is decoded: the base64 string, the decoded copy, the engine's BIN and view copies (4/3 + 3, rounded up) */
+export const PARSE_COPIES = 5;
+
 export type AssetWorkKind = 'model' | 'avatar' | 'emote' | 'script' | 'image' | 'hdr';
 
-/** What the rest of an asset's way costs in this process, from its actual size and (models) the export estimate. */
-export function workBytes(kind: AssetWorkKind, bytes: number, exportEstimate = 0): number {
+/**
+ * What the rest of an asset's way costs in this process, from its actual size: a script is
+ * decoded to a string (up to 2 bytes per byte), an image or HDR is sent to the page. For a model,
+ * `exportBytes` is the ceiling the page is held to (modelReservation).
+ */
+export function workBytes(kind: AssetWorkKind, bytes: number, exportBytes = 0): number {
   if (kind === 'script') return 3 * bytes;
-  if (kind === 'image' || kind === 'hdr') return 4 * bytes;
-  return 4 * bytes + 4 * exportEstimate;
+  if (kind === 'image' || kind === 'hdr') return SEND_COPIES * bytes;
+  return SEND_COPIES * bytes + RETURN_COPIES * exportBytes;
+}
+
+/**
+ * How much a model, avatar or emote of `downloadBytes` may get back from the render page, and what
+ * that reserves. The ceiling is twice the filter's export estimate, or the download times the
+ * room re-encoded textures need (an avatar keeps its textures in the export: 8 ×; a model or emote,
+ * whose texture slots are stripped, 2 ×), at least 1 MiB, and at most `exportCap` (the kind's
+ * export budget, lib/gltf-budget.ts). It is lowered until the reservation fits `pool`; when even
+ * the estimate does not fit, the load is refused.
+ */
+export function modelReservation(
+  kind: 'model' | 'avatar' | 'emote',
+  downloadBytes: number,
+  exportEstimate: number,
+  exportCap: number,
+  pool = ASSET_WORK_POOL_BYTES
+): { exportBytes: number; workBytes: number } | { problem: string } {
+  const room = kind === 'avatar' ? 8 : 2;
+  const fits = Math.floor((pool - SEND_COPIES * downloadBytes) / RETURN_COPIES);
+  const exportBytes = Math.min(exportCap, Math.max(2 * exportEstimate, room * downloadBytes, MiB), fits);
+  if (exportBytes < exportEstimate || exportBytes <= 0) {
+    const needed = workBytes(kind, downloadBytes, exportEstimate);
+    return { problem: `the ${kind} would need ${needed} bytes of the agent's memory for assets on their way, more than the ${pool} there are` };
+  }
+  return { exportBytes, workBytes: workBytes(kind, downloadBytes, exportBytes) };
 }
 
 /** Waiting for a reservation stopped: the caller's signal fired. */
@@ -43,7 +89,6 @@ export class AssetMemoryAborted extends Error {
 interface Waiter {
   bytes: number;
   grant: () => void;
-  fail: (error: Error) => void;
 }
 
 class Pool {
@@ -51,9 +96,10 @@ class Pool {
   #queue: Waiter[] = [];
   constructor(readonly size: number) {}
 
-  /** Waits for `bytes` (cut to the pool's size), first come first served */
+  /** Waits for `bytes`, first come first served; more than the pool holds is refused at once. */
   take(bytes: number, signal?: AbortSignal): Promise<number> {
-    const wanted = Math.min(Math.max(0, Math.ceil(bytes)), this.size);
+    const wanted = Math.max(0, Math.ceil(bytes));
+    if (wanted > this.size) return Promise.reject(new Error(`[AssetMemory] ${wanted} bytes asked for, more than the ${this.size} this pool holds`));
     if (signal?.aborted) return Promise.reject(new AssetMemoryAborted());
     if (this.#queue.length === 0 && this.used + wanted <= this.size) {
       this.used += wanted;
@@ -67,7 +113,6 @@ class Pool {
           this.used += wanted;
           resolve(wanted);
         },
-        fail: reject,
       };
       const onAbort = () => {
         this.#queue = this.#queue.filter((entry) => entry !== waiter);
@@ -93,11 +138,12 @@ class Pool {
   }
 }
 
-/** One asset's reservation: in the download pool, then in the work pool, until it is released. */
+/** One asset's reservation: in the download pool, then (once) in the work pool, until it is released. */
 export class AssetLease {
   #pool: Pool;
   #held: number;
   #released = false;
+  #moving = false;
   constructor(
     readonly memory: AssetMemory,
     pool: Pool,
@@ -115,7 +161,7 @@ export class AssetLease {
     return this.#released ? 'released' : this.#pool === this.memory.downloads ? 'download' : 'work';
   }
 
-  /** Holds less (never waits): what the asset is now known to need */
+  /** Holds less (never waits, never grows): what the asset is now known to need */
   shrink(bytes: number): void {
     if (this.#released) return;
     const to = Math.max(0, Math.min(this.#held, Math.ceil(bytes)));
@@ -123,25 +169,27 @@ export class AssetLease {
     this.#held = to;
   }
 
-  /** Exchanges the download reservation for `bytes` of work; the download is given back once the work is granted. */
+  /**
+   * Exchanges the download reservation for `bytes` of work, once; the download is given back when
+   * the work is granted. A second exchange, or growing afterwards, is refused: a lease only shrinks.
+   */
   async toWork(bytes: number, signal?: AbortSignal): Promise<void> {
     if (this.#released) return;
-    if (this.#pool === this.memory.work) {
-      // Already working: grow by what is missing (work holders never wait on anything else)
-      if (bytes > this.#held) {
-        const more = await this.memory.work.take(bytes - this.#held, signal);
-        this.#held += more;
+    if (this.#moving || this.#pool !== this.memory.downloads) throw new Error('[AssetMemory] A reservation moves to work once; after that it only shrinks');
+    this.#moving = true;
+    try {
+      const granted = await this.memory.work.take(bytes, signal);
+      // Released while it waited: the late grant goes straight back
+      if (this.#released) {
+        this.memory.work.give(granted);
+        return;
       }
-      return;
+      this.#pool.give(this.#held);
+      this.#pool = this.memory.work;
+      this.#held = granted;
+    } finally {
+      this.#moving = false;
     }
-    const granted = await this.memory.work.take(bytes, signal);
-    if (this.#released) {
-      this.memory.work.give(granted);
-      return;
-    }
-    this.#pool.give(this.#held);
-    this.#pool = this.memory.work;
-    this.#held = granted;
   }
 
   release(): void {

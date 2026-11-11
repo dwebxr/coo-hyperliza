@@ -37,14 +37,27 @@ export function stripInvisibleChars(value: string, replacement = ''): string {
   return value.replace(INVISIBLE_CHARS, replacement);
 }
 
+// Format characters (Cf: bidi controls and isolates, zero-width space, joiner and non-joiner, word
+// joiner, tag characters, BOM, soft hyphen...), except what emoji are made of: a subdivision flag's
+// tag sequence (U+1F3F4, tags, cancel tag) is matched whole and kept, and a zero-width joiner
+// between two pictographs (each possibly followed by VS16 or a skin tone) is kept. Variation
+// selectors, keycap marks and skin tones are not format characters and are kept anyway.
+const FORMAT_CHARS = /\u{1F3F4}[\u{E0020}-\u{E007E}]+\u{E007F}|(?<=\p{Extended_Pictographic}[\u{FE0F}\u{1F3FB}-\u{1F3FF}]?)\u200D(?=\p{Extended_Pictographic})|(\p{Cf})/gu;
+
+/** `value` without format characters, emoji sequences kept whole (FORMAT_CHARS). */
+export function stripFormatChars(value: string): string {
+  return value.replace(FORMAT_CHARS, (match, format: string | undefined) => (format === undefined ? match : ''));
+}
+
 /**
  * Untrusted text as one line of at most `max` code points: control characters and line/paragraph
- * separators become spaces, so it cannot start a new line in a log or a new section in a prompt.
- * Runs of ordinary spaces and format characters (emoji joiners) are kept.
+ * separators become spaces, so it cannot start a new line in a log or a new section in a prompt,
+ * and format characters (bidi overrides, zero-width characters, tags) are removed except inside
+ * emoji (stripFormatChars). Runs of ordinary spaces are kept.
  */
 export function oneLine(value: string, max: number): string {
   // A code point is at most two UTF-16 units: nothing beyond 2 x max units can survive the cut
-  return truncateCodePoints(head(value, max * 2).replace(LINE_BREAKING_CHARS, ' ').trim(), max).trimEnd();
+  return truncateCodePoints(stripFormatChars(head(value, max * 2).replace(LINE_BREAKING_CHARS, ' ')).trim(), max).trimEnd();
 }
 
 /** The first `units` UTF-16 units of `value`, never ending in half a surrogate pair. */

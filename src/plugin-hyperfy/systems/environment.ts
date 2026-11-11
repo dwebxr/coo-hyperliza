@@ -181,7 +181,12 @@ export class AgentEnvironment extends System {
     if (bgUrl) {
       // Downloaded here, under the world's network policy: the render page has no network
       const done = await this.toPage(bgUrl, 'image', signal, (image) => puppeteerManager.registerTexture(image, 'map', { signal }))
-      if (!done || stopped()) return
+      if (!done) return
+      if (stopped()) {
+        // Accepted by the page just before a newer sky (or destroy) came: no use for it now
+        puppeteerManager.releaseTexture(done.result, 'map').catch(() => {})
+        return
+      }
       bgUrl = done.asset.url;
       bgUUID = done.result;
     }

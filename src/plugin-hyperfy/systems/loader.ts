@@ -10,7 +10,7 @@ import type { WorldScripts } from "../lib/script-api";
 import { ASSET_BYTE_CAPS, type AssetBytes, type AssetKind, describeUrl, fetchAssetBytes } from "../lib/asset-bytes";
 import { SafeFetchError } from "../lib/net-policy";
 import { gltfCharge, modelBudget } from "../lib/gltf-budget";
-import { type AssetLease, assetMemory, workBytes } from "../lib/asset-memory";
+import { type AssetLease, PARSE_COPIES, assetMemory, modelReservation, workBytes } from "../lib/asset-memory";
 import { PageWork } from "../lib/page-work";
 
 /** What the agent loads. The engine also asks for images, video and audio, which the agent has no use for. */
@@ -137,7 +137,10 @@ export class AgentLoader extends System {
     for (const waiter of this.waiting.splice(0)) waiter.cancel(error);
   }
 
-  /** Called after every await of a load: nothing is evaluated, rendered or kept after destroy(). */
+  /**
+   * Called after every await of a load: nothing is evaluated, rendered or kept after destroy(). A
+   * model the render page has been told is accepted (parseGLB) is kept: its last check was before.
+   */
   private throwIfStopped() {
     if (this.stopped.signal.aborted) throw new Error("[AgentLoader] The world was destroyed");
   }
@@ -220,49 +223,48 @@ export class AgentLoader extends System {
     const budget = modelBudget(type);
     const admitted = gltfCharge(asset.bytes, budget);
     if ('problem' in admitted) throw new Error(`[AgentLoader] ${admitted.problem}`);
-    // The rest of the way, from the actual bytes and the export the filter estimates
-    await lease?.toWork(workBytes(type, asset.bytes.byteLength, admitted.charge.exportBytes), this.stopped.signal);
+    // The most the page may hand back for this load, and the agent's memory for the rest of the way
+    // sized from that (lib/asset-memory.ts); the page is held to the same number
+    const reservation = modelReservation(type, asset.bytes.byteLength, admitted.charge.exportBytes, budget.exportBytes);
+    if ('problem' in reservation) throw new Error(`[AgentLoader] ${reservation.problem}`);
+    await lease?.toWork(reservation.workBytes, this.stopped.signal);
     this.throwIfStopped();
     const puppeteerManager = PuppeteerManager.getInstance()
-    // The render page keeps the textures (and the whole avatar) and hands back a copy without them
-    const stripped = await this.pageWork.run(key, `${type} from ${describeUrl(asset.url)}`, () =>
-      type === 'avatar' ?
-        puppeteerManager.loadVRMBytes(asset.bytes, asset.url, { maxExportBytes: budget.exportBytes, signal: this.stopped.signal }) :
-        puppeteerManager.loadGlbBytes(asset.bytes, { maxExportBytes: budget.exportBytes, signal: this.stopped.signal })
+    // The render page keeps the textures (and the whole avatar) and hands back a copy without them.
+    // That copy is parsed and converted here before the page is told the load is accepted: if any
+    // of it fails, or the world goes away first, what the page kept is taken back (pageCall).
+    const accept = async (stripped: Uint8Array) => {
+      this.throwIfStopped();
+      // From here: the download, the page's answer (its base64 and decoded copy) and the engine's
+      // copies of its BIN chunk and buffer views
+      lease?.shrink(asset.bytes.byteLength + PARSE_COPIES * stripped.byteLength);
+      // The page's copy comes in memory of its own (managers/puppeteer-manager.ts fromBase64): no second copy
+      const arrayBuffer = stripped.byteOffset === 0 && stripped.byteLength === stripped.buffer.byteLength ? stripped.buffer : stripped.slice().buffer;
+      const gltf: any = await new Promise((ok, bad) => this.gltfLoader.parse(arrayBuffer, '', ok, bad));
+      this.throwIfStopped();
+      let result: any;
+      if (type === 'model') {
+        const node = glbToNodes(gltf, this.world);
+        result = { gltf, toNodes() { return node.clone(true); } };
+      } else if (type === 'emote') {
+        const factory = createEmoteFactory(gltf, asset.url);
+        result = { gltf, toClip(o: any) { return factory.toClip(o); } };
+      } else {
+        const factory = null;
+        const root = createNode('group', { id: '$root' });
+        root.add(new AgentAvatar({ id: 'avatar' }));
+        result = { gltf, factory, toNodes() { return root.clone(true); } };
+      }
+      // The last check before the page is told: from the acceptance on, the result is this loader's
+      this.throwIfStopped();
+      return { result, bytes: Math.max(asset.bytes.byteLength, stripped.byteLength) };
+    };
+    const options = { maxExportBytes: reservation.exportBytes, signal: this.stopped.signal, accept };
+    const loaded = await this.pageWork.run(key, `${type} from ${describeUrl(asset.url)}`, () =>
+      type === 'avatar' ? puppeteerManager.loadVRMBytes(asset.bytes, asset.url, options) : puppeteerManager.loadGlbBytes(asset.bytes, options)
     );
-    this.throwIfStopped();
-    // From here: the download, the page's copy and the engine's copies of its BIN chunk and buffer views
-    lease?.shrink(asset.bytes.byteLength + 3 * stripped.byteLength);
-    // The page's copy comes in memory of its own (managers/puppeteer-manager.ts fromBase64): no second copy
-    const arrayBuffer = stripped.byteOffset === 0 && stripped.byteLength === stripped.buffer.byteLength ? stripped.buffer : stripped.slice().buffer;
-
-    const gltf: any = await new Promise((ok, bad) =>
-      this.gltfLoader.parse(arrayBuffer, '', ok, bad)
-    );
-    this.throwIfStopped();
-
-    let result: any;
-
-    if (type === 'model') {
-      const node = glbToNodes(gltf, this.world);
-      result = { gltf, toNodes() { return node.clone(true); } };
-
-    } else if (type === 'emote') {
-      const factory = createEmoteFactory(gltf, asset.url);
-      result = { gltf, toClip(o: any) { return factory.toClip(o); } };
-
-    } else if (type === 'avatar') {
-      const factory = null;
-      const root = createNode('group', { id: '$root' });
-      root.add(new AgentAvatar({ id: 'avatar' }));
-      result = { gltf, factory, toNodes() { return root.clone(true); } };
-
-    } else {
-      throw new Error(`[AgentLoader] Unsupported GLTF type: ${type}`);
-    }
-
     // What is held: the parsed copy the page returned (its buffer stays referenced), or the download if larger
-    this.keep(key, result, Math.max(asset.bytes.byteLength, stripped.byteLength));
-    return result;
+    this.keep(key, loaded.result, loaded.bytes);
+    return loaded.result;
   }
 }

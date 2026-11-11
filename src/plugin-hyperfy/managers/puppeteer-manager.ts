@@ -56,7 +56,8 @@ interface RenderPageWindow {
     registerTexture(base64: string, contentType: string, slot: string, source: string, op?: string): Promise<string>
     loadEnvironmentHDR(base64: string, op?: string): Promise<void>
     rehydrate(sceneJson: unknown, stripSlots: readonly string[], players: unknown[]): unknown
-    settle(op: string, step: string): unknown
+    settle(op: string, step: 'rollback' | 'forget'): unknown
+    releaseTexture(id: string, slot: string): unknown
   }
 }
 // Only inside functions handed to page.evaluate, which run in the render page
@@ -133,6 +134,16 @@ function untilAborted<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> 
 }
 // The largest model the page returns when the caller names no budget (a model's, lib/gltf-budget.ts)
 const DEFAULT_MAX_EXPORT_BYTES = modelBudget('model').exportBytes
+
+/** What a model or avatar load takes besides its bytes (see PuppeteerManager.pageCall). */
+export interface LoadOptions<T, R> {
+  maxExportBytes?: number
+  signal?: AbortSignal
+  /** The caller's work on the result before it is accepted; a failure takes back what the call kept */
+  accept?: (result: T) => R | Promise<R>
+}
+
+const asIs = <T, R = T>(result: T): R => result as unknown as R
 
 /** A page call whose world went away (the caller's signal fired); what it kept in the page was taken back. */
 export class PageOperationCancelled extends Error {
@@ -316,6 +327,8 @@ export class PuppeteerManager {
         const gone = () => new Error('[PuppeteerManager] The render page was given up while it was being built')
         // A launch that finished after that is disposed of by getBrowser(); no page is built on it
         if (givenUp()) throw gone()
+        // Nor while the render page is down: the cooldown may have started while this launched
+        this.watchdog.breaker.check()
         const page = await this.watchdog.watch(generation, () => this.buildPage(browser, initPromise), { deadlineMs: this.watchdog.initDeadlineMs, init: true })
         if (givenUp()) {
           await page.close().catch(() => { })
@@ -333,6 +346,13 @@ export class PuppeteerManager {
       })
     }
     return await untilAborted(this.initPromise, signal)
+  }
+
+  /** The page, for page work admitted now: not during a cooldown that started while it was waited for */
+  private async ready(signal?: AbortSignal): Promise<Page> {
+    const page = await this.init(signal)
+    this.watchdog.breaker.check()
+    return page
   }
 
   private async buildPage(browser: Browser, initPromise: Promise<Page>): Promise<Page> {
@@ -405,7 +425,7 @@ export class PuppeteerManager {
    */
   public capture(world: CaptureWorld, view: CaptureView, { signal }: { signal?: AbortSignal } = {}): Promise<string> {
     return this.captures.run(signal, async () => {
-      const page = await this.init(signal)
+      const page = await this.ready(signal)
       const player = world.entities.player
       if (!player) {
         throw new Error('Player entity not yet available')
@@ -431,45 +451,57 @@ export class PuppeteerManager {
    * The asset loaders below take bytes the agent has already downloaded (lib/asset-bytes.ts): the
    * page cannot fetch anything itself. Bytes cross to the page and back as base64.
    *
-   * Each takes a `signal` (the world the asset is for going away): checked once the page is ready
-   * and right before the page is asked, so nothing is handed to the page after it fired. A page
-   * call cannot be interrupted. With a signal, the page files how to take back what the call kept
-   * under the call's id, and every call is then settled, in this order:
-   *   - the call failed, or the signal fired by the time it returned: taken back ("rollback");
-   *   - otherwise committed ("commit": the page keeps the record), then the signal is checked again:
-   *     fired meanwhile, taken back; not, the record is dropped ("forget") and the result returned.
-   * A settlement that fails fails the call (a RenderPageKilled among them, for the loader's
-   * accounting); only the take-back after a call that already failed ignores its own failure, as
-   * the call's error is what counts and a page that cannot be reached holds nothing of it.
+   * Each takes a `signal` (the world the asset is for going away) and an `accept` step (the
+   * caller's own work on the result: for a model, parsing and converting it in Node). The signal is
+   * checked once the page is ready and right before the page is asked, so nothing is handed to the
+   * page after it fired. A page call cannot be interrupted. With a signal, the page files how to
+   * take back what the call kept under the call's id and keeps it until the call is settled:
+   *   - the call failed, `accept` failed, or the signal fired before `accept` began or by the time
+   *     it finished: taken back ("rollback");
+   *   - otherwise the record is dropped ("forget") and what `accept` returned is returned. That is
+   *     the acceptance: from here the result is the caller's, and a signal that fires later changes
+   *     nothing (a caller that then has no use for it releases it, as environment.ts does a sky
+   *     texture with releaseTexture).
+   * A settlement that fails fails the call (a RenderPageKilled among them, for PageWork's
+   * accounting); only the take-back after a call or an acceptance that already failed ignores its
+   * own failure, as that error is what counts and a page that cannot be reached holds nothing.
+   * A record lives from the call's return to its settlement: at most one per page call in
+   * progress, and a kill or page rebuild discards them all.
    */
-  private async pageCall<T>(signal: AbortSignal | undefined, run: (page: Page, op: string[]) => Promise<T>): Promise<T> {
-    const page = await this.init(signal)
+  private async pageCall<T, R>(signal: AbortSignal | undefined, run: (page: Page, op: string[]) => Promise<T>, accept: (result: T) => R | Promise<R>): Promise<R> {
+    const page = await this.ready(signal)
     if (signal?.aborted) throw new PageOperationCancelled()
     // The id the page files its undo under; only when there is something to cancel
     const op = signal ? [`op-${++this.operations}`] : []
+    const takeBack = () => (op.length ? this.settle(page, op[0], 'rollback') : Promise.resolve())
     let result: T
     try {
       result = await this.watched(page, () => run(page, op))
     } catch (error) {
-      if (op.length) await this.settle(page, op[0], 'rollback').catch(() => {})
+      await takeBack().catch(() => {})
       throw error
     }
-    if (!signal || !op.length) return result
-    if (signal.aborted) {
-      await this.settle(page, op[0], 'rollback')
+    if (signal?.aborted) {
+      await takeBack()
       throw new PageOperationCancelled()
     }
-    await this.settle(page, op[0], 'commit')
-    if (signal.aborted) {
-      await this.settle(page, op[0], 'rollback')
+    let accepted: R
+    try {
+      accepted = await accept(result)
+    } catch (error) {
+      await takeBack().catch(() => {})
+      throw error
+    }
+    if (signal?.aborted) {
+      await takeBack()
       throw new PageOperationCancelled()
     }
-    await this.settle(page, op[0], 'forget')
-    return result
+    if (op.length) await this.settle(page, op[0], 'forget')
+    return accepted
   }
 
   /** One settlement step of call `op` in the page (assets.js settle) */
-  private async settle(page: Page, op: string, step: 'commit' | 'rollback' | 'forget'): Promise<void> {
+  private async settle(page: Page, op: string, step: 'rollback' | 'forget'): Promise<void> {
     await this.watched(page, () => page.evaluate((id, step) => { window.agentPage!.settle(id, step) }, op, step))
   }
 
@@ -478,7 +510,7 @@ export class PuppeteerManager {
    * scripts/smoke-chromium.mjs, which checks the watchdog with it.
    */
   async evaluateWatched<T>(fn: (...args: any[]) => T | Promise<T>, ...args: unknown[]): Promise<T> {
-    const page = await this.init()
+    const page = await this.ready()
     return this.watched(page, () => page.evaluate(fn, ...args) as Promise<T>)
   }
 
@@ -488,51 +520,69 @@ export class PuppeteerManager {
   }
 
   /**
-   * Keeps a model's textures in the page and returns the model without them (GLB). The page
-   * refuses to return more than `maxExportBytes` (lib/gltf-budget.ts).
+   * Keeps a model's textures in the page and returns the model without them (GLB), or what
+   * `accept` makes of it (see pageCall). The page refuses to return more than `maxExportBytes`.
    */
-  async loadGlbBytes(bytes: Uint8Array, { maxExportBytes = DEFAULT_MAX_EXPORT_BYTES, signal }: { maxExportBytes?: number; signal?: AbortSignal } = {}): Promise<Uint8Array> {
-    const stripped = await this.pageCall(signal, (page, op) =>
-      page.evaluate(
-        (base64, STRIP_SLOTS, maxExportBytes, op?: string) => window.agentPage!.loadGlb(base64, STRIP_SLOTS, maxExportBytes, op),
-        toBase64(bytes), STRIP_SLOTS, maxExportBytes, ...op
-      )
+  async loadGlbBytes<R = Uint8Array>(bytes: Uint8Array, { maxExportBytes = DEFAULT_MAX_EXPORT_BYTES, signal, accept }: LoadOptions<Uint8Array, R> = {}): Promise<R> {
+    return this.pageCall(
+      signal,
+      (page, op) =>
+        page.evaluate(
+          (base64, STRIP_SLOTS, maxExportBytes, op?: string) => window.agentPage!.loadGlb(base64, STRIP_SLOTS, maxExportBytes, op),
+          toBase64(bytes), STRIP_SLOTS, maxExportBytes, ...op
+        ),
+      (stripped) => (accept ?? asIs<Uint8Array, R>)(fromBase64(stripped))
     );
-    return fromBase64(stripped);
   }
 
   /**
    * Keeps an avatar in the page under `url` (what rehydrateSceneAssets looks players' avatars up
-   * by) and returns it as a GLB, of at most `maxExportBytes`.
+   * by) and returns it as a GLB of at most `maxExportBytes`, or what `accept` makes of it.
    */
-  async loadVRMBytes(bytes: Uint8Array, url: string, { maxExportBytes = DEFAULT_MAX_EXPORT_BYTES, signal }: { maxExportBytes?: number; signal?: AbortSignal } = {}): Promise<Uint8Array> {
-    const exported = await this.pageCall(signal, (page, op) =>
-      page.evaluate(
-        (url, base64, maxExportBytes, op?: string) => window.agentPage!.loadVrm(url, base64, maxExportBytes, op),
-        url, toBase64(bytes), maxExportBytes, ...op
-      )
+  async loadVRMBytes<R = Uint8Array>(bytes: Uint8Array, url: string, { maxExportBytes = DEFAULT_MAX_EXPORT_BYTES, signal, accept }: LoadOptions<Uint8Array, R> = {}): Promise<R> {
+    return this.pageCall(
+      signal,
+      (page, op) =>
+        page.evaluate(
+          (url, base64, maxExportBytes, op?: string) => window.agentPage!.loadVrm(url, base64, maxExportBytes, op),
+          url, toBase64(bytes), maxExportBytes, ...op
+        ),
+      (exported) => (accept ?? asIs<Uint8Array, R>)(fromBase64(exported))
     );
-    return fromBase64(exported);
   }
 
   /** Keeps an image in the page as a texture and returns the id to name it by. `url` is where it came from. */
   async registerTexture(image: { bytes: Uint8Array; contentType: string; url: string }, slot: string, { signal }: { signal?: AbortSignal } = {}): Promise<string> {
     // Only the part three's TextureLoader looks at: of a data: URL, that is what comes before the data
     const source = image.url.startsWith('data:') ? image.url.slice(0, image.url.indexOf(',')) : image.url;
-    return this.pageCall(signal, (page, op) =>
-      page.evaluate(
-        (base64, contentType, slot, source, op?: string) => window.agentPage!.registerTexture(base64, contentType, slot, source, op),
-        toBase64(image.bytes), image.contentType, slot, source, ...op
-      )
+    return this.pageCall(
+      signal,
+      (page, op) =>
+        page.evaluate(
+          (base64, contentType, slot, source, op?: string) => window.agentPage!.registerTexture(base64, contentType, slot, source, op),
+          toBase64(image.bytes), image.contentType, slot, source, ...op
+        ),
+      asIs
     );
   }
 
+  /** Drops a texture registerTexture kept (by its id and slot), for a caller that accepted it and then had no use for it. */
+  async releaseTexture(id: string, slot: string): Promise<void> {
+    // A page built since holds none of the old one's textures: nothing to release then
+    const page = this.page
+    if (!page) return
+    await this.watched(page, () => page.evaluate((id, slot) => { window.agentPage!.releaseTexture(id, slot) }, id, slot))
+  }
+
   public async loadEnvironmentHDR(bytes: Uint8Array, { signal }: { signal?: AbortSignal } = {}): Promise<void> {
-    await this.pageCall(signal, (page, op) =>
-      page.evaluate(
-        (base64, op?: string) => window.agentPage!.loadEnvironmentHDR(base64, op),
-        toBase64(bytes), ...op
-      )
+    await this.pageCall(
+      signal,
+      (page, op) =>
+        page.evaluate(
+          (base64, op?: string) => window.agentPage!.loadEnvironmentHDR(base64, op),
+          toBase64(bytes), ...op
+        ),
+      asIs
     );
   }
 

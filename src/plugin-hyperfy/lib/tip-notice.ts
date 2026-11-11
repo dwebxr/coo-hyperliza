@@ -5,9 +5,11 @@
  * (src/core/systems/ServerNetwork.js tipConfirmed / announceTip)
  *
  * An announcement is all the agent has: it checks nothing on chain. What is read from one is what
- * the world announced, not a payment the agent verified. The public announcement names the
- * recipient only by display name, and display names are not identities: it is the agent's only
- * when no other player present has the same name (namesakeOf).
+ * the world announced, not a payment the agent verified. Both forms name the recipient only by
+ * text, and display names are not identities: a notice counts only while no other player present
+ * has the agent's name as the world writes it (namesakeOf), and the private form only while no
+ * player present could have produced its text as a public announcement (privateLookalikeOf).
+ * Without a recipient id from the server that is as far as text goes.
  */
 
 import { SHOWN_NAME_MAX, escapeRegExp, shownName } from './text';
@@ -27,6 +29,9 @@ export const TIP_NAME_MAX_CODE_POINTS = SHOWN_NAME_MAX;
 const AMOUNT = '\\d{1,30}(?:\\.\\d{1,18})?';
 const TOKEN = '[A-Za-z0-9.]{1,16}';
 const AMOUNT_AND_TOKEN = `(${AMOUNT}) (${TOKEN})`;
+const PRIVATE_PREFIX = '(only you)';
+/** The word the private form uses for its recipient */
+const PRIVATE_RECIPIENT = 'you';
 const PRIVATE_NOTICE = new RegExp(`^\\(only you\\) (.+) tipped you ${AMOUNT_AND_TOKEN}$`);
 
 /**
@@ -63,12 +68,29 @@ function tipNotice(match: RegExpMatchArray, addressed: TipNotice['addressed']): 
   return { fromName: shownName(match[1], TIP_NAME_MAX_CODE_POINTS) || 'Anonymous', amount: match[2], token: match[3], addressed };
 }
 
+type Players = Iterable<[string, { data?: { type?: unknown; name?: unknown } } | undefined]>;
+
+/**
+ * The id of a player other than the agent (`selfId`) whose name, as the world writes it, could
+ * make a public announcement read like the private "(only you) A tipped you N T" notice: one that
+ * starts with "(only you)" (the tipper's place) or is "you" (the recipient's), or null. While there
+ * is one, a private-looking notice may be someone else's public announcement.
+ */
+export function privateLookalikeOf(players: Players, selfId: unknown): string | null {
+  for (const [id, entity] of players) {
+    if (id === selfId || entity?.data?.type !== 'player') continue;
+    const shown = announcedName(entity.data.name);
+    if (shown.startsWith(PRIVATE_PREFIX) || shown === PRIVATE_RECIPIENT) return id;
+  }
+  return null;
+}
+
 /**
  * The id of a player other than the agent (`selfId`) who is present with the agent's name as the
- * world writes it into announcements, or null. While there is one, a public announcement of a tip
- * "to" that name may be for them.
+ * world writes it into announcements, or null. While there is one, a notice of a tip "to" that
+ * name may be for them.
  */
-export function namesakeOf(agentName: string, players: Iterable<[string, { data?: { type?: unknown; name?: unknown } } | undefined]>, selfId: unknown): string | null {
+export function namesakeOf(agentName: string, players: Players, selfId: unknown): string | null {
   const shown = announcedName(agentName);
   for (const [id, entity] of players) {
     if (id !== selfId && entity?.data?.type === 'player' && announcedName(entity.data.name) === shown) return id;
