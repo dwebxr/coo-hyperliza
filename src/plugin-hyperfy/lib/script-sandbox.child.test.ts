@@ -15,7 +15,9 @@ import type { Scenario } from '../test-support/sandbox/scenario';
  *
  * The children are bundled once into a temporary directory, with the engine's storage module (which
  * reads and writes localstorage.json) and Chromium replaced by stand-ins. Every scenario runs under
- * Bun, the agent's runtime, and under Node.
+ * Bun, the agent's runtime, and under Node. The child serves the world's assets itself on loopback
+ * and loads them through the agent's real network policy; `report.outbound` is everything that got
+ * anywhere else.
  *
  * Without `bun` on PATH the Bun runs FAIL. Set SANDBOX_TESTS_WITHOUT_BUN=1 to skip them instead,
  * knowingly: the agent runs under Bun, so a pass without them says nothing about the agent.
@@ -103,6 +105,8 @@ interface Report {
   chat: { id: string; body: string }[];
   appState: unknown;
   playerPosition: number[];
+  api?: { method: string; url: string; body: string; headers: Record<string, string | undefined> }[];
+  assetRequests: string[];
   useItem?: string;
   releaseItem?: boolean;
   host: Record<string, boolean>;
@@ -259,16 +263,67 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     expect(report.outbound).toContain('http://127.0.0.1:3000/api/agents');
   });
 
-  test('fetch() is refused and makes no request; world.load() goes to the loader and reveals nothing about a failure', () => {
+  test("without a network function fetch() is refused; world.load() of a URL inside the agent's network is refused by the loader's policy, asks no server, and reveals nothing about the failure", () => {
     const report = run(runtime, { mode: 'sandboxed', script: fixture('hostile-app.js'), waitForEvent: 'report' });
     const [found] = events(report, 'report');
 
     expect(found.notes.fetch).toBe('rejected: fetch is not available to world scripts in this agent');
     expect(report.logs.join('\n')).toContain('fetch() is not available');
-    // Known and documented: until the outbound policy (plan D3) is applied in the loader, a script can
-    // make the loader request a URL. This is that one request; fetch() itself produced none.
-    expect(report.outbound).toEqual(['http://127.0.0.1:9/internal.glb']);
+    // world.load() of a URL inside the agent's network (the fixture's http://127.0.0.1:9/internal.glb
+    // is a server that is really listening, in the child): the loader's network policy refuses it,
+    // and the server is never asked. Before the policy was applied in the loader, this was one request.
+    expect(report.outbound).toEqual([]);
     expect(found.notes.loadFailure).toBe('world.load() failed');
+    expect(found.notes.load).toBe('node');
+    expect(report.logs.join('\n')).toMatch(/\[AgentLoader\] Failed to load model from http:\/\/127\.0\.0\.1:\d+\/internal\.glb: http:\/\/ is only allowed on the world's own origin/);
+  });
+
+  test("fetch() through the network policy: a public https API answers; nothing inward is reached, the world's own origin included; nothing of the agent's is sent", () => {
+    const script = `
+      const out = {}
+      const attempt = (name, url, options) => fetch(url, options).then(
+        async (r) => { out[name] = [r.status, r.ok, r.headers['content-type'], await r.text()] },
+        (e) => { out[name] = e.name + ': ' + e.message }
+      )
+      const steps = [
+        ['public', 'https://api.test/data?q=1', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer the-scripts-own-key', 'X-App': 'demo', Host: 'internal.test', Cookie: 'a=b', 'X-Forwarded-For': '10.0.0.1', Connection: 'keep-alive' }, body: '{"ping":true}' }],
+        ['loopback', 'https://127.0.0.1/secret'],
+        ['agentApi', 'http://127.0.0.1:9/api/agents'],
+        ['privateName', 'https://internal.test/secret'],
+        ['loopbackName', 'https://localhost/secret'],
+        ['world', '%WORLD%/app.js'],
+        ['redirectInward', 'https://api.test/redirect-inward'],
+        ['otherPort', 'https://api.test:8443/data'],
+        ['put', 'https://api.test/data', { method: 'PUT', body: 'x' }],
+        ['bodyOnGet', 'https://api.test/data', { body: 'x' }],
+      ]
+      steps.reduce((before, step) => before.then(() => attempt(...step)), Promise.resolve()).then(() => app.send('report', out))
+    `;
+    const report = run(runtime, { mode: 'sandboxed', script, waitForEvent: 'report', policyNetwork: true });
+    const [found] = events(report, 'report');
+
+    expect(found.public).toEqual([200, true, 'application/json', '{"pong":true}']);
+    // One message for every refusal: a script does not learn what a name resolves to
+    for (const name of ['loopback', 'agentApi', 'privateName', 'loopbackName', 'world', 'redirectInward', 'otherPort']) expect(found[name], name).toBe('TypeError: fetch failed');
+    expect(found.put).toBe('TypeError: fetch: only GET, HEAD and POST are available to world scripts');
+    expect(found.bodyOnGet).toBe('TypeError: fetch: only a POST request can have a body');
+    // Nothing inward was asked, by fetch or by the redirect; the world's server saw the loader's two requests only
+    expect(report.outbound).toEqual([]);
+    expect(report.assetRequests).toEqual(['/app.glb', '/app.js']);
+    // What the public API received: the script's own values, the URL's host, nothing else
+    expect(report.api!.map((hit) => `${hit.method} ${hit.url}`)).toEqual(['POST /data?q=1', 'GET /redirect-inward']);
+    const [{ headers, body }] = report.api!;
+    expect(body).toBe('{"ping":true}');
+    expect(headers).toMatchObject({ host: 'api.test', 'content-type': 'application/json', authorization: 'Bearer the-scripts-own-key', 'x-app': 'demo', connection: 'close' });
+    expect(Object.keys(headers).sort()).toEqual(['accept-encoding', 'authorization', 'connection', 'content-length', 'content-type', 'host', 'user-agent', 'x-app']);
+    // The reasons are on the host's console
+    const logs = report.logs.join('\n');
+    expect(logs).toContain('[script] fetch() failed: 127.0.0.1 is a loopback address');
+    expect(logs).toContain('[script] fetch() failed: internal.test resolves to 10.0.0.5, which is a private address');
+    // Refused in the lookup hook of the request itself, which also works in the locked-down realm
+    expect(logs).toContain('[script] fetch() failed: localhost resolves to 127.0.0.1, which is a loopback address');
+    expect(logs).toContain("[script] fetch() failed: http:// is only allowed on the world's own origin");
+    expect(report.host).toEqual(untouchedHost);
   });
 
   test('with a network function plugged in, a script gets plain data and a blob facade, never a host Blob', () => {

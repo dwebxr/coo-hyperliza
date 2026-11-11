@@ -1,8 +1,10 @@
 import * as THREE from 'three';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { BuildManager, type EditGuard } from './build-manager';
+import { BuildManager, type EditGuard, importByteCap } from './build-manager';
 import { SceneEditStopped } from '../lib/authorization';
 import { uploadAsset } from '../lib/asset-upload';
+import { MAX_MODEL_BYTES, NetPolicy, installWorldNet } from '../lib/net-policy';
+import { PUBLIC_ADDRESS, type TestServer, closeServers, startServer, testNet } from '../test-support/net';
 
 /*
  * The real BuildManager, with uploads going through the real upload helper (lib/asset-upload.ts,
@@ -10,9 +12,15 @@ import { uploadAsset } from '../lib/asset-upload';
  * answers the test releases one by one. The guard's authorization and connection can be
  * withdrawn at any point; nothing may reach the world after that, whichever await it happened
  * during, except taking back what the edit itself added.
+ *
+ * Imports are downloaded through the real network policy (lib/net-policy.ts): cdn.test is a public
+ * host that a server on loopback stands in for (test-support/net.ts).
  */
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await closeServers();
+});
 
 interface ApiRequest {
   method: string;
@@ -43,7 +51,7 @@ function setup() {
   const fetchImpl = ((url: string, init?: RequestInit) =>
     new Promise<Response>((answer) => requests.push({ method: init?.method ?? 'GET', url: String(url), answer }))) as typeof fetch;
   const network: any = { id: 'coo', apiUrl: 'https://world.test/api', maxUploadSize: 10, send: vi.fn() };
-  network.upload = vi.fn((file: File, { check }: { check?: () => void } = {}) => uploadAsset(network, file, { authToken: 'session', fetchImpl, check }));
+  network.upload = vi.fn((file: File, { check }: { check?: () => void } = {}) => uploadAsset(network, file, { net: new NetPolicy({ worldOrigin: 'https://world.test' }), authToken: 'session', fetchImpl, check }));
   const world: any = {
     assetsUrl: 'https://world.test/assets',
     controls: { goto: vi.fn().mockResolvedValue(undefined) },
@@ -81,12 +89,27 @@ function hyp() {
   out.set([9, 9, 9, 9], 4 + header.length);
   return out;
 }
-function download(file: Uint8Array, { status = 200, onFetch = () => {} }: { status?: number; onFetch?: () => void } = {}) {
-  return vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+/** Serves `file` as https://cdn.test/… for `world`. `internal` is where a request the policy must refuse would land. */
+async function download(world: object, file: Uint8Array, { status = 200, onFetch = () => {}, headers = {} }: { status?: number; onFetch?: () => void; headers?: Record<string, string> } = {}) {
+  const cdn = await startServer((_request, response) => {
     onFetch();
-    return new Response(file, { status, headers: { 'content-type': 'application/octet-stream' } });
+    response.writeHead(status, { 'content-type': 'application/octet-stream', ...headers }).end(Buffer.from(file));
+  }, { tls: true });
+  const internal = await startServer((_request, response) => response.end('internal'), { tls: true });
+  const { policy } = testNet({
+    hosts: { 'cdn.test': PUBLIC_ADDRESS, 'internal.test': '10.0.0.5' },
+    routes: {
+      'cdn.test:443': { port: cdn.port, direct: true },
+      'internal.test:443': { port: internal.port, direct: true },
+      '127.0.0.1:443': { port: internal.port, direct: true },
+      '169.254.169.254:443': { port: internal.port, direct: true },
+    },
+    worldOrigin: 'https://world.test',
   });
+  installWorldNet(world, policy);
+  return { cdn, internal };
 }
+const requestsTo = (server: TestServer) => server.hits.length;
 
 describe('BuildManager stops when the authorization is withdrawn', () => {
   it.each([
@@ -152,20 +175,108 @@ describe('BuildManager reports what each operation did', () => {
     const { guard, world, effects, manager } = setup();
     await expect(manager.importEntity(guard, 'file:///etc/hosts')).resolves.toEqual({ outcome: 'failed', reason: 'only http(s):// and asset:// URLs can be imported' });
     await expect(manager.importEntity(guard, 'https://cdn.test/thing.exe')).resolves.toEqual({ outcome: 'failed', reason: 'only .hyp, .glb and .vrm files can be imported' });
-    download(glb, { status: 404 });
+    await download(world, glb, { status: 404 });
     await expect(manager.importEntity(guard, 'https://cdn.test/thing.glb')).resolves.toEqual({ outcome: 'failed', reason: 'download failed (HTTP 404)' });
-    vi.restoreAllMocks();
-    download(new Uint8Array(2 * 1024 * 1024));
+    await download(world, new Uint8Array(2 * 1024 * 1024));
     world.network.maxUploadSize = 1;
     await expect(manager.importEntity(guard, 'https://cdn.test/thing.glb')).resolves.toEqual({ outcome: 'failed', reason: 'the file is too large for the world' });
     expect(effects()).toEqual(none);
   });
 });
 
+describe('BuildManager downloads imports under the network policy', () => {
+  it.each([
+    ["the agent's own API port", 'http://127.0.0.1:3000/api/agents/x.glb'],
+    ['a loopback address over https', 'https://127.0.0.1/thing.glb'],
+    ['a loopback address spelled as a number', 'https://2130706433/thing.glb'],
+    ['a name that resolves to a private address', 'https://internal.test/thing.glb'],
+    ['the cloud metadata address', 'https://169.254.169.254/latest/thing.glb'],
+    ['a URL with credentials', 'https://user:pw@cdn.test/thing.glb'],
+    ['a public host on another port', 'https://cdn.test:8443/thing.glb'],
+    ['plain http', 'http://cdn.test/thing.glb'],
+  ])('an import of %s makes no request at all and changes nothing', async (_name, url) => {
+    const { guard, world, effects, manager } = setup();
+    const { cdn, internal } = await download(world, glb);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    // The reason given to the requester says nothing about what the name resolves to
+    await expect(manager.importEntity(guard, url)).resolves.toEqual({ outcome: 'failed', reason: "the URL is not allowed by the agent's network policy" });
+
+    expect(cdn.connections + internal.connections).toBe(0);
+    expect(effects()).toEqual(none);
+    expect(world.controls.goto).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('(refused)'));
+  });
+
+  it('an import that is redirected inward stops at the redirect', async () => {
+    const { guard, world, effects, manager } = setup();
+    const { cdn, internal } = await download(world, glb, { status: 302, headers: { location: 'https://internal.test/secret.glb' } });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(manager.importEntity(guard, 'https://cdn.test/thing.glb')).resolves.toEqual({ outcome: 'failed', reason: "the URL is not allowed by the agent's network policy" });
+
+    expect(requestsTo(cdn)).toBe(1);
+    expect(internal.connections).toBe(0);
+    expect(effects()).toEqual(none);
+  });
+
+  it("the world's upload limit can lower the import cap and never raise it; a missing or unusable one means the operator's cap", () => {
+    const MB = 1024 * 1024;
+    expect(importByteCap('12')).toBe(12 * MB);
+    expect(importByteCap(1)).toBe(MB);
+    expect(importByteCap(0.5)).toBe(MB / 2);
+    for (const raising of ['100000', 1e9, Number.MAX_VALUE, MAX_MODEL_BYTES]) expect(importByteCap(raising)).toBe(MAX_MODEL_BYTES);
+    for (const unusable of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, undefined, null, '', '  ', 'none', {}, [], true]) expect(importByteCap(unusable)).toBe(MAX_MODEL_BYTES);
+    // A world that allows nothing gets nothing
+    for (const nothing of [0, -1, '0', '-5']) expect(importByteCap(nothing)).toBe(0);
+  });
+
+  it.each([
+    ['NaN', Number.NaN],
+    ['missing', undefined],
+    ['not a number', 'unlimited'],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['far above the operator cap', '1000000'],
+  ])("stops a download larger than the operator's cap when the world's limit is %s", async (_name, maxUploadSize) => {
+    const { guard, world, effects, manager } = setup();
+    world.network.maxUploadSize = maxUploadSize;
+    // Declares one byte more than the cap; the test does not have to send it
+    const { cdn } = await download(world, new Uint8Array(0), { headers: { 'content-length': String(MAX_MODEL_BYTES + 1) } });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(manager.importEntity(guard, 'https://cdn.test/thing.glb')).resolves.toEqual({ outcome: 'failed', reason: 'the file is too large to import' });
+
+    expect(requestsTo(cdn)).toBe(1);
+    expect(effects()).toEqual(none);
+  });
+
+  it('stops a download at the cap when the server does not say how much it sends', async () => {
+    const { guard, world, effects, manager } = setup();
+    world.network.maxUploadSize = '1';
+    let sent = 0;
+    const cdn = await startServer((_request, response) => {
+      response.writeHead(200);
+      const timer = setInterval(() => {
+        sent += 65536;
+        response.write(Buffer.alloc(65536));
+      }, 1);
+      response.on('close', () => clearInterval(timer));
+    }, { tls: true });
+    installWorldNet(world, testNet({ hosts: { 'cdn.test': PUBLIC_ADDRESS }, routes: { 'cdn.test:443': { port: cdn.port, direct: true } } }).policy);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(manager.importEntity(guard, 'https://cdn.test/endless.glb')).resolves.toEqual({ outcome: 'failed', reason: 'the file is too large for the world' });
+
+    await expect.poll(() => cdn.cutShort).toBe(1);
+    expect(sent).toBeLessThan(20 * 1024 * 1024);
+    expect(effects()).toEqual(none);
+  });
+});
+
 describe('BuildManager imports through the real upload helper', () => {
   it('imports a model when nothing changes (control)', async () => {
-    const { guard, effects, answer, manager } = setup();
-    download(glb);
+    const { guard, world, effects, answer, manager } = setup();
+    await download(world, glb);
     const result = manager.importEntity(guard, 'https://cdn.test/thing.glb', [0, 0, 0]);
     await answer(0, 200, { exists: false });
     await answer(1, 200, {});
@@ -174,24 +285,24 @@ describe('BuildManager imports through the real upload helper', () => {
   });
 
   it('downloads nothing for an import that is no longer allowed', async () => {
-    const { auth, guard, effects, manager } = setup();
-    const fetch = download(glb);
+    const { auth, guard, world, effects, manager } = setup();
+    const { cdn } = await download(world, glb);
     auth.allowed = false;
     await expect(manager.importEntity(guard, 'https://cdn.test/thing.glb')).rejects.toBeInstanceOf(SceneEditStopped);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(cdn.connections).toBe(0);
     expect(effects()).toEqual(none);
   });
 
   it('uploads and adds nothing when it was withdrawn during the download', async () => {
-    const { auth, guard, effects, manager } = setup();
-    download(glb, { onFetch: () => (auth.allowed = false) });
+    const { auth, guard, world, effects, manager } = setup();
+    await download(world, glb, { onFetch: () => (auth.allowed = false) });
     await expect(manager.importEntity(guard, 'https://cdn.test/thing.glb')).rejects.toBeInstanceOf(SceneEditStopped);
     expect(effects()).toEqual(none);
   });
 
   it.each([['a model', 'thing.glb', glb], ['an app', 'thing.hyp', hyp()]])('uploads and adds nothing for %s when it was withdrawn while walking to the spot', async (_what, name, bytes) => {
     const { auth, guard, world, effects, manager } = setup();
-    download(bytes);
+    await download(world, bytes);
     world.controls.goto.mockImplementation(async () => {
       auth.allowed = false;
     });
@@ -200,8 +311,8 @@ describe('BuildManager imports through the real upload helper', () => {
   });
 
   it('never posts a model it was withdrawn for while the upload-check was pending', async () => {
-    const { auth, guard, effects, answer, manager } = setup();
-    download(glb);
+    const { auth, guard, world, effects, answer, manager } = setup();
+    await download(world, glb);
     const result = manager.importEntity(guard, 'https://cdn.test/thing.glb');
     await vi.waitFor(() => expect(effects().requests).toEqual(['GET /api/upload-check']));
     auth.allowed = false;
@@ -211,8 +322,8 @@ describe('BuildManager imports through the real upload helper', () => {
   });
 
   it('adds no model when it was withdrawn while the upload was posted', async () => {
-    const { auth, guard, effects, answer, manager } = setup();
-    download(glb);
+    const { auth, guard, world, effects, answer, manager } = setup();
+    await download(world, glb);
     const result = manager.importEntity(guard, 'https://cdn.test/thing.glb');
     await answer(0, 200, { exists: false });
     await vi.waitFor(() => expect(effects().requests).toHaveLength(2));
@@ -223,8 +334,8 @@ describe('BuildManager imports through the real upload helper', () => {
   });
 
   it("never posts an app's asset it was withdrawn for, and takes the app back from the world", async () => {
-    const { auth, guard, effects, answer, manager } = setup();
-    download(hyp());
+    const { auth, guard, world, effects, answer, manager } = setup();
+    await download(world, hyp());
     const result = manager.importEntity(guard, 'https://cdn.test/thing.hyp');
     await vi.waitFor(() => expect(effects().requests).toEqual(['GET /api/upload-check']));
     auth.allowed = false;
@@ -235,8 +346,8 @@ describe('BuildManager imports through the real upload helper', () => {
   });
 
   it("takes back an app whose upload failed, even though the requester was demoted meanwhile (same connection)", async () => {
-    const { auth, guard, effects, answer, manager } = setup();
-    download(hyp());
+    const { auth, guard, world, effects, answer, manager } = setup();
+    await download(world, hyp());
     const result = manager.importEntity(guard, 'https://cdn.test/thing.hyp');
     await answer(0, 200, { exists: false });
     await vi.waitFor(() => expect(effects().requests).toHaveLength(2));
@@ -247,8 +358,8 @@ describe('BuildManager imports through the real upload helper', () => {
   });
 
   it('does not touch a new connection when an upload fails after the connection changed', async () => {
-    const { auth, guard, effects, answer, manager } = setup();
-    download(hyp());
+    const { auth, guard, world, effects, answer, manager } = setup();
+    await download(world, hyp());
     const result = manager.importEntity(guard, 'https://cdn.test/thing.hyp');
     await answer(0, 200, { exists: false });
     await vi.waitFor(() => expect(effects().requests).toHaveLength(2));
@@ -259,8 +370,8 @@ describe('BuildManager imports through the real upload helper', () => {
   });
 
   it('takes back an app whose uploads finished after it was withdrawn, instead of finishing it', async () => {
-    const { auth, guard, effects, answer, manager } = setup();
-    download(hyp());
+    const { auth, guard, world, effects, answer, manager } = setup();
+    await download(world, hyp());
     const result = manager.importEntity(guard, 'https://cdn.test/thing.hyp');
     await answer(0, 200, { exists: false });
     await vi.waitFor(() => expect(effects().requests).toHaveLength(2));

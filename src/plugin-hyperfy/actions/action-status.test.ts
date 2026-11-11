@@ -335,8 +335,8 @@ describe('action status recorded by core for every Hyperfy action', () => {
   });
 
   it('refuses the OpenPay share action on an autonomous turn, even for a message its own check would let through', async () => {
-    vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise(() => {}));
-    const shop = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'someone' })!;
+    // The Store's listings API never answers here (and the real one is never asked)
+    const shop = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'someone' }, { fetchImpl: (() => new Promise(() => {})) as typeof fetch })!;
     const { runtime, recorded } = createRuntime();
     runtime.registerAction(shop.actions![0]);
     // A player's message with text: the action's own isAutonomous() check would not refuse it
@@ -349,8 +349,8 @@ describe('action status recorded by core for every Hyperfy action', () => {
   });
 
   it('still refuses the OpenPay share action for a self-sent, empty message outside any turn (its own check)', async () => {
-    vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise(() => {}));
-    const shop = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'someone' })!;
+    // The Store's listings API never answers here (and the real one is never asked)
+    const shop = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'someone' }, { fetchImpl: (() => new Promise(() => {})) as typeof fetch })!;
     const { runtime, recorded } = createRuntime();
     runtime.registerAction(shop.actions![0]);
     const stored = await run(runtime, recorded, SHARE_ACTION, { message: { entityId: runtime.agentId, content: { text: '' } } });

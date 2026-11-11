@@ -80,6 +80,12 @@ window.snapshotEquirectangular = async function(playerData) {
     imageData.data.set(pixels);
     ctx.putImageData(imageData, 0, 0);
   
+    // Made for this one snapshot: without this each call leaves two render targets on the GPU
+    cubeRenderTarget.dispose();
+    renderTarget.dispose();
+    material.dispose();
+    plane.dispose();
+
     return canvas.toDataURL('image/jpeg').split(',')[1];
 };
   

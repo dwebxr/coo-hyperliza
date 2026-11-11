@@ -1,5 +1,6 @@
 import { logger } from '@elizaos/core';
 import { stripControlChars, truncateCodePoints } from '../plugin-hyperfy/lib/text';
+import { safeFetch, toResponse } from '../plugin-hyperfy/lib/net-policy';
 
 /**
  * Products from the public OpenPay Store listings API
@@ -11,6 +12,15 @@ const LIMIT = 100; // API maximum
 const TTL_MS = 5 * 60_000; // the API's data is up to ~4 minutes stale anyway
 const TIMEOUT_MS = 10_000;
 const RETRY_BASE_MS = 30_000; // after a failure: 30 s, 60 s, ... up to the TTL
+// 100 listings are a few hundred kilobytes at most
+const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+
+/**
+ * The listings request, under the outbound policy (lib/net-policy.ts): the API must be a public
+ * https host, a redirect cannot lead inside the agent's network, and the answer is cut off at
+ * MAX_RESPONSE_BYTES and TIMEOUT_MS.
+ */
+const fetchListings = async (url: URL): Promise<Response> => toResponse(await safeFetch(url.href, { maxBytes: MAX_RESPONSE_BYTES, timeoutMs: TIMEOUT_MS }));
 
 export type StoreLocale = 'ja' | 'en';
 
@@ -193,7 +203,7 @@ export class StoreCatalog {
 
     let response: Response;
     try {
-      response = await (this.options.fetchImpl ?? fetch)(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+      response = this.options.fetchImpl ? await this.options.fetchImpl(url, { signal: AbortSignal.timeout(TIMEOUT_MS) }) : await fetchListings(url);
     } catch (error: any) {
       throw new TransientError(`request failed: ${error?.message || error}`);
     }

@@ -20,6 +20,10 @@
     "src/usage-budget.test.ts",
     "src/openpay-store/**/*.ts",
     "src/plugin-hyperfy/lib/**/*.ts",
+    "src/plugin-hyperfy/test-support/net.ts",
+    "src/plugin-hyperfy/test-support/net-child.ts",
+    "src/plugin-hyperfy/test-support/no-network.ts",
+    "src/plugin-hyperfy/test-support/no-network.test.ts",
     "src/plugin-hyperfy/utils.ts"
   ]
 }

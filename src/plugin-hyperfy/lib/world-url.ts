@@ -24,3 +24,20 @@ export function resolveWorldWsUrl(raw: string | undefined): string {
   }
   return value;
 }
+
+/**
+ * The http(s) origin of the world behind a world socket URL (wss: -> https:, ws: -> http:, an
+ * http(s): URL as it is), or null when `wsUrl` is not such a URL. This is the one origin the
+ * outbound network policy treats as the world itself (lib/net-policy.ts).
+ */
+export function worldHttpOrigin(wsUrl: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(wsUrl);
+  } catch {
+    return null;
+  }
+  if (!WORLD_URL_PROTOCOLS.includes(url.protocol)) return null;
+  const scheme = url.protocol === 'wss:' || url.protocol === 'https:' ? 'https:' : 'http:';
+  return new URL(`${scheme}//${url.host}`).origin;
+}

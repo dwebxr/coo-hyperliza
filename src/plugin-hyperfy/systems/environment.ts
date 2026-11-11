@@ -4,7 +4,7 @@ import { isNumber, isString } from 'lodash-es'
 import { System } from '../hyperfy/src/core/systems/System.js'
 import * as THREE from 'three';
 import { PuppeteerManager } from "../managers/puppeteer-manager.js";
-import { resolveUrl } from '../utils.js';
+import { fetchAssetBytes } from '../lib/asset-bytes';
 
 interface SkyHandle {
   node: any
@@ -129,8 +129,10 @@ export class AgentEnvironment extends System {
     const n = ++this.skyN
     let bgUUID
     if (bgUrl) {
-      bgUrl = await resolveUrl(bgUrl, this.world);
-      bgUUID = await puppeteerManager.registerTexture(bgUrl, 'map');
+      // Downloaded here, under the world's network policy: the render page has no network
+      const image = await fetchAssetBytes(this.world, bgUrl, 'image');
+      bgUrl = image.url;
+      bgUUID = await puppeteerManager.registerTexture(image, 'map');
     }
     if (bgUUID) {
       this.sky.material.userData.materialId = bgUUID;
@@ -140,7 +142,8 @@ export class AgentEnvironment extends System {
     }
 
     if (hdrUrl) {
-      await puppeteerManager.loadEnvironmentHDR(hdrUrl);
+      const hdr = await fetchAssetBytes(this.world, hdrUrl, 'hdr');
+      await puppeteerManager.loadEnvironmentHDR(hdr.bytes);
     }
     if (n !== this.skyN) return
 

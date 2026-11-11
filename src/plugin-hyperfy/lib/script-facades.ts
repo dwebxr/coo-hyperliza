@@ -74,10 +74,11 @@ export interface ScriptResponse {
 }
 
 /**
- * THE SEAM FOR THE NETWORK POLICY (plan D3, phase P1b). Scripts have no network access until a
- * function of this type is passed to createWorldScripts(): it must apply the outbound policy
- * itself (address classes, redirects, byte cap, deadline) and return only what ScriptResponse
- * holds. `signal` aborts when the app that made the request is rebuilt or removed.
+ * The network behind a script's fetch(). Scripts have none unless a function of this type is
+ * passed to createWorldScripts(): it must apply the outbound policy itself (address classes,
+ * redirects, byte cap, deadline) and return only what ScriptResponse holds. The agent passes
+ * createScriptNetwork() (lib/script-network.ts). `signal` aborts when the app that made the
+ * request is rebuilt or removed.
  */
 export type ScriptNetwork = (url: string, request: ScriptRequest, signal: AbortSignal) => Promise<ScriptResponse>;
 

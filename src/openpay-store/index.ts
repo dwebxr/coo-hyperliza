@@ -117,7 +117,8 @@ export function formatSpokenProduct(product: StoreProduct): string {
   return `${product.title} — ${product.totalJpyc} JPYC. OpenPay Store, @${product.handle}.`;
 }
 
-export function createOpenPayStorePlugin(env: Record<string, string | undefined>): Plugin | null {
+/** `fetchImpl` replaces the request to the listings API (tests); the default goes through the outbound policy. */
+export function createOpenPayStorePlugin(env: Record<string, string | undefined>, { fetchImpl }: { fetchImpl?: typeof fetch } = {}): Plugin | null {
   const handles = parseHandles(env.OPENPAY_STORE_HANDLES);
   if (!handles) return null;
 
@@ -128,7 +129,7 @@ export function createOpenPayStorePlugin(env: Record<string, string | undefined>
     logger.warn(`[OpenPayStore] Invalid OPENPAY_STORE_API_URL "${apiUrl}"; using the default`);
     apiUrl = DEFAULT_OPENPAY_STORE_API_URL;
   }
-  const catalog = new StoreCatalog({ apiUrl, handles, locale: parseLocale(env.OPENPAY_STORE_LOCALE) });
+  const catalog = new StoreCatalog({ apiUrl, handles, locale: parseLocale(env.OPENPAY_STORE_LOCALE) }, { fetchImpl });
 
   const provider: Provider = {
     name: 'OPENPAY_STORE',

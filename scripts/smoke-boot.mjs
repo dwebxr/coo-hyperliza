@@ -26,18 +26,25 @@
  *   node_modules   a symlink to the repository's (package auto-install is switched off, so nothing
  *                  is written through it)
  *   pg/            a throwaway Postgres cluster (TCP on 127.0.0.1 only), stopped and deleted afterwards
- *   home/          an empty HOME, so no user-level configuration or Chromium is found
+ *   home/          an empty HOME, so no user-level configuration is found
  *
  * The agent's environment is exactly the `agentEnv` object below: nothing is inherited but PATH.
- * No real key is passed. Two things that do reach out in normal operation are switched off here,
- * because the point is that nothing leaves the machine: Chromium is not found (empty
- * PUPPETEER_CACHE_DIR; its page still imports three.js from a CDN), and npm is offline (the
- * elizaOS CLI asks the npm registry for its latest version on every start).
+ * No real key is passed. One thing that does reach out in normal operation is switched off here,
+ * because the point is that nothing leaves the machine: npm is offline (the elizaOS CLI asks the
+ * npm registry for its latest version on every start).
+ *
+ * Chromium IS started: the agent launches it for its render page when it connects, and the page
+ * and the browser have no way to the network (managers/puppeteer-manager.ts). PUPPETEER_CACHE_DIR
+ * points at the Chromium puppeteer installed for the person running this (SMOKE_PUPPETEER_CACHE_DIR,
+ * or ~/.cache/puppeteer); when there is none there, the Chromium checks FAIL rather than pass
+ * unseen. The smoke checks that the page came up, that Chromium was given none of the agent's
+ * secrets, and that its sockets, too, only ever went to 127.0.0.1. It takes no snapshot (the agent
+ * never gets into a world here); scripts/smoke-chromium.mjs does that.
  *
  * "No request left the machine" is checked two ways, both with limits: every HTTP(S)_PROXY-aware
  * client is pointed at a recorder on 127.0.0.1 that logs and refuses, and the sockets of the agent's
- * process group are sampled with lsof every 200 ms (a connection shorter than that, and DNS lookups,
- * would not be seen).
+ * process group and of everything it started (Chromium runs in a group of its own) are sampled
+ * with lsof every 200 ms (a connection shorter than that, and DNS lookups, would not be seen).
  */
 
 import { spawn, spawnSync } from 'node:child_process';
@@ -55,11 +62,13 @@ import {
   writeFileSync,
 } from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PG_BIN = process.env.SMOKE_PG_BIN || '/opt/homebrew/opt/postgresql@17/bin';
+const PUPPETEER_CACHE = process.env.SMOKE_PUPPETEER_CACHE_DIR || path.join(os.homedir(), '.cache/puppeteer');
 const BOOT_TIMEOUT_MS = 180_000;
 const EXIT_TIMEOUT_MS = 30_000;
 
@@ -147,17 +156,48 @@ async function socketHandshake(port, auth) {
   return `unexpected answer (${answer.slice(0, 80)})`;
 }
 
-/** Remote ends of the TCP/UDP sockets held by the processes of one process group */
-function sampleSockets(pgid, remotes, listeners) {
-  const pids = spawnSync('pgrep', ['-g', String(pgid)], { encoding: 'utf8' }).stdout.split('\n').filter(Boolean);
-  if (!pids.length) return;
-  const out = spawnSync('lsof', ['-nP', '-a', '-p', pids.join(','), '-iTCP', '-iUDP', '-Fn'], { encoding: 'utf8' }).stdout;
+/**
+ * The agent's processes: its process group, and everything started from it, whatever group that
+ * is in (puppeteer starts Chromium in a group of its own). `[pid, command]` each.
+ */
+function agentProcesses(pid) {
+  const rows = spawnSync('ps', ['-axo', 'pid=,ppid=,pgid=,command='], { encoding: 'utf8' })
+    .stdout.split('\n')
+    .map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/))
+    .filter(Boolean)
+    .map(([, id, parent, group, command]) => ({ id: Number(id), parent: Number(parent), group: Number(group), command }));
+  const found = new Map(rows.filter((row) => row.group === pid || row.id === pid).map((row) => [row.id, row.command]));
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const row of rows) {
+      if (found.has(row.parent) && !found.has(row.id)) {
+        found.set(row.id, row.command);
+        grew = true;
+      }
+    }
+  }
+  return [...found];
+}
+
+const isChromium = (command) => /chrome|chromium/i.test(command.split(' --')[0]);
+
+/** Remote ends of the TCP/UDP sockets held by the agent's processes; `chromium` gets those of Chromium's */
+function sampleSockets(pid, remotes, listeners, chromium = new Set()) {
+  const processes = agentProcesses(pid);
+  if (!processes.length) return;
+  const browsers = new Set(processes.filter(([, command]) => isChromium(command)).map(([id]) => String(id)));
+  const out = spawnSync('lsof', ['-nP', '-a', '-p', processes.map(([id]) => id).join(','), '-iTCP', '-iUDP', '-Fpn'], { encoding: 'utf8' }).stdout;
+  let owner = '';
   for (const line of out.split('\n')) {
+    if (line.startsWith('p')) owner = line.slice(1);
     if (!line.startsWith('n')) continue;
     const name = line.slice(1);
     const arrow = name.indexOf('->');
     if (arrow === -1) listeners.add(name);
-    else remotes.add(name.slice(arrow + 2));
+    else {
+      remotes.add(name.slice(arrow + 2));
+      if (browsers.has(owner)) chromium.add(name.slice(arrow + 2));
+    }
   }
 }
 
@@ -184,7 +224,6 @@ async function smoke(mode, { locked = false } = {}) {
   try {
     // ---- the run directory ----
     mkdirSync(path.join(runDir, 'home'), { recursive: true });
-    mkdirSync(path.join(runDir, 'no-chromium'));
     const pkg = JSON.parse(readFileSync(path.join(repo, 'package.json'), 'utf8'));
     pkg.scripts = { build: 'cp -R dist-built dist' };
     writeFileSync(path.join(runDir, 'package.json'), JSON.stringify(pkg, null, 2));
@@ -213,9 +252,8 @@ async function smoke(mode, { locked = false } = {}) {
     const serverPort = await freePort();
     recorder = await startRecorder(() => {
       if (!agent?.pid) return 'not started';
-      const pids = spawnSync('pgrep', ['-g', String(agent.pid)], { encoding: 'utf8' }).stdout.split('\n').filter(Boolean);
-      if (!pids.length) return 'no process';
-      const commands = spawnSync('ps', ['-o', 'command=', '-p', pids.join(',')], { encoding: 'utf8' }).stdout.split('\n').filter(Boolean);
+      const commands = agentProcesses(agent.pid).map(([, command]) => command);
+      if (!commands.length) return 'no process';
       return commands.map((command) => command.replace(runDir, '.').replace(repo, '<repo>').slice(0, 90)).join(' ; ');
     });
     const dummyAnthropicKey = `smoke-dummy-anthropic-${randomBytes(12).toString('hex')}`;
@@ -236,7 +274,8 @@ async function smoke(mode, { locked = false } = {}) {
       // Nothing may be installed: node_modules is a link to the repository's
       ELIZA_NO_AUTO_INSTALL: 'true',
       ELIZA_NO_PLUGIN_AUTO_INSTALL: 'true',
-      PUPPETEER_CACHE_DIR: path.join(runDir, 'no-chromium'),
+      // HOME is empty here, so say where the installed Chromium is
+      PUPPETEER_CACHE_DIR: PUPPETEER_CACHE,
       HTTP_PROXY: `http://127.0.0.1:${recorder.port}`,
       HTTPS_PROXY: `http://127.0.0.1:${recorder.port}`,
       ALL_PROXY: `http://127.0.0.1:${recorder.port}`,
@@ -264,7 +303,19 @@ async function smoke(mode, { locked = false } = {}) {
     const logText = () => log.join('');
     const remotes = new Set();
     const listeners = new Set();
-    sampler = setInterval(() => sampleSockets(agent.pid, remotes, listeners), 200);
+    const chromiumRemotes = new Set();
+    // Chromium's command line and environment, read once it is seen (macOS: ps eww; Linux: /proc)
+    let chromium = null;
+    const sample = () => {
+      sampleSockets(agent.pid, remotes, listeners, chromiumRemotes);
+      if (chromium) return;
+      const browser = agentProcesses(agent.pid).find(([, command]) => isChromium(command) && !/--type=/.test(command));
+      if (!browser) return;
+      const [id, command] = browser;
+      const environ = existsSync(`/proc/${id}/environ`) ? readFileSync(`/proc/${id}/environ`, 'utf8') : spawnSync('ps', ['eww', '-o', 'command=', '-p', String(id)], { encoding: 'utf8' }).stdout;
+      chromium = { id, command, environ };
+    };
+    sampler = setInterval(sample, 200);
 
     const waitFor = async (what, test) => {
       const deadline = Date.now() + BOOT_TIMEOUT_MS;
@@ -316,6 +367,18 @@ async function smoke(mode, { locked = false } = {}) {
     check('the reconnect schedule is logged', /\[Hyperfy Reconnect\] Next attempt in \d+s/.test(logText()), (logText().match(/\[Hyperfy Reconnect\] Next attempt in \d+s/) ?? [''])[0]);
     check('the scene-edit setting is logged at connect (off by default)', logText().includes('[Hyperfy] Scene edits by request: off'));
 
+    // ---- Chromium: started by the agent for its render page, with no secrets and no way out ----
+    await waitFor('the render page', () => /\[PuppeteerManager\] (Render page ready|Failed to launch browser)/.test(logText()) && chromium !== null);
+    check('the render page came up in Chromium', logText().includes('[PuppeteerManager] Render page ready') && !logText().includes('[PuppeteerManager] Failed to launch browser'), existsSync(PUPPETEER_CACHE) ? (logText().match(/\[PuppeteerManager\] Failed to launch browser[^\n]*/) ?? [''])[0].slice(0, 200) : `no Chromium: ${PUPPETEER_CACHE} does not exist (set SMOKE_PUPPETEER_CACHE_DIR)`);
+    check('Chromium was started with a proxy address where nothing listens and no name resolution', !!chromium && ['--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>', '--host-resolver-rules=MAP * ~NOTFOUND'].every((arg) => chromium.command.includes(arg)));
+    {
+      const leaked = chromium
+        ? [dummyAnthropicKey, dummyTipKey, dummyTipKey.slice(2), apiToken, agentEnv.POSTGRES_URL, `127.0.0.1:${recorder.port}`].filter((value) => value && chromium.environ.includes(value))
+        : ['(Chromium was never seen)'];
+      const names = chromium ? ['ANTHROPIC_API_KEY', 'TIP_WALLET_PRIVATE_KEY', 'ELIZA_SERVER_AUTH_TOKEN', 'POSTGRES_URL', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY'].filter((name) => chromium.environ.includes(`${name}=`)) : [];
+      check("none of the agent's keys, tokens, database URL or proxy settings are in Chromium's environment", !!chromium && chromium.environ.length > 0 && leaked.length === 0 && names.length === 0, chromium ? `${chromium.environ.length} characters of command line and environment read${names.length ? `; variables present: ${names.join(', ')}` : ''}` : 'Chromium was never seen');
+    }
+
     if (locked) {
       // The agent booted (the lines above come from its Hyperfy service); its API stays locked
       check('the "web UI/API is locked" line is logged', logText().includes('the elizaOS web UI/API and its Socket.IO connections are locked for this run'));
@@ -326,7 +389,7 @@ async function smoke(mode, { locked = false } = {}) {
       }
       const handshake = await socketHandshake(serverPort, { entityId: crypto.randomUUID() });
       check('a Socket.IO handshake without a token is refused', handshake.startsWith('refused'), handshake);
-      sampleSockets(agent.pid, remotes, listeners);
+      sample();
       const onPort = [...listeners].filter((entry) => entry.endsWith(`:${serverPort}`));
       check(
         `the API listens on loopback only (SERVER_HOST unset)`,
@@ -388,10 +451,12 @@ async function smoke(mode, { locked = false } = {}) {
 
     // A little longer, for anything that phones home after start-up
     await sleep(3000);
-    sampleSockets(agent.pid, remotes, listeners);
+    sample();
     const external = [...remotes].filter((remote) => !isLoopback(remote.replace(/:\d+$/, '')));
     check('no proxy-aware client tried to reach another host', recorder.seen.length === 0, recorder.seen.join(' | '));
-    check('every sampled connection of the agent process group went to 127.0.0.1', external.length === 0, `remote ends seen: ${JSON.stringify([...remotes].map((remote) => remote.replace(/:\d+$/, '')).filter((v, i, a) => a.indexOf(v) === i))}${external.length ? `, EXTERNAL: ${external.join(', ')}` : ''}`);
+    check('every sampled connection of the agent and of what it started (Chromium included) went to 127.0.0.1', external.length === 0, `remote ends seen: ${JSON.stringify([...remotes].map((remote) => remote.replace(/:\d+$/, '')).filter((v, i, a) => a.indexOf(v) === i))}${external.length ? `, EXTERNAL: ${external.join(', ')}` : ''}`);
+    // Its DevTools connection to the agent is a socket too: seeing it shows Chromium was among the sampled
+    check("Chromium's own sockets were among those sampled, all to 127.0.0.1", chromiumRemotes.size > 0 && [...chromiumRemotes].every((remote) => isLoopback(remote.replace(/:\d+$/, ''))), `Chromium's remote ends: ${JSON.stringify([...chromiumRemotes])}`);
     // With SERVER_HOST=127.0.0.1. Unset, elizaOS listens on every interface (*:port).
     console.log(`  info  the agent listens on: ${JSON.stringify([...listeners])} (SERVER_HOST=${agentEnv.SERVER_HOST}, SERVER_PORT=${serverPort})`);
 

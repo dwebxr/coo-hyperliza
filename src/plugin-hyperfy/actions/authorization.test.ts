@@ -160,8 +160,8 @@ describe('the action allow-list on autonomous turns', () => {
   });
 
   it('refuses every registered action outside the autonomy list, and lets the listed ones run', async () => {
-    vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise(() => {}));
-    const shop = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'someone' })!;
+    // The Store's listings API never answers here (and the real one is never asked)
+    const shop = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'someone' }, { fetchImpl: (() => new Promise(() => {})) as typeof fetch })!;
     const actions = [...hyperfyPlugin.actions!, ...shop.actions!];
     const { runtime, recorded } = createRuntime({ actions, models: {} });
     const world = coo();
@@ -550,8 +550,8 @@ describe('failures the requester is told about', () => {
   });
 
   it('a shop link the agent could not match to a product says so', async () => {
-    vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise(() => {}));
-    const shop = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'someone' })!;
+    // The Store's listings API never answers here (and the real one is never asked)
+    const shop = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'someone' }, { fetchImpl: (() => new Promise(() => {})) as typeof fetch })!;
     const { runtime, recorded } = createRuntime({ actions: shop.actions! });
     const stored = await inChatTurn({}, () => run(runtime, recorded, SHARE_ACTION, { message: { content: { text: 'the link please', source: 'hyperfy' } } }));
     expect(stored.actionResult.error).toBe('could not tell which product to share');

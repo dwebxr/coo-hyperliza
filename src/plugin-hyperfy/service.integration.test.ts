@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { closeServers, startServer } from './test-support/net';
 import { inspect } from 'node:util';
 
 const { TOKEN } = vi.hoisted(() => ({ TOKEN: 'test-protocol-session-token' }));
@@ -620,19 +621,27 @@ describe('HyperfyService uploads', () => {
     vi.stubGlobal('WebSocket', OpenSocket);
     const { service } = createRuntime();
     (service as any).reconnectController.stop();
+    // The world's API, on loopback: the origin of the socket URL the service connects to
+    const api = await startServer((_request, response) => response.setHeader('content-type', 'application/json').end('{"exists":true}'));
+    const elsewhere = await startServer((_request, response) => response.setHeader('content-type', 'application/json').end('{"exists":true}'));
     try {
-      await service.connect({ wsUrl: 'wss://play.world.test/ws', worldId: UNREACHABLE.worldId });
+      await service.connect({ wsUrl: `ws://127.0.0.1:${api.port}/ws`, worldId: UNREACHABLE.worldId });
       const network = service.getWorld().network;
-      network.apiUrl = 'https://play.world.test/api'; // sent in the snapshot
-      const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ exists: true }), { status: 200 }));
+      network.apiUrl = `http://127.0.0.1:${api.port}/api`; // sent in the snapshot
       const file = () => new File([new Uint8Array([1, 2, 3])], 'thing.glb');
       const stop = new SceneEditStopped('the requester is not a builder in this world');
       await expect(network.upload(file(), { check: () => { throw stop; } })).rejects.toBe(stop);
-      expect(fetch).not.toHaveBeenCalled();
+      expect(api.hits).toEqual([]);
       await expect(network.upload(file())).resolves.toBeUndefined();
-      expect(fetch).toHaveBeenCalledWith(expect.stringContaining('https://play.world.test/api/upload-check?filename='), expect.anything());
+      expect(api.hits.map((hit) => `${hit.method} ${hit.url.split('=')[0]}`)).toEqual(['GET /api/upload-check?filename']);
+
+      // The service gives the upload its world's policy: an API URL anywhere else gets nothing
+      network.apiUrl = `http://127.0.0.1:${elsewhere.port}/api`;
+      await expect(network.upload(file())).rejects.toThrow("not on the world's own origin");
+      expect(elsewhere.connections).toBe(0);
     } finally {
       await service.stop();
+      await closeServers();
     }
   });
 });

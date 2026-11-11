@@ -1,19 +1,40 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../service.js', () => ({ HyperfyService: { serviceType: 'hyperfy' } }));
+/*
+ * The manager against a stand-in for puppeteer: what it asks of the browser (how it is started,
+ * that the page is never navigated and refuses its requests, when a page is rebuilt). What the
+ * real Chromium then does is checked by scripts/smoke-chromium.mjs, by hand.
+ */
 
 const launched: any[] = [];
+const launchOptions: any[] = [];
 let failNextLaunch = false;
+const writes = vi.hoisted(() => [] as string[]);
 vi.mock('puppeteer', () => {
-  const makePage = () => ({
-    goto: vi.fn().mockResolvedValue(undefined),
-    addScriptTag: vi.fn().mockResolvedValue(undefined),
-    waitForFunction: vi.fn().mockResolvedValue(undefined),
-    close: vi.fn().mockResolvedValue(undefined),
-  });
+  const makePage = () => {
+    const listeners = new Map<string, ((...args: any[]) => void)[]>();
+    const page = {
+      listeners,
+      on: vi.fn((event: string, listener: (...args: any[]) => void) => {
+        listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+        return page;
+      }),
+      emit: (event: string, ...args: any[]) => (listeners.get(event) ?? []).forEach((listener) => listener(...args)),
+      goto: vi.fn().mockResolvedValue(undefined),
+      setRequestInterception: vi.fn().mockResolvedValue(undefined),
+      setContent: vi.fn().mockResolvedValue(undefined),
+      addScriptTag: vi.fn().mockResolvedValue(undefined),
+      waitForFunction: vi.fn().mockResolvedValue(undefined),
+      // The page functions answer with base64, as the real ones do
+      evaluate: vi.fn(async (_fn: unknown, ...args: any[]) => Buffer.from(`page got ${args.map((arg) => (typeof arg === 'string' ? arg : JSON.stringify(arg))).join('|')}`).toString('base64')),
+      close: vi.fn(async () => page.emit('close')),
+    };
+    return page;
+  };
   return {
     default: {
-      launch: vi.fn(async () => {
+      launch: vi.fn(async (options: any) => {
+        launchOptions.push(options);
         if (failNextLaunch) {
           failNextLaunch = false;
           throw new Error('no chromium');
@@ -34,18 +55,28 @@ vi.mock('puppeteer', () => {
     },
   };
 });
-// injectScripts reads the bundled scripts; their content doesn't matter here.
+// The built render page is not there in a source checkout; its content does not matter here.
 vi.mock('fs', async (importOriginal) => {
   const actual: any = await importOriginal();
-  return { ...actual, promises: { ...actual.promises, readFile: vi.fn().mockResolvedValue('') } };
+  const mocked = {
+    ...actual,
+    writeFileSync: vi.fn((file: string) => void writes.push(String(file))),
+    promises: { ...actual.promises, readFile: vi.fn().mockResolvedValue('/* render page bundle */') },
+  };
+  return { ...mocked, default: mocked };
 });
 
-import { PuppeteerManager } from './puppeteer-manager';
+import { OFFLINE_CHROMIUM_ARGS, PuppeteerManager } from './puppeteer-manager';
+
+const text = (bytes: Uint8Array) => Buffer.from(bytes).toString();
 
 describe('PuppeteerManager', () => {
   afterEach(async () => {
     await (PuppeteerManager as any).instance?.close();
     launched.length = 0;
+    launchOptions.length = 0;
+    writes.length = 0;
+    vi.unstubAllEnvs();
   });
 
   it('reuses one browser across sessions and gives each session a fresh page', async () => {
@@ -84,5 +115,106 @@ describe('PuppeteerManager', () => {
   it('refuses a second constructor call', () => {
     PuppeteerManager.getOrCreate({} as any);
     expect(() => new PuppeteerManager({} as any)).toThrow('already been instantiated');
+  });
+
+  it("starts Chromium without the agent's environment, without a way to the network, and without slowMo", async () => {
+    const agentOnly = {
+      ANTHROPIC_API_KEY: 'value-of-the-anthropic-key',
+      ELIZA_SERVER_AUTH_TOKEN: 'value-of-the-api-token',
+      TIP_WALLET_PRIVATE_KEY: 'value-of-the-wallet-key',
+      POSTGRES_URL: 'value-of-the-database-url',
+      HTTPS_PROXY: 'value-of-the-proxy',
+      SOMETHING_NEW: 'value-of-a-name-nobody-listed',
+    };
+    for (const [name, value] of Object.entries(agentOnly)) vi.stubEnv(name, value);
+    vi.stubEnv('HOME', '/home/agent');
+    await (PuppeteerManager.getOrCreate({} as any) as any).init();
+
+    const [options] = launchOptions;
+    expect(options.slowMo).toBeUndefined();
+    expect(options.args).toEqual(OFFLINE_CHROMIUM_ARGS);
+    expect(options.args).toEqual(['--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>', '--host-resolver-rules=MAP * ~NOTFOUND']);
+    expect(options.env).toMatchObject({ HOME: '/home/agent', PATH: process.env.PATH });
+    for (const [name, value] of Object.entries(agentOnly)) {
+      expect(Object.keys(options.env)).not.toContain(name);
+      expect(Object.values(options.env)).not.toContain(value);
+    }
+    expect(Object.keys(options.env).filter((name) => /KEY|TOKEN|SECRET|PASSWORD|POSTGRES|PROXY/i.test(name))).toEqual([]);
+  });
+
+  it('writes the page into an empty tab, adds its code inline, and refuses every request the page makes', async () => {
+    await (PuppeteerManager.getOrCreate({} as any) as any).init();
+    const [page] = launched[0].pages;
+
+    expect(page.goto).not.toHaveBeenCalled();
+    expect(page.setRequestInterception).toHaveBeenCalledWith(true);
+    expect(page.setContent.mock.calls[0][0]).toContain('<!DOCTYPE html>');
+    expect(page.setContent.mock.calls[0][0]).not.toMatch(/https?:|<script/);
+    expect(page.addScriptTag).toHaveBeenCalledWith({ content: '/* render page bundle */' });
+    // Interception was on before any of the page existed
+    expect(page.setRequestInterception.mock.invocationCallOrder[0]).toBeLessThan(page.setContent.mock.invocationCallOrder[0]);
+
+    const request = { abort: vi.fn().mockResolvedValue(undefined), continue: vi.fn(), respond: vi.fn() };
+    page.emit('request', request);
+    expect(request.abort).toHaveBeenCalledTimes(1);
+    expect(request.continue).not.toHaveBeenCalled();
+    expect(request.respond).not.toHaveBeenCalled();
+  });
+
+  it.each(['close', 'error'])('builds a new page on the next use after the page emitted "%s"', async (event) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const manager = PuppeteerManager.getOrCreate({} as any) as any;
+    const first = await manager.init();
+
+    first.emit(event, new Error('Page crashed!'));
+    expect(manager.page).toBeNull();
+    const second = await manager.init();
+
+    expect(second).not.toBe(first);
+    expect(launched).toHaveLength(1);
+    expect(launched[0].pages).toHaveLength(2);
+    expect(await manager.init()).toBe(second);
+    vi.restoreAllMocks();
+  });
+
+  it('passes asset bytes to the page as base64 and returns bytes', async () => {
+    const manager = PuppeteerManager.getOrCreate({} as any);
+    const glb = new Uint8Array([103, 108, 84, 70]);
+
+    expect(text(await manager.loadGlbBytes(glb))).toMatch(/^page got Z2xURg==\|\[/);
+    expect(text(await manager.loadVRMBytes(glb, 'https://world.test/assets/me.vrm'))).toBe('page got https://world.test/assets/me.vrm|Z2xURg==');
+    const [page] = launched[0].pages;
+    await manager.registerTexture({ bytes: glb, contentType: 'image/jpeg', url: 'data:image/jpeg;base64,Z2xURg==' }, 'map');
+    // Of a data: URL only the part before the data travels again
+    expect(page.evaluate.mock.calls.at(-1)!.slice(1)).toEqual(['Z2xURg==', 'image/jpeg', 'map', 'data:image/jpeg;base64']);
+    await manager.loadEnvironmentHDR(glb);
+    expect(page.evaluate.mock.calls.at(-1)!.slice(1)).toEqual(['Z2xURg==']);
+  });
+
+  it('writes diagnostic snapshots to disk only when HYPERFY_DEBUG_SNAPSHOTS=true', async () => {
+    const vector = { toArray: () => [0, 0, 0], x: 0, y: 0, z: 0, w: 1 };
+    const world = {
+      stage: { scene: { toJSON: () => ({}) } },
+      controls: { rotateTo: async () => {}, stopRotation: () => {} },
+      entities: { player: { data: { id: 'coo' }, base: { position: vector, quaternion: vector } }, players: new Map() },
+    };
+    const manager = PuppeteerManager.getOrCreate({ getService: () => ({ getWorld: () => world }) } as any);
+
+    await manager.snapshotEquirectangular();
+    await manager.snapshotFacingDirection('front');
+    await manager.snapshotViewToTarget([1, 2, 3]);
+    expect(writes).toEqual([]);
+
+    for (const value of ['1', 'yes', 'TRUE', '']) {
+      vi.stubEnv('HYPERFY_DEBUG_SNAPSHOTS', value);
+      await manager.snapshotEquirectangular();
+    }
+    expect(writes).toEqual([]);
+
+    vi.stubEnv('HYPERFY_DEBUG_SNAPSHOTS', 'true');
+    expect(await manager.snapshotEquirectangular()).toMatch(/^data:image\/jpeg;base64,/);
+    await manager.snapshotFacingDirection('front');
+    await manager.snapshotViewToTarget([1, 2, 3]);
+    expect(writes.map((file) => file.split('/').pop())).toEqual(['scene_equirectangular.jpeg', 'scene_facing_front.jpeg', 'scene_view_to_target.jpeg']);
   });
 });

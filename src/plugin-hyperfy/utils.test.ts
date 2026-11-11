@@ -8,7 +8,9 @@ describe('resolveUrl', () => {
     expect(await resolveUrl('asset://abc.glb', world)).toBe('https://assets.example.com/abc.glb');
   });
 
-  it('passes http(s), data and blob URLs through', async () => {
+  // resolveUrl only says what a name refers to. Whether an http(s) URL may be fetched is decided
+  // where it is fetched (lib/net-policy.ts; see asset-bytes.test.ts and net-policy.test.ts).
+  it('leaves URLs that are already absolute as they are', async () => {
     for (const url of ['https://x.test/a.glb', 'http://x.test/a.glb', 'data:text/plain;base64,aGk=', 'blob:abc']) {
       expect(await resolveUrl(url, world)).toBe(url);
     }

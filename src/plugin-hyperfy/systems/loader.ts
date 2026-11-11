@@ -6,8 +6,9 @@ import { glbToNodes } from "../hyperfy/src/core/extras/glbToNodes.js";
 import { createEmoteFactory } from "../hyperfy/src/core/extras/createEmoteFactory.js";
 import { AgentAvatar } from "./avatar.js";
 import { PuppeteerManager } from "../managers/puppeteer-manager.js";
-import { resolveUrl } from "../utils.js";
 import type { WorldScripts } from "../lib/script-api";
+import { type AssetBytes, type AssetKind, describeUrl, fetchAssetBytes } from "../lib/asset-bytes";
+import { SafeFetchError } from "../lib/net-policy";
 
 // --- Mock Browser Environment for Loaders ---
 // These might need adjustment based on GLTFLoader/VRMLoaderPlugin requirements
@@ -53,16 +54,54 @@ if (typeof globalThis !== "undefined") {
 }
 // --- End Mocks ---
 
+/** What the agent loads. The engine also asks for images, video and audio, which the agent has no use for. */
+const LOADABLE: ReadonlySet<string> = new Set<AssetKind>(["model", "avatar", "emote", "script"]);
+
+/**
+ * Bounds on what one world can make the loader do and keep. The cache holds what the loader itself
+ * keeps for a repeated load; assets the world's live entities are built from stay referenced by
+ * those entities whatever is dropped here.
+ */
+export interface LoaderLimits {
+  cacheEntries: number;
+  cacheBytes: number;
+  concurrent: number;
+  queued: number;
+}
+
+export const LOADER_LIMITS: Readonly<LoaderLimits> = Object.freeze({
+  /** Loaded assets kept for reuse; the least recently used are dropped first */
+  cacheEntries: 256,
+  /** Downloaded bytes those assets add up to */
+  cacheBytes: 512 * 1024 * 1024,
+  /** Downloads (and their parsing) in progress at once */
+  concurrent: 8,
+  /** Loads waiting for one of those slots; more are refused */
+  queued: 1024,
+});
+
 export class AgentLoader extends System {
-  promises: Map<any, any>;
-  results: Map<any, any>;
+  /** Loads in progress, and loaded assets (the same keys as `results`) */
+  promises: Map<string, Promise<any>>;
+  /** Loaded assets, least recently used first */
+  results: Map<string, any>;
   gltfLoader: GLTFLoader;
   dummyScene: any;
   /** The sandboxed script runtime, or null when world scripts are off (lib/script-sandbox.ts) */
   private scripts: WorldScripts | null;
-  constructor(world, { scripts = null }: { scripts?: WorldScripts | null } = {}) {
+  private sizes = new Map<string, number>();
+  private cachedBytes = 0;
+  private active = 0;
+  private waiting: Array<{ start: () => void; cancel: (error: Error) => void }> = [];
+  /** Fires when the world is destroyed: downloads stop and waiting loads fail */
+  private stopped = new AbortController();
+
+  private limits: LoaderLimits;
+
+  constructor(world, { scripts = null, limits = {} }: { scripts?: WorldScripts | null; limits?: Partial<LoaderLimits> } = {}) {
     super(world);
     this.scripts = scripts;
+    this.limits = { ...LOADER_LIMITS, ...limits };
     this.promises = new Map();
     this.results = new Map();
     this.gltfLoader = new GLTFLoader();
@@ -85,69 +124,120 @@ export class AgentLoader extends System {
   }
   // ---------------------------
 
-  // --- Basic Cache Handling ---
-  // ... (has, get methods remain the same) ...
   has(type, url) {
     const key = `${type}/${url}`;
     return this.results.has(key) || this.promises.has(key);
   }
   get(type, url) {
     const key = `${type}/${url}`;
-    return this.results.get(key);
+    const result = this.results.get(key);
+    if (result !== undefined) {
+      // Most recently used last
+      this.results.delete(key);
+      this.results.set(key, result);
+    }
+    return result;
   }
-  // ---------------------------
 
-  async load(type, url) {
+  /**
+   * Loads an asset once: a second call for the same type and URL, also while the first is still
+   * downloading, gets the same promise. A failed load is forgotten, so it can be tried again.
+   */
+  load(type, url): Promise<any> {
+    if (!LOADABLE.has(type)) {
+      // Nothing is requested for these
+      console.warn(`[AgentLoader] Unsupported type in load(): ${type}`);
+      return Promise.resolve(null);
+    }
     const key = `${type}/${url}`;
-    if (this.promises.has(key)) return this.promises.get(key);
-
-    let resolvedUrl = await resolveUrl(url, this.world);
-
-    const promise = fetch(resolvedUrl)
-      .then(async (response) => {
-        if (!response.ok) {
-          throw new Error(
-            `[AgentLoader] HTTP error ${response.status} for ${resolvedUrl}`
-          );
-        }
-
-        if (type === "model" || type === "avatar" || type === "emote") {
-          const result = await this.parseGLB(type, key, resolvedUrl);
-          return result;
-        }
-
-        if (type === 'script') {
-          const code = await response.text();
-          // HYPERFY_WORLD_SCRIPTS=off (the default): the code is kept for the engine's bookkeeping
-          // and never evaluated, so the app shows its model and does nothing.
-          const script = this.scripts ? this.scripts.evaluate(code) : { exec() { }, code };
-          this.results.set(key, script);
-          return script;
-        }
-
-        console.warn(`[AgentLoader] Unsupported type in load(): ${type}`);
-        return null;
-      })
-      .catch((error) => {
-        this.promises.delete(key);
-        console.error(
-          `[AgentLoader] Failed to load ${type} from ${resolvedUrl}`,
-          error
-        );
-        throw error;
-      });
-
+    const existing = this.promises.get(key);
+    if (existing) return existing;
+    const promise = this.loadOnce(type as AssetKind, url, key);
+    // Registered before anything is awaited: until here, a concurrent load would start a second download
     this.promises.set(key, promise);
+    promise.catch(() => {
+      if (this.promises.get(key) === promise) this.promises.delete(key);
+    });
     return promise;
   }
 
-  async parseGLB(type: string, key: string, url: string) {
+  destroy() {
+    this.stopped.abort();
+    const error = new Error("[AgentLoader] The world was destroyed");
+    for (const waiter of this.waiting.splice(0)) waiter.cancel(error);
+  }
+
+  private async loadOnce(type: AssetKind, url: unknown, key: string) {
+    try {
+      return await this.inSlot(async () => {
+        const asset = await fetchAssetBytes(this.world, url, type, { signal: this.stopped.signal });
+        if (type === "script") {
+          const code = new TextDecoder().decode(asset.bytes);
+          // HYPERFY_WORLD_SCRIPTS=off (the default): the code is kept for the engine's bookkeeping
+          // and never evaluated, so the app shows its model and does nothing.
+          const script = this.scripts ? this.scripts.evaluate(code) : { exec() { }, code };
+          this.keep(key, script, asset.bytes.byteLength);
+          return script;
+        }
+        return await this.parseGLB(type, key, asset);
+      });
+    } catch (error) {
+      // A refusal or a network failure needs no stack; anything else might
+      const detail = error instanceof SafeFetchError ? `${error.message} (${error.kind})` : error;
+      console.error(`[AgentLoader] Failed to load ${type} from ${describeUrl(url)}:`, detail);
+      throw error;
+    }
+  }
+
+  /** Runs `task` in one of the `concurrent` slots, waiting for one if need be. */
+  private async inSlot<T>(task: () => Promise<T>): Promise<T> {
+    if (this.stopped.signal.aborted) throw new Error("[AgentLoader] The world was destroyed");
+    if (this.active < this.limits.concurrent) {
+      this.active++;
+    } else {
+      if (this.waiting.length >= this.limits.queued) throw new Error(`[AgentLoader] More than ${this.limits.queued} loads are waiting`);
+      // Whoever finishes hands its slot over, so `active` stays as it is
+      await new Promise<void>((start, cancel) => this.waiting.push({ start, cancel }));
+    }
+    try {
+      return await task();
+    } finally {
+      const next = this.waiting.shift();
+      if (next) next.start();
+      else this.active--;
+    }
+  }
+
+  /** Caches a loaded asset and drops the least recently used ones beyond the limits. */
+  private keep(key: string, result: unknown, bytes: number) {
+    this.forget(key);
+    this.results.set(key, result);
+    this.sizes.set(key, bytes);
+    this.cachedBytes += bytes;
+    for (const oldest of this.results.keys()) {
+      if (this.results.size <= this.limits.cacheEntries && this.cachedBytes <= this.limits.cacheBytes) break;
+      // Never the one just added: its caller is about to use it
+      if (oldest === key) break;
+      this.forget(oldest);
+    }
+  }
+
+  private forget(key: string) {
+    if (!this.results.has(key)) return;
+    this.results.delete(key);
+    this.promises.delete(key);
+    this.cachedBytes -= this.sizes.get(key) ?? 0;
+    this.sizes.delete(key);
+  }
+
+  async parseGLB(type: AssetKind, key: string, asset: AssetBytes) {
     const puppeteerManager = PuppeteerManager.getInstance()
-    const bytes =
+    // The render page keeps the textures (and the whole avatar) and hands back a copy without them
+    const stripped =
       type === 'avatar' ?
-        await puppeteerManager.loadVRMBytes(url) :
-        await puppeteerManager.loadGlbBytes(url);
-    const arrayBuffer = Uint8Array.from(bytes).buffer;
+        await puppeteerManager.loadVRMBytes(asset.bytes, asset.url) :
+        await puppeteerManager.loadGlbBytes(asset.bytes);
+    const arrayBuffer = Uint8Array.from(stripped).buffer;
 
     const gltf: THREE.GLTF = await new Promise((ok, bad) =>
       this.gltfLoader.parse(arrayBuffer, '', ok, bad)
@@ -160,7 +250,7 @@ export class AgentLoader extends System {
       result = { gltf, toNodes() { return node.clone(true); } };
 
     } else if (type === 'emote') {
-      const factory = createEmoteFactory(gltf, url);
+      const factory = createEmoteFactory(gltf, asset.url);
       result = { gltf, toClip(o) { return factory.toClip(o); } };
 
     } else if (type === 'avatar') {
@@ -173,7 +263,7 @@ export class AgentLoader extends System {
       throw new Error(`[AgentLoader] Unsupported GLTF type: ${type}`);
     }
 
-    this.results.set(key, result);
+    this.keep(key, result, asset.bytes.byteLength);
     return result;
   }
 }

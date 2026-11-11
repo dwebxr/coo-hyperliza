@@ -3,12 +3,48 @@ import path from 'path'
 import fs from 'fs'
 import { promises as fsPromises } from 'fs';
 import puppeteer from 'puppeteer'
-import { IAgentRuntime, ModelType } from '@elizaos/core'
-import { HyperfyService } from '../service.js'
-import * as THREE from 'three';
+import type { IAgentRuntime } from '@elizaos/core'
+import type { HyperfyService } from '../service.js'
 import { resolveUrl } from '../utils.js';
 import { getModuleDirectory } from '../utils.js';
+import { childEnv } from '../lib/child-env';
 
+// HyperfyService.serviceType. Not imported as a value: this module must load without the service
+// (and the whole engine behind it), which is how scripts/smoke-chromium.mjs runs it.
+const HYPERFY_SERVICE = 'hyperfy'
+
+/**
+ * The page the renderer runs in. It is written into an empty tab, never navigated to, and its
+ * code (dist/puppeteer/page.js, built by scripts/build-assets.mjs) is added as one inline script.
+ */
+const PAGE_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Three.js Test (module)</title>
+  <style>
+    body { margin: 0; overflow: hidden; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+</body>
+</html>`
+
+/**
+ * Chromium has no way out. Everything the browser itself would send (it contacts update and
+ * safe-browsing services on its own when started plainly) goes to a proxy address where nothing
+ * listens, loopback included, and no host name resolves. The page's own requests are refused
+ * one by one as well (see init). Neither covers WebRTC/UDP, which nothing in the page uses.
+ */
+export const OFFLINE_CHROMIUM_ARGS = [
+  '--proxy-server=http://127.0.0.1:9',
+  '--proxy-bypass-list=<-loopback>',
+  '--host-resolver-rules=MAP * ~NOTFOUND',
+]
+
+const toBase64 = (bytes: Uint8Array) => Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64')
+const fromBase64 = (text: string) => new Uint8Array(Buffer.from(text, 'base64'))
 
 export class PuppeteerManager {
   private static instance: PuppeteerManager | null = null
@@ -18,6 +54,8 @@ export class PuppeteerManager {
   private page: puppeteer.Page
   private browserPromise: Promise<puppeteer.Browser> | null = null
   private initPromise: Promise<puppeteer.Page> | null = null
+  private pageScript: Promise<string> | null = null
+  private pageBundlePath: string
   private readonly STRIP_SLOTS = [
     'map', 'aoMap', 'alphaMap',
     'bumpMap', 'normalMap',
@@ -26,11 +64,13 @@ export class PuppeteerManager {
   ] as const;
 
 
-  constructor(runtime: IAgentRuntime) {
+  /** `pageBundlePath`: the built render page, when it is not next to this module (the smoke script). */
+  constructor(runtime: IAgentRuntime, { pageBundlePath }: { pageBundlePath?: string } = {}) {
     if (PuppeteerManager.instance) {
       throw new Error('PuppeteerManager has already been instantiated.')
     }
     this.runtime = runtime
+    this.pageBundlePath = pageBundlePath ?? path.join(getModuleDirectory(), 'puppeteer', 'page.js')
     PuppeteerManager.instance = this
     // Warm up Chromium in the background; callers await init() themselves.
     this.init().catch(error => {
@@ -48,8 +88,8 @@ export class PuppeteerManager {
   /**
    * Returns the existing manager, so reconnects reuse one Chromium.
    */
-  public static getOrCreate(runtime: IAgentRuntime): PuppeteerManager {
-    return this.instance ?? new PuppeteerManager(runtime)
+  public static getOrCreate(runtime: IAgentRuntime, options?: { pageBundlePath?: string }): PuppeteerManager {
+    return this.instance ?? new PuppeteerManager(runtime, options)
   }
 
   public async close(): Promise<void> {
@@ -85,7 +125,9 @@ export class PuppeteerManager {
       const browserPromise = puppeteer.launch({
         // headless: false,
         defaultViewport: null,
-        slowMo: 50
+        // Not the agent's environment: it holds API keys and tokens (lib/child-env.ts)
+        env: childEnv(),
+        args: OFFLINE_CHROMIUM_ARGS,
       })
       this.browserPromise = browserPromise
       browserPromise.then(
@@ -113,29 +155,40 @@ export class PuppeteerManager {
       const initPromise = (async () => {
         const browser = await this.getBrowser()
         const page = await browser.newPage()
+        // A page that closed or crashed is rebuilt by the next call. The new one starts without
+        // the textures and avatars the old one held; those come back with the next connection.
+        const lost = () => {
+          if (this.page === page) this.page = null
+          if (this.initPromise === initPromise) this.initPromise = null
+        }
+        page.on('close', lost)
+        page.on('error', (error) => {
+          console.warn('[PuppeteerManager] The render page crashed and will be rebuilt on next use:', error?.message || error)
+          lost()
+          page.close().catch(() => { })
+        })
         try {
-          const moduleDirPath = getModuleDirectory();
-          const filePath = moduleDirPath + '/puppeteer/index.html';
-
-          await page.goto(`file://${filePath}`, { waitUntil: 'load' })
-
-          await this.injectScripts(page, [
-            `${moduleDirPath}/scripts/createVRMFactory.js`,
-            `${moduleDirPath}/scripts/snapshotEquirectangular.js`,
-            `${moduleDirPath}/scripts/snapshotFacingDirection.js`,
-            `${moduleDirPath}/scripts/snapshotViewToTarget.js`
-          ]);
+          // The page loads nothing by URL: every request it makes is refused. blob: and data:
+          // URLs, which is how assets reach it, never become requests.
+          await page.setRequestInterception(true)
+          page.on('request', (request) => {
+            request.abort('blockedbyclient').catch(() => { })
+          })
+          await page.setContent(PAGE_HTML, { waitUntil: 'load' })
+          await page.addScriptTag({ content: await this.readPageScript() })
 
           await page.waitForFunction(() =>
-            window.THREE !== undefined && 
-            window.scene !== undefined && 
-            window.camera !== undefined
+            window.THREE !== undefined &&
+            window.scene !== undefined &&
+            window.camera !== undefined &&
+            window.agentPage !== undefined
           )
         } catch (error) {
           await page.close().catch(() => { })
           throw error
         }
         this.page = page
+        console.info('[PuppeteerManager] Render page ready (Chromium has no network access)')
         return page
       })()
       this.initPromise = initPromise
@@ -147,11 +200,23 @@ export class PuppeteerManager {
     return await this.initPromise
   }
 
-  private async injectScripts(page: puppeteer.Page, scriptPaths: string[]) {
-    for (const relativePath of scriptPaths) {
-      const absPath = path.resolve(relativePath);
-      const content = await fsPromises.readFile(absPath, 'utf8');
-      await page.addScriptTag({ content });
+  private readPageScript(): Promise<string> {
+    if (!this.pageScript) {
+      const reading = fsPromises.readFile(this.pageBundlePath, 'utf8')
+      this.pageScript = reading
+      // A missing file may be there on the next try (a rebuild)
+      reading.catch(() => { if (this.pageScript === reading) this.pageScript = null })
+    }
+    return this.pageScript
+  }
+
+  /** Diagnostic copies of the snapshots, written to the working directory when HYPERFY_DEBUG_SNAPSHOTS=true. */
+  private saveDebugSnapshot(fileName: string, base64: string) {
+    if (process.env.HYPERFY_DEBUG_SNAPSHOTS !== 'true') return
+    try {
+      fs.writeFileSync(path.resolve(fileName), Buffer.from(base64, 'base64'))
+    } catch (error) {
+      console.warn(`[PuppeteerManager] Could not write ${fileName}:`, error?.message || error)
     }
   }
 
@@ -187,8 +252,7 @@ export class PuppeteerManager {
       return await window.snapshotFacingDirection(playerData);
     }, playerData);
   
-    const filePath = path.resolve(`scene_facing_${direction}.jpeg`);
-    fs.writeFileSync(filePath, Buffer.from(base64, 'base64'));
+    this.saveDebugSnapshot(`scene_facing_${direction}.jpeg`, base64);
   
     return `data:image/jpeg;base64,${base64}`;
   }
@@ -214,8 +278,7 @@ export class PuppeteerManager {
       return await window.snapshotViewToTarget(playerData, targetPosition);
     }, playerData, targetPosition);
   
-    const filePath = path.resolve(`scene_view_to_target.jpeg`);
-    fs.writeFileSync(filePath, Buffer.from(base64, 'base64'));
+    this.saveDebugSnapshot('scene_view_to_target.jpeg', base64);
   
     return `data:image/jpeg;base64,${base64}`;
   }
@@ -243,120 +306,59 @@ export class PuppeteerManager {
       return await window.snapshotEquirectangular(playerData);
     }, playerData);
   
-    const buffer = Buffer.from(base64, 'base64');
-    const filePath = path.resolve('scene_equirectangular.jpeg');
-    fs.writeFileSync(filePath, buffer);
+    this.saveDebugSnapshot('scene_equirectangular.jpeg', base64);
   
     return `data:image/jpeg;base64,${base64}`;
   }
   
   
-  async loadGlbBytes(url: string): Promise<number[]> {
+  /**
+   * The asset loaders below take bytes the agent has already downloaded (lib/asset-bytes.ts): the
+   * page cannot fetch anything itself. Bytes cross to the page and back as base64.
+   */
+
+  /** Keeps a model's textures in the page and returns the model without them (GLB). */
+  async loadGlbBytes(bytes: Uint8Array): Promise<Uint8Array> {
     const page = await this.init();
     const STRIP_SLOTS = this.STRIP_SLOTS;
 
-    return page.evaluate(async (url, STRIP_SLOTS) => {
-      const loader = new window.GLTFLoader();
-      const gltf = await loader.loadAsync(url);
-
-      if (!window.texturesMap) window.texturesMap = new Map();
-
-      gltf.scene.traverse(obj => {
-        if (!obj.isMesh || !obj.material) return;
-
-        const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-
-        mats.forEach(mat => {
-          if (!mat.userData.materialId) {
-            mat.userData.materialId = window.crypto.randomUUID();
-          }
-          const id = mat.userData.materialId;
-
-          STRIP_SLOTS.forEach(slot => {
-            const tex = mat[slot];
-            if (tex && tex.isTexture) {
-              window.texturesMap.set(`${id}:${slot}`, tex);
-              mat[slot] = null;
-            }
-          });
-
-          mat.needsUpdate = true;
-        });
-      });
-
-      const exporter = new window.GLTFExporter();
-      const buffer = await new Promise<ArrayBuffer>((done) =>
-        exporter.parse(gltf.scene, done, { binary: true, embedImages: true })
-      );
-
-      return [...new Uint8Array(buffer)];
-    }, url, STRIP_SLOTS);
+    const stripped = await page.evaluate(
+      (base64, STRIP_SLOTS) => window.agentPage.loadGlb(base64, STRIP_SLOTS),
+      toBase64(bytes), STRIP_SLOTS
+    );
+    return fromBase64(stripped);
   }
 
-  async loadVRMBytes(url: string): Promise<number[]> {
+  /** Keeps an avatar in the page under `url` (what rehydrateSceneAssets looks players' avatars up by) and returns it as a GLB. */
+  async loadVRMBytes(bytes: Uint8Array, url: string): Promise<Uint8Array> {
     const page = await this.init();
-    
-    return page.evaluate(async (url) => {
-      const loader = window.VRMLoader;
-      const gltf = await loader.loadAsync(url);
-      const factory = window.createVRMFactory(gltf, (m) => m);
-      
-      window.renderer.render(window.scene, window.camera);
 
-      if (!window.avatarMap) window.avatarMap = new Map();
-      window.avatarMap.set(url, factory); // Store a deep clone of the avatar
-  
-      const exporter = new window.GLTFExporter();
-      const buffer = await new Promise<ArrayBuffer>((done) =>
-        exporter.parse(gltf.scene, done, { binary: true, embedImages: true })
-      );
-  
-      return [...new Uint8Array(buffer)];
-    }, url);
+    const exported = await page.evaluate(
+      (url, base64) => window.agentPage.loadVrm(url, base64),
+      url, toBase64(bytes)
+    );
+    return fromBase64(exported);
   }
 
-  async registerTexture(url: string, slot: string): Promise<string> {
+  /** Keeps an image in the page as a texture and returns the id to name it by. `url` is where it came from. */
+  async registerTexture(image: { bytes: Uint8Array; contentType: string; url: string }, slot: string): Promise<string> {
     const page = await this.init();
-  
-    return page.evaluate(async (url, slot) => {
-      if (!window.texturesMap) window.texturesMap = new Map();
-  
-      const loader = window.TextureLoader;
-      const texture = await new Promise<THREE.Texture>((resolve, reject) => {
-        loader.load(
-          url,
-          tex => resolve(tex),
-          undefined,
-          err => reject(err)
-        );
-      });
-  
-      const uuid = window.crypto.randomUUID();
-      window.texturesMap.set(`${uuid}:${slot}`, texture);
-  
-      return uuid;
-    }, url, slot);
+    // Only the part three's TextureLoader looks at: of a data: URL, that is what comes before the data
+    const source = image.url.startsWith('data:') ? image.url.slice(0, image.url.indexOf(',')) : image.url;
+
+    return page.evaluate(
+      (base64, contentType, slot, source) => window.agentPage.registerTexture(base64, contentType, slot, source),
+      toBase64(image.bytes), image.contentType, slot, source
+    );
   }
-  
-  public async loadEnvironmentHDR(url: string): Promise<void> {
+
+  public async loadEnvironmentHDR(bytes: Uint8Array): Promise<void> {
     const page = await this.init();
-    const service = this.getService()
-    const world = service.getWorld()
 
-    url = await resolveUrl(url, world);
-
-    await page.evaluate(async (url) => {
-      const loader = new window.RGBELoader();
-      const hdrTexture = await new Promise((resolve, reject) => {
-        loader.load(url, resolve, undefined, reject);
-      });
-  
-      window.environment = hdrTexture;
-      window.scene.environment = hdrTexture;
-      window.scene.background = hdrTexture;
-  
-      window.renderer.render(window.scene, window.camera);
-    }, url);
+    await page.evaluate(
+      (base64) => window.agentPage.loadEnvironmentHDR(base64),
+      toBase64(bytes)
+    );
   }
 
   private async rehydrateSceneAssets(page: puppeteer.Page) {
@@ -386,80 +388,13 @@ export class PuppeteerManager {
     );
     
     const STRIP_SLOTS = this.STRIP_SLOTS;
-    await page.evaluate(async (sceneJson, STRIP_SLOTS, players) => {
-      const THREE = window.THREE;
-      const loader = new window.THREE.ObjectLoader();
-      const loadedScene = loader.parse(sceneJson);
-  
-      // Rehydrate materials
-      loadedScene.traverse(obj => {
-        if (!obj.isMesh || !obj.material) return;
-
-        const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-  
-        mats.forEach(mat => {
-          const id = mat.userData.materialId;
-          if (!id) return;
-  
-          STRIP_SLOTS.forEach(slot => {
-            const key = `${id}:${slot}`;
-            const tex = window.texturesMap?.get(key);
-            if (tex && tex.isTexture) mat[slot] = tex;
-          });
-  
-          mat.needsUpdate = true;
-        });
-      });
-  
-      // Rehydrate player avatars
-      if (window.activeVRMInstances) {
-        for (const inst of window.activeVRMInstances) {
-          try {
-            inst.destroy();
-          } catch (e) {
-            console.warn('[AgentLoader] Failed to destroy instance:', e);
-          }
-        }
-      }
-      window.activeVRMInstances = [];
-
-      players.forEach(player => {
-        if (!player.avatarUrl) return;
-        const factory = window.avatarMap?.get(player.avatarUrl);
-        if (!factory) return;
-
-        const vrmHooks = {
-          camera: window.camera,
-          scene: loadedScene,
-          octree: null,
-          setupMaterial: () => {},
-          loader: window.VRMLoader,
-        }
-        const instance = factory.create(new THREE.Matrix4(), vrmHooks, (m) => m);
-  
-        const position = new THREE.Vector3(...player.position);
-        const rotation = new THREE.Quaternion(...player.quaternion);
-        const scale = new THREE.Vector3(...player.scale);
-
-        const matrix = new THREE.Matrix4();
-        matrix.compose(position, rotation, scale);
-        instance.move(matrix);
-
-        window.activeVRMInstances.push(instance);
-      });
-
-      // Rehydrate environment
-      if (window.environment) {
-        loadedScene.environment = window.environment;
-        loadedScene.background = window.environment;
-      }
-
-      window.scene = loadedScene;
-      window.renderer.render(window.scene, window.camera);
-    }, sceneJson, STRIP_SLOTS, players);
+    await page.evaluate(
+      (sceneJson, STRIP_SLOTS, players) => window.agentPage.rehydrate(sceneJson, STRIP_SLOTS, players),
+      sceneJson, STRIP_SLOTS, players
+    );
   }
 
   private getService() {
-    return this.runtime.getService<HyperfyService>(HyperfyService.serviceType)
+    return this.runtime.getService<HyperfyService>(HYPERFY_SERVICE)
   }
 }

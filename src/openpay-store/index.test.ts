@@ -91,10 +91,10 @@ describe('createOpenPayStorePlugin', () => {
   });
 
   async function loadedPlugin() {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ ok: true, items: [{ ...board, priceJpyc: '500', feeJpyc: '5', usdcEnabled: false, tags: [], updatedAt: 1 }] }), { status: 200 })
-    );
-    const plugin = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'masia02' })!;
+    // The listings API, answered here: the plugin's own request would go to the real Store
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ ok: true, items: [{ ...board, priceJpyc: '500', feeJpyc: '5', usdcEnabled: false, tags: [], updatedAt: 1 }] }), { status: 200 })) as typeof fetch;
+    const plugin = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'masia02' }, { fetchImpl })!;
     await plugin.init!({}, {} as any);
     const provider = plugin.providers![0];
     const action = plugin.actions![0];
@@ -116,8 +116,8 @@ describe('createOpenPayStorePlugin', () => {
     expect(result.values?.openpayProductIdKey).toContain('"productId"');
     expect(result.values?.openpayProductIdOutput).toContain('<productId>');
 
-    vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise(() => {}));
-    const cold = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'someone' })!;
+    // The Store's listings API never answers here (and the real one is never asked)
+    const cold = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'someone' }, { fetchImpl: (() => new Promise(() => {})) as typeof fetch })!;
     const empty = await cold.providers![0].get(runtime(), userMessage('hyperfy'), {} as any);
     expect(empty.text).toBe('');
   });

@@ -5,6 +5,20 @@ import { importApp } from '../hyperfy/src/core/extras/appTools.js'
 import { hashFile } from '../hyperfy/src/core/utils-client.js'
 import { resolveUrl } from "../utils.js";
 import { SceneEditStopped } from "../lib/authorization";
+import { MAX_MODEL_BYTES, SafeFetchError, worldNet } from "../lib/net-policy";
+
+const IMPORT_DOWNLOAD_TIMEOUT_MS = 60_000;
+
+/**
+ * How many bytes an import may download: the operator's cap for models, lowered by the world's
+ * own upload limit (megabytes; the world sends it as it is configured, usually a string). A world
+ * can only lower it. A limit that is missing or not a number means the operator's cap alone.
+ */
+export function importByteCap(worldMaxUploadMb: unknown): number {
+  const mb = typeof worldMaxUploadMb === 'number' ? worldMaxUploadMb : typeof worldMaxUploadMb === 'string' && worldMaxUploadMb.trim() !== '' ? Number(worldMaxUploadMb) : NaN;
+  if (!Number.isFinite(mb)) return MAX_MODEL_BYTES;
+  return Math.min(MAX_MODEL_BYTES, Math.max(0, Math.floor(mb * 1024 * 1024)));
+}
 
 /**
  * What one scene edit request may act on: the world it was authorized for, a check that throws
@@ -146,25 +160,30 @@ export class BuildManager {
       console.warn(`[BuildManager] importEntity: could not resolve url: ${url}`)
       return failed('the URL could not be resolved')
     }
-    let file
-    
+    // The file is downloaded under the world's network policy (lib/net-policy.ts): public https
+    // hosts or the world's own origin, never an address inside the agent's network, and no more
+    // bytes than the cap, however much the server sends.
+    const maxBytes = importByteCap(world.network.maxUploadSize)
     guard.check();
-    const resp = await fetch(resolvedUrl)
-    if (!resp.ok) {
+    let resp
+    try {
+      resp = await worldNet(world).fetch(resolvedUrl, { maxBytes, timeoutMs: IMPORT_DOWNLOAD_TIMEOUT_MS })
+    } catch (err) {
+      if (!(err instanceof SafeFetchError)) throw err
+      console.warn(`[BuildManager] importEntity: download of ${url} failed (${err.kind}): ${err.message}`)
+      if (err.kind === 'too-large') return failed(maxBytes < MAX_MODEL_BYTES ? 'the file is too large for the world' : 'the file is too large to import')
+      // What a name resolves to stays in the log: the reason given here can end up in chat
+      if (err.kind === 'refused') return failed("the URL is not allowed by the agent's network policy")
+      return failed(err.kind === 'timeout' ? 'download timed out' : 'download failed')
+    }
+    if (resp.status < 200 || resp.status >= 300) {
       console.error(`[BuildManager] importEntity: fetch failed with ${resp.status} ${resp.statusText} for ${url}`)
       return failed(`download failed (HTTP ${resp.status})`)
     }
-    const blob = await resp.blob()
-    file = new File([blob], url.split('?')[0].split('/').pop(), { type: resp.headers.get('content-type') })
+    const file = new File([new Uint8Array(resp.body)], url.split('?')[0].split('/').pop(), { type: resp.headers['content-type'] ?? '' })
     
     await new Promise(resolve => setTimeout(resolve, 100))
     
-    const maxSize = world.network.maxUploadSize * 1024 * 1024
-
-    if (file.size > maxSize) {
-      console.error(`File too large. Maximum size is ${maxSize / (1024 * 1024)}MB`)
-      return failed('the file is too large for the world')
-    }
     const validVec3 = (v: any): v is [number, number, number] =>
       Array.isArray(v) && v.length === 3 && v.every(n => typeof n === 'number');
 

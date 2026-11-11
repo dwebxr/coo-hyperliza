@@ -1,6 +1,7 @@
 import { Readable } from 'node:stream';
 import { type IAgentRuntime, type Plugin, ModelType } from '@elizaos/core';
 import { generateElevenLabsTTS, transcribeWithElevenLabs } from './plugin-hyperfy/utils';
+import { MAX_AUDIO_BYTES, type NetPolicy, publicNet } from './plugin-hyperfy/lib/net-policy';
 
 /**
  * ElevenLabs speech for other plugins (e.g. Discord voice), which go through runtime models.
@@ -8,7 +9,10 @@ import { generateElevenLabsTTS, transcribeWithElevenLabs } from './plugin-hyperf
  * TRANSCRIPTION handler requests .../v1/v1/speech-to-text (404).
  */
 
-async function toAudioBuffer(input: unknown): Promise<Buffer> {
+const AUDIO_DOWNLOAD_TIMEOUT_MS = 30_000;
+
+/** The audio a TRANSCRIPTION call was given, as bytes. `net` is what a URL is downloaded through. */
+export async function toAudioBuffer(input: unknown, net: NetPolicy = publicNet): Promise<Buffer> {
   if (Buffer.isBuffer(input)) return input;
   if (input instanceof Uint8Array) return Buffer.from(input);
   const audio = (input as { audio?: unknown } | null)?.audio;
@@ -16,9 +20,11 @@ async function toAudioBuffer(input: unknown): Promise<Buffer> {
   if (audio instanceof Blob) return Buffer.from(await audio.arrayBuffer());
   const url = typeof input === 'string' ? input : (input as { audioUrl?: string } | null)?.audioUrl;
   if (url) {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`[ElevenLabs] Failed to fetch audio from ${url}: ${response.status}`);
-    return Buffer.from(await response.arrayBuffer());
+    // Whoever calls the model names this URL (another plugin, for a message's attachment): public
+    // https hosts only, a byte cap and a deadline (lib/net-policy.ts)
+    const response = await net.fetch(url, { maxBytes: MAX_AUDIO_BYTES, timeoutMs: AUDIO_DOWNLOAD_TIMEOUT_MS });
+    if (response.status < 200 || response.status >= 300) throw new Error(`[ElevenLabs] Failed to fetch audio from ${url}: ${response.status}`);
+    return Buffer.from(response.body);
   }
   throw new Error('[ElevenLabs] TRANSCRIPTION expects audio bytes, an audio URL, { audio } or { audioUrl }');
 }

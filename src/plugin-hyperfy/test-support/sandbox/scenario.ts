@@ -10,6 +10,12 @@ export interface Scenario {
   script: string;
   /** Give scripts a network function that answers every URL with these bytes (as text) */
   networkBody?: string;
+  /**
+   * Give scripts the real network function (lib/script-network.ts) over the real policy, in a
+   * made-up internet: https://api.test is a public API (a server in the child stands in for it),
+   * internal.test resolves to a private address. `%WORLD%` in the script becomes the world's origin.
+   */
+  policyNetwork?: boolean;
   /** Leave the engine's own Chat.add in place instead of the agent's (lib/world-chat.ts) */
   engineChat?: boolean;
   /** Have the agent use the nearest action node, then release it */

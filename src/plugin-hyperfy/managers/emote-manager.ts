@@ -4,6 +4,7 @@ import { EMOTES_LIST, LOCOMOTION_EMOTES, TALK_EMOTE } from '../constants.js'
 import { Emotes } from '../hyperfy/src/core/extras/playerEmotes.js'
 import { getModuleDirectory, resolveUrl } from '../utils'
 import { AssetUploadError, assetServed, ensureAsset } from '../lib/asset-upload'
+import { worldNet } from '../lib/net-policy'
 import { IAgentRuntime, logger } from '@elizaos/core'
 import { HyperfyService } from '../service.js'
 
@@ -165,7 +166,14 @@ export class EmoteManager {
    */
   private async assetExists(fileName: string, world: any = this.getService()?.getWorld()): Promise<boolean | null> {
     const url = await resolveUrl(`asset://${fileName}`, world ?? {});
-    return url ? assetServed(url) : null;
+    if (!url) return null;
+    try {
+      return await assetServed(url, worldNet(world));
+    } catch (error: any) {
+      // The network policy does not allow asking this world's assets URL
+      console.warn(`[Assets] Could not check ${url}: ${error?.message || error}`);
+      return null;
+    }
   }
 
   /**

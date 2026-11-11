@@ -8,7 +8,9 @@ const { transcribeWithElevenLabs, generateElevenLabsTTS } = vi.hoisted(() => ({
 }));
 vi.mock('./plugin-hyperfy/utils', () => ({ transcribeWithElevenLabs, generateElevenLabsTTS }));
 
-import { elevenLabsSpeechPlugin } from './elevenlabs-speech';
+import { elevenLabsSpeechPlugin, toAudioBuffer } from './elevenlabs-speech';
+import { MAX_AUDIO_BYTES, SafeFetchError } from './plugin-hyperfy/lib/net-policy';
+import { PUBLIC_ADDRESS, closeServers, startServer, testNet } from './plugin-hyperfy/test-support/net';
 
 const models = elevenLabsSpeechPlugin.models as Record<string, (rt: any, input: any) => Promise<any>>;
 const runtime: any = {};
@@ -45,12 +47,35 @@ describe('elevenLabsSpeechPlugin', () => {
     expect((elevenLabsSpeechPlugin as any).priority).toBeGreaterThan(100);
   });
 
-  it('fetches audio given as a URL or { audioUrl }', async () => {
-    transcribeWithElevenLabs.mockResolvedValue('hi');
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(Buffer.from('audio')));
-    await models[ModelType.TRANSCRIPTION](runtime, { audioUrl: 'https://x.test/a.mp3' });
-    expect(fetchSpy).toHaveBeenCalledWith('https://x.test/a.mp3');
-    expect(transcribeWithElevenLabs.mock.calls[0][0].toString()).toBe('audio');
+  it('downloads audio given as a URL or { audioUrl } from a public https host', async () => {
+    const server = await startServer((_request, response) => response.end('audio'), { tls: true });
+    const { policy } = testNet({ hosts: { 'cdn.test': PUBLIC_ADDRESS }, routes: { 'cdn.test:443': { port: server.port, direct: true } } });
+    try {
+      expect((await toAudioBuffer({ audioUrl: 'https://cdn.test/a.mp3' }, policy)).toString()).toBe('audio');
+      expect((await toAudioBuffer('https://cdn.test/b.mp3', policy)).toString()).toBe('audio');
+      expect(server.hits.map((hit) => hit.url)).toEqual(['/a.mp3', '/b.mp3']);
+    } finally {
+      await closeServers();
+    }
+  });
+
+  it('downloads no audio from a private address, over http, or beyond the audio cap, and transcribes nothing then', async () => {
+    const internal = await startServer((_request, response) => response.end('internal'));
+    const huge = await startServer((_request, response) => response.writeHead(200, { 'content-length': String(MAX_AUDIO_BYTES + 1) }).end(), { tls: true });
+    const { policy } = testNet({ hosts: { 'cdn.test': PUBLIC_ADDRESS }, routes: { 'cdn.test:443': { port: huge.port, direct: true } } });
+    try {
+      // The model handler itself, with nothing injected: the agent's own port, by address and by name
+      for (const audioUrl of [`http://127.0.0.1:${internal.port}/api/agents`, `http://localhost:${internal.port}/api/agents`, 'https://localhost/a.mp3', 'https://169.254.169.254/latest/meta-data/']) {
+        const error = await models[ModelType.TRANSCRIPTION](runtime, { audioUrl }).catch((e: unknown) => e);
+        expect(error).toBeInstanceOf(SafeFetchError);
+        expect((error as SafeFetchError).kind).toBe('refused');
+      }
+      expect(await toAudioBuffer('https://cdn.test/huge.wav', policy).catch((e: SafeFetchError) => e.kind)).toBe('too-large');
+      expect(internal.connections).toBe(0);
+      expect(transcribeWithElevenLabs).not.toHaveBeenCalled();
+    } finally {
+      await closeServers();
+    }
   });
 
   it('throws when transcription fails instead of returning null', async () => {

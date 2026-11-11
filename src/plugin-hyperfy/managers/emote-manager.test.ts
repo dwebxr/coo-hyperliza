@@ -10,6 +10,8 @@ vi.mock('fs/promises', async (importOriginal) => {
 import { logger } from '@elizaos/core';
 import { Emotes } from '../hyperfy/src/core/extras/playerEmotes.js';
 import { AssetUploadError } from '../lib/asset-upload';
+import { installWorldNet } from '../lib/net-policy';
+import { PUBLIC_ADDRESS, type TestServer, closeServers, startServer, testNet } from '../test-support/net';
 import { EmoteManager } from './emote-manager';
 
 const DEFAULT_TALK = 'asset://emote-talk.glb';
@@ -17,47 +19,64 @@ const HASHED = /^asset:\/\/[0-9a-f]{64}\.glb$/;
 const HASH_FILE = /^[0-9a-f]{64}\.glb$/;
 const original = { ...(Emotes as Record<string, string>) };
 
-/** HEAD responses by file name; anything not listed is 404. */
-function serveAssets(available: (file: string) => boolean) {
-  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
-    const file = String(url).split('/').pop()!;
-    return new Response(null, { status: available(file) ? 200 : 404 });
-  });
+// The world is https://world.test, a public host; the server of the current test stands in for it
+// (lookups go through the real network policy, lib/net-policy.ts)
+const routes: Record<string, { port: number; direct: true }> = {};
+const { policy } = testNet({ hosts: { 'world.test': PUBLIC_ADDRESS }, routes, worldOrigin: 'https://world.test' });
+
+/** The world's assets server: a status by file name, or 'down' for a connection that breaks. */
+async function answer(byFile: (file: string) => number | 'down'): Promise<TestServer> {
+  const server = await startServer((request, response) => {
+    const status = byFile(String(request.url).split('/').pop()!);
+    if (status === 'down') response.destroy();
+    else response.writeHead(status).end();
+  }, { tls: true });
+  routes['world.test:443'] = { port: server.port, direct: true };
+  return server;
 }
 
-const onlyHeadRequests = (fetchSpy: ReturnType<typeof serveAssets>) =>
-  fetchSpy.mock.calls.every(([, init]) => (init as RequestInit | undefined)?.method === 'HEAD');
+/** HEAD responses by file name; anything not listed is 404. */
+const serveAssets = (available: (file: string) => boolean) => answer((file) => (available(file) ? 200 : 404));
+
+const onlyHeadRequests = (server: TestServer) => server.hits.every((hit) => hit.method === 'HEAD');
+const asked = (server: TestServer) => server.hits.map((hit) => `https://world.test${hit.url}`);
 
 function newManager(upload = vi.fn().mockResolvedValue(undefined)) {
-  const world = { assetsUrl: 'https://world.test/assets/', network: { upload } };
+  const world = installed({ assetsUrl: 'https://world.test/assets/', network: { upload } });
   return { manager: new EmoteManager({ getService: () => ({ getWorld: () => world }) } as any), upload };
+}
+
+function installed<T extends object>(world: T): T {
+  installWorldNet(world, policy);
+  return world;
 }
 
 describe('EmoteManager talking gesture', () => {
   beforeEach(() => {
     readFile.mockResolvedValue(Buffer.from('custom-talk-clip'));
   });
-  afterEach(() => {
+  afterEach(async () => {
     vi.restoreAllMocks();
     access.mockReset();
     Object.assign(Emotes as Record<string, string>, original);
+    await closeServers();
   });
 
   it('uploads a bundled custom clip and uses it for TALK once the upload is verified', async () => {
     access.mockResolvedValue(undefined);
     let uploaded = false;
-    const fetchSpy = serveAssets((file) => uploaded && HASH_FILE.test(file));
+    const server = await serveAssets((file) => uploaded && HASH_FILE.test(file));
     const { manager, upload } = newManager(vi.fn(async () => { uploaded = true; }));
     await (manager as any).ensureTalkEmote();
     expect(upload).toHaveBeenCalledTimes(1);
     expect((Emotes as any).TALK).toMatch(HASHED);
-    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/^https:\/\/world\.test\/assets\/[0-9a-f]{64}\.glb$/);
-    expect(onlyHeadRequests(fetchSpy)).toBe(true);
+    expect(asked(server)[0]).toMatch(/^https:\/\/world\.test\/assets\/[0-9a-f]{64}\.glb$/);
+    expect(onlyHeadRequests(server)).toBe(true);
   });
 
   it('uses a clip the world already serves without uploading it', async () => {
     access.mockResolvedValue(undefined);
-    serveAssets((file) => HASH_FILE.test(file));
+    await serveAssets((file) => HASH_FILE.test(file));
     const { manager, upload } = newManager();
     await (manager as any).ensureTalkEmote();
     expect(upload).not.toHaveBeenCalled();
@@ -66,7 +85,7 @@ describe('EmoteManager talking gesture', () => {
 
   it("keeps the world's clip when a custom upload resolves but the asset never appears", async () => {
     access.mockResolvedValue(undefined);
-    serveAssets((file) => file === 'emote-talk.glb'); // upload "succeeded", hash is 404
+    await serveAssets((file) => file === 'emote-talk.glb'); // upload "succeeded", hash is 404
     const warn = vi.spyOn(logger, 'warn');
     const { manager } = newManager();
     await (manager as any).ensureTalkEmote();
@@ -76,11 +95,11 @@ describe('EmoteManager talking gesture', () => {
 
   it("keeps the world's own clip when there is no bundled one", async () => {
     access.mockRejectedValue(new Error('ENOENT'));
-    const fetchSpy = serveAssets((file) => file === 'emote-talk.glb');
+    const server = await serveAssets((file) => file === 'emote-talk.glb');
     const warn = vi.spyOn(logger, 'warn');
     const { manager, upload } = newManager();
     await (manager as any).ensureTalkEmote();
-    expect(String(fetchSpy.mock.calls[0][0])).toBe('https://world.test/assets/emote-talk.glb');
+    expect(asked(server)[0]).toBe('https://world.test/assets/emote-talk.glb');
     expect(upload).not.toHaveBeenCalled();
     expect((Emotes as any).TALK).toBe(DEFAULT_TALK);
     expect(warn).not.toHaveBeenCalled();
@@ -88,7 +107,7 @@ describe('EmoteManager talking gesture', () => {
 
   it('warns when neither a bundled clip nor the world provides one', async () => {
     access.mockRejectedValue(new Error('ENOENT'));
-    serveAssets(() => false);
+    await serveAssets(() => false);
     const warn = vi.spyOn(logger, 'warn');
     const { manager, upload } = newManager();
     await (manager as any).ensureTalkEmote();
@@ -98,7 +117,7 @@ describe('EmoteManager talking gesture', () => {
 
   it("does not claim the world lacks the clip when it simply couldn't be checked", async () => {
     access.mockRejectedValue(new Error('ENOENT'));
-    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('network down'));
+    await answer(() => 'down');
     const warn = vi.spyOn(logger, 'warn');
     const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const { manager } = newManager();
@@ -109,7 +128,7 @@ describe('EmoteManager talking gesture', () => {
   });
 
   it('does not carry an override from a previous world into the next one', async () => {
-    serveAssets(() => true);
+    await serveAssets(() => true);
     access.mockResolvedValue(undefined);
     await (newManager().manager as any).uploadLocomotionEmotes(); // world A, custom clip present
     expect((Emotes as any).TALK).toMatch(HASHED);
@@ -121,7 +140,7 @@ describe('EmoteManager talking gesture', () => {
 
   it('never points a locomotion emote at an upload that could not be verified', async () => {
     access.mockRejectedValue(new Error('ENOENT'));
-    serveAssets((file) => file === 'emote-talk.glb'); // every uploaded hash is 404
+    await serveAssets((file) => file === 'emote-talk.glb'); // every uploaded hash is 404
     await (newManager().manager as any).uploadLocomotionEmotes();
     expect((Emotes as any).WALK).toBe(original.WALK);
     expect((Emotes as any).RUN).toBe(original.RUN);
@@ -129,7 +148,7 @@ describe('EmoteManager talking gesture', () => {
 
   it('stops uploading once the world refuses, and keeps the defaults', async () => {
     access.mockRejectedValue(new Error('ENOENT'));
-    serveAssets((file) => file === 'emote-talk.glb');
+    await serveAssets((file) => file === 'emote-talk.glb');
     const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.spyOn(console, 'info').mockImplementation(() => {});
     const upload = vi.fn().mockRejectedValue(new AssetUploadError('Upload failed (HTTP 403): builder rank required', 403));
@@ -144,7 +163,7 @@ describe('EmoteManager talking gesture', () => {
 
   it('only maps custom emotes the world serves', async () => {
     access.mockRejectedValue(new Error('ENOENT'));
-    serveAssets((file) => file === 'emote-talk.glb'); // uploads "succeed", hashes stay 404
+    await serveAssets((file) => file === 'emote-talk.glb'); // uploads "succeed", hashes stay 404
     vi.spyOn(console, 'error').mockImplementation(() => {});
     vi.spyOn(console, 'info').mockImplementation(() => {});
     vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -157,7 +176,7 @@ describe('EmoteManager talking gesture', () => {
   it('retries clips that failed for a passing reason, keeping the ones already settled', async () => {
     access.mockRejectedValue(new Error('ENOENT'));
     let uploaded = false;
-    serveAssets((file) => file === 'emote-talk.glb' || (uploaded && HASH_FILE.test(file)));
+    await serveAssets((file) => file === 'emote-talk.glb' || (uploaded && HASH_FILE.test(file)));
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.spyOn(console, 'info').mockImplementation(() => {});
     const upload = vi
@@ -182,12 +201,12 @@ describe('EmoteManager talking gesture', () => {
 
   it('leaves the shared emotes alone when the world is replaced mid-way', async () => {
     access.mockRejectedValue(new Error('ENOENT'));
-    serveAssets(() => true);
+    await serveAssets(() => true);
     vi.spyOn(console, 'info').mockImplementation(() => {});
-    let world: any = { assetsUrl: 'https://world.test/assets/', network: { upload: vi.fn() } };
+    let world: any = installed({ assetsUrl: 'https://world.test/assets/', network: { upload: vi.fn() } });
     const manager = new EmoteManager({ getService: () => ({ getWorld: () => world }) } as any);
     readFile.mockImplementation(async () => {
-      world = { ...world }; // a reconnect happens while the first clip is read
+      world = installed({ ...world }); // a reconnect happens while the first clip is read
       return Buffer.from('custom-talk-clip');
     });
     expect(await manager.uploadEmotes()).toBe(false);
@@ -196,7 +215,7 @@ describe('EmoteManager talking gesture', () => {
 
   it('gives up on clips that keep failing after a few rounds', async () => {
     access.mockRejectedValue(new Error('ENOENT'));
-    serveAssets((file) => file === 'emote-talk.glb'); // uploads "succeed", hashes stay 404
+    await serveAssets((file) => file === 'emote-talk.glb'); // uploads "succeed", hashes stay 404
     const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.spyOn(console, 'info').mockImplementation(() => {});
     const { manager, upload } = newManager();
@@ -223,36 +242,28 @@ describe('EmoteManager talking gesture', () => {
 
     it("uses the world's own clips when it does not serve the engine defaults", async () => {
       // coo-world: mp-* locomotion, emote-float/fall/flip/talk, no emote-idle/walk/run
-      const fetchSpy = serveAssets((file) => /^mp-(idle|walk|jog)\.glb$/.test(file) || /^emote-(float|fall|flip|talk)\.glb$/.test(file));
+      const server = await serveAssets((file) => /^mp-(idle|walk|jog)\.glb$/.test(file) || /^emote-(float|fall|flip|talk)\.glb$/.test(file));
       await (newManager(refused()).manager as any).uploadLocomotionEmotes();
       expect((Emotes as any).IDLE).toBe('asset://mp-idle.glb');
       expect((Emotes as any).WALK).toBe('asset://mp-walk.glb?s=2');
       expect((Emotes as any).RUN).toBe('asset://mp-jog.glb?s=1.87');
       expect((Emotes as any).FLOAT).toBe(original.FLOAT);
       // looked up without the speed query
-      expect(fetchSpy.mock.calls.map(([url]) => String(url))).toContain('https://world.test/assets/mp-walk.glb');
+      expect(asked(server)).toContain('https://world.test/assets/mp-walk.glb');
     });
 
     it('keeps the engine defaults where the world serves them', async () => {
-      serveAssets((file) => file.startsWith('emote-') || file.startsWith('mp-'));
+      await serveAssets((file) => file.startsWith('emote-') || file.startsWith('mp-'));
       await (newManager(refused()).manager as any).uploadLocomotionEmotes();
       expect((Emotes as any).WALK).toBe(original.WALK);
       expect((Emotes as any).IDLE).toBe(original.IDLE);
     });
 
-    /** HEAD answers by file name: a status, or 'down' for a network failure. */
-    function answer(byFile: (file: string) => number | 'down') {
-      return vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
-        const status = byFile(String(url).split('/').pop()!);
-        if (status === 'down') throw new Error('network down');
-        return new Response(null, { status });
-      });
-    }
     const COO_WORLD = (file: string) => (/^mp-(idle|walk|jog)\.glb$/.test(file) || /^emote-(float|fall|flip|talk)\.glb$/.test(file) ? 200 : 404);
 
     it('checks the fallback again after a lookup failed', async () => {
       let outage = true;
-      answer((file) => (outage && file.startsWith('emote-walk') ? 503 : COO_WORLD(file)));
+      await answer((file) => (outage && file.startsWith('emote-walk') ? 503 : COO_WORLD(file)));
       const { manager } = newManager(refused());
 
       expect(await (manager as any).uploadLocomotionEmotes()).toBe(false);
@@ -265,7 +276,7 @@ describe('EmoteManager talking gesture', () => {
 
     it("replaces the world's clip with the agent's own once that becomes available", async () => {
       let uploaded = false;
-      answer((file) => (uploaded && HASH_FILE.test(file) ? 200 : COO_WORLD(file)));
+      await answer((file) => (uploaded && HASH_FILE.test(file) ? 200 : COO_WORLD(file)));
       const upload = vi
         .fn()
         // WALK is the first locomotion clip, so it is the one that hits the outage
@@ -282,10 +293,10 @@ describe('EmoteManager talking gesture', () => {
     });
 
     it('does not switch a newer connection to a fallback found for the old one', async () => {
-      let world: any = { assetsUrl: 'https://world.test/assets/', network: { upload: refused() } };
+      let world: any = installed({ assetsUrl: 'https://world.test/assets/', network: { upload: refused() } });
       const manager = new EmoteManager({ getService: () => ({ getWorld: () => world }) } as any);
-      answer((file) => {
-        if (file === 'mp-walk.glb') world = { ...world }; // reconnect while the fallback is looked up
+      await answer((file) => {
+        if (file === 'mp-walk.glb') world = installed({ ...world }); // reconnect while the fallback is looked up
         return COO_WORLD(file);
       });
       await (manager as any).uploadLocomotionEmotes(world);
@@ -293,7 +304,7 @@ describe('EmoteManager talking gesture', () => {
     });
 
     it('keeps the default when the world has neither', async () => {
-      serveAssets(() => false);
+      await serveAssets(() => false);
       await (newManager(refused()).manager as any).uploadLocomotionEmotes();
       expect((Emotes as any).WALK).toBe(original.WALK);
     });

@@ -5,8 +5,13 @@
  * It runs in a process of its own
  * because `sandboxed` locks the whole realm down, which a test runner's worker must never be.
  *
- * Not initialised, as in service.integration.test.ts: no socket, no physics, no tick loop. Asset
- * requests are answered by a fake fetch; every other request is recorded as outbound.
+ * Not initialised, as in service.integration.test.ts: no socket, no physics, no tick loop.
+ *
+ * The world's assets are served by a server in this process on loopback, which is the world's own
+ * origin for the agent's real network policy (lib/net-policy.ts). A second loopback server stands
+ * for something inside the agent's network: scripts name it where the fixtures say
+ * http://127.0.0.1:9, and whatever reaches it is recorded as outbound. So is every call of the
+ * global fetch, which nothing here should make (the engine's own script fetch does).
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { inspect } from 'node:util';
@@ -20,13 +25,15 @@ import { installWorldChat } from '../../lib/world-chat';
 import { activateWorldScripts, createWorldScripts } from '../../lib/script-api';
 import { surviveUnhandledRejections } from '../../lib/script-sandbox';
 import type { ScriptNetwork } from '../../lib/script-facades';
+import { NetPolicy, installWorldNet } from '../../lib/net-policy';
+import { createScriptNetwork } from '../../lib/script-network';
+import { PUBLIC_ADDRESS, type TestServer, startServer, testNet } from '../net';
 import type { Scenario } from './scenario';
 import { extendThreePhysX } from '../../hyperfy/src/core/extras/extendThreePhysX.js';
 import { clamp, num, uuid } from '../../hyperfy/src/core/utils.js';
 import { prng } from '../../hyperfy/src/core/extras/prng.js';
 import { pathToFileURL } from 'node:url';
 
-const ASSETS = 'http://assets.test';
 const endowed: Function[] = [num, clamp, uuid, prng];
 const THREE = engineThree as any;
 
@@ -58,16 +65,50 @@ async function main() {
   }
 
   const glb = minimalGlb();
+  // Something inside the agent's network. Nothing may reach it: not a script's fetch, not the loader.
+  const inward = (name: string, tls: boolean): Promise<TestServer> =>
+    startServer((_request, response, hit) => {
+      outbound.push(`${name}:${hit.method} ${hit.url}`);
+      response.end('internal');
+    }, { tls });
+  const internal = await inward('internal', false);
+  let script = scenario.script.replaceAll('http://127.0.0.1:9/', `http://127.0.0.1:${internal.port}/`);
+  // The world: its assets, on its own origin
+  const assets = await startServer((request, response) => {
+    if (request.url === '/app.glb' || request.url === '/crash-block.glb') response.end(Buffer.from(glb));
+    else if (request.url === '/app.js') response.end(script);
+    else response.writeHead(404).end();
+  });
+  const ASSETS = `http://127.0.0.1:${assets.port}`;
+  script = script.replaceAll('%WORLD%', ASSETS);
+
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async (input: unknown) => {
     const url = String(input);
-    if (url === `${ASSETS}/app.glb` || url === `${ASSETS}/crash-block.glb`) return new Response(glb);
-    if (url === `${ASSETS}/app.js`) return new Response(scenario.script);
     // The PhysX loader reads its .wasm file this way
     if (url.startsWith('file:')) return realFetch(input as string);
     outbound.push(url);
     throw new TypeError(`unexpected request in the sandbox child: ${url}`);
   }) as typeof fetch;
+
+  // scenario.policyNetwork: a public API scripts may call, and the real policy to call it through
+  let scriptNetwork: ScriptNetwork | null = null;
+  let api: TestServer | undefined;
+  if (scenario.policyNetwork) {
+    const internalTls = await inward('internal-tls', true);
+    api = await startServer((request, response) => {
+      if (request.url === '/redirect-inward') response.writeHead(302, { location: 'https://internal.test/secret' }).end();
+      else response.writeHead(200, { 'content-type': 'application/json' }).end('{"pong":true}');
+    }, { tls: true });
+    const { policy } = testNet({
+      hosts: { 'api.test': PUBLIC_ADDRESS, 'internal.test': '10.0.0.5', localhost: '127.0.0.1' },
+      // localhost: only the port is re-targeted, so that request is judged in the policy's lookup hook, in this locked-down realm
+      routes: { 'api.test:443': { port: api.port, direct: true }, 'internal.test:443': { port: internalTls.port, direct: true }, '127.0.0.1:443': { port: internalTls.port, direct: true }, 'localhost:443': internalTls.port },
+      // The world's origin is known to this policy, and a script's fetch still gets no exception for it
+      worldOrigin: ASSETS,
+    });
+    scriptNetwork = createScriptNetwork({ policy });
+  }
 
   if (scenario.mode !== 'off') {
     report.activated = await activateWorldScripts({ info: (m: string) => void logs.push(`info: ${m}`), error: (m: string) => void logs.push(`error: ${m}`) });
@@ -109,6 +150,8 @@ async function main() {
   world.network.ws = { url: 'ws://world.test/ws?authToken=SECRET-SESSION-TOKEN', send() { handlerCalls.push('ws.send'); } };
   world.network.send = (name: string, data: unknown) => void sent.push([name, data]);
   world.assetsUrl = ASSETS;
+  // As service.ts does for a world it connects to
+  installWorldNet(world, new NetPolicy({ worldOrigin: ASSETS }));
   if (!scenario.engineChat) installWorldChat(world);
   // The handlers chat provenance, ranks and the tip wallet are fed from: a script must never call them
   for (const handler of ['onChatAdded', 'onEntityModified', 'onEntityAdded', 'onSnapshot', 'onEvmNonce', 'onSettingsModified', 'upload']) {
@@ -124,7 +167,7 @@ async function main() {
   const scripts = scenario.mode === 'sandboxed'
     ? createWorldScripts({
         network: scenario.networkBody === undefined
-          ? null
+          ? scriptNetwork
           : ((async (url) => {
               outbound.push(`script-network:${url}`);
               return { status: 200, statusText: 'OK', headers: { 'Content-Type': 'image/png' }, body: new TextEncoder().encode(scenario.networkBody) };
@@ -225,6 +268,10 @@ async function main() {
   };
   // Frozen by the sandbox (script-api.ts), so only when scripts are sandboxed
   report.endowedFrozen = endowed.every((fn) => Object.isFrozen(fn));
+  // What the public API was sent (scenario.policyNetwork)
+  report.api = api?.hits.map((hit) => ({ method: hit.method, url: hit.url, body: hit.body, headers: hit.headers }));
+  // What the world's own server was asked for (by the loader, and by nobody else)
+  report.assetRequests = assets.hits.map((hit) => hit.url);
   globalThis.fetch = realFetch;
   return report;
 }

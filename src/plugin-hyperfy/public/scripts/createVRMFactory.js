@@ -326,6 +326,9 @@ window.createVRMFactory = function(glb, setupMaterial) {
         },
         destroy() {
           hooks.scene.remove(vrm.scene)
+          // each instance has skeletons of its own, with a bone texture on the GPU once drawn;
+          // its geometry and materials are the avatar's and stay
+          for (const mesh of skinnedMeshes) mesh.skeleton.dispose()
           // world.updater.remove(update)
           // hooks.octree?.remove(sItem)
         },

@@ -83,7 +83,7 @@ SECRET_SALT=another-long-random-string
 >
 > **These defaults only apply when the CLI loads this project.** `elizaos start --character <file>` and `elizaos dev --character <file>` start the server without it, and then none of the above applies: unless `.env` (or the environment) says otherwise, the server listens on `0.0.0.0` with no authentication. The values in `.env` are the only protection that holds on every start path, so keep `SERVER_HOST=127.0.0.1` there (the example file has it) and fill in your own `ELIZA_SERVER_AUTH_TOKEN`.
 >
-> What remains: with your own token, the API is as strong as that token, and anyone who has it can read and rewrite `.env`; with a token and a non-loopback `SERVER_HOST`, anyone on the network who has the token can (Coo logs a warning then). On the locked default, other programs on this machine and web pages in your browser cannot use the REST API or Socket.IO. The token does not cover `/media/uploads/...` and `/media/generated/...`, which serve files from elizaOS's data directory to whoever knows the agent or channel id and the file name (Coo itself puts none there). The random token lives in the agent's process environment, so processes the agent starts (Chromium, ffmpeg) inherit it.
+> What remains: with your own token, the API is as strong as that token, and anyone who has it can read and rewrite `.env`; with a token and a non-loopback `SERVER_HOST`, anyone on the network who has the token can (Coo logs a warning then). On the locked default, other programs on this machine and web pages in your browser cannot use the REST API or Socket.IO. The token does not cover `/media/uploads/...` and `/media/generated/...`, which serve files from elizaOS's data directory to whoever knows the agent or channel id and the file name (Coo itself puts none there). The random token lives in the agent's process environment; the processes the agent starts (Chromium, ffmpeg) are given a reduced environment without it and without the API keys.
 >
 > Stored secrets: Coo does not copy `.env` into the agent record. On each start it deletes what earlier versions stored there: the keys that are in `.env` now, in the start's own merge, and, once the agent has started, stored keys that have since been removed from `.env`. If the database refuses that second step, the log says so as an error and those keys stay stored. elizaOS itself still stores the variables its CLI copies from the environment, notably `POSTGRES_URL`, and the settings it reads from the record (such as per-model tuning like `OBJECT_SMALL_TEMPERATURE`). Stored secrets are encrypted with `SECRET_SALT`; its default, `secretsalt`, is public, so set your own.
 
@@ -129,7 +129,15 @@ bun run build
 node scripts/smoke-boot.mjs --dir /tmp/coo-smoke    # any empty directory outside the repository
 ```
 
-It copies `dist/` next to a throwaway PostgreSQL cluster, starts `elizaos start` there with a dummy key and an unreachable world in both `HYPERFY_WORLD_SCRIPTS` modes, and checks that the agent is listed, tries to connect and schedules a retry, passes the sandbox self-test, returns no key from its API, contacts nothing but 127.0.0.1, and exits on SIGTERM. It needs `initdb`/`pg_ctl` from PostgreSQL 17 with pgvector (`SMOKE_PG_BIN` overrides the Homebrew path).
+It copies `dist/` next to a throwaway PostgreSQL cluster, starts `elizaos start` there with a dummy key and an unreachable world in both `HYPERFY_WORLD_SCRIPTS` modes, and checks that the agent is listed, tries to connect and schedules a retry, passes the sandbox self-test, returns no key from its API, brings its render page up in Chromium without handing Chromium any key, contacts nothing but 127.0.0.1 (Chromium included), and exits on SIGTERM. It needs `initdb`/`pg_ctl` from PostgreSQL 17 with pgvector (`SMOKE_PG_BIN` overrides the Homebrew path) and the Chromium that puppeteer installed (`SMOKE_PUPPETEER_CACHE_DIR` overrides `~/.cache/puppeteer`).
+
+`bun run build` also bundles the page the agent's headless Chromium draws its snapshots on (`scripts/build-assets.mjs` writes `dist/puppeteer/page.js`). After changing that page, the manager that drives it, puppeteer or Chromium, run the render-page smoke by hand:
+
+```bash
+node scripts/smoke-chromium.mjs --dir /tmp/coo-chromium-smoke    # any empty directory outside the repository
+```
+
+It drives the real manager and page in the real Chromium with the bundled avatar, an emote, the base environment, the sky image and the HDR, takes each kind of snapshot, and checks that Chromium can reach nothing, this machine's own ports included. It starts neither the agent nor the engine, and its scene is a small one built for the purpose, not a live world's.
 
 ## Configuration
 
@@ -239,7 +247,7 @@ A Hyperfy world sends *app scripts*: JavaScript written by whoever builds in the
 
 What a sandboxed script gets: the engine's `world` and `app` API, `props`, `setTimeout`, `console`, `Vector3`/`Quaternion`/`Euler`/`Matrix4`/`LerpVector3`/`LerpQuaternion`/`Curve` and the helper functions. Differences from a Hyperfy client that script authors will notice:
 
-- `fetch()` is refused: scripts have no network access in the agent. (Models, avatars and images a script asks the engine to load are still downloaded by the agent's loader.)
+- `fetch()` reaches public `https://` hosts on the default port only, with `GET`, `HEAD` or `POST`, a few request headers (`Accept`, `Accept-Language`, `Authorization`, `Content-Type`, the conditional ones and `X-…`), at most 256 KB sent and 1 MB received, 10 seconds and four requests at a time. Anything else fails with `fetch failed`, whatever the reason (the reason is in the agent's log): addresses inside the agent's network, the world's own origin, plain `http://`, other ports. Nothing of the agent's is attached to a request. Models and avatars a script loads with `world.load()` go through the agent's loader (see "What the Agent Downloads"); images, video and audio are not loaded at all.
 - `Object3D` and `URL.createObjectURL` are not available; `world.get`/`world.set`/`world.open` do nothing.
 - Objects a script hands to the engine are copied (later changes to the script's own object are not seen by the engine), and the engine's objects are seen through proxies. On a vector, quaternion, euler, matrix, lerp or curve, adding properties, replacing methods and reading fields that start with `_` do not work; `class X extends Vector3` does not behave like a subclass.
 - A property named `_isRef` or `_ref` cannot be handed to the engine or set on its objects (the engine reads those names as node references), and the members that take a node (`add`, `remove`, `insert`, a joint's `body0`/`body1`, `world.add`/`remove`/`attach`) or a geometry (`geometry`) take only one the engine made.
@@ -251,9 +259,32 @@ What a sandboxed script gets: the engine's `world` and `app` API, `props`, `setT
 
 What the sandbox does not do:
 
-> A sandboxed world script still runs inside the agent's process, on its only thread. There is no CPU or memory isolation: `while (true) {}` hangs the agent for good, and a script can allocate until the process dies. A script can use everything the engine's script API offers it: create and move nodes, read every player's position, name and id, teleport, push, freeze and re-skin the agent's own avatar, send app events to the world's server, post to the agent's local chat view, and make the agent download models, avatars and images from any URL it names (of a download it learns only whether it worked and, for a model, the names and positions of its parts). A script can break the engine code it calls into by passing it nonsense, which can stop that app, the world's update loop, or the whole process. A script's own error stack traces name the agent's files and where they are on disk. The sandbox is defence for worlds whose builders you mostly trust. It is not a guarantee against a hostile world: use `off` there.
+> A sandboxed world script still runs inside the agent's process, on its only thread. There is no CPU or memory isolation: `while (true) {}` hangs the agent for good, and a script can allocate until the process dies. A script can use everything the engine's script API offers it: create and move nodes, read every player's position, name and id, teleport, push, freeze and re-skin the agent's own avatar, send app events to the world's server, post to the agent's local chat view, make the agent download models and avatars from the world's own origin or from any public https URL it names (of a download it learns only whether it worked and, for a model, the names and positions of its parts), and with `fetch()` send whatever it can read to any public https host and read the answer. A script can break the engine code it calls into by passing it nonsense, which can stop that app, the world's update loop, or the whole process. A script's own error stack traces name the agent's files and where they are on disk. The sandbox is defence for worlds whose builders you mostly trust. It is not a guarantee against a hostile world: use `off` there.
 
 Side effects of `sandboxed` on the rest of the process: the JavaScript built-ins are frozen for everything, including elizaOS and its plugins (SES logs the few Bun-only built-ins it removes at startup), and unhandled promise rejections are logged and survived instead of ending the process, because one line of script can cause one. After upgrading Bun, elizaOS or a plugin, run the tests and the boot smoke below with `sandboxed` before relying on it: lockdown is sensitive to new built-ins, and the self-test only proves that the escapes it knows are closed.
+
+### What the Agent Downloads
+
+A world tells its clients what to download: models, avatars, emotes, scripts, the sky. A builder can ask Coo to import a file from a URL, a sandboxed script can call `fetch()`, and another plugin can hand Coo an audio URL to transcribe. All of these go through one policy (`src/plugin-hyperfy/lib/net-policy.ts`):
+
+- **Public `https://` hosts on the default port.** A host name is judged by the addresses it resolves to, at the moment the connection is made, and the connection goes to the address that was checked. Loopback, private, link-local, carrier-grade NAT, multicast and cloud-metadata addresses are refused, in every spelling (`https://2130706433/`, IPv4-mapped IPv6, NAT64, 6to4 ...), and so is a name with even one such address among several. No user name or password in the URL.
+- **The world's own origin**, whatever its address, port and scheme: the origin of `WS_URL` (`wss://` becomes `https://`, `ws://` becomes `http://`). That is what keeps a local or LAN world working. It is exactly that origin: `ws://127.0.0.1:3000/ws` does not cover `http://localhost:3000`. A world that names its assets under another origin gets them loaded only if that origin is a public `https://` host (a bucket or CDN is fine); otherwise the agent logs which URL it will not use and why when it joins, and the fix is to write `WS_URL` with the host name the world itself uses.
+- Redirects are followed by hand, at most five, and each one is judged from scratch: a redirect off the world's origin loses the exception.
+- One deadline per download, and a size cap enforced while the bytes arrive: 50 MB for models and avatars (also for imports, where the world's own upload limit lowers it and can never raise it), 16 MB for emotes, 2 MB for scripts, 32 MB for images, HDR environments and audio.
+- **Uploads** (the avatar, emotes, imported models) carry the agent's session token, so they go to the world's own origin only. A world whose API URL is on any other origin gets no upload: the agent logs that once when it joins, keeps the world's default avatar, and never sends the token there. A redirect from the upload API is not followed.
+- The listings request of the OpenPay Store shop goes through the same policy, so `OPENPAY_STORE_API_URL` must be a public `https://` URL.
+
+What this does not do:
+
+- It trusts the world's own origin completely. Anything that can name a URL (the world, a script, an import request) can make the agent `GET` any path on that origin, without credentials. Do not point `WS_URL` at a host that also serves something private.
+- The agent can be made to fetch from any public `https://` host, which shows that host the agent's address. Nothing here limits how often.
+- These requests do not go through `HTTP_PROXY`/`HTTPS_PROXY`. Where the only way out is a proxy, they fail (and the uploads with them), while Claude and ElevenLabs, which use the runtime's own `fetch`, keep working.
+- The voice connection is not covered: the world names a LiveKit server and the agent connects to it with LiveKit's own client.
+- Requests the agent makes to fixed services (Claude, ElevenLabs, OpenAI speech) are not world-supplied URLs and are not part of this.
+
+The headless Chromium the agent uses for its snapshots has no network at all. Its page is bundled at build time (three.js 0.132.2 and three-vrm 3.3.3, the versions it was written against; nothing is fetched from a CDN any more), the agent downloads every asset itself under the policy above and passes the bytes in, every request the page makes is refused, and the browser is started with a proxy address where nothing listens and no name resolution, so that the browser's own background requests go nowhere either. A model that refers to files outside itself (a `.gltf` with separate buffers or images) is not given them: it fails to load, or is drawn without them. Chromium and ffmpeg are started with a reduced environment: no API keys, no tokens, no database URL.
+
+`HYPERFY_DEBUG_SNAPSHOTS=true` makes the agent write each snapshot it takes to its working directory (`scene_equirectangular.jpeg`, `scene_facing_<direction>.jpeg`, `scene_view_to_target.jpeg`). Without it, nothing is written.
 
 ### World Compatibility
 
@@ -310,6 +341,10 @@ src/
 │   │   ├── script-membrane.ts   # What crosses between app scripts and the engine
 │   │   ├── script-api.ts        # The world/app API and globals a sandboxed script gets
 │   │   ├── script-facades.ts    # console, fetch and setTimeout for scripts
+│   │   ├── script-network.ts    # What a script's fetch() may reach
+│   │   ├── net-policy.ts        # The one outbound policy: what may be downloaded from where
+│   │   ├── asset-bytes.ts       # An asset's bytes: bundled file, data: URL or policy download
+│   │   ├── child-env.ts         # The reduced environment Chromium and ffmpeg are started with
 │   │   ├── tip-wallet.ts        # Coo's wallet sign-in for tips
 │   │   ├── tip-notice.ts        # Reads the world's tip announcements
 │   │   ├── idle-behavior.ts     # Scripted patrol / wander / greeting steps
@@ -325,7 +360,8 @@ src/
 │   │   ├── message-manager.ts   # Chat message handling
 │   │   ├── voice-manager.ts     # Voice input/output
 │   │   ├── emote-manager.ts     # Emote control
-│   │   └── puppeteer-manager.ts # Screenshots & VRM control
+│   │   └── puppeteer-manager.ts # Snapshots: drives the render page in headless Chromium
+│   ├── public/puppeteer/        # The render page's source (bundled by scripts/build-assets.mjs)
 │   ├── systems/
 │   │   ├── liveKit.ts          # LiveKit audio streaming
 │   │   ├── avatar.ts           # VRM avatar management
@@ -363,6 +399,7 @@ stubs/unused-elizaos-plugin/    # Stands in for plugins @elizaos/cli lists but n
 10. **Lean, Pinned Dependencies**: Unused integrations removed and `bun.lock` committed (`bun audit` to check)
 11. **Tips**: Coo can receive coo-world tips (JPYC) with its own wallet and thanks the tippers
 12. **Authorization**: Scene edits only for players the world lets build, an enforced list of what autonomous steps may do, and only the world server's chat counts as conversation (see "Who Can Ask for What")
+13. **One Outbound Policy, Offline Renderer**: Everything a world, a script or an import makes the agent download is limited to public https hosts and the world's own origin, with size caps and deadlines; Chromium has no network and gets none of the agent's keys (see "What the Agent Downloads")
 
 ## Troubleshooting
 
@@ -382,6 +419,10 @@ stubs/unused-elizaos-plugin/    # Stands in for plugins @elizaos/cli lists but n
 
 ### Disconnected as "outdated"
 - The log says the world `requires a newer protocol`: the world changed its network protocol. Update `src/plugin-hyperfy/lib/world-protocol.ts` to match the world's `src/core/packets.js` (protocol version and packet table); the agent retries every 5 minutes meanwhile.
+
+### Models, Avatars or the Sky Missing; Uploads Refused
+- The log says `This world's assets ... will not be loaded` or `Uploads to this world are refused` when the agent joins: the world names its assets or API under another origin than `WS_URL` (for example `WS_URL=ws://127.0.0.1:3000/ws` while the world announces `http://localhost:3000/...`). Use the world's own host name in `WS_URL`. See "What the Agent Downloads".
+- `[AgentLoader] Failed to load ... (refused)` for single assets: the URL is not a public `https://` address or the world's own origin.
 
 ### Avatar Not Shown
 - The world only accepts uploads from builders, or `.vrm` avatars when **custom avatars** is turned on in the world settings. Turn it on, then restart the agent (it does not notice the setting change on its own). Until then it keeps the world's default avatar.

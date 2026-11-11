@@ -22,7 +22,7 @@ export type WorldScriptsMode = 'off' | 'sandboxed';
 export const WORLD_SCRIPTS_RESIDUAL_RISK = [
   "A sandboxed world script still runs inside the agent's process, on its only thread.",
   'There is no CPU or memory isolation: `while (true) {}` hangs the agent for good, and a script can allocate until the process dies.',
-  "A script can use everything the engine's script API offers it: create and move nodes, read every player's position, name and id, teleport, push, freeze and re-skin the agent's own avatar, send app events to the world's server, post to the agent's local chat view, and make the agent download models, avatars and images from any URL it names (of a download it learns only whether it worked and, for a model, the names and positions of its parts).",
+  "A script can use everything the engine's script API offers it: create and move nodes, read every player's position, name and id, teleport, push, freeze and re-skin the agent's own avatar, send app events to the world's server, post to the agent's local chat view, make the agent download models and avatars from the world's own origin or from any public https URL it names (of a download it learns only whether it worked and, for a model, the names and positions of its parts), and with `fetch()` send whatever it can read to any public https host and read the answer.",
   "A script can break the engine code it calls into by passing it nonsense, which can stop that app, the world's update loop, or the whole process.",
   "A script's own error stack traces name the agent's files and where they are on disk.",
   'The sandbox is defence for worlds whose builders you mostly trust. It is not a guarantee against a hostile world: use `off` there.',

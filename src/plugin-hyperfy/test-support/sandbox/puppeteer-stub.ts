@@ -1,12 +1,12 @@
-// Stands in for managers/puppeteer-manager in the sandbox child process: the agent downloads
-// model bytes through Chromium, the child takes them from its own fake fetch instead.
+// Stands in for managers/puppeteer-manager in the sandbox child process. The agent hands the model
+// bytes it downloaded to Chromium and gets them back without textures; here they come back as
+// they are.
 const manager = {
-  async loadGlbBytes(url: string): Promise<number[]> {
-    const response = await fetch(url);
-    return Array.from(new Uint8Array(await response.arrayBuffer()));
+  async loadGlbBytes(bytes: Uint8Array): Promise<Uint8Array> {
+    return bytes;
   },
-  async loadVRMBytes(url: string): Promise<number[]> {
-    return manager.loadGlbBytes(url);
+  async loadVRMBytes(bytes: Uint8Array, _url: string): Promise<Uint8Array> {
+    return bytes;
   },
 };
 

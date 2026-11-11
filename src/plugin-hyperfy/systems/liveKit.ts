@@ -11,6 +11,7 @@ import {
 } from '@livekit/rtc-node';
 import { System } from '../hyperfy/src/core/systems/System';
 import { spawn } from 'node:child_process';
+import { childEnv } from '../lib/child-env';
 
 export interface LiveKitInitOptions {
   wsUrl: string;
@@ -225,7 +226,8 @@ export class AgentLiveKit extends System {
 
     console.log('[LiveKit] Running ffmpeg to convert', format, 'to PCM...');
     return new Promise((resolve, reject) => {
-      const ff = spawn('ffmpeg', ffmpegArgs);
+      // Not the agent's environment, which holds API keys and tokens (lib/child-env.ts)
+      const ff = spawn('ffmpeg', ffmpegArgs, { env: childEnv() });
       const chunks: Buffer[] = [];
       let stderrOutput = '';
       let settled = false;

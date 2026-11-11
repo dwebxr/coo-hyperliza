@@ -23,11 +23,13 @@ import { PuppeteerManager } from './managers/puppeteer-manager.js'
 import { BuildManager } from './managers/build-manager.js'
 import { getModuleDirectory } from './utils'
 import { ReconnectController } from './lib/reconnect'
-import { type AssetUploadError, type UploadOptions, ensureAsset, uploadAsset } from './lib/asset-upload'
+import { type AssetUploadError, type UploadOptions, ensureAsset, uploadAsset, worldEndpointProblems } from './lib/asset-upload'
+import { NetPolicy, installWorldNet } from './lib/net-policy'
+import { createScriptNetwork } from './lib/script-network'
 import { PROTOCOL_VERSION, adaptToWorldProtocol } from './lib/world-protocol'
 import { storage } from './hyperfy/src/core/storage.js'
 import { TipWallet, signInHost, takeTipWalletAccount } from './lib/tip-wallet'
-import { resolveWorldWsUrl } from './lib/world-url'
+import { resolveWorldWsUrl, worldHttpOrigin } from './lib/world-url'
 import { installWorldChat, worldChat } from './lib/world-chat'
 import { trackWorldIdentity } from './lib/world-identity'
 import { describeSceneEditsMode, readSceneEditsMode } from './lib/authorization'
@@ -224,11 +226,23 @@ export class HyperfyService extends Service {
       if (sceneEdits.problem) console.error(`[Hyperfy] ${sceneEdits.problem}`)
       console.info(describeSceneEditsMode(process.env))
 
+      // Everything this world makes the agent download goes through one policy (lib/net-policy.ts):
+      // public https hosts, plus this world's own origin whatever its address
+      const net = installWorldNet(world, new NetPolicy({ worldOrigin: worldHttpOrigin(config.wsUrl) }))
+      console.info(`[Hyperfy] Downloads for this world: public https hosts, and the world's own origin ${net.worldOrigin ?? '(none: WS_URL has no usable origin)'}`)
+      const engineOnSnapshot = world.network.onSnapshot
+      world.network.onSnapshot = function (this: unknown, data: unknown) {
+        const result = engineOnSnapshot.call(world.network, data)
+        // The snapshot names the world's API and assets URLs; say so now if the agent will not use them
+        for (const problem of worldEndpointProblems(net, { apiUrl: world.network.apiUrl, assetsUrl: world.assetsUrl })) console.warn(`[Hyperfy] ${problem}`)
+        return result
+      }
+
       // The engine's upload sends no session token and ignores the response, but the world only
       // accepts uploads from an authenticated session. The token is read per call: the snapshot
-      // may issue a new one.
+      // may issue a new one. It is sent to the world's own origin only.
       world.network.upload = (file: File, { check }: UploadOptions = {}) =>
-        uploadAsset(world.network, file, { authToken: storage.get('authToken'), check })
+        uploadAsset(world.network, file, { net, authToken: storage.get('authToken'), check })
 
       // Registered before init so a socket that closes during init is not missed.
       let kickCode: string | null = null
@@ -274,7 +288,8 @@ export class HyperfyService extends Service {
         ; (world as any).controls = this.controls
       world.systems.push(this.controls)
       // Temporarily comment out AgentLoader to test for updateTransform error
-      const loader = new AgentLoader(world, { scripts: this.worldScriptsSandboxed ? createWorldScripts() : null })
+      // A sandboxed script's fetch() reaches public https hosts only (lib/script-network.ts)
+      const loader = new AgentLoader(world, { scripts: this.worldScriptsSandboxed ? createWorldScripts({ network: createScriptNetwork() }) : null })
         ; (world as any).loader = loader
       world.systems.push(loader);
 
