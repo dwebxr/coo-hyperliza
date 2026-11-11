@@ -6,7 +6,8 @@ import {
     State,
     logger,
 } from "@elizaos/core";
-import { HyperfyService } from "../service";
+import { actingSession, connectedSession } from "../service";
+import { TurnCancelled } from "../lib/turn-context";
 import { actionFailed, actionSucceeded, tellFailure } from "../lib/action-result";
 
 const TELEPORT_TO_USER = "HYPERFY_TELEPORT_TO_USER";
@@ -16,8 +17,7 @@ export const teleportToUserAction: Action = {
     similes: ["TELEPORT_TO_PLAYER", "WARP_TO_USER", "FOLLOW_USER_INSTANTLY"],
     description: "Teleport instantly to the location of the user who sent the message or a specified user. Use this when the user asks you to come to them, follow them immediately, or when they are too far away to walk.",
     validate: async (runtime: IAgentRuntime) => {
-        const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-        return !!service && service.isConnected();
+        return !!connectedSession(runtime);
     },
     handler: async (
         runtime: IAgentRuntime,
@@ -27,15 +27,10 @@ export const teleportToUserAction: Action = {
         callback: HandlerCallback
     ) => {
         logger.info("[Teleport Action] Handler triggered.");
-        const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-        if (!service) {
-            logger.error("[Teleport Action] HyperfyService not found.");
-            await tellFailure(callback, TELEPORT_TO_USER, "I can't teleport right now.");
-            return actionFailed(TELEPORT_TO_USER, "HyperfyService not found");
-        }
-
-        const world = service.getWorld();
-        if (!world) {
+        // The turn's own connection (never a newer one); throws when the turn may no longer act
+        const session = actingSession(runtime);
+        const world = session?.world;
+        if (!session || !world) {
             logger.warn("[Teleport Action] World not ready.");
             await tellFailure(callback, TELEPORT_TO_USER, "I can't teleport right now.");
             return actionFailed(TELEPORT_TO_USER, "world not ready");
@@ -50,16 +45,18 @@ export const teleportToUserAction: Action = {
         let teleported: boolean;
         try {
             if (world.actions && typeof world.actions.teleportToUser === 'function') {
-                teleported = world.actions.teleportToUser(targetUserId) === true;
+                // Moves the avatar: one such section at a time (ConnectionSession.withBody)
+                teleported = await session.withBody(async () => world.actions.teleportToUser(targetUserId) === true);
             } else if (world.controls && typeof world.controls.teleportToEntity === 'function') {
                 // Fallback direct control
-                teleported = world.controls.teleportToEntity(targetUserId) === true;
+                teleported = await session.withBody(async () => world.controls.teleportToEntity(targetUserId) === true);
             } else {
                 logger.error("[Teleport Action] Teleport capability not found on world.actions or world.controls.");
                 await tellFailure(callback, TELEPORT_TO_USER, "I can't teleport right now.");
                 return actionFailed(TELEPORT_TO_USER, "teleport capability not found");
             }
         } catch (error: any) {
+            if (error instanceof TurnCancelled) throw error;
             logger.error("[Teleport Action] Teleport failed:", error);
             await tellFailure(callback, TELEPORT_TO_USER, "I couldn't teleport just now.");
             return actionFailed(TELEPORT_TO_USER, `teleport failed: ${error?.message ?? error}`);

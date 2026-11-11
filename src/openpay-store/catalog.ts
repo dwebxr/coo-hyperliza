@@ -3,6 +3,7 @@ import { stripControlChars, stripInvisibleChars, truncateCodePoints } from '../p
 import { safeFetch, toResponse } from '../plugin-hyperfy/lib/net-policy';
 import { WORLD_CHAT_MAX_LENGTH } from '../plugin-hyperfy/lib/chat-chunks';
 import { describeUrl } from '../plugin-hyperfy/lib/log-url';
+import { type ScanSteps, addressParts, findAddresses, replaceAddresses } from './addresses';
 
 /**
  * Products from the public OpenPay Store listings API
@@ -52,43 +53,33 @@ export interface StoreCatalogConfig {
   locale: StoreLocale;
 }
 
-// Top-level domains a bare host name without a path is recognised by: every country code, and the
-// generic ones in common use (a name such as `Mt.Fuji` or `Node.js` is not taken for a host)
-const COUNTRY_TLDS =
-  'ac ad ae af ag ai al am ao aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bm bn bo br bs bt bw by bz ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg er es et eu fi fj fk fm fo fr ga gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il im in io iq ir is it je jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md me mg mh mk ml mm mn mo mp mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro rs ru rw sa sb sc sd se sg sh si sk sl sm sn so sr ss st su sv sx sy sz tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug uk us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw';
-const GENERIC_TLDS =
-  'com net org info biz edu gov int mil arpa name pro mobi app dev xyz shop store site online top link click live life world tech cloud blog news page web win vip club fun art icu buzz rest bar today email space website zone tokyo osaka nagoya yokohama kyoto okinawa moe cool wiki pay cash money bank finance exchange market trade sale deals gift gifts ltd inc llc company network digital media social chat run studio design agency solutions services support help center care family love fyi lol best ninja guru expert systems tools codes host hosting domains download stream games game bet casino poker loan loans credit cards crypto nft wallet eth sol';
-const KNOWN_TLDS = `${COUNTRY_TLDS} ${GENERIC_TLDS}`.split(' ').join('|');
-
-/**
- * Text that reads as an address a browser or a chat client would open: anything with a scheme
- * (`https://`, misspelt ones such as `hxxps://` too, and `mailto:`/`javascript:`/`data:` ...), a
- * scheme-relative `//host`, `www.` and what follows it, a host name followed by a path, port or
- * query (labels with dots, the last one of 2 or more letters: `evil.test/pay`), a bare host name
- * whose last label is a known top-level domain (`evil.shop`, `ASP.NET`), and an IPv4 address, each
- * with whatever follows it up to a space. A dot is also the ideographic full stop, which browsers
- * read as one in a host name. Matched on NFKC-normalized text (full-width letters as ASCII).
- */
-const LABELS = String.raw`(?<![a-z0-9.-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?[.\u3002])+`;
-const LINK_LIKE = new RegExp(
-  [
-    String.raw`(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/\S*`,
-    String.raw`(?<![a-z0-9+.-])(?:mailto|javascript|vbscript|data|file|tel|sms|intent):\S+`,
-    String.raw`(?<![\w/:])\/\/[a-z0-9-]+(?:[.\u3002][a-z0-9-]+)+\S*`,
-    String.raw`(?<![a-z0-9.-])www\d{0,3}[.\u3002]\S*`,
-    String.raw`${LABELS}(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})(?![a-z0-9-])[:/?#]\S*`,
-    String.raw`${LABELS}(?:${KNOWN_TLDS}|xn--[a-z0-9-]{1,59})(?![a-z0-9-])\S*`,
-    String.raw`(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?![\d.])\S*`,
-  ].join('|'),
-  'giu'
-);
-
-/** What a link-like stretch of seller text is replaced with: neither an address nor clickable. */
+/** What an address in seller text is replaced with: neither an address nor clickable. */
 export const LINK_REMOVED = '(link removed)';
 
-/** The stretches of `text` that read as a web address (LINK_LIKE), in order. */
-export function linkLikeParts(text: string): string[] {
-  return [...text.normalize('NFKC').matchAll(LINK_LIKE)].map((match) => match[0]);
+/** The stretches of `text` that read as an address (addresses.ts), in order. */
+export const linkLikeParts = addressParts;
+
+// How much of a seller's field is read at all: eight UTF-16 units (four code points or more) for
+// every code point that is shown. The rest is never normalized or scanned.
+const RAW_UNITS_PER_SHOWN = 8;
+
+/** The first `units` UTF-16 units of `value`, never ending in half a surrogate pair. */
+function headUnits(value: string, units: number): string {
+  if (value.length <= units) return value;
+  const last = value.charCodeAt(units - 1);
+  return value.slice(0, last >= 0xd800 && last <= 0xdbff ? units - 1 : units);
+}
+
+/**
+ * `text` as it is shown in at most `max` code points: whole when it fits; otherwise cut, and cut
+ * further back to before any address the cut made (`photo.jpg` cut to `photo.jp`), then `…`. What
+ * is shown therefore holds no address that the whole text did not hold.
+ */
+export function shownText(text: string, max: number): string {
+  if (Array.from(text).length <= max) return text;
+  let cut = truncateCodePoints(text, max - 1).trimEnd();
+  for (let spans = findAddresses(cut); spans.length; spans = findAddresses(cut)) cut = cut.slice(0, spans[0].start).trimEnd();
+  return `${cut}…`;
 }
 
 /**
@@ -96,18 +87,19 @@ export function linkLikeParts(text: string): string[] {
  * reply format (no <, >, backticks, control characters or newlines), shows as it reads (format
  * characters such as bidi overrides and isolates, zero-width characters and tags are removed;
  * compatibility characters are NFKC-normalized, so full-width letters become ASCII), and holds no
- * web address: every link-like stretch (LINK_LIKE) becomes LINK_REMOVED. So a seller's text posted
- * next to a purchase link or shown in a prompt names no other place to pay.
+ * address that addresses.ts recognises: each becomes LINK_REMOVED, also one that cutting the text
+ * to `max` would make (shownText). Only the start of the field is read (RAW_UNITS_PER_SHOWN).
+ * `steps` counts the characters the address scan looked at (tests).
  */
-export function sanitizeText(value: unknown, max: number): string {
+export function sanitizeText(value: unknown, max: number, steps?: ScanSteps): string {
   if (typeof value !== 'string') return '';
+  const raw = headUnits(value, max * RAW_UNITS_PER_SHOWN);
   // Controls and line separators become a space; format characters, which have no width, go
-  const clean = stripInvisibleChars(stripControlChars(value.normalize('NFKC'), ' ').replace(/[\u2028\u2029]/g, ' '))
+  const clean = stripInvisibleChars(stripControlChars(raw.normalize('NFKC'), ' ').replace(/[\u2028\u2029]/g, ' '))
     .replace(/[<>`]/g, ' ')
     .replace(/\s+/g, ' ')
-    .trim()
-    .replace(LINK_LIKE, LINK_REMOVED);
-  return truncateCodePoints(clean, max, '…');
+    .trim();
+  return shownText(replaceAddresses(clean, LINK_REMOVED, steps), max);
 }
 
 const HANDLE = /^[\w.-]{1,64}$/;
@@ -179,29 +171,33 @@ export function purchaseUrlProblem(url: unknown, { allowedOrigin, handle }: { al
 }
 
 /**
- * The chat message that shares `product`'s purchase link, or null when it would not be safe to
- * post (logged): it must hold exactly one link, the product's purchase URL (still a purchase page
+ * The chat message that shares `product`'s purchase link, or why it would not be safe to post: it
+ * must hold exactly one address (addresses.ts), the product's purchase URL (still a purchase page
  * of that seller as it can be posted, purchaseUrlShapeProblem), and fit one chat message. Every
- * shop link the agent posts is made here.
+ * shop link the agent posts is made here, and the catalog takes no product it cannot make it for.
  */
-export function formatLinkMessage(product: StoreProduct): string | null {
-  const title = truncateCodePoints(product.title, LINK_TITLE_MAX_CODE_POINTS, '…');
+export function linkMessage(product: StoreProduct): { text: string; problem?: undefined } | { text?: undefined; problem: string } {
+  const urlProblem = purchaseUrlShapeProblem(product.url, product.handle);
+  if (urlProblem) return { problem: `its purchase URL (${describeUrl(String(product.url))}) is ${urlProblem}` };
+  const title = shownText(product.title, LINK_TITLE_MAX_CODE_POINTS);
   const text = `🛒 ${product.emoji ? `${product.emoji} ` : ''}${title} — ${product.totalJpyc} JPYC\n${product.url}`;
-  const problem = linkMessageProblem(text, product);
-  if (problem) {
-    logger.warn(`[OpenPayStore] Not posting the link of product ${product.id}: ${problem}`);
-    return null;
-  }
-  return text;
+  const links = addressParts(text);
+  if (links.length !== 1 || links[0] !== product.url) return { problem: `the message would hold ${links.length} address(es) where it must hold the purchase URL alone` };
+  if (text.length > WORLD_CHAT_MAX_LENGTH) return { problem: `the message would be ${text.length} characters, more than one chat message` };
+  return { text };
 }
 
-function linkMessageProblem(text: string, product: StoreProduct): string | null {
-  const urlProblem = purchaseUrlShapeProblem(product.url, product.handle);
-  if (urlProblem) return `its purchase URL (${describeUrl(String(product.url))}) is ${urlProblem}`;
-  const links = linkLikeParts(text);
-  if (links.length !== 1 || links[0] !== product.url) return `the message would hold ${links.length} link(s) where it must hold the purchase URL alone`;
-  if (text.length > WORLD_CHAT_MAX_LENGTH) return `the message would be ${text.length} characters, more than one chat message`;
-  return null;
+/** Whether `product`'s link message can be made (linkMessage). */
+export const isShareable = (product: StoreProduct): boolean => linkMessage(product).text !== undefined;
+
+/** linkMessage's text, or null (the reason is logged). */
+export function formatLinkMessage(product: StoreProduct): string | null {
+  const message = linkMessage(product);
+  if (message.problem !== undefined) {
+    logger.warn(`[OpenPayStore] Not posting the link of product ${product.id}: ${message.problem}`);
+    return null;
+  }
+  return message.text;
 }
 
 /** Parses OPENPAY_STORE_HANDLES. null when nothing usable is configured (feature off). */
@@ -231,16 +227,17 @@ export function parseLocale(raw: string | undefined): StoreLocale {
 
 /**
  * Whitelists one API item; null when it is malformed, its seller is not one of `sellers` (the
- * configured handles, compared without case; '*' is every seller), or its url is not that
- * seller's purchase page (purchaseUrlProblem). The API is asked per seller, but what it answers is
- * checked here: an item of another seller is never sold.
+ * configured handles, compared without case; '*' is every seller), its url is not that seller's
+ * purchase page (purchaseUrlProblem), or its link message cannot be made (linkMessage): what the
+ * catalog holds can always be shared. The API is asked per seller, but what it answers is checked
+ * here: an item of another seller is never sold.
  */
 export function toStoreProduct(item: any, allowedOrigin: string, sellers: readonly string[] | '*' = '*'): StoreProduct | null {
   if (!item || typeof item !== 'object') return null;
   const { id, handle, url } = item;
   // Strings per the API contract; a finite number is tolerated in case that ever changes
   const totalJpyc = typeof item.totalJpyc === 'number' && Number.isFinite(item.totalJpyc) ? String(item.totalJpyc) : item.totalJpyc;
-  // An id reaches the prompt: one that reads as a web address is not taken
+  // An id reaches the prompt: one that reads as an address is not taken
   if (typeof id !== 'string' || !ID.test(id) || linkLikeParts(id).length) return null;
   if (typeof handle !== 'string' || !HANDLE.test(handle)) return null;
   if (sellers !== '*' && !sellers.some((seller) => seller.toLowerCase() === handle.toLowerCase())) return null;
@@ -258,7 +255,8 @@ export function toStoreProduct(item: any, allowedOrigin: string, sellers: readon
   if (emoji) product.emoji = emoji;
   const category = sanitizeText(item.category, 32);
   if (category) product.category = category;
-  return product;
+  // Offered only when its link can be posted (linkMessage)
+  return isShareable(product) ? product : null;
 }
 
 class TransientError extends Error {}
@@ -374,7 +372,7 @@ export class StoreCatalog {
     const items: unknown[] = body.items.slice(0, LIMIT);
     const products = items.map((item) => toStoreProduct(item, this.origin, sellers)).filter(Boolean) as StoreProduct[];
     if (products.length < items.length) {
-      logger.warn(`[OpenPayStore] ${source}: ${items.length - products.length} of ${items.length} item(s) were rejected (malformed, another seller's, or a purchase URL that is not a plain https link to that seller on the API's origin)`);
+      logger.warn(`[OpenPayStore] ${source}: ${items.length - products.length} of ${items.length} item(s) were rejected (malformed, another seller's, a purchase URL that is not a plain https link to that seller on the API's origin, or a link message that could not be made)`);
     }
     return products;
   }

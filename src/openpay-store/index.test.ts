@@ -222,7 +222,7 @@ describe('createOpenPayStorePlugin', () => {
     expect(formatLinkMessage({ ...board, url: 'https://open-pay.jp/ja/@someone-else?product=h_board' })).toBeNull();
     expect(formatLinkMessage({ ...board, url: `${board.url} https://evil.test` })).toBeNull();
     expect(warn.mock.calls.map(([line]) => String(line))).toEqual([
-      '[OpenPayStore] Not posting the link of product h_forged: the message would hold 2 link(s) where it must hold the purchase URL alone',
+      '[OpenPayStore] Not posting the link of product h_forged: the message would hold 2 address(es) where it must hold the purchase URL alone',
       expect.stringContaining("[OpenPayStore] Not posting the link of product h_board: its purchase URL (https://open-pay.jp/ja/@someone-else?product=…) is its path does not name the seller"),
       expect.stringContaining('[OpenPayStore] Not posting the link of product h_board: its purchase URL'),
     ]);
@@ -237,9 +237,10 @@ describe('createOpenPayStorePlugin', () => {
   });
 
   it("shows a seller's handle in the shelf and in spoken text without the address it may read as", () => {
-    const dotted = product('h_dot', 'Dotted Seller Item', { handle: 'pay.evil.com' });
+    const dotted = product('h_dot', 'Dotted Seller Item', { handle: 'pay.evil.com', url: 'https://open-pay.jp/ja/@pay.evil.com?product=h_dot' });
+    expect(formatShelf([dotted], { autonomous: false })).toContain('Dotted Seller Item');
     expect(linkLikeParts(formatShelf([dotted], { autonomous: false }))).toEqual([]);
-    expect(formatShelf([dotted], { autonomous: false })).toContain(`@${LINK_REMOVED}`);
+    expect(formatShelf([dotted], { autonomous: false })).toContain(`(${LINK_REMOVED})`);
     expect(linkLikeParts(formatSpokenProduct(dotted))).toEqual([]);
     // An ordinary handle is shown as it is
     expect(formatSpokenProduct(board)).toContain('@masia02');

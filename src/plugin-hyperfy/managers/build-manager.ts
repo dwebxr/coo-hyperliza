@@ -1,4 +1,3 @@
-import { IAgentRuntime } from "@elizaos/core";
 import { uuid } from '../hyperfy/src/core/utils.js'
 import { cloneDeep } from 'lodash-es'
 import { importApp } from '../hyperfy/src/core/extras/appTools.js'
@@ -23,16 +22,18 @@ export function importByteCap(worldMaxUploadMb: unknown): number {
 
 /**
  * What one scene edit request may act on: the world it was authorized for, a check that throws
- * SceneEditStopped once that authorization no longer holds (the connection changed, or the
- * requester may no longer build), and whether the connection is still the one it started on.
- * Every method acts only on `world` and calls `check()` right before each effect on it (walking
- * there, changing or adding entities, each upload request), which also covers every await before
- * that effect.
+ * SceneEditStopped once that authorization no longer holds (the turn was cancelled or its
+ * connection ended, or the requester may no longer build), and whether the connection is still
+ * the one it started on. Every method acts only on `world` and calls `check()` right before each
+ * effect on it (walking there, changing or adding entities, each upload request), which also
+ * covers every await before that effect.
  */
 export interface EditGuard {
   readonly world: any;
   check(): void;
   connectionLive(): boolean;
+  /** The request's turn: a walk the edit started stops when it fires. */
+  readonly signal?: AbortSignal;
 }
 
 /** What one operation did: only `applied` changed the world. */
@@ -74,6 +75,12 @@ export function acceptedTransform(field: TransformField, value: unknown): number
   return value.every((v) => Number.isFinite(Math.fround(v)) && Math.fround(v) !== 0) ? value : null;
 }
 
+/** Where an imported app is put: values acceptedTransform passed */
+interface PlacedAt {
+  position: number[];
+  quaternion: number[];
+}
+
 const invalid = (field: TransformField) => failed(`invalid ${field} (${ACCEPTED[field]})`);
 
 /** What coo-world's isBlueprintURL (src/core/extras/assetURL.js) accepts: asset://<one file name> or an http(s) URL. */
@@ -92,26 +99,25 @@ function blueprintReference(value: unknown): boolean {
   }
 }
 
+/** Scene edits. Keeps no state: every method acts on the world of the guard it is given. */
 export class BuildManager {
-  constructor(_runtime: IAgentRuntime) {}
-
   /** Walks next to the target first, as before; the edit itself is checked again afterwards. */
   private async walkTo(guard: EditGuard, x: number, z: number) {
     const controls = guard.world.controls;
     if (!controls) return;
     guard.check();
-    await controls.goto(x, z);
+    await controls.goto(x, z, { signal: guard.signal });
   }
 
   /**
    * Why the target found before walking over can no longer be acted on, or null: it was removed (or
    * replaced under the same id) while the agent walked.
    */
-  private gone(guard: EditGuard, entityId, entity): EditResult | null {
+  private gone(guard: EditGuard, entityId: unknown, entity: any): EditResult | null {
     return guard.world.entities.items.get(entityId) === entity && !entity.destroyed ? null : skipped('the target was removed while I walked over');
   }
 
-  private async transform(guard: EditGuard, entityId, field: TransformField, value: unknown): Promise<EditResult> {
+  private async transform(guard: EditGuard, entityId: unknown, field: TransformField, value: unknown): Promise<EditResult> {
     const accepted = acceptedTransform(field, value);
     if (!accepted) return invalid(field);
     const entity = guard.world.entities.items.get(entityId);
@@ -127,19 +133,19 @@ export class BuildManager {
     return applied;
   }
 
-  translate(guard: EditGuard, entityId, position: [number, number, number]): Promise<EditResult> {
+  translate(guard: EditGuard, entityId: unknown, position: unknown): Promise<EditResult> {
     return this.transform(guard, entityId, 'position', position);
   }
 
-  rotate(guard: EditGuard, entityId, quaternion: [number, number, number, number]): Promise<EditResult> {
+  rotate(guard: EditGuard, entityId: unknown, quaternion: unknown): Promise<EditResult> {
     return this.transform(guard, entityId, 'quaternion', quaternion);
   }
 
-  scale(guard: EditGuard, entityId, scale: [number, number, number]): Promise<EditResult> {
+  scale(guard: EditGuard, entityId: unknown, scale: unknown): Promise<EditResult> {
     return this.transform(guard, entityId, 'scale', scale);
   }
 
-  async duplicate(guard: EditGuard, entityId): Promise<EditResult> {
+  async duplicate(guard: EditGuard, entityId: unknown): Promise<EditResult> {
     const world = guard.world;
     const entity = world.entities.items.get(entityId);
     if (!entity) return skipped('target not found');
@@ -203,7 +209,7 @@ export class BuildManager {
     return applied;
   }
 
-  async delete(guard: EditGuard, entityId): Promise<EditResult> {
+  async delete(guard: EditGuard, entityId: unknown): Promise<EditResult> {
     const entity = guard.world.entities.items.get(entityId);
     if (!entity) return skipped('target not found');
     if (!entity.isApp) return skipped('only apps can be deleted');
@@ -262,7 +268,7 @@ export class BuildManager {
       console.error(`[BuildManager] importEntity: fetch failed with ${resp.status} ${resp.statusText} for ${describeUrl(url)}`)
       return failed(`download failed (HTTP ${resp.status})`)
     }
-    const file = new File([new Uint8Array(resp.body)], url.split('?')[0].split('/').pop(), { type: resp.headers['content-type'] ?? '' })
+    const file = new File([new Uint8Array(resp.body)], url.split('?')[0].split('/').pop() ?? '', { type: resp.headers['content-type'] ?? '' })
     
     await new Promise(resolve => setTimeout(resolve, 100))
 
@@ -281,7 +287,7 @@ export class BuildManager {
     }
   }
 
-  async addApp(guard: EditGuard, file, transform): Promise<EditResult> {
+  async addApp(guard: EditGuard, file: File, transform: PlacedAt): Promise<EditResult> {
     const world = guard.world;
     const info = await importApp(file)
     guard.check();
@@ -335,10 +341,10 @@ export class BuildManager {
     return applied
   }
 
-  async addModel(guard: EditGuard, file, transform): Promise<EditResult> {
+  async addModel(guard: EditGuard, file: File, transform: PlacedAt): Promise<EditResult> {
     const world = guard.world;
     const hash = await hashFile(file)
-    const ext = file.name.split('.').pop().toLowerCase()
+    const ext = (file.name.split('.').pop() ?? '').toLowerCase()
     const filename = `${hash}.${ext}`
     
     const baseUrl = world.assetsUrl.replace(/\/$/, "");
@@ -389,7 +395,7 @@ export class BuildManager {
   }
   
   /** Called right after a checked change, with no await in between. */
-  entityUpdate(guard: EditGuard, entity) {
+  entityUpdate(guard: EditGuard, entity: any) {
     guard.world.network.send('entityModified', {
         id: entity.data.id,
         position: entity.root.position.toArray(),

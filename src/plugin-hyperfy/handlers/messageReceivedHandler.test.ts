@@ -4,13 +4,14 @@ import * as THREE from 'three';
 import { messageReceivedHandler } from './messageReceivedHandler';
 import { AiBudgetExceededError, UsageBudget, resetUsageBudget } from '../../usage-budget';
 import { AnthropicRefusalError } from '../../anthropic-models';
-import { BuildManager } from '../managers/build-manager';
-import { MessageManager } from '../managers/message-manager';
 import { installWorldChat } from '../lib/world-chat';
 import { connectedService, createRuntime } from '../test-support/core-runtime';
+import { serviceFor, sessionFor, withParts } from '../test-support/session';
+import type { ConnectionSession } from '../session/connection-session';
 import { hyperfyEventType, hyperfyEvents } from '../events';
 import { cooWorldSnapshot } from '../test-support/world-packets';
-import { inChatTurn, worldFromSnapshot } from '../test-support/turns';
+import { inChatTurn, inTurn, worldFromSnapshot } from '../test-support/turns';
+import { currentTurn } from '../lib/turn-context';
 
 function setup({ embeddingModel, embeddingError }: { embeddingModel: boolean; embeddingError?: Error }) {
   const runtime: any = {
@@ -56,6 +57,45 @@ describe('messageReceivedHandler reply fields', () => {
   });
 });
 
+describe('messageReceivedHandler and a turn that may no longer act', () => {
+  it("runs none of the plan when the model's answer comes back after the turn was cancelled, and answers nothing", async () => {
+    const { runtime, message } = setup({ embeddingModel: false });
+    const slot = new AbortController();
+    runtime.useModel.mockImplementation(async () => {
+      // The turn's slot runs out while Claude is asked
+      slot.abort();
+      return '<response><thought>t</thought><actions>REPLY,HYPERFY_GOTO_ENTITY</actions><text>On my way!</text></response>';
+    });
+    const callback = vi.fn();
+    await inTurn({ origin: 'chat', world: {}, requesterId: 'p1', cancel: slot.signal }, () => messageReceivedHandler({ runtime, message, callback } as any));
+    expect(runtime.useModel).toHaveBeenCalledTimes(1);
+    expect(runtime.processActions).not.toHaveBeenCalled();
+    expect(runtime.evaluate).not.toHaveBeenCalled();
+    expect(callback).not.toHaveBeenCalled();
+  });
+
+  it('cancels the turn a newer message of the same room took the place of, so that nothing it started goes on', async () => {
+    const { runtime, message } = setup({ embeddingModel: false });
+    let finishFirst!: (answer: string) => void;
+    const answer = '<response><thought>t</thought><actions>REPLY</actions><text>Hello!</text></response>';
+    runtime.useModel.mockImplementationOnce(() => new Promise((resolve) => (finishFirst = resolve))).mockResolvedValue(answer);
+    let older: ReturnType<typeof currentTurn>;
+    const first = inTurn({ origin: 'chat', world: {}, requesterId: 'p1' }, async () => {
+      older = currentTurn();
+      await messageReceivedHandler({ runtime, message, callback: vi.fn() } as any);
+    });
+    await vi.waitFor(() => expect(runtime.useModel).toHaveBeenCalledTimes(1));
+    // A second message in the same room is handled while the first still waits for its answer
+    await inTurn({ origin: 'chat', world: {}, requesterId: 'p2' }, () => messageReceivedHandler({ runtime, message: { ...message, id: '00000000-0000-0000-0000-000000000002' }, callback: vi.fn() } as any));
+    expect(runtime.processActions).toHaveBeenCalledTimes(1);
+    finishFirst(answer);
+    await first;
+    expect(runtime.processActions).toHaveBeenCalledTimes(1);
+    expect(older!.live).toBe(false);
+    expect(() => older!.assertLive()).toThrow('a newer message took its place');
+  });
+});
+
 describe('messageReceivedHandler embeddings', () => {
   it('replies without trying to embed when no embedding model is registered', async () => {
     const { runtime, message } = setup({ embeddingModel: false });
@@ -96,18 +136,20 @@ describe('messageReceivedHandler cost controls', () => {
   it('carries out "come here" from the speaker without a model call', async () => {
     const { runtime, message } = setup({ embeddingModel: false });
     const w = world();
-    runtime.getService = vi.fn(() => ({ getWorld: () => w }));
+    const session = sessionFor(w);
+    runtime.getService = vi.fn(() => serviceFor(session));
     message.content = { text: 'Coo, come here!', metadata: { directlyAddressed: true, hyperfyFromId: 'player-bob' } };
     const callback = vi.fn();
     await messageReceivedHandler({ runtime, message, callback } as any);
     expect(runtime.useModel).not.toHaveBeenCalled();
-    expect(w.controls.followEntity).toHaveBeenCalledWith('player-bob');
+    // The walk is tied to what it is for (here, outside a turn, the connection)
+    expect(w.controls.followEntity).toHaveBeenCalledWith('player-bob', undefined, { signal: session.signal });
     expect(callback).toHaveBeenCalledWith(expect.objectContaining({ text: 'On my way!', actions: ['HYPERFY_GOTO_ENTITY'] }));
   });
 
   it('leaves "come here" to the model when it is not addressed to the agent', async () => {
     const { runtime, message } = setup({ embeddingModel: false });
-    runtime.getService = vi.fn(() => ({ getWorld: () => world() }));
+    runtime.getService = vi.fn(() => serviceFor(sessionFor(world())));
     message.content = { text: 'come here', metadata: { hyperfyFromId: 'player-bob' } };
     await messageReceivedHandler({ runtime, message, callback: vi.fn() } as any);
     expect(runtime.useModel).toHaveBeenCalled();
@@ -216,7 +258,7 @@ describe('messageReceivedHandler answers when an action stops the turn before an
           throw new AnthropicRefusalError('claude', 'cyber');
         },
       },
-      connectedService(world, { getBuildManager: () => ({}) })
+      connectedService(world, { build: ({}) })
     );
     await inChatTurn(world, () => messageReceivedHandler({ runtime, message, callback }), 'builder-1');
     expect(callback.mock.calls.map(([content]) => content.text)).toEqual(["Sorry, I can't help with that."]);
@@ -234,16 +276,15 @@ describe('messageReceivedHandler answers when an action stops the turn before an
       entities: { items: new Map([['box', box]]), player: { data: { id: 'coo', name: 'Coo' } } },
     });
     installWorldChat(world);
-    const service: any = connectedService(world, { getBuildManager: () => new BuildManager({} as never), getEntityName: () => 'Coo' });
+    // The session's own managers: the real build manager, and the real message manager, which
+    // posts to the world (and records that the turn delivered something)
+    const service = connectedService(world);
     const plan = [{ success: true, operation: 'translate', target: 'box', parameters: { position: [0, 2, 0] }, description: 'Moved the box up' }];
     const { runtime, message, callback } = realTurn(
       '<response><thought>t</thought><actions>HYPERFY_EDIT_ENTITY</actions></response>',
       { [ModelType.OBJECT_LARGE]: { operations: plan }, [ModelType.TEXT_SMALL]: budgetError },
       service
     );
-    // The real message manager posts to the world (and records that the turn delivered something)
-    const messageManager = new MessageManager(runtime as never);
-    service.getMessageManager = () => messageManager;
     await inChatTurn(world, () => messageReceivedHandler({ runtime, message, callback }), 'builder-1');
     expect(sent.filter(([name]) => name === 'chatAdded').map(([, msg]) => msg.body)).toEqual(['Moved the box up', 'I made the change.']);
     expect(sent).toContainEqual(['entityModified', expect.objectContaining({ id: 'box', position: [0, 2, 0] })]);
@@ -284,18 +325,15 @@ describe('messageReceivedHandler counts what actually reached the world', () => 
       entities: { player: { data: { id: 'coo', name: 'Coo' } }, items: new Map() },
     };
     installWorldChat(world);
-    const service: any = connectedService(world, {
-      getEntityName: () => 'Coo',
-      currentWorldId: crypto.randomUUID(),
-      getEmoteManager: () => ({ playEmote: vi.fn() }),
-      getVoiceManager: () => null,
-    });
-    const { runtime } = createRuntime({ service, models: { [ModelType.TEXT_LARGE]: plan, ...models } });
+    // A real session around that world and the real runtime: its own message manager, and the one
+    // delivery path (no speech here: nothing is configured to synthesize it)
+    let session: ConnectionSession | null = null;
+    const { runtime } = createRuntime({ service: serviceFor(() => session), models: { [ModelType.TEXT_LARGE]: plan, ...models } });
     vi.spyOn(runtime, 'ensureConnection').mockResolvedValue(undefined);
     vi.spyOn(runtime, 'getEntityById').mockResolvedValue({ id: crypto.randomUUID() } as never);
     for (const handler of hyperfyEvents[hyperfyEventType.MESSAGE_RECEIVED]) runtime.registerEvent(hyperfyEventType.MESSAGE_RECEIVED, handler as never);
-    const manager = new MessageManager(runtime as never);
-    service.getMessageManager = () => manager;
+    session = withParts(sessionFor(world, { runtime }), { emotes: { playEmote: vi.fn(), hasEmote: () => false } });
+    const manager = session.messages;
     const say = (body: string) => manager.handleMessage({ id: crypto.randomUUID(), fromId: 'p1', from: 'Alice', body });
     return { posted, say };
   }

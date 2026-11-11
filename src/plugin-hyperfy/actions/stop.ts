@@ -6,7 +6,7 @@ import {
     type State,
     logger
 } from '@elizaos/core';
-import { HyperfyService } from '../service';
+import { actingSession, connectedSession } from '../service';
 import { AgentControls } from '../systems/controls'; // Import AgentControls type
 import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
 
@@ -17,11 +17,7 @@ export const hyperfyStopMovingAction: Action = {
     similes: ['STOP', 'HALT', 'STOP_WALKING', 'CANCEL_MOVEMENT', 'STOP_PATROLLING'],
     description: 'Instantly stops your current walking or pathing; use to pause movement before speaking or performing another action.',
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
-      const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-      const controls = service?.getWorld()?.controls as AgentControls | undefined;
-      // Valid only if connected and controls are available
-      // Optional: Could check if getIsNavigating() or getIsPatrolling() is true
-      return !!service && service.isConnected() && !!controls;
+      return !!connectedSession(runtime)?.world?.controls;
     },
     handler: async (
       runtime: IAgentRuntime,
@@ -30,8 +26,9 @@ export const hyperfyStopMovingAction: Action = {
       options: { reason?: string }, // Optional reason for stopping
       callback: HandlerCallback
     ) => {
-      const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-      const controls = service?.getWorld()?.controls as AgentControls | undefined;
+      // The turn's own connection (never a newer one); throws when the turn may no longer act.
+      // Stopping waits for nobody: it ends whatever walk is in progress, whoever started it.
+      const controls = actingSession(runtime)?.world?.controls as AgentControls | undefined;
 
       if (!controls) {
         // Should not happen if validate works, but good practice

@@ -111,8 +111,9 @@ describe('action status recorded by core for every Hyperfy action', () => {
     const node = addActionNode(world, 'crate');
     const goto = vi.spyOn(world.controls, 'goto').mockResolvedValue(undefined);
     vi.spyOn(world.controls, 'startRandomWalk').mockResolvedValue(undefined);
+    const service = connectedService(world);
     const { runtime, recorded } = createRuntime({
-      service: connectedService(world),
+      service,
       models: {
         [ModelType.OBJECT_LARGE]: { navigationType: 'position', parameter: { position: { x: 5, z: -3 } } },
         [ModelType.OBJECT_SMALL]: { entityId: 'crate' },
@@ -126,8 +127,10 @@ describe('action status recorded by core for every Hyperfy action', () => {
     expect(node._onTrigger).toHaveBeenCalledWith({ playerId: 'agent' });
     expect((await run(runtime, recorded, 'HYPERFY_UNUSE_ITEM')).actionStatus).toBe('completed');
     expect(world.entities.player.teleport).toHaveBeenCalledWith(expect.objectContaining({ position: expect.objectContaining({ x: 3, z: 4 }) }));
-    expect(goto).toHaveBeenCalledWith(5, -3);
-    expect(goto).toHaveBeenCalledWith(1, 2);
+    // Each walk is handed the signal it stops with (outside a turn: the session's)
+    const signal = service.session.signal;
+    expect(goto).toHaveBeenCalledWith(5, -3, { signal });
+    expect(goto).toHaveBeenCalledWith(1, 2, { signal });
     expect(recorded.callbacks.map((c) => c.text)).toEqual(expect.arrayContaining(['Teleporting to you!', 'Using item: crate', 'Item released.']));
   });
 
@@ -245,7 +248,7 @@ describe('action status recorded by core for every Hyperfy action', () => {
     const messageManager = { sendMessage: vi.fn() };
     const world = worldWithBuilder({ controls: {} });
     const { runtime, recorded } = createRuntime({
-      service: connectedService(world, { getBuildManager: () => buildManager, getMessageManager: () => messageManager }),
+      service: connectedService(world, { build: buildManager, messages: messageManager }),
       models: {
         [ModelType.OBJECT_LARGE]: {
           operations: [{ success: true, operation: 'translate', target: 'box', parameters: { position: [0, 2, 0] }, description: 'Moved the box up' }],
@@ -271,7 +274,7 @@ describe('action status recorded by core for every Hyperfy action', () => {
     const summary = '<response><thought>t</thought><text>Summary</text></response>';
     const world = worldWithBuilder({ controls: {} });
     const editService = (buildManager: Record<string, unknown>) =>
-      connectedService(world, { getBuildManager: () => buildManager, getMessageManager: () => ({ sendMessage: vi.fn() }) });
+      connectedService(world, { build: buildManager, messages: ({ sendMessage: vi.fn() }) });
     const refused = { success: false, operation: 'delete', requestedEntityName: 'stone throne', reason: 'not found' };
     const move = { success: true, operation: 'translate', target: 'box', parameters: { position: [0, 2, 0] }, description: 'Moved' };
 
@@ -326,7 +329,7 @@ describe('action status recorded by core for every Hyperfy action', () => {
   it('records a scene edit with no usable plan from the model as failed', async () => {
     const world = worldWithBuilder({ controls: {} });
     const { runtime, recorded } = createRuntime({
-      service: connectedService(world, { getBuildManager: () => ({}), getMessageManager: () => ({}) }),
+      service: connectedService(world, { build: ({}), messages: ({}) }),
       models: { [ModelType.OBJECT_LARGE]: { nothing: true } },
     });
     const stored = await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_EDIT_ENTITY'));

@@ -20,9 +20,9 @@ interface EnvironmentConfig {
   sunDirection?: THREE.Vector3
   sunIntensity?: number
   sunColor?: string | number
-  fogNear?: number
-  fogFar?: number
-  fogColor?: string
+  fogNear?: number | null
+  fogFar?: number | null
+  fogColor?: string | null
   model?: string
 }
 
@@ -256,11 +256,8 @@ export class AgentEnvironment extends System {
     } else {
       this.csm = new CSM({
         mode: 'practical',
-        cascades: 3,
         maxCascades: 3,
-        shadowMapSize: 2048,
         maxFar: 100,
-        lightIntensity: 1,
         lightDirection: new THREE.Vector3(0, -1, 0).normalize(),
         fade: true,
         parent: this.world.stage.scene,

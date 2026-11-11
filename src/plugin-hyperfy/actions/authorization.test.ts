@@ -3,12 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
 import { hyperfyPlugin } from '../index';
 import { SHARE_ACTION, createOpenPayStorePlugin } from '../../openpay-store';
-import { AUTONOMY_ACTIONS } from '../lib/authorization';
+import { AUTONOMY_ACTIONS, guardActions } from '../lib/authorization';
+import { actionSucceeded } from '../lib/action-result';
+import { TurnCancelled } from '../lib/turn-context';
 import { AiBudgetExceededError } from '../../usage-budget';
 import { AnthropicRefusalError } from '../../anthropic-models';
 import { hyperfyEditEntityAction } from './build';
-import { BuildManager } from '../managers/build-manager';
 import { connectedService, createRuntime, run, runPlan } from '../test-support/core-runtime';
+import { sessionFor, withParts } from '../test-support/session';
 import { cooWorldSnapshot, upstreamSnapshot } from '../test-support/world-packets';
 import { inAutonomousTurn, inChatTurn, inTurn, worldFromSnapshot } from '../test-support/turns';
 
@@ -36,7 +38,7 @@ function editSetup(world: Record<string, unknown> = coo(), models: Record<string
   const buildManager = { translate: vi.fn().mockResolvedValue({ outcome: 'applied' }), delete: vi.fn(), importEntity: vi.fn() };
   const sendMessage = vi.fn();
   const { runtime, recorded, useModel } = createRuntime({
-    service: connectedService(world, { getBuildManager: () => buildManager, getMessageManager: () => ({ sendMessage }) }),
+    service: connectedService(world, { build: buildManager, messages: { sendMessage } }),
     models,
   });
   return { world, buildManager, sendMessage, runtime, recorded, useModel };
@@ -177,6 +179,37 @@ describe('the action allow-list on autonomous turns', () => {
   });
 });
 
+describe('in a turn that may no longer act', () => {
+  it('starts no further action: the plan ends there, through real core processActions', async () => {
+    const ran: string[] = [];
+    const slot = new AbortController();
+    const probe = (name: string, after: () => void = () => {}) => ({
+      name,
+      description: name,
+      validate: async () => true,
+      handler: async () => {
+        ran.push(name);
+        after();
+        return actionSucceeded(name);
+      },
+    });
+    // The first action is the one during which the turn's slot runs out
+    const actions = guardActions([probe('PROBE_FIRST', () => slot.abort()), probe('PROBE_SECOND'), probe('PROBE_THIRD')]);
+    const { runtime, recorded } = createRuntime({ actions });
+    const plan = ['PROBE_FIRST', 'PROBE_SECOND', 'PROBE_THIRD'];
+    const cancelled = inTurn({ origin: 'chat', world: coo(), requesterId: 'builder-1', cancel: slot.signal }, () => runPlan(runtime, recorded, plan));
+    await expect(cancelled).rejects.toBeInstanceOf(TurnCancelled);
+    expect(ran).toEqual(['PROBE_FIRST']);
+
+    // The same plan in a turn nothing cancels runs to its end (control)
+    ran.length = 0;
+    const live = guardActions([probe('PROBE_FIRST'), probe('PROBE_SECOND'), probe('PROBE_THIRD')]);
+    const second = createRuntime({ actions: live });
+    await inTurn({ origin: 'chat', world: coo(), requesterId: 'builder-1' }, () => runPlan(second.runtime, second.recorded, plan));
+    expect(ran).toEqual(plan);
+  });
+});
+
 describe('outside any turn', () => {
   it('the wrapper refuses the scene edit before its handler runs', async () => {
     const { buildManager, runtime, recorded, useModel } = editSetup();
@@ -270,21 +303,22 @@ describe('a scene edit that loses its authorization while it runs', () => {
 
   function liveEdit(operations: unknown[], models: Record<string, unknown>) {
     const first = worldWith(1);
-    const connection = { world: first.world as object, generation: 0 };
     const sendMessage = vi.fn();
-    const service = {
-      isConnected: () => true,
-      getWorld: () => connection.world,
-      getConnectionGeneration: () => connection.generation,
-      getBuildManager: () => new BuildManager({} as never),
-      getMessageManager: () => ({ sendMessage }),
+    // Real sessions: the one the edit's turn starts on, and whatever replaces it
+    const connection = { session: withParts(sessionFor(first.world), { messages: { sendMessage } }) };
+    const service = { getSession: () => connection.session };
+    /** What a reconnect does: the current session ends, and a new one (around `world`) is the current one */
+    const reconnect = (world: object) => {
+      void connection.session.end();
+      connection.session = withParts(sessionFor(world), { messages: { sendMessage } });
     };
     const { runtime, recorded, useModel } = createRuntime({
       service,
       models: { [ModelType.OBJECT_LARGE]: { operations }, [ModelType.TEXT_SMALL]: summary, ...models },
     });
-    const edit = () => inChatTurn(first.world, () => run(runtime, recorded, 'HYPERFY_EDIT_ENTITY'), 'builder-1');
-    return { first, connection, sendMessage, recorded, useModel, edit, runtime };
+    const turnSession = connection.session;
+    const edit = () => turnSession.runTurn({ origin: 'chat', requesterId: 'builder-1' }, () => run(runtime, recorded, 'HYPERFY_EDIT_ENTITY'));
+    return { first, connection, reconnect, sendMessage, recorded, useModel, edit, runtime };
   }
 
   it('edits the world and announces it when nothing changed (control)', async () => {
@@ -294,18 +328,22 @@ describe('a scene edit that loses its authorization while it runs', () => {
     expect(sendMessage).toHaveBeenCalledWith('Moved the box up');
   });
 
-  it('sends nothing to a new connection when the world was replaced during the planner call', async () => {
-    const second = worldWith(0);
+  it.each([
+    ['a new world object', () => worldWith(0)],
+    ['the same world object under a new session', (ctx: ReturnType<typeof liveEdit>) => ctx.first],
+  ])('sends nothing to a new connection when the connection was replaced during the planner call (%s)', async (_what, next) => {
+    let second!: ReturnType<typeof worldWith>;
     const ctx = liveEdit(plan, {
       [ModelType.OBJECT_LARGE]: () => {
-        // Reconnected meanwhile; on the new connection the requester is a visitor
-        Object.assign(ctx.connection, { world: second.world, generation: 1 });
+        // Reconnected meanwhile (on a new world object the requester is a visitor)
+        second = next(ctx);
+        ctx.reconnect(second.world);
         return { operations: plan };
       },
     });
     const stored = await ctx.edit();
     expect(stored.actionStatus).toBe('failed');
-    expect(stored.actionResult.error).toBe('stopped: the connection to the world changed');
+    expect(stored.actionResult.error).toBe('stopped: the turn was cancelled or its connection ended');
     expect(second.send).not.toHaveBeenCalled();
     expect(ctx.first.send).not.toHaveBeenCalled();
     expect(second.box.root.position.toArray()).toEqual([1, 0, 1]);
@@ -351,7 +389,7 @@ describe('a scene edit that loses its authorization while it runs', () => {
     const error = new AiBudgetExceededError('AI_MAX_CALLS_PER_HOUR=2');
     const ctx = liveEdit(plan, {
       [ModelType.TEXT_SMALL]: () => {
-        Object.assign(ctx.connection, { world: worldWith(1).world, generation: 1 });
+        ctx.reconnect(worldWith(1).world);
         throw error;
       },
     });
@@ -638,7 +676,7 @@ describe('budget errors and model refusals at the other model calls in actions',
     const error = new AnthropicRefusalError('claude', 'cyber');
     const world = { controls: { stopAllActions: vi.fn() }, entities: { items: new Map(), player: { data: { id: 'coo' } } } };
     const { runtime, recorded } = createRuntime({
-      service: connectedService(world, { getPuppeteerManager: () => ({ snapshotEquirectangular: async () => 'aGVsbG8=' }) }),
+      service: connectedService(world, { renderPage: { capture: async () => 'aGVsbG8=' } }),
       models: {
         [ModelType.IMAGE_DESCRIPTION]: () => {
           throw error;
@@ -665,7 +703,7 @@ describe('budget errors and model refusals at the other model calls in actions',
     const error = new AiBudgetExceededError('AI_MAX_CALLS_PER_HOUR=1');
     const world = { controls: { stopAllActions: vi.fn() }, entities: { items: new Map(), player: { data: { id: 'coo' } } } };
     const { runtime, recorded } = createRuntime({
-      service: connectedService(world, { getPuppeteerManager: () => ({ snapshotEquirectangular: async () => 'aGVsbG8=' }) }),
+      service: connectedService(world, { renderPage: { capture: async () => 'aGVsbG8=' } }),
       models: {
         [ModelType.IMAGE_DESCRIPTION]: () => {
           throw error;
@@ -730,11 +768,11 @@ describe('failures the requester is told about', () => {
     const world = { controls: { stopAllActions: vi.fn() }, entities: { items: new Map(), player: { data: { id: 'coo' } } } };
     const { runtime, recorded } = createRuntime({
       service: connectedService(world, {
-        getPuppeteerManager: () => ({
-          snapshotEquirectangular: async () => {
+        renderPage: {
+          capture: async () => {
             throw new Error('page closed');
           },
-        }),
+        },
       }),
     });
     const stored = await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_SCENE_PERCEPTION', { message: { content: { text: 'look around', source: 'hyperfy' } } }));

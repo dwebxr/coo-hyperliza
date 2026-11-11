@@ -1,7 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../service', () => ({ HyperfyService: { serviceType: 'hyperfy' } }));
-vi.mock('../events', () => ({ hyperfyEventType: { VOICE_MESSAGE_RECEIVED: 'HYPERFY_VOICE_MESSAGE_RECEIVED' } }));
 // The native client is never loaded here: a room that connects and takes frames
 vi.mock('@livekit/rtc-node', () => ({
   Room: class {},
@@ -15,10 +13,12 @@ vi.mock('@livekit/rtc-node', () => ({
   AudioStream: class {},
 }));
 
-import { MAX_CONCURRENT_TRANSCRIPTIONS, MAX_HELD_VOICE_BYTES, MAX_SPEAKERS, MAX_SPOKEN_CODE_POINTS, MAX_UTTERANCE_BYTES, UTTERANCE_PAUSE_MS, VoiceManager, spokenPart } from './voice-manager';
+import { MAX_CONCURRENT_TRANSCRIPTIONS, MAX_HELD_VOICE_BYTES, MAX_SPEAKERS, MAX_SPOKEN_CODE_POINTS, MAX_UTTERANCE_BYTES, UTTERANCE_PAUSE_MS, spokenPart } from './voice-manager';
+import { installWorldChat } from '../lib/world-chat';
+import { sessionFor, sessionRuntime, withParts } from '../test-support/session';
 import { Events } from '../hyperfy/src/core/systems/Events.js';
 import { UsageBudget, resetUsageBudget } from '../../usage-budget';
-import { currentTurn, neverAbortedSignal, runTurn, turnDelivered } from '../lib/turn-context';
+import { currentTurn, turnDelivered } from '../lib/turn-context';
 import { AgentLiveKit } from '../systems/liveKit';
 
 const PLAYED = { played: 'all' } as const;
@@ -27,8 +27,8 @@ function setup(publishAudioStream: (...args: any[]) => Promise<unknown>) {
   const player = { setSpeaking: vi.fn() };
   const livekit = { publishAudioStream: vi.fn(publishAudioStream), on: vi.fn(), off: vi.fn() };
   const world = { livekit, entities: { player } };
-  const runtime: any = { getService: () => ({ getWorld: () => world }) };
-  return { manager: new VoiceManager(runtime), livekit, player };
+  const session = sessionFor(world);
+  return { manager: session.voice, session, livekit, player };
 }
 
 const audio = (label: string) => Buffer.from(label);
@@ -129,6 +129,42 @@ describe('VoiceManager playback queue', () => {
   });
 });
 
+describe('VoiceManager.speak and the turn it speaks for', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('does not play an utterance whose turn was cancelled while it waited behind another one, and lets the one playing finish', async () => {
+    const utils = await import('../utils');
+    vi.spyOn(utils, 'generateSpeech').mockImplementation(async (text: string) => Buffer.from(text));
+    let finishFirst!: () => void;
+    const { manager, session, livekit } = setup((buf: Buffer) => (buf.toString() === 'First reply' ? new Promise<unknown>((resolve) => (finishFirst = () => resolve(PLAYED))) : Promise.resolve(PLAYED)));
+    const slot = new AbortController();
+    const first = session.runTurn({ origin: 'chat', requesterId: 'p1' }, () => manager.speak('First reply'));
+    await vi.waitFor(() => expect(livekit.publishAudioStream).toHaveBeenCalledTimes(1));
+    // The second turn's reply is synthesized and waits for the first to finish playing
+    const second = session.runTurn({ origin: 'chat', requesterId: 'p2', cancel: slot.signal }, () => manager.speak('Second reply'));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    slot.abort();
+    finishFirst();
+    expect(await first).toBe('all');
+    expect(await second).toBe('none');
+    expect(livekit.publishAudioStream.mock.calls.map(([buf]) => buf.toString())).toEqual(['First reply']);
+    // The queue is not stuck: the next live utterance plays
+    expect(await session.runTurn({ origin: 'chat', requesterId: 'p3' }, () => manager.speak('Third reply'))).toBe('all');
+  });
+
+  it('does not play an utterance whose turn was cancelled while it was being synthesized', async () => {
+    const utils = await import('../utils');
+    const slot = new AbortController();
+    vi.spyOn(utils, 'generateSpeech').mockImplementation(async (text: string) => {
+      slot.abort();
+      return Buffer.from(text);
+    });
+    const { manager, session, livekit } = setup(async () => PLAYED);
+    expect(await session.runTurn({ origin: 'voice', requesterId: 'p1', cancel: slot.signal }, () => manager.speak('Too late'))).toBe('none');
+    expect(livekit.publishAudioStream).not.toHaveBeenCalled();
+  });
+});
+
 describe('VoiceManager.speak', () => {
   it('discards speech synthesized after stop()', async () => {
     const utils = await import('../utils');
@@ -181,12 +217,12 @@ function listening({
   };
   const sendMessage = vi.fn();
   const useModel = vi.fn((_type: string, wav: Buffer) => transcribe(wav));
-  const runtime: any = {
-    getService: () => ({ getWorld: () => world, getConnectionGeneration: () => 4, getMessageManager: () => ({ sendMessage }) }),
+  const runtime: any = sessionRuntime({
     getModel: vi.fn(() => (hasModel ? () => '' : undefined)),
     useModel,
-  };
-  const manager = new VoiceManager(runtime);
+  });
+  const session = withParts(sessionFor(world, { runtime }), { messages: { sendMessage } });
+  const manager = session.voice;
   const heard: { text: string; speaker: string; turn: any }[] = [];
   (manager as any).handleMessage = vi.fn(async (text: string, speaker: string) => void heard.push({ text, speaker, turn: currentTurn() }));
   manager.start();
@@ -195,7 +231,7 @@ function listening({
   const state = () => ({ speakers: (manager as any).speakers.size, transcribing: (manager as any).transcribing.size, held: (manager as any).heldVoiceBytes });
   /** PCM seconds in each transcription request so far */
   const requests = () => useModel.mock.calls.map(([, wav]) => (wav.length - 44) / 96_000);
-  return { manager, budget, runtime, useModel, emit, say, state, requests, heard, sendMessage, world, leave, events };
+  return { manager, session, budget, runtime, useModel, emit, say, state, requests, heard, sendMessage, world, leave, events };
 }
 
 describe('VoiceManager voice input', () => {
@@ -210,7 +246,7 @@ describe('VoiceManager voice input', () => {
   });
 
   it("transcribes a speaker's utterance once, after 1.5 s of silence, as a voice turn for that player", async () => {
-    const { say, useModel, heard, requests } = listening();
+    const { say, session, useModel, heard, requests } = listening();
     say('p1', loud(100));
     say('p1', quiet(100));
     say('p1', loud(200));
@@ -223,7 +259,7 @@ describe('VoiceManager voice input', () => {
     expect(requests()).toEqual([0.3]);
     expect(useModel.mock.calls[0][1].subarray(0, 4).toString()).toBe('RIFF');
     expect(heard).toHaveLength(1);
-    expect(heard[0]).toMatchObject({ text: 'hello there', speaker: 'p1', turn: { origin: 'voice', requesterId: 'p1', generation: 4 } });
+    expect(heard[0]).toMatchObject({ text: 'hello there', speaker: 'p1', turn: { origin: 'voice', requesterId: 'p1', generation: session.generation, live: true } });
   });
 
   it('transcribes two people who speak at the same time, each on their own', async () => {
@@ -307,6 +343,29 @@ describe('VoiceManager voice input', () => {
     finish('hello there');
     await vi.advanceTimersByTimeAsync(0);
     expect(heard).toEqual([]);
+  });
+
+  it('starts no turn for a transcript whose speaker left the world while it waited its turn; one who stayed gets theirs', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const { manager, session, runtime, say, leave } = listening();
+    // The real turn handling, up to the event the message handler would take over
+    delete (manager as any).handleMessage;
+    runtime.ensureConnection = vi.fn().mockResolvedValue(undefined);
+    runtime.emitEvent = vi.fn().mockResolvedValue(undefined);
+    // A chat turn in progress: what was said meanwhile waits behind it
+    let finishChat!: () => void;
+    (session.messages as any).handleMessage = () => new Promise<void>((resolve) => (finishChat = resolve));
+    session.conversation.accept({ id: 'c1', body: 'hello', fromId: 'p9', from: 'P9', createdAt: '' });
+    say('p1', loud(300));
+    say('p2', loud(300));
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS);
+    expect(session.conversation.waiting).toBe(2);
+    leave('p1');
+    finishChat();
+    await vi.advanceTimersByTimeAsync(0);
+    await session.conversation.idle();
+    const answered = runtime.emitEvent.mock.calls.map(([, payload]: [string, any]) => payload.message.content.metadata.hyperfyFromId);
+    expect(answered).toEqual(['p2']);
   });
 
   it('does not transcribe a voice that is not a player in the world', async () => {
@@ -524,7 +583,8 @@ describe('VoiceManager voice input', () => {
       await new Promise((resolve) => setImmediate(resolve));
       expect(unhandled).not.toHaveBeenCalled();
       expect(error.mock.calls.flat().map(String).join('\n')).toContain('speech-to-text is down');
-      expect(error.mock.calls.flat().map(String).join('\n')).toContain('turn failed');
+      // The failing turn is the conversation queue's to report (lib/chat-intake.ts)
+      expect(warn.mock.calls.flat().map(String).join('\n')).toContain('turn failed');
     } finally {
       process.off('unhandledRejection', unhandled);
     }
@@ -568,7 +628,7 @@ describe('VoiceManager.speak and links', () => {
   it('never reads URLs aloud and skips text that is only a link', async () => {
     const utils = await import('../utils');
     const tts = vi.spyOn(utils, 'generateSpeech').mockResolvedValue(null);
-    const manager = new VoiceManager({ getService: () => ({ getWorld: () => null }) } as any);
+    const manager = sessionFor({}).voice;
     await manager.speak('Here you go https://open-pay.jp/ja/@a?product=x');
     expect(tts).toHaveBeenCalledWith('Here you go');
     tts.mockClear();
@@ -580,30 +640,19 @@ describe('VoiceManager.speak and links', () => {
 
 describe('VoiceManager shop links', () => {
   it('posts a shop link from a voice turn to chat (voice replies are otherwise only spoken) without speaking it', async () => {
-    let callback: any;
-    const sendMessage = vi.fn();
+    const sendMessage = vi.fn().mockResolvedValue(true);
     const world = { entities: { getPlayer: () => ({ data: { name: 'Alice' } }), items: new Map() } };
-    const service = {
-      getWorld: () => world,
-      getConnectionGeneration: () => 0,
-      currentWorldId: 'w1',
-      getEmoteManager: () => ({ playEmote: vi.fn() }),
-      getMessageManager: () => ({ sendMessage }),
-    };
-    const runtime: any = {
-      agentId: 'agent',
-      character: { name: 'Coo' },
-      getService: () => service,
+    const link = '🛒 HoverBoard — 505 JPYC\nhttps://open-pay.jp/ja/@a?product=x';
+    const runtime: any = sessionRuntime({
       ensureConnection: vi.fn(),
       createMemory: vi.fn(),
-      emitEvent: vi.fn(async (_e: string, payload: any) => { callback = payload.callback; }),
-    };
-    const manager = new VoiceManager(runtime);
-    const speak = vi.spyOn(manager, 'speak');
-    await (manager as any).handleMessage('HoverBoardのリンクちょうだい', 'p1');
-    const link = '🛒 HoverBoard — 505 JPYC\nhttps://open-pay.jp/ja/@a?product=x';
-    await callback({ text: link, metadata: { openpayLink: true } });
-    expect(sendMessage).toHaveBeenCalledWith(link);
+      // The message handler's part: it answers through the callback while the turn runs
+      emitEvent: vi.fn(async (_e: string, payload: any) => void (await payload.callback({ text: link, metadata: { openpayLink: true } }))),
+    });
+    const session = withParts(sessionFor(world, { runtime }), { emotes: { playEmote: vi.fn() }, messages: { sendMessage } });
+    const speak = vi.spyOn(session.voice, 'speak');
+    await session.runTurn({ origin: 'voice', requesterId: 'p1' }, () => (session.voice as any).handleMessage('HoverBoardのリンクちょうだい', 'p1'));
+    expect(sendMessage.mock.calls).toEqual([[link]]);
     expect(speak).not.toHaveBeenCalled();
   });
 });
@@ -714,9 +763,8 @@ describe('VoiceManager delivery', () => {
     vi.spyOn(utils, 'generateSpeech').mockResolvedValue(Buffer.from('audio'));
     vi.spyOn(console, 'error').mockImplementation(() => {});
     vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const { manager } = setup(publish);
-    const turn = { origin: 'voice' as const, requesterId: 'p1', world: {}, generation: 0, signal: neverAbortedSignal() };
-    const result = await runTurn(turn, async () => [await manager.speak('Hello there'), turnDelivered(currentTurn())]);
+    const { manager, session } = setup(publish);
+    const result = await session.runTurn({ origin: 'voice', requesterId: 'p1' }, async () => [await manager.speak('Hello there'), turnDelivered(currentTurn())]);
     expect(result).toEqual([played, played !== 'none']);
   });
 
@@ -726,12 +774,11 @@ describe('VoiceManager delivery', () => {
       const utils = await import('../utils');
       vi.spyOn(utils, 'generateSpeech').mockResolvedValue(Buffer.from('audio'));
       vi.spyOn(console, 'warn').mockImplementation(() => {});
-      const { manager } = setup((_buf: Buffer, { progress }: { progress: { frames: number } }) => {
+      const { manager, session } = setup((_buf: Buffer, { progress }: { progress: { frames: number } }) => {
         progress.frames = 2;
         return new Promise(() => {});
       });
-      const turn = { origin: 'voice' as const, requesterId: 'p1', world: {}, generation: 0, signal: neverAbortedSignal() };
-      const result = runTurn(turn, async () => [await manager.speak('Hello there'), turnDelivered(currentTurn())]);
+      const result = session.runTurn({ origin: 'voice', requesterId: 'p1' }, async () => [await manager.speak('Hello there'), turnDelivered(currentTurn())]);
       await vi.advanceTimersByTimeAsync(120_000);
       expect(await result).toEqual(['partial', true]);
     } finally {
@@ -743,113 +790,152 @@ describe('VoiceManager delivery', () => {
 it('does not count an utterance that could not be played because the world has no voice room', async () => {
   const utils = await import('../utils');
   vi.spyOn(utils, 'generateSpeech').mockResolvedValue(Buffer.from('audio'));
-  const manager = new VoiceManager({ getService: () => ({ getWorld: () => ({ entities: {} }) }) } as any);
-  const turn = { origin: 'voice' as const, requesterId: 'p1', world: {}, generation: 0, signal: neverAbortedSignal() };
-  const result = await runTurn(turn, async () => [await manager.speak('Hello there'), turnDelivered(currentTurn())]);
+  const session = sessionFor({ entities: {} });
+  const result = await session.runTurn({ origin: 'voice', requesterId: 'p1' }, async () => [await session.voice.speak('Hello there'), turnDelivered(currentTurn())]);
   expect(result).toEqual(['none', false]);
   vi.restoreAllMocks();
 });
 
-describe('VoiceManager voice replies (the callback a voice turn answers through)', () => {
+describe('VoiceManager voice replies (a voice turn answered through the one delivery path)', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  /** handleMessage with a real AgentLiveKit (no room unless `room`), on connection `generation` of `service` */
-  async function voiceTurn({ livekit = new AgentLiveKit({}) as any } = {}) {
-    let callback: any;
-    const sendMessage = vi.fn();
+  /**
+   * A voice turn of player p1 with the real session, the real message manager posting into the
+   * real world chat, and a real AgentLiveKit (no room unless `livekit` is given). The message
+   * handler's part is `answer`: it replies through the callback while the turn runs.
+   */
+  async function voiceTurn({ livekit = new AgentLiveKit({}) as any, reply = { text: 'Hi Alice' } as Record<string, unknown> } = {}) {
+    const sent: [string, any][] = [];
     const playEmote = vi.fn();
-    const world = { livekit, entities: { getPlayer: () => ({ data: { name: 'Alice' } }), items: new Map(), player: { setSpeaking: vi.fn() } } };
-    const connection = { world: world as object, generation: 3 };
-    const service = {
-      getWorld: () => connection.world,
-      getConnectionGeneration: () => connection.generation,
-      currentWorldId: 'w1',
-      getEmoteManager: () => ({ playEmote }),
-      getMessageManager: () => ({ sendMessage }),
+    const world: any = {
+      livekit,
+      chat: { msgs: [], listeners: new Set(), add: vi.fn() },
+      events: { emit: vi.fn() },
+      network: { send: (name: string, data: unknown) => sent.push([name, data]) },
+      entities: { getPlayer: () => ({ data: { name: 'Alice' } }), items: new Map(), player: { data: { id: 'coo', name: 'Coo' }, setSpeaking: vi.fn() } },
     };
-    const runtime: any = {
-      agentId: 'agent',
-      character: { name: 'Coo' },
-      getService: () => service,
+    installWorldChat(world);
+    const outcome: { delivered?: boolean } = {};
+    const runtime: any = sessionRuntime({
       ensureConnection: vi.fn(),
       createMemory: vi.fn(async () => {}),
       emitEvent: vi.fn(async (_e: string, payload: any) => {
-        callback = payload.callback;
+        await payload.callback(reply);
+        outcome.delivered = turnDelivered(currentTurn());
       }),
-    };
-    const manager = new VoiceManager(runtime);
-    const turn = { origin: 'voice' as const, requesterId: 'p1', world, generation: 3, signal: neverAbortedSignal() };
-    await runTurn(turn, () => (manager as any).handleMessage('hello there', 'p1'));
-    const reply = (text: string) => runTurn(turn, async () => [await callback({ text }), turnDelivered(currentTurn())]);
-    return { manager, runtime, connection, sendMessage, playEmote, reply };
+    });
+    const session = withParts(sessionFor(world, { runtime }), { emotes: { playEmote, stop: vi.fn() } });
+    const run = () => session.runTurn({ origin: 'voice', requesterId: 'p1' }, () => (session.voice as any).handleMessage('hello there', 'p1'));
+    const posted = () => sent.filter(([name]) => name === 'chatAdded').map(([, msg]) => msg.body);
+    return { session, world, runtime, playEmote, run, posted, outcome };
   }
 
-  it("posts the reply as text when LiveKit played nothing (no room), and does not count it as spoken", async () => {
+  it('posts the reply as text, once, when LiveKit played nothing (no room)', async () => {
     const utils = await import('../utils');
     vi.spyOn(utils, 'generateSpeech').mockResolvedValue(Buffer.from('audio'));
-    vi.spyOn(console, 'log').mockImplementation(() => {});
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
-    vi.spyOn(console, 'info').mockImplementation(() => {});
-    const { sendMessage, reply } = await voiceTurn();
-    const [, delivered] = await reply('Hi Alice');
-    expect(sendMessage).toHaveBeenCalledWith('Hi Alice');
-    // Delivered as text (message-manager counts that one), not as speech
-    expect(delivered).toBe(false);
+    for (const method of ['log', 'warn', 'info'] as const) vi.spyOn(console, method).mockImplementation(() => {});
+    const { run, posted, runtime, playEmote } = await voiceTurn();
+    await run();
+    expect(posted()).toEqual(['Hi Alice']);
+    expect(playEmote).toHaveBeenCalledWith('TALK');
+    // Remembered as a voice reply to what was said
+    expect(runtime.createMemory).toHaveBeenCalledTimes(1);
+    expect(runtime.createMemory.mock.calls[0][0].content).toMatchObject({ text: 'Hi Alice', isVoiceMessage: true, name: 'Coo', inReplyTo: expect.any(String) });
   });
 
-  it('posts the whole reply as text when only part of it was spoken before the playback failed, and counts it delivered', async () => {
+  it('posts the whole reply as text, once, when only part of it was spoken before the playback failed', async () => {
     const utils = await import('../utils');
     vi.spyOn(utils, 'generateSpeech').mockResolvedValue(Buffer.from('audio'));
-    vi.spyOn(console, 'info').mockImplementation(() => {});
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    for (const method of ['warn', 'info'] as const) vi.spyOn(console, method).mockImplementation(() => {});
     const publishAudioStream = vi.fn(async (_buf: Buffer, { progress }: { progress: { frames: number } }) => {
       progress.frames = 1;
       throw new Error('capture failed');
     });
-    const { sendMessage, reply } = await voiceTurn({ livekit: { publishAudioStream } });
-    const [, delivered] = await reply('Hi Alice');
-    expect(sendMessage).toHaveBeenCalledWith('Hi Alice');
-    expect(delivered).toBe(true);
+    const { run, posted, outcome } = await voiceTurn({ livekit: { publishAudioStream } });
+    await run();
+    expect(posted()).toEqual(['Hi Alice']);
+    expect(outcome.delivered).toBe(true);
   });
 
-  it('does not post the reply as text when it was played', async () => {
+  it('posts the whole reply as text, once, when the playback timed out after some of it went out', async () => {
+    vi.useFakeTimers();
+    try {
+      const utils = await import('../utils');
+      vi.spyOn(utils, 'generateSpeech').mockResolvedValue(Buffer.from('audio'));
+      for (const method of ['warn', 'info'] as const) vi.spyOn(console, method).mockImplementation(() => {});
+      const publishAudioStream = vi.fn((_buf: Buffer, { progress }: { progress: { frames: number } }) => {
+        progress.frames = 2;
+        return new Promise(() => {});
+      });
+      const { run, posted } = await voiceTurn({ livekit: { publishAudioStream } });
+      const turn = run();
+      await vi.advanceTimersByTimeAsync(120_000);
+      await turn;
+      expect(posted()).toEqual(['Hi Alice']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('posts a reply longer than what is said aloud as text, once, although the spoken part played to its end', async () => {
+    const utils = await import('../utils');
+    const tts = vi.spyOn(utils, 'generateSpeech').mockResolvedValue(Buffer.from('audio'));
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const long = `${'A sentence of the reply. '.repeat(40)}The end.`;
+    expect(Array.from(long).length).toBeGreaterThan(MAX_SPOKEN_CODE_POINTS);
+    const { run, posted } = await voiceTurn({ livekit: { publishAudioStream: vi.fn(async () => PLAYED) }, reply: { text: long } });
+    await run();
+    expect(Array.from(tts.mock.calls[0][0]).length).toBeLessThanOrEqual(MAX_SPOKEN_CODE_POINTS);
+    // The whole reply, in the chunks the world's chat takes (cut at spaces)
+    expect(posted().length).toBeGreaterThan(1);
+    expect(posted().join(' ').replace(/\s+/g, ' ')).toBe(long);
+  });
+
+  it('does not post the reply as text when all of it was played', async () => {
     const utils = await import('../utils');
     vi.spyOn(utils, 'generateSpeech').mockResolvedValue(Buffer.from('audio'));
     vi.spyOn(console, 'info').mockImplementation(() => {});
-    const { sendMessage, reply } = await voiceTurn({ livekit: { publishAudioStream: vi.fn(async () => PLAYED) } });
-    const [, delivered] = await reply('Hi Alice');
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect(delivered).toBe(true);
+    const { run, posted, outcome, runtime } = await voiceTurn({ livekit: { publishAudioStream: vi.fn(async () => PLAYED) } });
+    await run();
+    expect(posted()).toEqual([]);
+    expect(outcome.delivered).toBe(true);
+    expect(runtime.createMemory).toHaveBeenCalledTimes(1);
   });
 
   it.each([
-    ['while the reply was stored', 'memory'],
-    ['while it was being synthesized', 'speech'],
-  ])('posts nothing to a replacement connection that came %s', async (_when, at) => {
+    ['ended', (ctx: any) => void ctx.session.end()],
+    ['was replaced by a connection around the same world object', (ctx: any) => {
+      void ctx.session.end();
+      sessionFor(ctx.world, { runtime: ctx.runtime });
+    }],
+  ])('posts and plays nothing when its connection %s while the reply was being synthesized', async (_what, change) => {
     const utils = await import('../utils');
-    vi.spyOn(console, 'info').mockImplementation(() => {});
-    vi.spyOn(console, 'log').mockImplementation(() => {});
-    const ctx = await voiceTurn();
-    const reconnect = () => Object.assign(ctx.connection, { world: { entities: {} }, generation: 4 });
+    for (const method of ['log', 'warn', 'info'] as const) vi.spyOn(console, method).mockImplementation(() => {});
+    const publishAudioStream = vi.fn(async () => PLAYED);
+    const ctx = await voiceTurn({ livekit: { publishAudioStream, disconnectRoom: vi.fn(async () => {}) } });
     vi.spyOn(utils, 'generateSpeech').mockImplementation(async () => {
-      if (at === 'speech') reconnect();
-      return null;
+      change(ctx);
+      return Buffer.from('audio');
     });
-    if (at === 'memory') ctx.runtime.createMemory.mockImplementation(async () => reconnect());
-    await ctx.reply('Hi Alice');
-    expect(ctx.sendMessage).not.toHaveBeenCalled();
-    if (at === 'memory') expect(ctx.playEmote).not.toHaveBeenCalled();
+    await ctx.run();
+    expect(publishAudioStream).not.toHaveBeenCalled();
+    expect(ctx.posted()).toEqual([]);
+    // Nothing reached anyone: nothing is remembered as said
+    expect(ctx.runtime.createMemory).not.toHaveBeenCalled();
   });
 
-  it('posts nothing when the same world object comes back on a new connection generation', async () => {
+  it('remembers a reply that was played although its connection ended while it played, and posts nothing after that', async () => {
     const utils = await import('../utils');
-    vi.spyOn(console, 'info').mockImplementation(() => {});
-    const ctx = await voiceTurn();
-    vi.spyOn(utils, 'generateSpeech').mockImplementation(async () => {
-      ctx.connection.generation = 4;
-      return null;
+    vi.spyOn(utils, 'generateSpeech').mockResolvedValue(Buffer.from('audio'));
+    for (const method of ['log', 'warn', 'info'] as const) vi.spyOn(console, method).mockImplementation(() => {});
+    let ctx!: Awaited<ReturnType<typeof voiceTurn>>;
+    const publishAudioStream = vi.fn(async () => {
+      void ctx.session.end();
+      return { played: 'partial', reason: 'stopped' } as const;
     });
-    await ctx.reply('Hi Alice');
-    expect(ctx.sendMessage).not.toHaveBeenCalled();
+    ctx = await voiceTurn({ livekit: { publishAudioStream, disconnectRoom: vi.fn(async () => {}) } });
+    await ctx.run();
+    expect(ctx.posted()).toEqual([]);
+    expect(ctx.runtime.createMemory).toHaveBeenCalledTimes(1);
   });
 });

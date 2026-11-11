@@ -8,7 +8,8 @@ import {
   composePromptFromState,
   ModelType
 } from '@elizaos/core';
-import { HyperfyService } from '../service';
+import { actingSession, connectedSession } from '../service';
+import { TurnCancelled } from '../lib/turn-context';
 import { AiBudgetExceededError, forPurpose } from '../../usage-budget';
 import { AnthropicRefusalError } from '../../anthropic-models';
 import { AgentActions, type PerformActionOutcome } from '../systems/actions';
@@ -51,9 +52,8 @@ export const hyperfyUseItemAction: Action = {
   similes: ['INTERACT_WITH_ITEM', 'USE_NEARBY_OBJECT', 'PICK_UP_ITEM'],
   description: 'Walks to and interacts with a nearby usable item (like picking it up); use when a player asks you to use or grab something.',
   validate: async (runtime: IAgentRuntime): Promise<boolean> => {
-    const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-    const world = service?.getWorld();
-    return !!service && service.isConnected() && !!world?.controls && !!world?.actions;
+    const world = connectedSession(runtime)?.world;
+    return !!world?.controls && !!world?.actions;
   },
   handler: async (
     runtime: IAgentRuntime,
@@ -62,12 +62,13 @@ export const hyperfyUseItemAction: Action = {
     options: { entityId?: string },
     callback: HandlerCallback
   ) => {
-    const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-    const world = service?.getWorld();
+    // The turn's own connection (never a newer one); throws when the turn may no longer act
+    const session = actingSession(runtime);
+    const world = session?.world;
     const controls = world?.controls as AgentControls | undefined;
     const actions = world?.actions as AgentActions | undefined;
 
-    if (!service || !world || !actions || !controls) {
+    if (!session || !world || !actions || !controls) {
       logger.error('Hyperfy service, world, or actions not found for HYPERFY_USE_ITEM action.');
       await tellFailure(callback, USE_ITEM, "Error: Cannot use item. Agent action system unavailable.");
       return actionFailed(USE_ITEM, 'agent action system unavailable');
@@ -111,10 +112,15 @@ export const hyperfyUseItemAction: Action = {
 
     let outcome: PerformActionOutcome;
     try {
-      await controls.goto(targetPosition.x, targetPosition.z);
-      logger.info(`[USE ITEM] Attempting to use item with entity ID: ${targetEntityId}`);
-      outcome = actions.performAction(targetEntityId);
+      // The walk and the use are one section: nothing else moves the avatar in between
+      outcome = await session.withBody(async (signal) => {
+        await controls.goto(targetPosition.x, targetPosition.z, { signal });
+        session.assertLive();
+        logger.info(`[USE ITEM] Attempting to use item with entity ID: ${targetEntityId}`);
+        return actions.performAction(targetEntityId);
+      });
     } catch (error: any) {
+      if (error instanceof TurnCancelled) throw error;
       logger.error('[USE ITEM] Walking to or using the item failed:', error);
       await tellFailure(callback, USE_ITEM, "I couldn't get to that item.");
       return actionFailed(USE_ITEM, `could not reach or use the item: ${error?.message ?? error}`, { targetEntityId });

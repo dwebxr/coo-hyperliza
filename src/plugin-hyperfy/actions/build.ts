@@ -9,15 +9,15 @@ import {
     ModelType,
     parseKeyValueXml
   } from '@elizaos/core';
-  import { HyperfyService } from '../service';
+  import { actingSession, connectedSession } from '../service';
   import { AiBudgetExceededError, forPurpose } from '../../usage-budget';
   import { AnthropicRefusalError } from '../../anthropic-models';
   import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
-  import { EDIT_ENTITY_ACTION, SceneEditStopped, readSceneEditsMode, sceneEditRefusal, sceneEditStillAllowed } from '../lib/authorization';
+  import { EDIT_ENTITY_ACTION, SceneEditStopped, readSceneEditsMode, reportsPrivilegedAction, sceneEditRefusal, sceneEditStillAllowed } from '../lib/authorization';
   import type { EditGuard, EditResult } from '../managers/build-manager';
   import { readString } from '../lib/model-output';
   import { isJapanese } from '../lib/simple-commands';
-  import { currentTurn } from '../lib/turn-context';
+  import { TurnCancelled, currentTurn } from '../lib/turn-context';
   import { describeUrl } from '../lib/log-url';
   import { oneLine } from '../lib/text';
   const MAX_RETRIES = 3;
@@ -263,8 +263,7 @@ Don't list every action like a log — instead, summarize the overall outcome na
     similes: ['EDIT_ENTITY_IN_WORLD', 'MODIFY_SCENE', 'BUILD_STRUCTURE'],
     description: `Performs scene edits in Hyperfy, including duplicating, moving, rotating, scaling, deleting, or importing entities. Use when the user asks to modify or add something in the 3D world.`,
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
-      const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-      return !!service && service.isConnected() && !!service.getWorld()?.controls;
+      return !!connectedSession(runtime)?.world?.controls;
     },
     handler: async (
       runtime: IAgentRuntime,
@@ -292,20 +291,21 @@ Don't list every action like a log — instead, summarize the overall outcome na
         return actionFailed(EDIT_ENTITY, refusal ?? 'no turn');
       }
 
-      const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-      const buildManager = service?.getBuildManager();
+      // The session the turn started on, never whatever connection is current now
+      const session = actingSession(runtime);
+      const buildManager = session?.build;
 
-      if (!service || service.getWorld() !== turn.world || !buildManager) {
+      if (!session || session.world !== turn.world || !buildManager) {
         logger.error('[EDIT_ENTITY Action] Hyperfy service, world, or buildManager not found.');
         await tellFailure(callback, EDIT_ENTITY, japanese ? '今はワールドを編集できません。' : "I can't edit the world right now.");
         return actionFailed(EDIT_ENTITY, 'Hyperfy service, world, or buildManager not found');
       }
 
       // The edit acts only on the world it was authorized for, and stops as soon as that no longer
-      // holds: the connection changed, or the requester may no longer build there
-      const stillAllowed = () =>
-        sceneEditStillAllowed(turn, { world: service.getWorld(), generation: service.getConnectionGeneration() });
-      const connectionLive = () => service.getWorld() === turn.world && service.getConnectionGeneration() === turn.generation;
+      // holds: the turn was cancelled (its slot ran out) or its connection ended, or the requester
+      // may no longer build there
+      const stillAllowed = () => sceneEditStillAllowed(turn);
+      const connectionLive = () => !session.ended;
       const guard: EditGuard = {
         world: turn.world,
         check() {
@@ -313,23 +313,27 @@ Don't list every action like a log — instead, summarize the overall outcome na
           if (reason) throw new SceneEditStopped(reason);
         },
         connectionLive,
+        signal: turn.signal,
       };
       // Posted while the turn runs (core holds callback content until the handler returns), and only
-      // while the edit is still allowed: never to another connection, or for a requester who may no
-      // longer build.
+      // while the edit is still allowed: never by a turn that was cancelled, to another connection,
+      // or for a requester who may no longer build. (The post itself refuses a cancelled turn too.)
       const postNow = (text: string) => {
-        if (!stillAllowed()) service.getMessageManager()?.sendMessage(text);
+        if (!stillAllowed()) session.messages.sendMessage(text);
       };
-      // Every closing message goes through here, checked as the edits were: a requester who lost the
-      // right meanwhile is told one neutral line, nothing about the scene
+      // All a requester who may no longer have the world edited is told: nothing about the scene
+      const neutral = (): Parameters<HandlerCallback>[0] => ({ thought: 'The edit request ended.', text: japanese ? NO_LONGER_JA : NO_LONGER_EN, actions: [EDIT_ENTITY], source: 'hyperfy' });
       const sayNoLonger = async (reason: string) => {
         logger.warn(`[EDIT_ENTITY Action] Not reporting the outcome: ${reason}`);
-        await callback({ thought: 'The edit request ended.', text: japanese ? NO_LONGER_JA : NO_LONGER_EN, actions: [EDIT_ENTITY], source: 'hyperfy' });
+        await callback(neutral());
       };
-      // Core holds callback content and delivers it after ACTION_COMPLETED; it is not checked again then
+      // Every closing message that says what was done goes through here, checked as the edits were.
+      // Core holds it until this handler has returned, so it is registered to be checked once more
+      // when it is delivered (session/deliver-reply.ts): a requester who lost the right in between
+      // gets the neutral line then.
       const finish = async (content: Parameters<HandlerCallback>[0]) => {
         const reason = stillAllowed();
-        await (reason ? sayNoLonger(reason) : callback(content));
+        await (reason ? sayNoLonger(reason) : callback(reportsPrivilegedAction(content, { refusal: stillAllowed, instead: neutral() })));
       };
     
       let operationResults: any = null;
@@ -417,43 +421,36 @@ Don't list every action like a log — instead, summarize the overall outcome na
 
         let done: EditResult;
         try {
-          switch (operation) {
-            case EditOperationType.TRANSLATE:
-              done = await buildManager.translate(guard, target, parameters?.position);
-              break;
+          // One operation at a time has the avatar and the scene (ConnectionSession.withBody): it
+          // walks to its target, checks again, then edits
+          done = await session.withBody(async (): Promise<EditResult> => {
+            switch (operation) {
+              case EditOperationType.TRANSLATE:
+                return buildManager.translate(guard, target, parameters?.position);
 
-            case EditOperationType.ROTATE:
-              done = await buildManager.rotate(guard, target, parameters?.rotation);
-              break;
+              case EditOperationType.ROTATE:
+                return buildManager.rotate(guard, target, parameters?.rotation);
 
-            case EditOperationType.SCALE:
-              done = await buildManager.scale(guard, target, parameters?.scale);
-              break;
+              case EditOperationType.SCALE:
+                return buildManager.scale(guard, target, parameters?.scale);
 
-            case EditOperationType.DUPLICATE:
-              done = await buildManager.duplicate(guard, target);
-              break;
+              case EditOperationType.DUPLICATE:
+                return buildManager.duplicate(guard, target);
 
-            case EditOperationType.DELETE:
-              done = await buildManager.delete(guard, target);
-              break;
+              case EditOperationType.DELETE:
+                return buildManager.delete(guard, target);
 
-            case EditOperationType.IMPORT:
-              done = await buildManager.importEntity(
-                guard,
-                target,
-                parameters?.position,
-                parameters?.rotation
-              );
-              break;
+              case EditOperationType.IMPORT:
+                return buildManager.importEntity(guard, target, parameters?.position, parameters?.rotation);
 
-            default:
-              logger.warn(`[EDIT_ENTITY Action] Unsupported operation type: ${operation}`);
-              done = { outcome: 'failed', reason: 'unsupported operation type' };
-              break;
-          }
+              default:
+                logger.warn(`[EDIT_ENTITY Action] Unsupported operation type: ${operation}`);
+                return { outcome: 'failed', reason: 'unsupported operation type' };
+            }
+          });
         } catch (error: any) {
-          if (error instanceof SceneEditStopped) {
+          // TurnCancelled: the turn was cancelled while this operation waited for its section
+          if (error instanceof SceneEditStopped || error instanceof TurnCancelled) {
             logger.warn(`[EDIT_ENTITY Action] Stopped before ${operation} on "${shownTarget(operation, target)}": ${error.message}`);
             stopped = error.message;
             outcome.outcome = 'failed';

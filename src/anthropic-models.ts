@@ -12,6 +12,7 @@ import {
   logger,
 } from '@elizaos/core';
 import { AiBudgetExceededError, currentOrigin, getUsageBudget, isAiPurpose, maxTokensFor, purposeEnvKey } from './usage-budget';
+import { assertTurnLive } from './plugin-hyperfy/lib/turn-context';
 
 /**
  * Text/JSON generation with current Claude models.
@@ -106,8 +107,9 @@ function getClient(runtime: IAgentRuntime): Anthropic {
   let client = clients.get(apiKey);
   if (!client) {
     // Without an explicit key the SDK falls back to ANTHROPIC_API_KEY / other credentials in the environment.
-    // This always runs in Node, but the Hyperfy loader (systems/loader.ts) installs a fake global
-    // window/document at import time, which the SDK's browser check would otherwise refuse.
+    // The SDK refuses to run where it sees a browser (a global window with a document) unless
+    // told otherwise. The agent itself has none; this keeps a host process that does from
+    // silencing it.
     client = new Anthropic({ ...(apiKey ? { apiKey } : {}), dangerouslyAllowBrowser: true });
     clients.set(apiKey, client);
   }
@@ -166,6 +168,9 @@ async function generate(
   const signal = AbortSignal.timeout(GENERATION_DEADLINE_MS);
   /** One request, under a reservation of its own; settled with what the API billed, or failed. */
   const attempt = async (): Promise<Anthropic.Message> => {
+    // A turn that may no longer act (its connection ended, or its slot ran out) asks nothing more
+    // of the model: no request is made and nothing is counted (plugin-hyperfy/lib/turn-context.ts)
+    assertTurnLive();
     // Admitted and counted before the request, in one step: calls that start together cannot all
     // pass a limit only one of them fits (usage-budget.ts reserveAi)
     const reservation = budget.reserveAi({ purpose: label, origin: currentOrigin() }, reserve);

@@ -4,6 +4,7 @@ import * as THREE from 'three';
 import { Vector3Enhanced } from '../hyperfy/src/core/extras/Vector3Enhanced.js'
 import { ControlPriorities } from '../hyperfy/src/core/extras/ControlPriorities.js'
 import { buttons } from '../hyperfy/src/core/extras/buttons.js'
+import { errorText } from '../lib/error-text'
 
 const FORWARD = new THREE.Vector3(0, 0, -1)
 const v1 = new THREE.Vector3()
@@ -49,7 +50,18 @@ class ControlsToken {
   get aborted() { return this._isAborted; }
 }
 
+/**
+ * `signal`: the turn (or connection) the movement is for. When it fires while the movement is
+ * still the current one, the movement stops; when it has fired already, nothing is started. A
+ * turn that completed leaves its signal as it is, so what it left running goes on.
+ */
+export interface MoveOptions {
+  signal?: AbortSignal;
+}
+
 export class AgentControls extends System {
+  // Button states by key name (keyW, space, ...): set in the constructor and by setKey
+  [key: string]: any;
   // Define expected control properties directly on the instance
   scrollDelta = { value: 0 };
   pointer = { locked: false, delta: { x: 0, y: 0 } };
@@ -167,8 +179,10 @@ export class AgentControls extends System {
   public async startRandomWalk(
     interval: number = RANDOM_WALK_DEFAULT_INTERVAL,
     maxDistance: number = RANDOM_WALK_DEFAULT_MAX_DISTANCE,
-    duration: number = 30000
+    duration: number = 30000,
+    { signal }: MoveOptions = {}
   ) {
+    if (signal?.aborted) return;
     this.stopRandomWalk(); // cancel if already running
     this._isRandomWalking = true;
     logger.info("[Controls] Random walk started.");
@@ -176,6 +190,7 @@ export class AgentControls extends System {
     const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
     const token = new ControlsToken();
     this._currentWalkToken = token;
+    const untie = this.stopWith(signal, token);
     const tmpTarget = new THREE.Vector3();
     const walkLoop = async () => {
       const startTime = Date.now();
@@ -205,11 +220,12 @@ export class AgentControls extends System {
 
           await this._navigateTowards(() => tmpTarget, NAVIGATION_STOP_DISTANCE, token, false);
         } catch (e) {
-          logger.warn("[Random Walk] Navigation error:", e);
+          logger.warn(`[Random Walk] Navigation error: ${errorText(e)}`);
         }
 
         await delay(Math.random() * interval);
       }
+      untie();
       if (this._currentWalkToken === token && !token.aborted) {
         this.stopRandomWalk();
       }
@@ -223,18 +239,39 @@ export class AgentControls extends System {
   /**
    * Navigates toward an entity (by ID) until within stop distance.
    */
-  public async followEntity(entityId: string, stopDistance: number = FOLLOW_STOP_DISTANCE): Promise<void> {
+  public async followEntity(entityId: string, stopDistance: number = FOLLOW_STOP_DISTANCE, { signal }: MoveOptions = {}): Promise<void> {
+    if (signal?.aborted) return;
     this.stopRandomWalk();
     this.stopNavigation("starting followEntity");
 
     const token = new ControlsToken();
     this._currentWalkToken = token;
     this._isNavigating = true;
-    await this._navigateTowards(() => {
-      const target = this.world.entities.items.get(entityId);
-      if (!target) return null;
-      return target.base?.position?.clone() || target.root?.position?.clone() || null;
-    }, stopDistance, token);
+    const untie = this.stopWith(signal, token);
+    try {
+      await this._navigateTowards(() => {
+        const target = this.world.entities.items.get(entityId);
+        if (!target) return null;
+        return target.base?.position?.clone() || target.root?.position?.clone() || null;
+      }, stopDistance, token);
+    } finally {
+      untie();
+    }
+  }
+
+  /**
+   * Stops the navigation `token` stands for when `signal` fires, unless a newer one has taken its
+   * place by then. Returns how to undo the tie (once that navigation has ended by itself).
+   */
+  private stopWith(signal: AbortSignal | undefined, token: ControlsToken): () => void {
+    if (!signal) return () => { };
+    const onAbort = () => {
+      if (this._currentWalkToken !== token) return;
+      logger.info("[Controls] Stopping a navigation: what it was for was cancelled.");
+      this.stopRandomWalk();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    return () => signal.removeEventListener('abort', onAbort);
   }
 
   /**
@@ -287,15 +324,20 @@ export class AgentControls extends System {
   /**
    * Starts navigating the agent towards the target X, Z coordinates.
    */
-  public async goto(x: number, z: number): Promise<void> {
+  public async goto(x: number, z: number, { signal }: MoveOptions = {}): Promise<void> {
+    if (signal?.aborted) return;
     this.stopAllActions("starting new navigation");
 
     const navigationToken = new ControlsToken();
     this._currentWalkToken = navigationToken;
     this._navigationTarget = new THREE.Vector3(x, 0, z);
     this._isNavigating = true;
-
-    await this._navigateTowards(() => this._navigationTarget, NAVIGATION_STOP_DISTANCE, navigationToken);
+    const untie = this.stopWith(signal, navigationToken);
+    try {
+      await this._navigateTowards(() => this._navigationTarget, NAVIGATION_STOP_DISTANCE, navigationToken);
+    } finally {
+      untie();
+    }
   }
 
 
@@ -372,7 +414,7 @@ export class AgentControls extends System {
             tickDelay(1000), // fallback timeout
           ]);
         } catch (e) {
-          logger.error("[Controls] Rotation during stuck recovery failed:", e);
+          logger.error(`[Controls] Rotation during stuck recovery failed: ${errorText(e)}`);
         }
         this.setKey('space', true);
         noProgressTicks = 0;
@@ -397,12 +439,13 @@ export class AgentControls extends System {
     }
   }
 
-  public async rotateTo(direction: 'front' | 'back' | 'left' | 'right', duration: number = 500): Promise<void> {
+  public async rotateTo(direction: 'front' | 'back' | 'left' | 'right', duration: number = 500, { signal }: MoveOptions = {}): Promise<void> {
     const player = this.world?.entities?.player;
     if (!player?.base) {
       logger.warn("[Controls rotateTo] Player entity not ready.");
       return;
     }
+    if (signal?.aborted) return;
 
     this.stopRotation();
     this._isRotating = true;
@@ -421,17 +464,17 @@ export class AgentControls extends System {
     const yawQuat = q2.setFromEuler(
       new THREE.Euler(0, rotationOffsetY[direction], 0, 'YXZ')
     );
-    await this._rotateToward(baseQuat.clone().multiply(yawQuat), duration, token);
+    await this._rotateToward(baseQuat.clone().multiply(yawQuat), duration, token, signal);
   }
 
   /**
    * Turns in place to face an entity (e.g. a player). Visible to others without any emote clip.
    */
-  public async faceEntity(entityId: string, duration: number = 600): Promise<void> {
+  public async faceEntity(entityId: string, duration: number = 600, { signal }: MoveOptions = {}): Promise<void> {
     const player = this.world?.entities?.player;
     const target = this.world?.entities?.items?.get(entityId);
     const targetPos = target?.base?.position || target?.root?.position;
-    if (!player?.base || !targetPos) return;
+    if (!player?.base || !targetPos || signal?.aborted) return;
 
     const direction = targetPos.clone().sub(player.base.position).setY(0);
     if (direction.lengthSq() < 1e-6) return;
@@ -440,10 +483,10 @@ export class AgentControls extends System {
     this._isRotating = true;
     const token = new ControlsToken();
     this._rotationAbortController = token;
-    await this._rotateToward(new THREE.Quaternion().setFromUnitVectors(FORWARD, direction.normalize()), duration, token);
+    await this._rotateToward(new THREE.Quaternion().setFromUnitVectors(FORWARD, direction.normalize()), duration, token, signal);
   }
 
-  private async _rotateToward(target: THREE.Quaternion, duration: number, token: ControlsToken): Promise<void> {
+  private async _rotateToward(target: THREE.Quaternion, duration: number, token: ControlsToken, signal?: AbortSignal): Promise<void> {
     const player = this.world.entities.player;
     this._rotationTarget = target;
 
@@ -453,7 +496,8 @@ export class AgentControls extends System {
 
     const tickDelay = (ms: number) => new Promise(res => setTimeout(res, ms));
 
-    while (this._isRotating && !token.aborted && step <= totalSteps) {
+    // `signal`: what the turn is for was cancelled; the turn stops where it is
+    while (this._isRotating && !token.aborted && !signal?.aborted && step <= totalSteps) {
       const t = step / totalSteps;
 
       player.base.quaternion.copy(startQuat).slerp(this._rotationTarget, t);
@@ -506,7 +550,7 @@ export class AgentControls extends System {
         this.setKey('shiftLeft', false);
         logger.debug("[Controls Navigation] Movement keys released.");
       } catch (e) {
-        logger.error("[Controls Navigation] Error releasing keys on stop:", e);
+        logger.error(`[Controls Navigation] Error releasing keys on stop: ${errorText(e)}`);
       }
       this._currentNavKeys = { forward: false, backward: false, left: false, right: false };
     }
@@ -583,7 +627,7 @@ export class AgentControls extends System {
     return true;
   }
 
-  createCamera(self) {
+  createCamera(self: AgentControls) {
     const world = self.world;
     const position = new THREE.Vector3().copy(world.rig?.position || new THREE.Vector3());
     const quaternion = new THREE.Quaternion().copy(world.rig?.quaternion || new THREE.Quaternion());

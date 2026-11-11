@@ -8,7 +8,7 @@ import { type NetPolicy, onWorldOrigin, SafeFetchError, toResponse, worldNet } f
  * The world only accepts uploads from a connected session: both requests carry the session's
  * bearer token, and posting a file needs builder rank (or, for a .vrm, custom avatars turned on
  * in the world settings). The engine's ClientNetwork.upload predates this: it sends no token and
- * ignores the response, so service.ts installs uploadAsset in its place.
+ * ignores the response, so session/create-agent-world.ts installs uploadAsset in its place.
  *
  * The token goes to the world's own origin only (the one WS_URL names): the API URL arrives from
  * the world, and one on any other origin is refused before anything is sent. A redirect is not
@@ -140,12 +140,13 @@ export interface UploadNetwork {
   maxUploadSize?: unknown;
 }
 
-/** What a caller of world.network.upload may pass (service.ts installs uploadAsset there). */
+/** What a caller of world.network.upload may pass (session/create-agent-world.ts installs uploadAsset there). */
 export interface UploadOptions {
   /**
    * Called right before each HTTP request (and so after every await before it); it throws to stop
    * the upload. Scene edits pass their authorization check here; the agent's own avatar and emote
-   * uploads pass none.
+   * uploads pass none. The connection's session adds its own to every upload: none is made once
+   * the connection has ended (session/connection-session.ts).
    */
   check?: () => void;
 }

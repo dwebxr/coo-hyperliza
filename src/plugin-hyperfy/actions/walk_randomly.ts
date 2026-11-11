@@ -8,7 +8,7 @@ import {
 } from '@elizaos/core';
 // No longer need THREE here
 import { AgentControls } from '../systems/controls'; // Still need type for casting
-import { HyperfyService } from '../service';
+import { actingSession, connectedSession } from '../service';
 import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
 
 const WALK_RANDOMLY = 'HYPERFY_WALK_RANDOMLY';
@@ -24,9 +24,7 @@ export const hyperfyWalkRandomlyAction: Action = {
     similes: ['WANDER', 'PACE_AROUND', 'WALK_AROUND', 'MOVE_RANDOMLY'], // Reverted similes/desc
     description: 'Makes your character wander to random points nearby; use for idle behavior or ambient movement.',
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
-      const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-      // Keep validation simple: Check if controls exist
-      return !!service && service.isConnected() && !!service.getWorld()?.controls;
+      return !!connectedSession(runtime)?.world?.controls;
     },
     handler: async (
       runtime: IAgentRuntime,
@@ -35,11 +33,12 @@ export const hyperfyWalkRandomlyAction: Action = {
       options: { interval?: number, distance?: number, command?: 'start' | 'stop' }, // Reverted options
       callback: HandlerCallback,
     ) => {
-      const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-      const world = service?.getWorld();
+      // The turn's own connection (never a newer one); throws when the turn may no longer act
+      const session = actingSession(runtime);
+      const world = session?.world;
       const controls = world?.controls as AgentControls | undefined;
 
-      if (!service || !world || !controls) {
+      if (!session || !world || !controls) {
         logger.error('Hyperfy service, world, or controls not found for HYPERFY_WALK_RANDOMLY action.');
         await tellFailure(callback, WALK_RANDOMLY, "Error: Cannot wander. Hyperfy connection/controls unavailable.");
         return actionFailed(WALK_RANDOMLY, 'Hyperfy connection/controls unavailable');
@@ -66,8 +65,12 @@ export const hyperfyWalkRandomlyAction: Action = {
           }
           return actionSucceeded(WALK_RANDOMLY, { status: 'stopped' });
       } else { // command === 'start'
-          // Call startRandomWalk with calculated interval and distance
-          controls.startRandomWalk(intervalMs, maxDistance);
+          // Started in its turn among the sections that move the avatar, then left running: it
+          // goes on after this turn completes, and stops when the turn is cancelled, when another
+          // walk starts, or with the connection
+          await session.withBody(async (signal) => {
+            controls.startRandomWalk(intervalMs, maxDistance, undefined, { signal });
+          });
 
           await callback({
              text: ``,

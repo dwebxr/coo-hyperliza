@@ -6,8 +6,7 @@ import { getModuleDirectory, resolveUrl } from '../utils'
 import { AssetUploadError, assetServed, ensureAsset } from '../lib/asset-upload'
 import { worldNet } from '../lib/net-policy'
 import { describeUrl } from '../lib/log-url'
-import { IAgentRuntime, logger } from '@elizaos/core'
-import { HyperfyService } from '../service.js'
+import { logger } from '@elizaos/core'
 
 // Emotes is shared process-wide and overridden per world below; keep the engine defaults to reset to
 const DEFAULT_EMOTES: Record<string, string> = { ...(Emotes as Record<string, string>) };
@@ -27,14 +26,32 @@ const WORLD_LOCOMOTION_FALLBACKS: Record<string, string> = {
   RUN: 'asset://mp-jog.glb?s=1.87',
 };
 
+/** The engine's clip for `name`, if it has one of its own (not something every object inherits). */
+function engineEmote(name: string): string | undefined {
+  const clip = Object.prototype.hasOwnProperty.call(Emotes, name) ? (Emotes as Record<string, unknown>)[name] : undefined
+  return typeof clip === 'string' && clip ? clip : undefined
+}
+
+/** What the emotes of one connection need of its session. */
+export interface EmoteHost {
+  readonly world: any
+  /** True once the connection has ended: its world is no longer touched. */
+  readonly ended: boolean
+}
+
+/**
+ * The agent's emotes on one connection: which clips its world serves, and the one playing. The
+ * engine's Emotes table is shared by the whole process and overridden per world here; a
+ * connection that has ended no longer writes to it.
+ */
 export class EmoteManager {
   private emoteHashMap: Map<string, string>
   private currentEmoteTimeout: NodeJS.Timeout | null
   private movementCheckInterval: NodeJS.Timeout | null = null;
-  private runtime: IAgentRuntime;
+  private session: EmoteHost;
 
-  constructor(runtime) {
-    this.runtime = runtime;
+  constructor(session: EmoteHost) {
+    this.session = session;
     this.emoteHashMap = new Map()
     this.currentEmoteTimeout = null
   }
@@ -51,8 +68,8 @@ export class EmoteManager {
    * reason that may pass (network, server error); calling again retries only those.
    */
   async uploadEmotes(): Promise<boolean> {
-    const world = this.getService()?.getWorld();
-    if (!world) return false;
+    const world = this.session.world;
+    if (!world || this.session.ended) return false;
     // Locomotion emotes first: they update the shared Emotes object
     let complete = await this.uploadLocomotionEmotes(world);
     if (!this.isCurrent(world)) return false;
@@ -76,19 +93,17 @@ export class EmoteManager {
 
   /** Whether playEmote(name) has a clip to play in this world (some worlds refuse emote uploads). */
   hasEmote(name: string): boolean {
-    return this.emoteHashMap.has(name) || !!(Emotes as Record<string, string>)[name];
+    return this.emoteHashMap.has(name) || engineEmote(name) !== undefined;
   }
 
+  /**
+   * Plays the emote `name` (a model chooses it: any text). A name that is not an emote of this
+   * world does nothing; so does a connection that has ended.
+   */
   playEmote(name: string) {
-    const fallback = (Emotes as Record<string, string>)[name];
-    const hashName = this.emoteHashMap.get(name) || fallback;
-    const service = this.getService();
-    if (!service) {
-      console.warn('[Emote] Cannot play emote - service not available');
-      return;
-    }
-    const world = service.getWorld();
-    if (!world) {
+    const hashName = this.emoteHashMap.get(name) || engineEmote(name);
+    const world = this.session.world;
+    if (!world || this.session.ended) {
       console.warn('[Emote] Cannot play emote - world not available');
       return;
     }
@@ -131,7 +146,7 @@ export class EmoteManager {
     }, duration * 1000);
   }
 
-  private clearEmote(player) {
+  private clearEmote(player: any) {
     if (player.data?.effect) {
       player.data.effect.emote = null;
     }
@@ -153,19 +168,16 @@ export class EmoteManager {
     }
   }
 
-  private getService() {
-    return this.runtime.getService<HyperfyService>(HyperfyService.serviceType);
-  }
-
+  /** Whether `world` is this connection's and the connection has not ended. */
   private isCurrent(world: any): boolean {
-    return this.getService()?.getWorld() === world;
+    return !this.session.ended && this.session.world === world;
   }
 
   /**
    * Whether the world's asset server serves `fileName`, as clients resolve asset:// names.
    * null when that could not be checked (cause already logged).
    */
-  private async assetExists(fileName: string, world: any = this.getService()?.getWorld()): Promise<boolean | null> {
+  private async assetExists(fileName: string, world: any = this.session.world): Promise<boolean | null> {
     const url = await resolveUrl(`asset://${fileName}`, world ?? {});
     if (!url) return null;
     try {
@@ -221,7 +233,7 @@ export class EmoteManager {
     return { retry: result.retryable };
   }
 
-  private async uploadLocomotionEmotes(world: any = this.getService()?.getWorld()): Promise<boolean> {
+  private async uploadLocomotionEmotes(world: any = this.session.world): Promise<boolean> {
     if (!this.emotesReset) {
       // Don't carry another world's uploaded hashes into this one
       Object.assign(Emotes as Record<string, string>, DEFAULT_EMOTES);
@@ -289,7 +301,7 @@ export class EmoteManager {
    * otherwise the world's own emote-talk.glb is used, with a warning if it has none.
    * false when the bundled clip should be tried again.
    */
-  private async ensureTalkEmote(world: any = this.getService()?.getWorld()): Promise<boolean> {
+  private async ensureTalkEmote(world: any = this.session.world): Promise<boolean> {
     const bundled = getModuleDirectory() + TALK_EMOTE.path;
     const hasBundled = await fs.access(bundled).then(() => true, () => false);
     if (hasBundled) {

@@ -1,4 +1,4 @@
-import { type Action, type Handler, logger } from '@elizaos/core';
+import { type Action, type Content, type Handler, logger } from '@elizaos/core';
 import { actionFailed } from './action-result';
 import { type TurnContext, currentTurn } from './turn-context';
 import { Ranks, worldIdentity } from './world-identity';
@@ -93,17 +93,40 @@ export class SceneEditStopped extends Error {
 }
 
 /**
- * Why a scene edit authorized for `turn` must stop now, or null while it may go on: the service is
- * still on the connection the turn started on, and the requester is still allowed there (a rank
- * change, or the player leaving, ends it). Checked before each effect and after each await.
+ * Why a scene edit authorized for `turn` must stop now, or null while it may go on: the turn is
+ * live (its connection has not ended and it was not cancelled, lib/turn-context.ts) and the
+ * requester is still allowed there (a rank change, or the player leaving, ends it). Checked before
+ * each effect and after each await.
  */
-export function sceneEditStillAllowed(
-  turn: TurnContext,
-  current: { world: unknown; generation: number },
-  env: Env = process.env
-): string | null {
-  if (current.world !== turn.world || current.generation !== turn.generation) return 'the connection to the world changed';
+export function sceneEditStillAllowed(turn: TurnContext, env: Env = process.env): string | null {
+  if (!turn.live) return 'the turn was cancelled or its connection ended';
   return sceneEditRefusal(turn, env);
+}
+
+/**
+ * A reply that reports what a privileged action did is checked again when it is delivered:
+ * elizaOS core (1.7.2) holds what an action hands its callback until the action has returned, and
+ * the requester's right can end in between. The action registers the reply (the content object
+ * itself, which core passes on as it is) with the check and what to say instead.
+ */
+export interface PrivilegedReport {
+  /** Why the report must not be delivered now, or null while it may. */
+  refusal(): string | null;
+  /** What the requester is told instead: nothing about what was done. */
+  readonly instead: Content;
+}
+
+const privilegedReports = new WeakMap<object, PrivilegedReport>();
+
+/** Marks `content` as a report of a privileged action (see PrivilegedReport). Returns `content`. */
+export function reportsPrivilegedAction<T extends Content>(content: T, report: PrivilegedReport): T {
+  privilegedReports.set(content, report);
+  return content;
+}
+
+/** The check `content` was registered with, or undefined for an ordinary reply. */
+export function privilegedReport(content: object): PrivilegedReport | undefined {
+  return privilegedReports.get(content);
 }
 
 /**
@@ -124,10 +147,14 @@ export function actionRefusal(actionName: string, turn: TurnContext | undefined)
  * before running an action and resolves the names a model emits by exact, then substring, then
  * simile match, so a list in the prompt is no restriction. The wrapper runs after that
  * resolution and checks the action's real name; a refused action's handler is not called.
+ *
+ * No action of a turn that may no longer act is started either: the wrapper throws TurnCancelled
+ * (assertLive), which ends core's processActions and so the rest of the turn's plan.
  */
 export function guardActions(actions: Action[]): Action[] {
   return actions.map((action) => {
     const handler: Handler = async (runtime, message, state, options, callback, responses) => {
+      currentTurn()?.assertLive();
       const refusal = actionRefusal(action.name, currentTurn());
       if (refusal) {
         // Silent on purpose: an autonomous turn has nobody to tell, and a privileged action outside

@@ -6,101 +6,66 @@ import {
   type IAgentRuntime,
   Service,
 } from '@elizaos/core'
-import fs from 'fs/promises'
-import path from 'path'
-import { createNodeClientWorld } from './hyperfy/src/core/createNodeClientWorld.js'
-import { AgentControls } from './systems/controls'
-import { AgentEnvironment } from './systems/environment.js'
-import { AgentLoader } from './systems/loader'
-import { AgentLiveKit } from './systems/liveKit.js'
-import { AgentActions } from './systems/actions.js'
-import { loadPhysX } from './physx/loadPhysX.js'
-import { BehaviorManager } from "./managers/behavior-manager.js"
-import { EmoteManager } from './managers/emote-manager.js'
-import { MessageManager } from './managers/message-manager.js'
-import { VoiceManager } from './managers/voice-manager.js'
 import { PuppeteerManager } from './managers/puppeteer-manager.js'
-import { BuildManager } from './managers/build-manager.js'
-import { getModuleDirectory } from './utils'
 import { ReconnectController } from './lib/reconnect'
-import { type AssetUploadError, type UploadOptions, ensureAsset, uploadAsset, worldEndpointProblems } from './lib/asset-upload'
-import { NetPolicy, installWorldNet } from './lib/net-policy'
-import { createScriptNetwork } from './lib/script-network'
-import { PROTOCOL_VERSION, adaptToWorldProtocol } from './lib/world-protocol'
-import { storage } from './hyperfy/src/core/storage.js'
-import { TipWallet, signInHost, takeTipWalletAccount } from './lib/tip-wallet'
-import { resolveWorldWsUrl, worldHttpOrigin } from './lib/world-url'
-import { installWorldChat, worldChat } from './lib/world-chat'
-import { ChatIntake } from './lib/chat-intake'
-import { trackWorldIdentity } from './lib/world-identity'
-import { describeSceneEditsMode, readSceneEditsMode } from './lib/authorization'
+import { PROTOCOL_VERSION } from './lib/world-protocol'
+import { takeTipWalletAccount } from './lib/tip-wallet'
+import { resolveWorldWsUrl } from './lib/world-url'
 import { resolveWorldScriptsMode, surviveUnhandledRejections } from './lib/script-sandbox'
-import { activateWorldScripts, createWorldScripts } from './lib/script-api'
-import { destroyWorld } from './lib/world-teardown'
+import { activateWorldScripts } from './lib/script-api'
 import { describeUrl } from './lib/log-url'
+import { currentTurn } from './lib/turn-context'
+import { ConnectionSession, sessionOfTurn } from './session/connection-session'
 import { type HyperfyDisconnectedPayload, hyperfyEventType } from './events'
 
-const moduleDirPath = getModuleDirectory();
-const LOCAL_AVATAR_PATH = `${moduleDirPath}/avatars/avatar.vrm`;
+type ConnectConfig = { wsUrl: string; authToken?: string; worldId: UUID }
 
-const HYPERFY_APPEARANCE_POLL_INTERVAL = 30000
-
-type AvatarResult = { outcome: 'applied' | 'gave-up'; error?: string } | { outcome: 'retry'; error?: string }
-// Teardown must not hang a reconnect on a stuck native/CDP call
-const TEARDOWN_STEP_TIMEOUT_MS = 10000
-
+/**
+ * Coordinates the agent's connection to a Hyperfy world: starting and stopping, connecting,
+ * disconnecting and reconnecting. Everything that belongs to one connection lives in its
+ * ConnectionSession (session/connection-session.ts); the accessors here answer from the current
+ * session, or null while there is none.
+ */
 export class HyperfyService extends Service {
   static serviceType = 'hyperfy'
   capabilityDescription = 'Manages connection and interaction with a Hyperfy world.'
 
-  private world: any | null = null
-  private controls: AgentControls | null = null
-  private isConnectedState: boolean = false
-  private wsUrl: string | null = null
-  private _currentWorldId: UUID | null = null
-
-  private playerNamesMap: Map<string, string> = new Map()
-  private appearanceIntervalId: NodeJS.Timeout | null = null
-  private appearanceSet: boolean = false
-  /** How the avatar ended for this connection; emotes may still be retried after it is settled. */
-  private avatarOutcome: { outcome: 'applied' | 'gave-up'; error?: string } | null = null
-  private nameSet: boolean = false
-
-  private appearancePollInFlight: boolean = false
-  private lastConnectConfig: { wsUrl: string; authToken?: string; worldId: UUID } | null = null
+  private session: ConnectionSession | null = null
+  private lastConnectConfig: ConnectConfig | null = null
   private connectPromise: Promise<void> | null = null
+  /** The teardown of the session that was current last, while it runs */
   private teardownPromise: Promise<void> | null = null
   private isStopping: boolean = false
-  // Bumped by every teardown so an in-flight connect can tell its world was torn down
-  private connectionGeneration: number = 0
-  /** Turns the world's live chat into turns for this connection (lib/chat-intake.ts) */
-  private chatIntake: ChatIntake | null = null
   private reconnectController: ReconnectController
-  private behaviorManager: BehaviorManager;
-  private emoteManager: EmoteManager;
-  private messageManager: MessageManager;
-  private voiceManager: VoiceManager;
-  private puppeteerManager: PuppeteerManager;
-  private buildManager: BuildManager;
-  private tipWallet: TipWallet | null = null;
+  /** Process-wide: one Chromium for every connection (managers/puppeteer-manager.ts) */
+  private puppeteerManager: PuppeteerManager | null = null
   /** HYPERFY_WORLD_SCRIPTS=sandboxed and the sandbox passed its self-test; false means scripts are off */
-  private worldScriptsSandboxed: boolean = false;
+  private worldScriptsSandboxed: boolean = false
+
+  /** The current connection, from the moment it is being set up until it ends; null otherwise. */
+  public getSession(): ConnectionSession | null {
+    return this.session
+  }
 
   public get currentWorldId(): UUID | null {
-    return this._currentWorldId
+    return this.session?.worldId ?? null
   }
 
   public getWorld(): any | null {
-    return this.world;
+    return this.session?.world ?? null
   }
 
-  /** Bumped by every teardown; a turn records the one it started on. */
-  public getConnectionGeneration(): number {
-    return this.connectionGeneration;
+  /** Whether the current connection's world is initialised and its managers run. */
+  public isConnected(): boolean {
+    return this.session?.connected ?? false
+  }
+
+  public getPuppeteerManager(): PuppeteerManager | null {
+    return this.puppeteerManager
   }
 
   constructor(protected runtime: IAgentRuntime) {
-    super();
+    super()
     this.reconnectController = new ReconnectController(
       async () => {
         if (!this.lastConnectConfig) return
@@ -174,7 +139,7 @@ export class HyperfyService extends Service {
    * Connects to a Hyperfy world. Concurrent calls share the in-flight attempt.
    * Note: the auth token comes from localstorage.json (ClientNetwork ignores initialAuthToken).
    */
-  connect(config: { wsUrl: string; authToken?: string; worldId: UUID }): Promise<void> {
+  connect(config: ConnectConfig): Promise<void> {
     if (!this.connectPromise) {
       this.connectPromise = this.doConnect(config).finally(() => {
         this.connectPromise = null
@@ -191,10 +156,10 @@ export class HyperfyService extends Service {
     }
   }
 
-  private async doConnect(config: { wsUrl: string; authToken?: string; worldId: UUID }): Promise<void> {
+  private async doConnect(config: ConnectConfig): Promise<void> {
     if (this.teardownPromise) await this.teardownPromise
-    if (this.isConnectedState || this.world) {
-      console.warn(`HyperfyService already connected to world ${this._currentWorldId}. Disconnecting first.`)
+    if (this.session) {
+      console.warn(`HyperfyService already connected to world ${this.currentWorldId}. Disconnecting first.`)
       await this.handleDisconnect()
     }
     if (this.isStopping) throw new Error('HyperfyService is stopping')
@@ -203,140 +168,28 @@ export class HyperfyService extends Service {
 
     console.info(`Attempting to connect HyperfyService to ${describeUrl(config.wsUrl)} for world ${config.worldId}`)
     this.lastConnectConfig = config
-    this.wsUrl = config.wsUrl
-    this._currentWorldId = config.worldId
-    this.appearanceSet = false
-    this.avatarOutcome = null
-    this.nameSet = false
 
     try {
-      const world: any = createNodeClientWorld()
-      this.world = world
-      const generation = this.connectionGeneration
-
-      // The engine's packet table, encoding and socket URL predate the world's protocol version
-      const protocol = adaptToWorldProtocol(world.network, () => storage.get('authToken'))
-      // Ranks and account ids as the world's server reports them (lib/authorization.ts reads them)
-      trackWorldIdentity(world)
-      // Only chat the server sent becomes a turn; chat.add never broadcasts (lib/world-chat.ts)
-      installWorldChat(world)
-      const sceneEdits = readSceneEditsMode(process.env)
-      if (sceneEdits.problem) console.error(`[Hyperfy] ${sceneEdits.problem}`)
-      console.info(describeSceneEditsMode(process.env))
-
-      // Everything this world makes the agent download goes through one policy (lib/net-policy.ts):
-      // public https hosts, plus this world's own origin whatever its address
-      const net = installWorldNet(world, new NetPolicy({ worldOrigin: worldHttpOrigin(config.wsUrl) }))
-      console.info(`[Hyperfy] Downloads for this world: public https hosts, and the world's own origin ${net.worldOrigin ?? '(none: WS_URL has no usable origin)'}`)
-      const engineOnSnapshot = world.network.onSnapshot
-      world.network.onSnapshot = function (this: unknown, data: unknown) {
-        const result = engineOnSnapshot.call(world.network, data)
-        // The snapshot names the world's API and assets URLs; say so now if the agent will not use them
-        for (const problem of worldEndpointProblems(net, { apiUrl: world.network.apiUrl, assetsUrl: world.assetsUrl })) console.warn(`[Hyperfy] ${problem}`)
-        return result
-      }
-
-      // The engine's upload sends no session token and ignores the response, but the world only
-      // accepts uploads from an authenticated session. The token is read per call: the snapshot
-      // may issue a new one. It is sent to the world's own origin only, and not at all when it was
-      // withheld from the socket (lib/world-protocol.ts): that world's API is not encrypted either.
-      world.network.upload = (file: File, { check }: UploadOptions = {}) =>
-        uploadAsset(world.network, file, { net, authToken: protocol.sessionToken() ?? undefined, check })
-
-      // Registered before init so a socket that closes during init is not missed.
-      let kickCode: string | null = null
-      world.on('kick', (code: string) => {
-        kickCode = code
-        console.warn(`[Hyperfy] Kicked by server: ${code}`)
-      })
-      world.on('disconnect', (reason: any) => {
-        this.onWorldDisconnect(world, reason, kickCode).catch(error => {
-          console.error('[Hyperfy] Error while handling disconnect:', error)
-        })
-      })
-      // Tips: the agent's wallet signs in on every connection (TIP_WALLET_PRIVATE_KEY)
-      this.tipWallet = this.createTipWallet(world, config.wsUrl)
-
-      // The local player only spawns after a real session is established.
-      world.on('player', () => {
-        if (world !== this.world) return
-        this.reconnectController.markEstablished()
-        this.tipWallet?.begin()
-      })
-
-      this.puppeteerManager = PuppeteerManager.getOrCreate(this.runtime);
-      this.emoteManager = new EmoteManager(this.runtime);
-      this.messageManager = new MessageManager(this.runtime);
-      this.voiceManager = new VoiceManager(this.runtime);
-      this.behaviorManager = new BehaviorManager(this.runtime);
-      this.buildManager = new BuildManager(this.runtime);
-
-      ; (world as any).playerNamesMap = this.playerNamesMap
-
-      globalThis.self = globalThis
-
-      const livekit = new AgentLiveKit(world);
-      ; (world as any).livekit = livekit
-      world.systems.push(livekit);
-
-      const actions = new AgentActions(world);
-      ; (world as any).actions = actions
-      world.systems.push(actions);
-
-      this.controls = new AgentControls(world)
-        ; (world as any).controls = this.controls
-      world.systems.push(this.controls)
-      // Temporarily comment out AgentLoader to test for updateTransform error
-      // A sandboxed script's fetch() reaches public https hosts only (lib/script-network.ts)
-      const loader = new AgentLoader(world, { scripts: this.worldScriptsSandboxed ? createWorldScripts({ network: createScriptNetwork() }) : null })
-        ; (world as any).loader = loader
-      world.systems.push(loader);
-
-      const environment = new AgentEnvironment(world);
-      ; (world as any).environment = environment
-      world.systems.push(environment);
-
-      const mockElement = {
-        appendChild: () => { },
-        removeChild: () => { },
-        offsetWidth: 1920,
-        offsetHeight: 1080,
-        addEventListener: () => { },
-        removeEventListener: () => { },
-        style: {},
-      }
-
-      const hyperfyConfig = {
-        wsUrl: this.wsUrl,
-        viewport: mockElement,
-        ui: mockElement,
-        initialAuthToken: config.authToken,
-        loadPhysX
-      }
-
-      if (typeof this.world.init !== 'function') {
-        throw new Error('world.init is not a function')
-      }
-      await world.init(hyperfyConfig)
-      // Everything after this point is synchronous, so one check is enough.
-      if (this.world !== world || this.connectionGeneration !== generation) {
-        // init may have started the tick loop / socket after teardown destroyed the world
-        destroyWorld(world)
-        throw new Error('Hyperfy connection closed during initialization')
-      }
-      console.info('Hyperfy world initialized.')
-
-      this.voiceManager.start();
-
-      this.behaviorManager.start();
-
-      this.subscribeToHyperfyEvents()
-
-      this.isConnectedState = true
-
-      this.startAppearancePolling()
-
-      console.info(`HyperfyService connected successfully to ${describeUrl(this.wsUrl)}`)
+      // Before any world: its loader and its sky hand their assets to the render page
+      this.puppeteerManager = PuppeteerManager.getOrCreate()
+      const session = ConnectionSession.open(
+        this.runtime,
+        { wsUrl: config.wsUrl, worldId: config.worldId, sandboxedScripts: this.worldScriptsSandboxed, renderPage: this.puppeteerManager },
+        {
+          onEstablished: (established) => {
+            if (established === this.session) this.reconnectController.markEstablished()
+          },
+          onDisconnect: (closed, reason, kickCode) => {
+            this.onWorldDisconnect(closed, reason, kickCode).catch(error => {
+              console.error('[Hyperfy] Error while handling disconnect:', error)
+            })
+          },
+        }
+      )
+      // Current from here on, so a socket that closes during init ends this session
+      this.session = session
+      await session.connect(config.authToken)
+      console.info(`HyperfyService connected successfully to ${describeUrl(config.wsUrl)}`)
     } catch (error: any) {
       console.error(`HyperfyService connection failed for ${config.worldId} at ${describeUrl(config.wsUrl)}: ${error.message}`, error.stack)
       await this.handleDisconnect()
@@ -344,15 +197,15 @@ export class HyperfyService extends Service {
     }
   }
 
-  private async onWorldDisconnect(world: any, reason: any, kickCode: string | null): Promise<void> {
-    // Ignore events from a world we already replaced or tore down
-    if (world !== this.world) return
+  private async onWorldDisconnect(session: ConnectionSession, reason: any, kickCode: string | null): Promise<void> {
+    // Ignore events from a session we already replaced or ended
+    if (session !== this.session) return
 
     // Classify before any await so every retry path (this one, a failed connect, a failed
     // reconnect) sees the policy. A kick sent right before the close is still sitting in the
     // network queue, which is only flushed on the next tick.
     // The close reason also carries 'outdated', in case the kick packet itself was unreadable
-    const kick = kickCode ?? findQueuedKick(world) ?? (reason?.reason === 'outdated' ? 'outdated' : null)
+    const kick = kickCode ?? findQueuedKick(session.world) ?? (reason?.reason === 'outdated' ? 'outdated' : null)
     if (kick === 'duplicate_user') {
       // The server rejects the newer connection, so retrying never disturbs the other session;
       // it just lets us rejoin once that session leaves.
@@ -376,7 +229,7 @@ export class HyperfyService extends Service {
     const disconnected: HyperfyDisconnectedPayload = {
       runtime: this.runtime,
       source: 'hyperfy',
-      worldId: this._currentWorldId,
+      worldId: session.worldId,
       reason,
     }
     this.runtime.emitEvent(hyperfyEventType.DISCONNECTED, disconnected)
@@ -386,435 +239,104 @@ export class HyperfyService extends Service {
     this.scheduleReconnect()
   }
 
-  private subscribeToHyperfyEvents(): void {
-    if (!this.world || typeof this.world.on !== 'function') {
-      console.warn("[Hyperfy Events] Cannot subscribe: World or world.on not available.")
-      return
-    }
-
-    this.startChatSubscription()
-  }
-
   /**
-   * Shows the agent's VRM (uploading it when the world does not have it yet) and prepares its emotes.
-   * 'gave-up' when retrying cannot help, e.g. the world only lets builders upload and custom avatars
-   * are off: the world's default avatar stays until the next connection. (The engine does not expose
-   * the customAvatars setting, so a later change in the world is only noticed on reconnect.)
-   * 'retry' also covers emotes that failed for a reason that may pass; the avatar is not redone then.
-   */
-  private async uploadCharacterAssets(): Promise<{ outcome: 'applied' | 'gave-up' | 'retry'; error?: string }> {
-    const world = this.world
-    const emoteManager = this.emoteManager
-    if (!world || !world.entities?.player || !world.network || !world.assetsUrl) {
-      console.warn(
-        "[Appearance] Cannot set avatar: World, player, network, or assetsUrl not ready."
-      );
-      return { outcome: 'retry', error: "Prerequisites not met" };
-    }
-    const replaced = { outcome: 'retry', error: 'the connection was replaced' } as const
-
-    if (!this.avatarOutcome) {
-      const avatar = await this.applyAvatar(world);
-      if (this.world !== world) return replaced;
-      if (avatar.outcome === 'retry') return avatar;
-      this.avatarOutcome = avatar;
-    }
-
-    const emotesReady = await emoteManager.uploadEmotes();
-    if (this.world !== world) return replaced;
-    if (!emotesReady) return { outcome: 'retry', error: "some emotes are not available yet" };
-    return this.avatarOutcome;
-  }
-
-  private async applyAvatar(world: any): Promise<AvatarResult> {
-    const localAvatarPath = path.resolve(LOCAL_AVATAR_PATH);
-    const fileName = path.basename(localAvatarPath);
-    let buffer: Buffer;
-    try {
-      buffer = await fs.readFile(localAvatarPath);
-    } catch (error: any) {
-      console.error(
-        `[Appearance] Cannot read the avatar file at ${localAvatarPath} (CWD: ${process.cwd()}): ${error.message}`
-      );
-      return { outcome: 'gave-up', error: error.message };
-    }
-
-    console.info(`[Appearance] Preparing avatar ${fileName} (${(buffer.length / 1024).toFixed(2)} KB)...`);
-    const result = await ensureAsset(world, {
-      buffer,
-      name: fileName,
-      type: fileName.endsWith(".vrm") ? "model/gltf-binary" : "application/octet-stream",
-    });
-    if (result.ok === false) {
-      const { error } = result;
-      if (!result.retryable) {
-        const hint = (error as AssetUploadError).status === 403
-          ? " A world admin can allow it by turning on custom avatars in the world settings."
-          : "";
-        console.warn(
-          `[Appearance] The world refused the avatar upload (${error.message}). Keeping the default avatar for this connection.${hint}`
-        );
-        return { outcome: 'gave-up', error: error.message };
-      }
-      console.error(`[Appearance] Avatar not available yet: ${error.message}`);
-      return { outcome: 'retry', error: error.message };
-    }
-    console.info(`[Appearance] Avatar ${result.uploaded ? "uploaded" : "already on the server"}: ${describeUrl(result.url)}`);
-
-    // A destroyed world has no socket to send it on
-    if (this.world !== world) return { outcome: 'retry', error: 'the connection was replaced' };
-    const agentPlayer = world.entities.player;
-    if (typeof agentPlayer?.setSessionAvatar !== "function") {
-      console.warn("[Appearance] agentPlayer.setSessionAvatar not available.");
-      return { outcome: 'gave-up', error: "setSessionAvatar unavailable" };
-    }
-    // Applies it locally and sends it to the world as this session's avatar
-    agentPlayer.setSessionAvatar(result.url);
-    return { outcome: 'applied' };
-  }
-
-  private startAppearancePolling(): void {
-    if (this.appearanceIntervalId) clearInterval(this.appearanceIntervalId);
-    // Check if both are already set
-    let pollingTasks = { avatar: this.appearanceSet, name: this.nameSet }; // Track tasks locally
-
-    if (pollingTasks.avatar && pollingTasks.name) {
-      console.info("[Appearance/Name Polling] Already set, skipping start.");
-      return;
-    }
-    console.info(`[Appearance/Name Polling] Initializing interval every ${HYPERFY_APPEARANCE_POLL_INTERVAL}ms.`);
-
-
-    const poll = async () => {
-      // Stop polling if both tasks are complete
-      if (pollingTasks.avatar && pollingTasks.name) {
-        if (this.appearanceIntervalId) clearInterval(this.appearanceIntervalId);
-        this.appearanceIntervalId = null;
-        console.info(`[Appearance/Name Polling] Both avatar and name set. Polling stopped.`);
-        return;
-      }
-
-      // Results that arrive after this connection was replaced must not touch the new one
-      const world = this.world;
-      const agentPlayer = world?.entities?.player; // Get player once
-      const agentPlayerReady = !!agentPlayer;
-      const agentPlayerId = agentPlayer?.data?.id;
-      const agentPlayerIdReady = !!agentPlayerId;
-      const networkReady = this.world?.network?.id != null;
-      const assetsUrlReady = !!this.world?.assetsUrl; // Needed for avatar
-
-      // Condition checks player/ID/network readiness for name, adds assetsUrl for avatar
-      if (agentPlayerReady && agentPlayerIdReady && networkReady) {
-        const entityId = createUniqueUuid(this.runtime, this.runtime.agentId);
-        const entity = await this.runtime.getEntityById(entityId)
-        if (entity) {
-          entity.metadata.hyperfy = {
-            id: agentPlayerId,
-            name: agentPlayer?.data?.name,
-            userName: agentPlayer?.data?.name
-          }
-
-          await this.runtime.updateEntity(entity)
-        }
-        if (this.world !== world) return;
-
-        // --- Set Name (if not already done) ---
-        if (!pollingTasks.name) {
-          console.info(`[Name Polling] Player (ID: ${agentPlayerId}), network ready. Attempting name...`);
-          try {
-            await this.changeName(this.runtime.character.name);
-            if (this.world !== world) return;
-            this.nameSet = true; // Update global state
-            pollingTasks.name = true; // Update local task tracker
-            console.info(`[Name Polling] Initial name successfully set to "${this.runtime.character.name}".`);
-          } catch (error) {
-            console.error(`[Name Polling] Failed to set initial name:`, error);
-          }
-        }
-
-        // --- Set Avatar (if not already done AND assets URL ready) ---
-        if (!pollingTasks.avatar && assetsUrlReady) {
-          console.info(`[Appearance Polling] Player (ID: ${agentPlayerId}), network, assetsUrl ready. Attempting avatar upload and set...`);
-          const result = await this.uploadCharacterAssets();
-          if (this.world !== world) return;
-
-          if (result.outcome !== 'retry') {
-            this.appearanceSet = true; // Update global state
-            pollingTasks.avatar = true; // Update local task tracker
-            console.info(
-              result.outcome === 'applied'
-                ? `[Appearance Polling] Avatar setting process successfully completed.`
-                : `[Appearance Polling] Keeping the default avatar for this connection: ${result.error}`
-            );
-          } else {
-            console.warn(`[Appearance Polling] Not done yet: ${result.error || 'Unknown reason'}. Will retry...`);
-          }
-        } else if (!pollingTasks.avatar) {
-          console.debug(`[Appearance Polling] Waiting for: Assets URL (${assetsUrlReady})...`);
-        }
-      } else {
-        // Update waiting log
-        console.debug(`[Appearance/Name Polling] Waiting for: Player (${agentPlayerReady}), Player ID (${agentPlayerIdReady}), Network (${networkReady})...`);
-      }
-    }
-    // An avatar upload can take longer than the interval; don't start a second one.
-    const f = async () => {
-      if (this.appearancePollInFlight) return;
-      this.appearancePollInFlight = true;
-      try {
-        await poll();
-      } catch (error) {
-        console.error('[Appearance/Name Polling] Unexpected error:', error);
-      } finally {
-        this.appearancePollInFlight = false;
-      }
-    }
-    this.appearanceIntervalId = setInterval(f, HYPERFY_APPEARANCE_POLL_INTERVAL);
-    f();
-  }
-
-  private stopAppearancePolling(): void {
-    if (this.appearanceIntervalId) {
-      clearInterval(this.appearanceIntervalId)
-      this.appearanceIntervalId = null
-      console.info("[Appearance Polling] Stopped.")
-    }
-  }
-
-  /**
-   * Checks if the service is currently connected to a Hyperfy world.
-   */
-  public isConnected(): boolean {
-    return this.isConnectedState;
-  }
-
-  public getEntityById(entityId: string): any | null {
-    return this.world?.entities?.items?.get(entityId) || null
-  }
-
-  public getEntityName(entityId: string): string | null {
-    const entity = this.world?.entities?.items?.get(entityId)
-    return entity?.data?.name || entity?.blueprint?.name || 'Unnamed';
-  }
-
-  /**
-   * Tears down the current world. Concurrent calls share one teardown.
+   * Ends the current session. Concurrent calls share one teardown; from the first call on the
+   * service has no session (the accessors answer null).
    */
   handleDisconnect(): Promise<void> {
-    if (!this.teardownPromise) {
-      this.teardownPromise = this.teardown().finally(() => {
-        this.teardownPromise = null
+    const session = this.session
+    if (session) {
+      this.session = null
+      // Ended here and now: from this line on none of its turns may act
+      const ending = session.end()
+      const before = this.teardownPromise
+      const teardown: Promise<void> = (async () => {
+        await before
+        await ending
+      })().finally(() => {
+        if (this.teardownPromise === teardown) this.teardownPromise = null
       })
+      this.teardownPromise = teardown
     }
-    return this.teardownPromise
-  }
-
-  private async teardown(): Promise<void> {
-    if (!this.isConnectedState && !this.world) return
-    console.info('Handling Hyperfy disconnection...')
-    this.isConnectedState = false
-    this.connectionGeneration++
-
-    this.stopAppearancePolling()
-    this.tipWallet?.stop();
-    this.tipWallet = null;
-    this.chatIntake?.stop();
-    this.chatIntake = null;
-    this.behaviorManager?.stop();
-    this.voiceManager?.stop();
-    this.emoteManager?.stop();
-    this.messageManager?.stop();
-
-    if (this.world) {
-      try {
-        // Navigation loops keep driving the player entity, which outlives Entities.destroy()
-        this.controls?.stopAllActions?.('disconnect')
-      } catch (e: any) {
-        console.warn(`[Hyperfy Cleanup] Error stopping controls: ${e.message}`)
-      }
-      const leavingRoom = this.world.livekit?.disconnectRoom?.()
-      try {
-        // Destroy before awaiting anything so the old world stops ticking (and loading assets
-        // into the Puppeteer page) while we wait for LiveKit and the page to close.
-        console.info("[Hyperfy Cleanup] Destroying the world...")
-        // Each system on its own, then the socket and the tick timer, whatever failed before
-        destroyWorld(this.world)
-      } catch (e: any) {
-        console.warn(`[Hyperfy Cleanup] Error during world destroy: ${e.message}`)
-      }
-      await settleWithin(leavingRoom, TEARDOWN_STEP_TIMEOUT_MS, 'leaving LiveKit room')
-      // Drop this session's textures/avatars; the browser itself is reused.
-      await settleWithin(this.puppeteerManager?.resetPage(), TEARDOWN_STEP_TIMEOUT_MS, 'resetting Puppeteer page')
-    }
-
-    this.world = null
-    this.controls = null
-    this.playerNamesMap.clear()
-    this.wsUrl = null
-    this.appearanceSet = false
-    this.avatarOutcome = null
-
-    if (this.appearanceIntervalId) { clearInterval(this.appearanceIntervalId); this.appearanceIntervalId = null; }
-
-    console.info('Hyperfy disconnection handling complete.')
+    return this.teardownPromise ?? Promise.resolve()
   }
 
   async disconnect(): Promise<void> {
-    console.info(`Disconnecting HyperfyService from world ${this._currentWorldId}`)
+    console.info(`Disconnecting HyperfyService from world ${this.currentWorldId}`)
     // An explicit disconnect should not be undone by a retry that was already waiting
     this.reconnectController.cancelPending()
     await this.handleDisconnect()
     console.info('HyperfyService disconnect complete.')
   }
 
-  /**
-   * Changes the agent's display name.
-   */
-  async changeName(newName: string): Promise<void> {
-    if (!this.isConnected() || !this.world?.network || !this.world?.entities?.player) {
-      throw new Error('HyperfyService: Cannot change name. Network or player not ready.');
-    }
-    const agentPlayerId = this.world.entities.player.data.id;
-    if (!agentPlayerId) {
-      throw new Error('HyperfyService: Cannot change name. Player ID not available.');
-    }
-
-    console.info(`[Action] Attempting to change name to "${newName}" for ID ${agentPlayerId}`);
-
-    try {
-
-      // 2. Update local state immediately
-      // Update the name map
-      if (this.playerNamesMap.has(agentPlayerId)) {
-        console.info(`[Name Map Update] Setting name via changeName for ID ${agentPlayerId}: '${newName}'`);
-        this.playerNamesMap.set(agentPlayerId, newName);
-      } else {
-        console.warn(`[Name Map Update] Attempted changeName for ID ${agentPlayerId} not currently in map. Adding.`);
-        this.playerNamesMap.set(agentPlayerId, newName);
-      }
-
-      // --- Use agentPlayer.modify for local update --- >
-      const agentPlayer = this.world.entities.player;
-      agentPlayer.modify({ name: newName });
-      agentPlayer.data.name = newName
-
-      this.world.network.send('entityModified', { id: agentPlayer.data.id, name: newName })
-      console.debug(`[Action] Called agentPlayer.modify({ name: "${newName}" })`);
-
-    } catch (error: any) {
-      console.error(`[Action] Error during changeName to "${newName}":`, error);
-      throw error;
-    }
-  }
-
   async stop(): Promise<void> {
     console.info('*** Stopping Hyperfy service instance ***')
     this.isStopping = true
     this.reconnectController.stop()
+    // Ends the session a connect in progress is setting up, so that connect gives up
+    await this.handleDisconnect()
     if (this.connectPromise) {
       await this.connectPromise.catch(() => { })
     }
     await this.disconnect()
     await this.puppeteerManager?.close()
   }
+}
 
-  private startChatSubscription(): void {
-    const world = this.world
-    // Undefined (not installed) means nothing becomes a turn
-    const chat = world ? worldChat(world) : undefined
-    if (!world || !chat) {
-      console.error('Cannot subscribe to chat: World or its chat is not available.')
-      return
-    }
-
-    console.info('[HyperfyService] Initializing chat subscription...')
-    const generation = this.connectionGeneration
-    this.chatIntake?.stop()
-    // One turn at a time, in the order the world's server sent the messages; bounded and
-    // rate-limited (lib/chat-intake.ts)
-    const intake = new ChatIntake({
-      isLive: () => generation === this.connectionGeneration && this.chatIntake === intake,
-      handle: async (msg, turn) => {
-        // Before the agent's own player exists there is nobody to answer as
-        if (!this.messageManager || !world.entities?.player) return
-        await this.messageManager.handleMessage(msg, turn)
-      },
-    })
-    this.chatIntake = intake
-    // A message of the snapshot's history that the world sends again live is not a new turn
-    chat.onHistory((ids) => intake.markSeen(ids))
-    // Only what the world's server sent on this connection: not app scripts' chat (any fromId),
-    // not the agent's own posts, not the snapshot's history (lib/world-chat.ts)
-    chat.onLive((msg) => void intake.accept(msg))
+/** Thrown by requireHyperfy: the plugin's service is not registered with this runtime (yet). */
+export class HyperfyUnavailable extends Error {
+  constructor() {
+    super('The Hyperfy service is not available')
+    this.name = 'HyperfyUnavailable'
   }
+}
 
-  getEmoteManager() {
-    return this.emoteManager;
-  }
+/** The Hyperfy service of `runtime`. Throws HyperfyUnavailable when there is none. */
+export function requireHyperfy(runtime: IAgentRuntime): HyperfyService {
+  const service = runtime.getService<HyperfyService>(HyperfyService.serviceType)
+  if (!service) throw new HyperfyUnavailable()
+  return service
+}
 
-  getBehaviorManager() {
-    return this.behaviorManager;
+/**
+ * The connection the agent is on now (set up and not ended), or null: also when there is no
+ * service. For code that runs outside a turn (providers, an action's validate()).
+ */
+export function connectedSession(runtime: IAgentRuntime): ConnectionSession | null {
+  let service: HyperfyService
+  try {
+    service = requireHyperfy(runtime)
+  } catch (error) {
+    if (error instanceof HyperfyUnavailable) return null
+    throw error
   }
+  const session = service.getSession()
+  return session?.connected ? session : null
+}
 
-  getMessageManager() {
-    return this.messageManager;
-  }
+/**
+ * The session whose world a provider describes to the model: inside a turn the turn's own (null
+ * once it has ended), never a newer connection's; outside any turn the current connection.
+ */
+export function observedSession(runtime: IAgentRuntime): ConnectionSession | null {
+  const turn = currentTurn()
+  return turn ? sessionOfTurn(turn) : connectedSession(runtime)
+}
 
-  getVoiceManager() {
-    return this.voiceManager;
-  }
-
-  getPuppeteerManager() {
-    return this.puppeteerManager;
-  }
-
-  getBuildManager() {
-    return this.buildManager;
-  }
-
-  /** The agent's tip wallet on this connection; null when tips are not configured. */
-  getTipWallet(): TipWallet | null {
-    return this.tipWallet;
-  }
-
-  private createTipWallet(world: any, wsUrl: string): TipWallet | null {
-    // Read once per process; the environment no longer has the key after the first read
-    const account = takeTipWalletAccount()
-    if (!account) return null
-    const host = signInHost(wsUrl)
-    if (!host) {
-      console.warn(`[Tips] Cannot tell the world's sign-in domain from ${describeUrl(wsUrl)}; tips stay off`)
-      return null
-    }
-    return new TipWallet(world.network, account, {
-      host,
-      selfId: () => world.entities?.player?.data?.id,
-    })
-  }
+/**
+ * The session an action acts on. Inside a turn: the turn's own, never whatever connection is
+ * current now; throws TurnCancelled when the turn may no longer act, null when its session is
+ * gone. Outside any turn (another plugin's message handling): the current connection, or null.
+ */
+export function actingSession(runtime: IAgentRuntime): ConnectionSession | null {
+  const turn = currentTurn()
+  if (!turn) return connectedSession(runtime)
+  turn.assertLive()
+  return sessionOfTurn(turn)
 }
 
 export function findQueuedKick(world: any): string | null {
   const queue: any[] = world?.network?.queue ?? []
   const entry = queue.find(item => Array.isArray(item) && item[0] === 'onKick')
   return entry ? entry[1] : null
-}
-
-/** Waits for `promise` (logging, not throwing, its failure) at most `ms`. Returns false on timeout. */
-async function settleWithin(promise: Promise<unknown> | undefined, ms: number, label: string): Promise<boolean> {
-  if (!promise) return true
-  let timer: NodeJS.Timeout | undefined
-  const timeout = new Promise<boolean>(resolve => {
-    timer = setTimeout(() => {
-      console.warn(`[Hyperfy] Gave up ${label} after ${ms}ms`)
-      resolve(false)
-    }, ms)
-  })
-  try {
-    return await Promise.race([promise.then(() => true, (e: any) => {
-      console.warn(`[Hyperfy] Error ${label}: ${e?.message || e}`)
-      return true
-    }), timeout])
-  } finally {
-    clearTimeout(timer)
-  }
 }

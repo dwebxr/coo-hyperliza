@@ -16,12 +16,13 @@ import {
   StoreCatalog,
   type StoreProduct,
   formatLinkMessage,
+  isShareable,
   parseHandles,
   parseLocale,
   sanitizeText,
 } from './catalog';
 
-export { formatLinkMessage };
+export { formatLinkMessage, isShareable };
 
 /**
  * Coo as a shop clerk for OpenPay Store: knows the configured products, recommends them, and
@@ -57,7 +58,9 @@ function isAutonomous(runtime: IAgentRuntime, message: Memory): boolean {
 /** A seller's handle as it is shown (in a prompt, or spoken): `@handle`, with no web address in it (sanitizeText). */
 const shownHandle = (handle: string) => sanitizeText(`@${handle}`, 65);
 
-export function formatShelf(products: StoreProduct[], { autonomous }: { autonomous: boolean }): string {
+export function formatShelf(all: StoreProduct[], { autonomous }: { autonomous: boolean }): string {
+  // Only what can be shared: the catalog holds nothing else, but a shelf may be given anything
+  const products = all.filter(isShareable);
   if (!products.length) return '';
   const lines: string[] = [];
   let size = 0;

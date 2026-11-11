@@ -8,7 +8,7 @@ import {
     logger,
     createUniqueUuid
 } from '@elizaos/core';
-import { HyperfyService } from '../service';
+import { observedSession } from '../service';
 import * as THREE from 'three'
 import { Vector3Enhanced } from '../hyperfy/src/core/extras/Vector3Enhanced.js'
 import { SHOWN_NAME_MAX, oneLine, shownName, shownNames } from '../lib/text'
@@ -36,9 +36,9 @@ export const hyperfyProvider: Provider = {
       };
       const utcTimeString = new Intl.DateTimeFormat('en-US', timeOptions).format(currentDate);
 
-      const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
+      const session = observedSession(runtime);
 
-      if (!service || !service.isConnected()) {
+      if (!session) {
         const text = '# Hyperfy World State\nConnection Status: Disconnected';
         return {
           text,
@@ -48,9 +48,9 @@ export const hyperfyProvider: Provider = {
       }
 
       try {
-        const world = service.getWorld();
-        const messageManager = service.getMessageManager();
-        const _currentWorldId = service.currentWorldId;
+        const world = session.world;
+        const messageManager = session.messages;
+        const _currentWorldId = session.worldId;
         const elizaRoomId = createUniqueUuid(runtime, _currentWorldId || 'hyperfy-unknown-world') 
         const entities = world?.entities?.items;
         const agentId = world?.entities?.player?.data?.id;

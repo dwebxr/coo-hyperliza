@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../service', () => ({ HyperfyService: { serviceType: 'hyperfy' } }));
-
 import { ModelType } from '@elizaos/core';
 import { BehaviorManager } from './behavior-manager';
 import { AiBudgetExceededError, UsageBudget, type UsageLimits, resetUsageBudget } from '../../usage-budget';
 import { currentTurn } from '../lib/turn-context';
 import { createRuntime } from '../test-support/core-runtime';
+import { serviceFor, sessionFor, withParts } from '../test-support/session';
+import type { ConnectionSession } from '../session/connection-session';
+
+const AUTONOMY = { tickMinMs: 1, tickMaxMs: 1, patrolPoints: [{ x: 3, z: 4 }], wanderRadius: 6 };
 
 const noLimits: UsageLimits = {
   aiCallsPerHour: null,
@@ -35,18 +37,10 @@ function setup({ emoteClips = true }: { emoteClips?: boolean } = {}) {
     ['bob', { data: { id: 'bob', type: 'player' }, base: { position: position(2) } }],
   ]);
   const world = { controls, entities: { player: self, items } };
-  const emotes = { playEmote: vi.fn(), hasEmote: vi.fn(() => emoteClips) };
-  const service = {
-    getWorld: () => world,
-    getConnectionGeneration: () => 5,
-    currentWorldId: '00000000-0000-0000-0000-0000000000ee',
-    getEmoteManager: () => emotes,
-    getMessageManager: () => ({ sendMessage: vi.fn() }),
-    getVoiceManager: () => ({ speak: vi.fn() }),
-  };
+  const emotes = { playEmote: vi.fn(), hasEmote: vi.fn(() => emoteClips), stop: vi.fn() };
   const runtime: any = {
     agentId: '00000000-0000-0000-0000-0000000000aa',
-    getService: () => service,
+    character: { name: 'Coo', templates: {} },
     composeState: vi.fn().mockResolvedValue({ values: {}, data: {}, text: '' }),
     actions: [],
     useModel: vi.fn().mockResolvedValue('<response><thought>t</thought><actions>IGNORE</actions></response>'),
@@ -54,9 +48,12 @@ function setup({ emoteClips = true }: { emoteClips?: boolean } = {}) {
     processActions: vi.fn().mockResolvedValue(undefined),
     evaluate: vi.fn().mockResolvedValue(undefined),
   };
-  const manager = new BehaviorManager(runtime, { tickMinMs: 1, tickMaxMs: 1, patrolPoints: [{ x: 3, z: 4 }], wanderRadius: 6 });
+  // The connection the behavior runs on: a real session around that world, with the test's emotes
+  const session = withParts(sessionFor(world, { runtime }), { emotes, messages: { sendMessage: vi.fn() }, voice: { speak: vi.fn(), stop: vi.fn() } });
+  runtime.getService = () => serviceFor(session);
+  const manager = new BehaviorManager(runtime, session, AUTONOMY);
   const tick = () => (manager as any).executeBehavior() as Promise<boolean>;
-  return { runtime, controls, emotes, tick };
+  return { runtime, world, session, controls, emotes, tick };
 }
 
 describe('BehaviorManager', () => {
@@ -123,8 +120,8 @@ describe('BehaviorManager', () => {
 
   it('does nothing, and calls nothing, when no one else is around', async () => {
     resetUsageBudget(new UsageBudget(noLimits));
-    const { runtime, controls, emotes, tick } = setup();
-    runtime.getService().getWorld().entities.items.delete('bob');
+    const { runtime, world, controls, emotes, tick } = setup();
+    world.entities.items.delete('bob');
     await expect(tick()).resolves.toBe(false);
     expect(runtime.useModel).not.toHaveBeenCalled();
     expect(controls.goto).not.toHaveBeenCalled();
@@ -140,29 +137,62 @@ describe('BehaviorManager autonomous turns', () => {
 
   it('runs a Claude-decided tick as an autonomous turn with no requester', async () => {
     resetUsageBudget(new UsageBudget(noLimits));
-    const { runtime, tick } = setup();
+    const { runtime, world, session, tick } = setup();
     let seen: any;
     runtime.processActions.mockImplementation(async () => {
       seen = currentTurn();
     });
     await tick();
-    expect(seen).toMatchObject({ origin: 'autonomy', generation: 5, world: runtime.getService().getWorld() });
+    expect(seen).toMatchObject({ origin: 'autonomy', generation: session.generation, world, live: true });
     expect(seen.requesterId).toBeUndefined();
+  });
+
+  it('does nothing with the answer of a tick whose connection ended while Claude was asked, and no scripted step either', async () => {
+    resetUsageBudget(new UsageBudget(noLimits));
+    const { runtime, session, emotes, controls, tick } = setup();
+    runtime.useModel.mockImplementation(async () => {
+      void session.end();
+      return '<response><thought>t</thought><actions>HYPERFY_WALK_RANDOMLY</actions><text>Hello</text></response>';
+    });
+    await expect(tick()).resolves.toBe(true);
+    expect(runtime.processActions).not.toHaveBeenCalled();
+    expect(emotes.playEmote).not.toHaveBeenCalled();
+    expect(controls.goto).not.toHaveBeenCalled();
+    expect(controls.followEntity).not.toHaveBeenCalled();
+    // And nothing at all on a later tick of the ended connection
+    await expect(tick()).resolves.toBe(false);
+    expect(runtime.useModel).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts no scripted walk while a turn has the avatar to itself', async () => {
+    resetUsageBudget(new UsageBudget({ ...noLimits, autonomyAiPerHour: 0 }));
+    vi.spyOn(Math, 'random').mockReturnValue(0.1);
+    const { session, controls, tick } = setup();
+    await tick(); // greets bob first
+    let release: (() => void) | undefined;
+    const held = session.withBody(() => new Promise<void>((resolve) => (release = resolve)));
+    await vi.waitFor(() => expect(release).toBeDefined());
+    await tick();
+    expect(controls.goto).not.toHaveBeenCalled();
+    release!();
+    await held;
+    await tick();
+    expect(controls.goto).toHaveBeenCalledWith(3, 4);
   });
 
   /** The real BehaviorManager on a real core runtime with the plugin's real (guarded) actions. */
   function realRuntime(plan: string, models: Record<string, unknown> = {}) {
-    const { emotes, controls, runtime: fake } = setup();
-    const service = fake.getService();
-    const world = service.getWorld();
-    world.actions = {};
+    const { emotes, controls, world } = setup();
+    (world as any).actions = {};
     const buildManager = { translate: vi.fn(), delete: vi.fn(), importEntity: vi.fn() };
+    let session: ConnectionSession | null = null;
     const { runtime, recorded, useModel } = createRuntime({
-      service: { ...service, isConnected: () => true, getBuildManager: () => buildManager },
+      service: serviceFor(() => session),
       models: { [ModelType.TEXT_LARGE]: plan, ...models },
     });
     vi.spyOn(runtime, 'ensureConnection').mockResolvedValue(undefined);
-    const manager = new BehaviorManager(runtime, { tickMinMs: 1, tickMaxMs: 1, patrolPoints: [{ x: 3, z: 4 }], wanderRadius: 6 });
+    session = withParts(sessionFor(world, { runtime }), { emotes, build: buildManager, messages: { sendMessage: vi.fn() }, voice: { speak: vi.fn(), stop: vi.fn() } });
+    const manager = new BehaviorManager(runtime, session, AUTONOMY);
     const tick = () => (manager as any).executeBehavior() as Promise<boolean>;
     return { runtime, recorded, useModel, buildManager, emotes, controls, tick };
   }

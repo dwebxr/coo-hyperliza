@@ -15,8 +15,9 @@ const runtime = (): any => ({ getSetting: () => undefined, character: { system: 
 const message = { id: 'msg_1', type: 'message', role: 'assistant', model: 'claude-haiku-5-5', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { input_tokens: 12, output_tokens: 3 } };
 const each = tokenReserve('You are Coo.', 'x', 2048);
 
-type Answer = 'drop' | { status: number; body?: unknown; headers?: Record<string, string> };
+type Answer = 'drop' | 'stall-body' | { status: number; body?: unknown; headers?: Record<string, string> };
 let answers: Answer[] = [];
+let bodyStarted: () => void = () => {};
 let api: TestServer;
 let key = 0;
 
@@ -25,6 +26,12 @@ beforeAll(async () => {
     const answer = answers.shift() ?? { status: 200, body: message };
     // The request arrived; the connection is lost before any answer
     if (answer === 'drop') return void response.socket?.destroy();
+    // Accepted: the headers and the start of the body, then nothing more
+    if (answer === 'stall-body') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.write('{"id":"msg_1","type":"message","content":[');
+      return void bodyStarted();
+    }
     response.writeHead(answer.status, { 'content-type': 'application/json', ...answer.headers });
     response.end(JSON.stringify(answer.body ?? { type: 'error', error: { type: answer.status === 529 ? 'overloaded_error' : 'api_error', message: 'no' } }));
   });
@@ -54,6 +61,37 @@ describe('Claude requests and what they are counted as', () => {
     await expect(call()).rejects.toThrow();
     expect(api.hits).toHaveLength(1);
     expect(budget.snapshot(60_000).ai).toMatchObject({ calls: 1, reservedTokens: each });
+  });
+
+  it('gives up on an accepted answer whose body stalls at the overall deadline, 60 s after the call started, keeping its reservation counted', async () => {
+    const { budget, call } = chat();
+    const realSetTimeout = globalThis.setTimeout;
+    const realWait = (ms: number) => new Promise((resolve) => realSetTimeout(resolve, ms));
+    const started = new Promise<void>((resolve) => (bodyStarted = resolve));
+    answers = ['stall-body'];
+    // The deadline's signal on a fake clock; the request and its body go over the real loopback socket
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms: number) => {
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), ms);
+        return controller.signal;
+      });
+      const state: { outcome: unknown } = { outcome: 'pending' };
+      void call().then((value) => (state.outcome = value), (error) => (state.outcome = error));
+      await started;
+      await realWait(100);
+      await vi.advanceTimersByTimeAsync(59_999);
+      await realWait(50);
+      expect(state.outcome).toBe('pending');
+      await vi.advanceTimersByTimeAsync(1);
+      for (let i = 0; i < 100 && state.outcome === 'pending'; i++) await realWait(10);
+      expect(state.outcome).toBeInstanceOf(Error);
+      expect(api.hits).toHaveLength(1);
+      expect(budget.snapshot(60_000).ai).toMatchObject({ calls: 1, reservedTokens: each });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each([

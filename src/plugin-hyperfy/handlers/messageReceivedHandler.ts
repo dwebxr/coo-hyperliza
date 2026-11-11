@@ -1,8 +1,9 @@
-import { Content, EventType, HandlerCallback, IAgentRuntime, Memory, ModelType, asUUID, composePromptFromState, createUniqueUuid, logger, parseKeyValueXml, truncateToCompleteSentence } from "@elizaos/core";
+import { Content, EventType, HandlerCallback, IAgentRuntime, Memory, ModelType, type UUID, asUUID, composePromptFromState, createUniqueUuid, logger, parseKeyValueXml, truncateToCompleteSentence } from "@elizaos/core";
 import { hyperfyShouldRespondTemplate, hyperfyMessageHandlerTemplate } from "../templates";
 import { AiBudgetExceededError, forPurpose, getUsageBudget } from "../../usage-budget";
 import { AnthropicRefusalError } from "../../anthropic-models";
-import { currentTurn, turnDelivered } from "../lib/turn-context";
+import { cancelTurn, currentTurn, turnDelivered } from "../lib/turn-context";
+import { actingSession } from "../service";
 import { getShopProducts } from "../../openpay-store";
 import { parseAliases } from "../lib/addressing";
 import { isJapanese, matchSimpleCommand, simpleCommandReply } from "../lib/simple-commands";
@@ -35,22 +36,29 @@ async function handleSimpleCommand(runtime: IAgentRuntime, message: Memory, call
   const command = matchSimpleCommand(message.content.text, names);
   if (!command) return false;
 
-  const world = (runtime.getService?.('hyperfy') as { getWorld?: () => any } | null)?.getWorld?.();
+  // The turn's own connection (never a newer one); throws when the turn may no longer act
+  const session = actingSession(runtime);
+  const world = session?.world;
   const controls = world?.controls;
-  if (!controls) return false;
+  if (!session || !controls) return false;
 
   if (command === 'come') {
     const senderId = (message.content.metadata as { hyperfyFromId?: string } | undefined)?.hyperfyFromId;
     const theirs = senderId ? world.entities?.items?.get(senderId)?.base?.position : null;
     const mine = world.entities?.player?.base?.position;
     if (!theirs || !mine) return false;
-    if (theirs.distanceTo(mine) > COME_TELEPORT_BEYOND_M) {
-      controls.teleportToEntity(senderId);
-    } else {
-      // Not awaited: the reply goes out while walking
-      controls.followEntity(senderId).catch((error: unknown) => logger.debug(`[Bootstrap] Walking to the speaker failed: ${error}`));
-    }
+    // Moves the avatar: in its turn among such sections (ConnectionSession.withBody)
+    await session.withBody(async (signal) => {
+      if (theirs.distanceTo(mine) > COME_TELEPORT_BEYOND_M) {
+        controls.teleportToEntity(senderId);
+      } else {
+        // Not awaited: the reply goes out while walking. The walk goes on after this turn has
+        // completed, and stops if the turn is cancelled first, or with the connection
+        controls.followEntity(senderId, undefined, { signal }).catch((error: unknown) => logger.debug(`[Bootstrap] Walking to the speaker failed: ${error}`));
+      }
+    });
   } else {
+    // Waits for nobody: it ends whatever walk is in progress
     controls.stopAllActions('asked to stop');
   }
 
@@ -142,12 +150,14 @@ export const messageReceivedHandler = async ({
     // Generate a unique run ID for tracking this message handler execution
     const runId = asUUID(crypto.randomUUID());
     const startTime = Date.now();
+    // Every message the Hyperfy managers hand over has an id; core's run events require one
+    const messageId = message.id as UUID;
 
     // Emit run started event
     await runtime.emitEvent(EventType.RUN_STARTED, {
       runtime,
       runId,
-      messageId: message.id,
+      messageId,
       roomId: message.roomId,
       entityId: message.entityId,
       startTime,
@@ -160,7 +170,7 @@ export const messageReceivedHandler = async ({
         await runtime.emitEvent(EventType.RUN_TIMEOUT, {
           runtime,
           runId,
-          messageId: message.id,
+          messageId,
           roomId: message.roomId,
           entityId: message.entityId,
           startTime,
@@ -313,14 +323,19 @@ export const messageReceivedHandler = async ({
             }
           }
 
-          // Check if this is still the latest response ID for this agent+room
+          // Check if this is still the latest response ID for this agent+room. Turns of one
+          // connection run one at a time (lib/chat-intake.ts), so a newer one only starts while
+          // this one runs when this one outlived its slot; either way this turn does nothing more.
           const currentResponseId = agentResponses.get(message.roomId);
           if (currentResponseId !== responseId) {
             logger.info(
               `Response discarded - newer message being processed for agent: ${runtime.agentId}, room: ${message.roomId}`
             );
+            if (turn) cancelTurn(turn, 'a newer message took its place');
             return;
           }
+          // The answer came back for a turn that may no longer act: none of its plan is run
+          turn?.assertLive();
 
           if (responseContent && message.id) {
             responseContent.inReplyTo = createUniqueUuid(runtime, message.id);
@@ -362,6 +377,7 @@ export const messageReceivedHandler = async ({
             logger.info(
               `Ignore response discarded - newer message being processed for agent: ${runtime.agentId}, room: ${message.roomId}`
             );
+            if (turn) cancelTurn(turn, 'a newer message took its place');
             return; // Stop processing if a newer message took over
           }
 

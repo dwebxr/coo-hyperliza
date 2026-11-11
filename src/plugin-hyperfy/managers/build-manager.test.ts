@@ -8,7 +8,7 @@ import { PUBLIC_ADDRESS, type TestServer, closeServers, startServer, testNet } f
 
 /*
  * The real BuildManager, with uploads going through the real upload helper (lib/asset-upload.ts,
- * wired the way service.ts installs it as world.network.upload) against a fake world API whose
+ * wired the way session/create-agent-world.ts installs it as world.network.upload) against a fake world API whose
  * answers the test releases one by one. The guard's authorization and connection can be
  * withdrawn at any point; nothing may reach the world after that, whichever await it happened
  * during, except taking back what the edit itself added.
@@ -74,7 +74,7 @@ function setup() {
     await vi.waitFor(() => expect(requests.length).toBeGreaterThan(n));
     requests[n].answer(new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } }));
   };
-  return { auth, guard, world, entity, app, requests, effects, answer, manager: new BuildManager({} as never) };
+  return { auth, guard, world, entity, app, requests, effects, answer, manager: new BuildManager() };
 }
 
 const none = { sent: 0, requests: [], blueprints: 0, added: 0, destroyed: 0, rolledBack: [], finished: 0 };

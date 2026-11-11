@@ -1,12 +1,12 @@
-import { describe, expect, it, vi } from 'vitest';
-
-vi.mock('../service', () => ({ HyperfyService: { serviceType: 'hyperfy' } }));
+import { describe, expect, it } from 'vitest';
 
 import { hyperfyTipsProvider } from './tips';
+import { serviceFor, sessionFor } from '../test-support/session';
 
+// The tip wallet of the current connection: receiving, not receiving, or none (tips not configured)
 const runtime = (receiving: boolean | null): any => ({
   character: { name: 'Coo' },
-  getService: () => ({ getTipWallet: () => (receiving === null ? null : { receiving }) }),
+  getService: () => serviceFor(sessionFor({}, { tipWallet: receiving === null ? null : ({ receiving } as never) })),
 });
 
 describe('hyperfyTipsProvider', () => {
@@ -18,5 +18,8 @@ describe('hyperfyTipsProvider', () => {
       const off = await hyperfyTipsProvider.get(runtime(state), {} as any, {} as any);
       expect(off.values?.hyperfyTips).toBe('');
     }
+    // Not connected at all
+    const none = await hyperfyTipsProvider.get({ character: { name: 'Coo' }, getService: () => null } as any, {} as any, {} as any);
+    expect(none.values?.hyperfyTips).toBe('');
   });
 });

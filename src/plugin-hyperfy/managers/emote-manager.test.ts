@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../service.js', () => ({ HyperfyService: { serviceType: 'hyperfy' } }));
 const { access, readFile } = vi.hoisted(() => ({ access: vi.fn(), readFile: vi.fn() }));
 vi.mock('fs/promises', async (importOriginal) => {
   const actual: any = await importOriginal();
@@ -43,7 +42,9 @@ const asked = (server: TestServer) => server.hits.map((hit) => `https://world.te
 
 function newManager(upload = vi.fn().mockResolvedValue(undefined)) {
   const world = installed({ assetsUrl: 'https://world.test/assets/', network: { upload } });
-  return { manager: new EmoteManager({ getService: () => ({ getWorld: () => world }) } as any), upload };
+  // The connection the emotes are for: its world, and whether it has ended
+  const connection = { world, ended: false };
+  return { manager: new EmoteManager(connection), upload, connection, world };
 }
 
 function installed<T extends object>(world: T): T {
@@ -199,14 +200,13 @@ describe('EmoteManager talking gesture', () => {
     expect(upload.mock.calls.length).toBe(calls);
   });
 
-  it('leaves the shared emotes alone when the world is replaced mid-way', async () => {
+  it('leaves the shared emotes alone when its connection ends mid-way', async () => {
     access.mockRejectedValue(new Error('ENOENT'));
     await serveAssets(() => true);
     vi.spyOn(console, 'info').mockImplementation(() => {});
-    let world: any = installed({ assetsUrl: 'https://world.test/assets/', network: { upload: vi.fn() } });
-    const manager = new EmoteManager({ getService: () => ({ getWorld: () => world }) } as any);
+    const { manager, connection } = newManager(vi.fn());
     readFile.mockImplementation(async () => {
-      world = installed({ ...world }); // a reconnect happens while the first clip is read
+      connection.ended = true; // the connection ends (a reconnect) while the first clip is read
       return Buffer.from('custom-talk-clip');
     });
     expect(await manager.uploadEmotes()).toBe(false);
@@ -293,13 +293,12 @@ describe('EmoteManager talking gesture', () => {
     });
 
     it('does not switch a newer connection to a fallback found for the old one', async () => {
-      let world: any = installed({ assetsUrl: 'https://world.test/assets/', network: { upload: refused() } });
-      const manager = new EmoteManager({ getService: () => ({ getWorld: () => world }) } as any);
+      const { manager, connection } = newManager(refused());
       await answer((file) => {
-        if (file === 'mp-walk.glb') world = installed({ ...world }); // reconnect while the fallback is looked up
+        if (file === 'mp-walk.glb') connection.ended = true; // reconnect while the fallback is looked up
         return COO_WORLD(file);
       });
-      await (manager as any).uploadLocomotionEmotes(world);
+      await (manager as any).uploadLocomotionEmotes();
       expect((Emotes as any).WALK).toBe(original.WALK);
     });
 
@@ -308,5 +307,53 @@ describe('EmoteManager talking gesture', () => {
       await (newManager(refused()).manager as any).uploadLocomotionEmotes();
       expect((Emotes as any).WALK).toBe(original.WALK);
     });
+  });
+});
+
+describe('EmoteManager.playEmote (the name comes from a model: any text)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  function playing() {
+    const player = { data: { id: 'coo', effect: undefined as { emote?: string | null } | undefined }, moving: false };
+    const connection = { world: { entities: { player } }, ended: false };
+    return { manager: new EmoteManager(connection), player, connection };
+  }
+
+  it.each(['constructor', 'toString', '__proto__', 'hasOwnProperty', 'valueOf', 'no such emote', ''])('does nothing, and does not throw, for %j: a name every object has is not an emote', (name) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { manager, player } = playing();
+    expect(manager.hasEmote(name)).toBe(false);
+    expect(() => manager.playEmote(name)).not.toThrow();
+    expect(player.data.effect).toBeUndefined();
+  });
+
+  it("plays one of the engine's own emotes, then clears it and its timers when it is over", () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const { manager, player } = playing();
+    expect(manager.hasEmote('TALK')).toBe(true);
+    manager.playEmote('TALK');
+    expect(player.data.effect).toEqual({ emote: (Emotes as Record<string, string>).TALK });
+    expect(vi.getTimerCount()).toBe(2);
+    vi.advanceTimersByTime(1_500);
+    expect(player.data.effect).toEqual({ emote: null });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('stop() leaves no timer behind, and nothing is played once the connection has ended', () => {
+    vi.useFakeTimers();
+    for (const method of ['info', 'warn'] as const) vi.spyOn(console, method).mockImplementation(() => {});
+    const { manager, player, connection } = playing();
+    manager.playEmote('TALK');
+    manager.stop();
+    expect(vi.getTimerCount()).toBe(0);
+    player.data.effect = undefined;
+    connection.ended = true;
+    manager.playEmote('TALK');
+    expect(player.data.effect).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

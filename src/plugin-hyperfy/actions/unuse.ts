@@ -6,7 +6,7 @@ import {
     type State,
     logger
   } from '@elizaos/core';
-  import { HyperfyService } from '../service';
+  import { actingSession, connectedSession } from '../service';
   import { AgentActions } from '../systems/actions';
   import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
 
@@ -17,9 +17,7 @@ import {
     similes: ['RELEASE_ITEM', 'DROP_ITEM', 'CANCEL_INTERACTION'],
     description: `Drops or stops interacting with the currently held item; use when a player tells you to release it or you're done using it.`,
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
-      const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-      const world = service?.getWorld();
-      return !!service && service.isConnected() && !!world?.actions;
+      return !!connectedSession(runtime)?.world?.actions;
     },
     handler: async (
       runtime: IAgentRuntime,
@@ -28,11 +26,12 @@ import {
       _options: {},
       callback: HandlerCallback
     ) => {
-      const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-      const world = service?.getWorld();
+      // The turn's own connection (never a newer one); throws when the turn may no longer act
+      const session = actingSession(runtime);
+      const world = session?.world;
       const actions = world?.actions as AgentActions | undefined;
   
-      if (!service || !world || !actions) {
+      if (!session || !world || !actions) {
         logger.error('[UNUSE ITEM] Hyperfy service, world, or actions system not found.');
         await tellFailure(callback, UNUSE_ITEM, "Error: Cannot unuse item. Required systems are unavailable.");
         return actionFailed(UNUSE_ITEM, 'required systems are unavailable');

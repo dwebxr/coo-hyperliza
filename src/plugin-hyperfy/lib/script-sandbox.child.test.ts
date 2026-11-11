@@ -70,7 +70,7 @@ beforeAll(async () => {
       {
         name: 'sandbox-child-stand-ins',
         setup(esbuild) {
-          // By the resolved path, whoever imports it (service.ts does, as well as the engine)
+          // By the resolved path, whoever imports it (session/create-agent-world.ts does, as well as the engine)
           esbuild.onResolve({ filter: /(^|\/)storage(\.js)?$/ }, (args) => {
             const target = path.resolve(args.resolveDir, args.path);
             const isEngineStorage = [target, `${target}.js`].some((file) => existsSync(file) && realpathSync(file) === engineStorage);

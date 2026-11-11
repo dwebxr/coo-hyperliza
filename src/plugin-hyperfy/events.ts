@@ -1,4 +1,4 @@
-import type { EventPayload, MessagePayload, PluginEvents, UUID } from "@elizaos/core";
+import { type EventPayload, type MessagePayload, type PluginEvents, type UUID, logger } from "@elizaos/core";
 import { messageReceivedHandler } from "./handlers/messageReceivedHandler";
 
 export enum hyperfyEventType {
@@ -20,27 +20,22 @@ type MessageEventHandlers = Record<
   Array<(payload: MessagePayload) => Promise<void>>
 >;
 
+/** A chat or voice turn of the Hyperfy managers: what the model says goes out through its callback. */
+async function onMessage(payload: MessagePayload): Promise<void> {
+  if (!payload.callback) {
+    logger.warn('[Hyperfy] A message event came without a callback: there is nothing to answer it through, so it is not handled');
+    return;
+  }
+  await messageReceivedHandler({
+    runtime: payload.runtime,
+    message: payload.message,
+    callback: payload.callback,
+    onComplete: payload.onComplete,
+  });
+}
+
 // Core's PluginEvents type only names core events, but registerPlugin registers every key
 export const hyperfyEvents: PluginEvents & MessageEventHandlers = {
-  [hyperfyEventType.MESSAGE_RECEIVED]: [
-    async (payload: MessagePayload) => {
-      await messageReceivedHandler({
-        runtime: payload.runtime,
-        message: payload.message,
-        callback: payload.callback,
-        onComplete: payload.onComplete,
-      });
-    },
-  ],
-
-  [hyperfyEventType.VOICE_MESSAGE_RECEIVED]: [
-    async (payload: MessagePayload) => {
-      await messageReceivedHandler({
-        runtime: payload.runtime,
-        message: payload.message,
-        callback: payload.callback,
-        onComplete: payload.onComplete,
-      });
-    },
-  ],
+  [hyperfyEventType.MESSAGE_RECEIVED]: [onMessage],
+  [hyperfyEventType.VOICE_MESSAGE_RECEIVED]: [onMessage],
 };

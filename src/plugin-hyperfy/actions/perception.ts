@@ -10,7 +10,8 @@ import {
   ModelType
 } from '@elizaos/core';
 
-import { HyperfyService } from '../service';
+import { actingSession, connectedSession } from '../service';
+import { TurnCancelled } from '../lib/turn-context';
 import { AiBudgetExceededError, forPurpose, getUsageBudget } from '../../usage-budget';
 import { AnthropicRefusalError } from '../../anthropic-models';
 import { chooseSnapshot, type NamedEntity } from '../lib/snapshot-choice';
@@ -109,8 +110,7 @@ export const hyperfyScenePerceptionAction: Action = {
   similes: ['LOOK_AROUND', 'OBSERVE_SURROUNDINGS', 'LOOK_AT_SCENE', 'CHECK_VIEW'],
   description: 'Choose this when the user asks the agent to look around, look in a specific direction, or examine a visible object — it captures and interprets a scene snapshot to generate a context-aware response.',
   validate: async (runtime: IAgentRuntime): Promise<boolean> => {
-    const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-    return !!service && service.isConnected() && !!service.getWorld();
+    return !!connectedSession(runtime);
   },
 
   handler: async (
@@ -120,11 +120,12 @@ export const hyperfyScenePerceptionAction: Action = {
     _options: {},
     callback: HandlerCallback
   ) => {
-    const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-    const world = service?.getWorld();
-    const puppeteerManager = service?.getPuppeteerManager();
+    // The turn's own connection (never a newer one); throws when the turn may no longer act
+    const session = actingSession(runtime);
+    const world = session?.world;
+    const renderPage = session?.renderPage;
 
-    if (!service || !world || !puppeteerManager) {
+    if (!session || !world || !renderPage) {
       logger.error('Hyperfy service/world unavailable.');
       await tellFailure(callback, SCENE_PERCEPTION, 'Unable to observe environment. Hyperfy world not available.');
       return actionFailed(SCENE_PERCEPTION, 'Hyperfy world not available');
@@ -149,8 +150,6 @@ export const hyperfyScenePerceptionAction: Action = {
       return actionFailed(SCENE_PERCEPTION, 'vision budget used up');
     }
 
-    world.controls?.stopAllActions();
-
     /* Decide how to look, from the player's words (no model call) */
     const selfId = world.entities?.player?.data?.id;
     const entities: NamedEntity[] = [];
@@ -168,24 +167,33 @@ export const hyperfyScenePerceptionAction: Action = {
     /* Capture snapshot */
     let imgBase64: string;
     try {
-      switch (choice.type) {
-        case 'LOOK_AROUND':
-          imgBase64 = await puppeteerManager.snapshotEquirectangular();
-          break;
-        case 'LOOK_DIRECTION':
-          imgBase64 = await puppeteerManager.snapshotFacingDirection(choice.direction);
-          break;
-        case 'LOOK_AT_ENTITY': {
-          const ent = world.entities.items.get(choice.entityId);
-          const pos = ent?.base?.position || ent?.root?.position;
-          if (!pos) throw new Error('No position');
-          await world.controls.followEntity(choice.entityId);
-          imgBase64 = await puppeteerManager.snapshotViewToTarget([pos.x, pos.y, pos.z]);
-          break;
+      // The avatar stands still, turns or walks over, and stays there until the picture is taken:
+      // one section, with nothing else moving it (ConnectionSession.withBody). The render page
+      // takes one picture at a time (PuppeteerManager.capture).
+      imgBase64 = await session.withBody(async (signal) => {
+        world.controls?.stopAllActions();
+        switch (choice.type) {
+          case 'LOOK_AROUND':
+            return renderPage.capture(world, { kind: 'around' }, { signal });
+          case 'LOOK_DIRECTION':
+            await world.controls.rotateTo(choice.direction, 500, { signal });
+            world.controls.stopRotation();
+            session.assertLive();
+            return renderPage.capture(world, { kind: 'facing', direction: choice.direction }, { signal });
+          case 'LOOK_AT_ENTITY': {
+            const ent = world.entities.items.get(choice.entityId);
+            const pos = ent?.base?.position || ent?.root?.position;
+            if (!pos) throw new Error('No position');
+            await world.controls.followEntity(choice.entityId, undefined, { signal });
+            session.assertLive();
+            return renderPage.capture(world, { kind: 'target', position: [pos.x, pos.y, pos.z] }, { signal });
+          }
         }
-      }
+      });
     } catch (err) {
       look.release();
+      // A cancelled turn says nothing more
+      if (err instanceof TurnCancelled) throw err;
       logger.error('Snapshot failed:', err);
       await tellFailure(callback, SCENE_PERCEPTION, japanese ? LOOK_FAILED_JA : LOOK_FAILED_EN, { thought: 'Snapshot failed.', metadata: { error: 'snapshot_failure', snapshotType } });
       return actionFailed(SCENE_PERCEPTION, 'snapshot failed', { snapshotType });
@@ -223,9 +231,9 @@ export const hyperfyScenePerceptionAction: Action = {
     } catch (err) {
       // The turn's caller answers without Claude (handlers/messageReceivedHandler.ts); a reply sent
       // here would be dropped by core along with the error
-      // Refused by the Claude budget: no request was made for this look
-      if (err instanceof AiBudgetExceededError) look.release();
-      if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError) throw err;
+      // Refused by the Claude budget, or the turn was cancelled: no request was made for this look
+      if (err instanceof AiBudgetExceededError || err instanceof TurnCancelled) look.release();
+      if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError || err instanceof TurnCancelled) throw err;
       logger.error('Vision response failed:', err);
       await tellFailure(callback, SCENE_PERCEPTION, japanese ? LOOK_FAILED_JA : LOOK_FAILED_EN, { thought: 'Cannot understand the scene.', metadata: { error: 'vision_failure' } });
       return actionFailed(SCENE_PERCEPTION, 'vision model failed', { snapshotType });

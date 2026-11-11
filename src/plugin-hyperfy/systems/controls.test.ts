@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
+import * as THREE from 'three';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AgentControls } from './controls';
 import { AgentActions } from './actions';
 import { ControlPriorities } from '../hyperfy/src/core/extras/ControlPriorities.js';
@@ -176,5 +177,124 @@ describe('AgentControls.bind', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+/*
+ * Navigation with the signal of what it is for (a turn, or the connection). The player stands in
+ * for the engine's: while the agent holds W it moves, as physics would move it.
+ */
+describe('AgentControls navigation and the signal of what it is for', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  function walkable() {
+    const player = {
+      data: { id: 'coo' },
+      base: { position: new THREE.Vector3(), quaternion: new THREE.Quaternion() },
+      cam: { rotation: { y: 0 } },
+      teleport: vi.fn(),
+    };
+    const tower = { data: { id: 'tower' }, base: { position: new THREE.Vector3(10_000, 0, 0) } };
+    const w: any = { rig: { position: { x: 0, y: 0, z: 0 } }, camera: { position: { z: 10 } }, entities: { player, items: new Map<string, unknown>([['tower', tower]]) } };
+    const controls = new AgentControls(w);
+    w.controls = controls;
+    setInterval(() => {
+      if (controls.keyW.down) player.base.position.x += 0.5;
+    }, 100);
+    const walking = () => controls.keyW.down === true;
+    return { controls, player, walking };
+  }
+
+  it.each([
+    ['goto', (controls: AgentControls, signal: AbortSignal) => controls.goto(10_000, 0, { signal })],
+    ['followEntity', (controls: AgentControls, signal: AbortSignal) => controls.followEntity('tower', undefined, { signal })],
+  ])('%s walks until its signal fires, then stops: the keys are released and its promise resolves', async (_name, start) => {
+    const { controls, player, walking } = walkable();
+    const stop = new AbortController();
+    let ended = false;
+    void start(controls, stop.signal).then(() => (ended = true));
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect([controls.getIsNavigating(), walking(), ended]).toEqual([true, true, false]);
+    const reached = player.base.position.x;
+    expect(reached).toBeGreaterThan(10);
+
+    stop.abort();
+    // At once, not at the next tick
+    expect([controls.getIsNavigating(), walking()]).toEqual([false, false]);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(ended).toBe(true);
+    expect(player.base.position.x).toBe(reached);
+  });
+
+  it('starts nothing for a signal that has fired already', async () => {
+    const { controls, walking } = walkable();
+    const fired = new AbortController();
+    fired.abort();
+    await controls.goto(10_000, 0, { signal: fired.signal });
+    await controls.followEntity('tower', undefined, { signal: fired.signal });
+    await controls.startRandomWalk(1000, 5, 30_000, { signal: fired.signal });
+    await controls.rotateTo('left', 500, { signal: fired.signal });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect([controls.getIsNavigating(), controls.getIsWalkingRandomly(), walking()]).toEqual([false, false, false]);
+  });
+
+  it('goes on walking while the signal never fires: a walk a completed turn left running', async () => {
+    const { controls, walking } = walkable();
+    const completed = new AbortController();
+    void controls.followEntity('tower', undefined, { signal: completed.signal });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect([controls.getIsNavigating(), walking()]).toEqual([true, true]);
+    // What the session's end does
+    controls.stopAllActions('disconnect');
+    expect([controls.getIsNavigating(), walking()]).toEqual([false, false]);
+  });
+
+  it('leaves a newer walk alone when the signal of the walk it replaced fires', async () => {
+    const { controls, walking } = walkable();
+    const older = new AbortController();
+    const first = controls.goto(10_000, 0, { signal: older.signal });
+    await vi.advanceTimersByTimeAsync(1_000);
+    void controls.followEntity('tower');
+    // At once, before the replaced walk's own loop has noticed that it was replaced
+    older.abort();
+    expect([controls.getIsNavigating(), walking()]).toEqual([true, true]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await first;
+    expect([controls.getIsNavigating(), walking()]).toEqual([true, true]);
+    controls.stopAllActions();
+  });
+
+  it('wandering stops when its signal fires, and goes on while it does not', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const { controls } = walkable();
+    const stop = new AbortController();
+    void controls.startRandomWalk(1000, 5, 600_000, { signal: stop.signal });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(controls.getIsWalkingRandomly()).toBe(true);
+    stop.abort();
+    expect([controls.getIsWalkingRandomly(), controls.getIsNavigating()]).toEqual([false, false]);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect([controls.getIsWalkingRandomly(), controls.getIsNavigating()]).toEqual([false, false]);
+  });
+
+  it('a turn stops where it is when its signal fires', async () => {
+    const { controls, player } = walkable();
+    const stop = new AbortController();
+    let ended = false;
+    void controls.rotateTo('back', 2_000, { signal: stop.signal }).then(() => (ended = true));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(ended).toBe(false);
+    stop.abort();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(ended).toBe(true);
+    const turned = player.base.quaternion.clone();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(player.base.quaternion.equals(turned)).toBe(true);
   });
 });

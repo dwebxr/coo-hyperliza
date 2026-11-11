@@ -8,12 +8,13 @@ import {
     type State,
     logger,
 } from '@elizaos/core';
-import { HyperfyService } from '../service';
+import { actingSession, connectedSession } from '../service';
 import { AiBudgetExceededError, forPurpose } from '../../usage-budget';
 import { AnthropicRefusalError } from '../../anthropic-models';
 import { AgentControls } from '../systems/controls'; // Import AgentControls type
 import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
 import { oneLine, shownName } from '../lib/text';
+import { TurnCancelled } from '../lib/turn-context';
 
 const GOTO_ENTITY = 'HYPERFY_GOTO_ENTITY';
 // What a reply says of a world name or an id, as the world state shows other entities' names
@@ -81,9 +82,7 @@ export const hyperfyGotoEntityAction: Action = {
     similes: ['GO_TO_ENTITY_IN_WORLD', 'MOVE_TO_ENTITY', 'NAVIGATE_TO_ENTITY'],
     description: 'Moves your character to a specified player, object, or world position; use when you need to approach something or go somewhere before interacting.',
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
-      const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-      // Check if connected and if controls are available
-      return !!service && service.isConnected() && !!service.getWorld()?.controls;
+      return !!connectedSession(runtime)?.world?.controls;
     },
     handler: async (
       runtime: IAgentRuntime,
@@ -101,11 +100,12 @@ export const hyperfyGotoEntityAction: Action = {
         MAX_THOUGHT_CODE_POINTS
       );
 
-      const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-      const world = service?.getWorld(); // Use the getter
+      // The turn's own connection (never a newer one); throws when the turn may no longer act
+      const session = actingSession(runtime);
+      const world = session?.world;
       const controls = world?.controls as AgentControls | undefined; // Get controls and cast type
 
-      if (!service || !world || !controls) {
+      if (!session || !world || !controls) {
         logger.error('[GOTO Action] Hyperfy service, world, or controls not found.');
         await tellFailure(callback, GOTO_ENTITY, "I can't move right now.");
         return actionFailed(GOTO_ENTITY, 'Hyperfy connection/controls unavailable');
@@ -123,8 +123,9 @@ export const hyperfyGotoEntityAction: Action = {
         navigationResult = await runtime.useModel(ModelType.OBJECT_LARGE, forPurpose('navigation', { prompt }));
         logger.info('[GOTO Action] Navigation target extracted:', navigationResult);
       } catch (error) {
-        // The turn's caller handles these (scripted or offline fallback, a fixed decline)
-        if (error instanceof AiBudgetExceededError || error instanceof AnthropicRefusalError) throw error;
+        // The turn's caller handles these (scripted or offline fallback, a fixed decline); a
+        // cancelled turn does nothing more
+        if (error instanceof AiBudgetExceededError || error instanceof AnthropicRefusalError || error instanceof TurnCancelled) throw error;
         logger.error(`[GOTO Action] Error during navigation target extraction:`, error);
         await tellFailure(callback, GOTO_ENTITY, 'Action failed: Could not determine a navigation target.', {
           thought: 'Failed to extract navigation target.',
@@ -154,7 +155,10 @@ export const hyperfyGotoEntityAction: Action = {
             if (!entityId) throw new Error('Missing entityId in parameter.');
 
             logger.info(`Navigating to entity ${entityId}`);
-            await controls.followEntity(entityId);
+            // One walk at a time, started only for a turn that may still act (withBody). It stops
+            // when the turn is cancelled, and then nothing is said and nothing recorded as done
+            await session.withBody((signal) => controls.followEntity(entityId, undefined, { signal }));
+            session.assertLive();
 
             const targetEntity = world.entities.items.get(parameter.entityId);
             // World content (and an id the model chose): one short line, nothing invisible
@@ -178,7 +182,8 @@ export const hyperfyGotoEntityAction: Action = {
             }
 
             logger.info(`Navigating to position (${pos.x}, ${pos.z})`);
-            await controls.goto(pos.x, pos.z);
+            await session.withBody((signal) => controls.goto(pos.x, pos.z, { signal }));
+            session.assertLive();
 
             await callback({
               text: `Reached position (${pos.x}, ${pos.z}).`,
@@ -192,6 +197,7 @@ export const hyperfyGotoEntityAction: Action = {
             throw new Error(`Unsupported navigation type: ${shownName(String(navigationType), ENTITY_NAME_MAX)}`);
         }
       } catch (error: any) {
+        if (error instanceof TurnCancelled) throw error;
         logger.error(`[GOTO Action] Navigation failed:`, error);
         await tellFailure(callback, GOTO_ENTITY, `Navigation failed: ${oneLine(String(error?.message ?? error), ERROR_TEXT_MAX)}`, {
           metadata: { error: 'navigation_error', detail: error.message },

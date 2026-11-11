@@ -13,9 +13,11 @@ import {
   CHAT_TURN_MAX_AGE_MS,
   CHAT_TURN_SLOT_MS,
   ChatIntake,
+  type ChatTurn,
   type ReceivedChatMessage,
   readChatMessage,
 } from './chat-intake';
+import { TurnCancelled } from './turn-context';
 
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 const at = () => 1_700_000_000_000;
@@ -402,28 +404,83 @@ describe('ChatIntake', () => {
   });
 
   it('drops what is waiting once its connection is gone or it is stopped, and accepts nothing after stop()', async () => {
-    let live = true;
+    const connection = new AbortController();
     const handled: string[] = [];
-    let finishFirst!: () => void;
+    const turns: Record<string, { cancelled: boolean; signal: AbortSignal }> = {};
     const chat = new ChatIntake({
-      isLive: () => live,
-      handle: (msg) => {
+      signal: connection.signal,
+      handle: (msg, turn) => {
         handled.push(msg.id);
-        return msg.id === 'first' ? new Promise<void>((resolve) => (finishFirst = resolve)) : Promise.resolve();
+        turns[msg.id] = turn;
+        // Never finishes by itself
+        return new Promise<void>(() => {});
       },
     });
     chat.accept(message('first'));
     chat.accept(message('queued'));
     await vi.waitFor(() => expect(handled).toEqual(['first']));
-    live = false;
-    finishFirst();
+    expect(turns.first.cancelled).toBe(false);
+    // The connection ends: the turn in progress is cancelled and what waits is dropped, at once
+    connection.abort();
+    expect(turns.first.cancelled).toBe(true);
+    expect(turns.first.signal.reason).toBeInstanceOf(TurnCancelled);
+    expect(chat.waiting).toBe(0);
     await chat.idle();
     expect(handled).toEqual(['first']);
-
-    live = true;
-    chat.stop();
     expect(chat.accept(message('after-stop'))).toBe('stopped');
     await chat.idle();
     expect(handled).toEqual(['first']);
+  });
+
+  it('stop() ends the slot of the turn in progress: no timer of the intake is left running', async () => {
+    vi.useFakeTimers();
+    try {
+      const chat = new ChatIntake({ handle: () => new Promise<void>(() => {}) });
+      chat.accept(message('hangs'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(1);
+      chat.stop();
+      await chat.idle();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('is stopped from the start when its connection had ended already', async () => {
+    const connection = new AbortController();
+    connection.abort();
+    const handle = vi.fn(async () => {});
+    const chat = new ChatIntake({ signal: connection.signal, handle });
+    expect(chat.accept(message('late'))).toBe('stopped');
+    await chat.idle();
+    expect(handle).not.toHaveBeenCalled();
+  });
+
+  it("hands a message with a handler of its own (a voice transcript) to that handler, in its place in the queue and by the queue's rules", async () => {
+    const order: string[] = [];
+    let finishFirst!: () => void;
+    const chat = new ChatIntake({
+      log: () => {},
+      handle: (msg) => {
+        order.push(`chat:${msg.id}`);
+        return msg.id === 'c1' ? new Promise<void>((resolve) => (finishFirst = resolve)) : Promise.resolve();
+      },
+    });
+    const voice = vi.fn(async (msg: ReceivedChatMessage, _turn: ChatTurn) => void order.push(`voice:${msg.id}`));
+    chat.accept(message('c1', 'alice'));
+    expect(chat.accept(message('v1', 'bob'), voice)).toBe('queued');
+    chat.accept(message('c2', 'alice'));
+    // The same id again is a duplicate, whoever would handle it
+    expect(chat.accept(message('v1', 'bob'), voice)).toBe('duplicate');
+    await vi.waitFor(() => expect(order).toEqual(['chat:c1']));
+    // One speaker's transcripts share their sender's waiting places with what they type
+    for (let i = 0; i < CHAT_SENDER_WAITING_MAX; i++) chat.accept(message(`flood-${i}`, 'carol'), voice);
+    expect(chat.waiting).toBe(2 + CHAT_SENDER_BURST);
+    finishFirst();
+    await chat.idle();
+    expect(order.slice(0, 3)).toEqual(['chat:c1', 'voice:v1', 'chat:c2']);
+    expect(voice).toHaveBeenCalledTimes(1 + CHAT_SENDER_BURST);
+    expect(voice.mock.calls[0][1]).toMatchObject({ cancelled: false });
   });
 });

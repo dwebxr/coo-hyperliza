@@ -1,14 +1,25 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../service', () => ({ HyperfyService: { serviceType: 'hyperfy' } }));
-vi.mock('../events', () => ({ hyperfyEventType: { MESSAGE_RECEIVED: 'HYPERFY_MESSAGE_RECEIVED' } }));
-
-import { MessageManager } from './message-manager';
 import { installWorldChat } from '../lib/world-chat';
 import { currentTurn } from '../lib/turn-context';
+import { sessionFor, sessionRuntime, withParts } from '../test-support/session';
+
+/** A queue slot as lib/chat-intake.ts hands one to handleMessage, and how to end it */
+function slot() {
+  const controller = new AbortController();
+  return {
+    turn: {
+      signal: controller.signal,
+      get cancelled() {
+        return controller.signal.aborted;
+      },
+    },
+    runOut: () => controller.abort(),
+  };
+}
 
 describe('MessageManager.formatMessages', () => {
-  const manager = new MessageManager({ character: { templates: {} } } as any);
+  const manager = sessionFor({}).messages;
   const memory = (entityId: string, text: string): any => ({ entityId, content: { text }, createdAt: Date.UTC(2026, 0, 1, 12, 0) });
 
   it('does not throw for entities without hyperfy metadata', () => {
@@ -69,11 +80,8 @@ describe('MessageManager.sendMessage', () => {
       entities: { player: { data: { id: 'me', name: 'Coo' } } },
     };
     installWorldChat(world);
-    const runtime: any = {
-      character: { templates: {} },
-      getService: () => ({ isConnected: () => true, getWorld: () => world, getEntityName: () => 'Coo' }),
-    };
-    return { manager: new MessageManager(runtime), world, send };
+    const session = sessionFor(world);
+    return { manager: session.messages, session, world, send };
   }
 
   it('broadcasts a long reply as separate chatAdded messages in order, and shows each locally', async () => {
@@ -101,12 +109,31 @@ describe('MessageManager.sendMessage', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it('returns false instead of throwing when not connected', async () => {
-    const runtime: any = {
-      character: { templates: {} },
-      getService: () => ({ isConnected: () => false, getWorld: () => null }),
-    };
-    await expect(new MessageManager(runtime).sendMessage('hi')).resolves.toBe(false);
+  it('posts nothing, and returns false instead of throwing, once its connection has ended', async () => {
+    const { manager, session, world, send } = createChat();
+    await session.end();
+    await expect(manager.sendMessage('hi')).resolves.toBe(false);
+    expect(send).not.toHaveBeenCalled();
+    expect(world.chat.msgs).toEqual([]);
+  });
+
+  it('posts nothing for a turn that was cancelled, and posts again outside it', async () => {
+    const { manager, session, send } = createChat();
+    const { turn, runOut } = slot();
+    await session.runTurn({ origin: 'chat', requesterId: 'p1', cancel: turn.signal }, async () => {
+      await expect(manager.sendMessage('while live')).resolves.toBe(true);
+      runOut();
+      await expect(manager.sendMessage('after its slot ran out')).resolves.toBe(false);
+    });
+    await expect(manager.sendMessage('a notice of the connection itself')).resolves.toBe(true);
+    expect(send.mock.calls.map(([, msg]) => msg.body)).toEqual(['while live', 'a notice of the connection itself']);
+  });
+
+  it('returns false instead of throwing before the agent has a player', async () => {
+    const { manager, world, send } = createChat();
+    world.entities.player = null;
+    await expect(manager.sendMessage('hi')).resolves.toBe(false);
+    expect(send).not.toHaveBeenCalled();
   });
 
   it('returns false instead of throwing when the world chat is not installed', async () => {
@@ -114,11 +141,7 @@ describe('MessageManager.sendMessage', () => {
       chat: { add: vi.fn() },
       entities: { player: { data: { id: 'me', name: 'Coo' } } },
     };
-    const runtime: any = {
-      character: { templates: {} },
-      getService: () => ({ isConnected: () => true, getWorld: () => world, getEntityName: () => 'Coo' }),
-    };
-    await expect(new MessageManager(runtime).sendMessage('hi')).resolves.toBe(false);
+    await expect(sessionFor(world).messages.sendMessage('hi')).resolves.toBe(false);
     // Never the broadcasting path app scripts can reach
     expect(world.chat.add).not.toHaveBeenCalled();
   });
@@ -136,60 +159,64 @@ describe('MessageManager.sendMessage', () => {
   });
 });
 
-describe('MessageManager stale turns', () => {
+describe('MessageManager turns', () => {
+  /** A chat message handled up to the event the message handler would take over, with the reply callback it was given */
   async function receiveAndCaptureCallback() {
-    let world: any = { entities: { player: { data: { id: 'coo' } } } };
-    const sendMessage = vi.fn();
-    const speak = vi.fn();
+    const world: any = { entities: { player: { data: { id: 'coo' } } } };
+    const sendMessage = vi.fn().mockResolvedValue(true);
+    const speak = vi.fn().mockResolvedValue('all');
     let callback: any;
-    const runtime: any = {
-      agentId: 'agent',
-      character: { name: 'Coo', templates: {} },
-      getService: () => ({
-        getWorld: () => world,
-        getConnectionGeneration: () => 3,
-        currentWorldId: 'w1',
-        getEmoteManager: () => ({ playEmote: vi.fn() }),
-        getVoiceManager: () => ({ speak }),
-      }),
+    const runtime: any = sessionRuntime({
       ensureConnection: vi.fn(),
       getEntityById: vi.fn().mockResolvedValue({ id: 'e' }),
       createMemory: vi.fn(),
       emitEvent: vi.fn(async (_event: string, payload: any) => {
         callback = payload.callback;
       }),
-    };
-    const manager = new MessageManager(runtime);
+    });
+    const session = withParts(sessionFor(world, { runtime }), { emotes: { playEmote: vi.fn(), stop: vi.fn() }, voice: { speak, stop: vi.fn() } });
+    const manager = session.messages;
     manager.sendMessage = sendMessage as any;
-    const turn = { cancelled: false };
+    const { turn, runOut } = slot();
     await manager.handleMessage({ id: 'm1', fromId: 'p1', from: 'Alice', body: 'hi' }, turn);
-    return { manager, turn, callback, sendMessage, speak, runtime, replaceWorld: () => (world = { entities: world.entities }) };
+    return { manager, session, world, runOut, callback, sendMessage, speak, runtime };
   }
 
   it('handles the message as a chat turn for its sender, on the world and connection it arrived on', async () => {
     let seen: any;
     const world = { entities: { player: { data: { id: 'coo' } } } };
-    const runtime: any = {
-      agentId: 'agent',
-      character: { name: 'Coo', templates: {} },
-      getService: () => ({ getWorld: () => world, getConnectionGeneration: () => 7, currentWorldId: 'w1' }),
+    const runtime: any = sessionRuntime({
       ensureConnection: vi.fn(),
       getEntityById: vi.fn().mockResolvedValue({ id: 'e' }),
       emitEvent: vi.fn(async () => {
         seen = currentTurn();
       }),
-    };
-    await new MessageManager(runtime).handleMessage({ id: 'm1', fromId: 'p1', from: 'Alice', body: 'hi' });
-    expect(seen).toMatchObject({ origin: 'chat', requesterId: 'p1', world, generation: 7 });
+    });
+    const session = sessionFor(world, { runtime });
+    await session.messages.handleMessage({ id: 'm1', fromId: 'p1', from: 'Alice', body: 'hi' });
+    expect(seen).toMatchObject({ origin: 'chat', requesterId: 'p1', world, generation: session.generation, live: true });
     expect(seen.signal.aborted).toBe(false);
     expect(currentTurn()).toBeUndefined();
   });
 
+  it('asks nothing of the model for a turn that was cancelled while it was being set up', async () => {
+    const { turn, runOut } = slot();
+    const runtime: any = sessionRuntime({
+      ensureConnection: vi.fn(async () => runOut()),
+      getEntityById: vi.fn().mockResolvedValue({ id: 'e' }),
+      emitEvent: vi.fn(),
+    });
+    const session = sessionFor({ entities: { player: { data: { id: 'coo' } } } }, { runtime });
+    await session.messages.handleMessage({ id: 'm1', fromId: 'p1', from: 'Alice', body: 'hi' }, turn);
+    expect(runtime.emitEvent).not.toHaveBeenCalled();
+  });
+
   it('delivers replies for a live turn', async () => {
-    const { callback, sendMessage, speak } = await receiveAndCaptureCallback();
+    const { callback, sendMessage, speak, runtime } = await receiveAndCaptureCallback();
     await callback({ text: 'Hello!' });
     expect(sendMessage).toHaveBeenCalledWith('Hello!');
     expect(speak).toHaveBeenCalledWith('Hello!');
+    expect(runtime.createMemory).toHaveBeenCalledTimes(1);
   });
 
   it('passes the full original reply to voice even when chat needs splitting', async () => {
@@ -202,15 +229,19 @@ describe('MessageManager stale turns', () => {
   });
 
   it.each([
-    ['the turn timed out', (ctx: any) => (ctx.turn.cancelled = true)],
-    ['the manager was stopped (disconnect)', (ctx: any) => ctx.manager.stop()],
-    ['the world was replaced (reconnect)', (ctx: any) => ctx.replaceWorld()],
+    ['the turn timed out', async (ctx: any) => ctx.runOut()],
+    ['the connection ended (disconnect)', async (ctx: any) => void ctx.session.end()],
+    ['the connection was replaced by one around the same world object (reconnect)', async (ctx: any) => {
+      void ctx.session.end();
+      sessionFor(ctx.world, { runtime: ctx.runtime });
+    }],
   ])('drops a late reply when %s', async (_label, invalidate) => {
     const ctx = await receiveAndCaptureCallback();
-    invalidate(ctx);
-    await ctx.callback({ text: 'Too late' });
+    await invalidate(ctx);
+    await ctx.callback({ text: 'Too late', emote: 'wave' });
     expect(ctx.sendMessage).not.toHaveBeenCalled();
     expect(ctx.speak).not.toHaveBeenCalled();
+    expect(ctx.session.emotes.playEmote).not.toHaveBeenCalled();
     expect(ctx.runtime.createMemory).not.toHaveBeenCalled();
   });
 });
@@ -218,19 +249,16 @@ describe('MessageManager stale turns', () => {
 describe('MessageManager shop links', () => {
   it('posts a shop link to chat once and never reads it aloud', async () => {
     let callback: any;
-    const sendMessage = vi.fn();
+    const sendMessage = vi.fn().mockResolvedValue(true);
     const speak = vi.fn();
     const world = { entities: { player: { data: { id: 'coo' } } } };
-    const runtime: any = {
-      agentId: 'agent',
-      character: { name: 'Coo', templates: {} },
-      getService: () => ({ getWorld: () => world, getConnectionGeneration: () => 0, currentWorldId: 'w1', getEmoteManager: () => ({ playEmote: vi.fn() }), getVoiceManager: () => ({ speak }) }),
+    const runtime: any = sessionRuntime({
       ensureConnection: vi.fn(),
       getEntityById: vi.fn().mockResolvedValue({ id: 'e' }),
       createMemory: vi.fn(),
       emitEvent: vi.fn(async (_e: string, payload: any) => { callback = payload.callback; }),
-    };
-    const manager = new MessageManager(runtime);
+    });
+    const manager = withParts(sessionFor(world, { runtime }), { emotes: { playEmote: vi.fn() }, voice: { speak } }).messages;
     manager.sendMessage = sendMessage as any;
     await manager.handleMessage({ id: 'm1', fromId: 'p1', from: 'Alice', body: 'link please' });
     await callback({ text: '🛒 HoverBoard — 505 JPYC\nhttps://open-pay.jp/ja/@a?product=x', metadata: { openpayLink: true } });
@@ -259,27 +287,20 @@ describe('MessageManager tip notices', () => {
       entities: { player: self, items: new Map<string, any>([['me', self], ['p1', { data: { id: 'p1', type: 'player', name: 'Alice' } }]]) },
     };
     installWorldChat(world);
-    const speak = vi.fn().mockResolvedValue(true);
-    const service = {
-      isConnected: () => true,
-      getWorld: () => world,
-      getConnectionGeneration: () => 0,
-      getEntityName: () => 'Coo',
-      getEmoteManager: () => ({ hasEmote: () => false, playEmote: vi.fn() }),
-      getVoiceManager: () => ({ speak }),
-      // The tip wallet's state on this connection (lib/tip-wallet.ts TipWallet.receivedOnThisConnection)
-      getTipWallet: () => ({ receivedOnThisConnection: receiving }),
-      currentWorldId: '00000000-0000-0000-0000-0000000000ee',
-    };
-    const runtime: any = {
-      agentId: '00000000-0000-0000-0000-0000000000aa',
-      character: { name: 'Coo', templates: {} },
-      getService: () => service,
+    const speak = vi.fn().mockResolvedValue('all');
+    const runtime: any = sessionRuntime({
       createMemory: vi.fn().mockResolvedValue(undefined),
       ensureConnection: vi.fn().mockResolvedValue(undefined),
       getEntityById: vi.fn().mockResolvedValue({ id: 'e' }),
       emitEvent: vi.fn().mockResolvedValue(undefined),
-    };
+    });
+    /** A session around `onWorld` with the tip wallet's state on its connection (lib/tip-wallet.ts TipWallet.receivedOnThisConnection) */
+    const sessionOn = (onWorld: object) =>
+      withParts(sessionFor(onWorld, { runtime, tipWallet: { receivedOnThisConnection: receiving } as never }), {
+        emotes: { hasEmote: () => false, playEmote: vi.fn() },
+        voice: { speak },
+      });
+    const session = sessionOn(world);
     let count = 0;
     /** A notice as the world's server sends it: through the network handler, which is what makes it count */
     const notice = (body: string) => {
@@ -287,7 +308,7 @@ describe('MessageManager tip notices', () => {
       return world.chat.msgs.at(-1);
     };
     const thanked = () => add.mock.calls.map(([msg]) => msg.body as string);
-    return { manager: new MessageManager(runtime), add, speak, faceEntity, runtime, notice, world, thanked };
+    return { manager: session.messages, session, sessionOn, add, speak, faceEntity, runtime, notice, world, thanked };
   }
 
   it('thanks the tipper the world announced without a model call: faces them, speaks, and remembers that the world said so', async () => {
@@ -295,7 +316,7 @@ describe('MessageManager tip notices', () => {
     await manager.handleMessage(notice('Alice tipped Coo 100 JPYC'));
     expect(add).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining('Aliceさん、100 JPYCの投げゼニ') }), 'chatAdded');
     expect(speak).toHaveBeenCalledWith(expect.stringContaining('ありがとうございます'));
-    expect(faceEntity).toHaveBeenCalledWith('p1');
+    expect(faceEntity).toHaveBeenCalledWith('p1', undefined, { signal: expect.any(AbortSignal) });
     expect(runtime.createMemory.mock.calls[0][0].content.thought).toBe('The world announced that Alice tipped me 100 JPYC. I did not check it on chain.');
     expect(runtime.emitEvent).not.toHaveBeenCalled();
   });
@@ -337,12 +358,12 @@ describe('MessageManager tip notices', () => {
   });
 
   it('ignores a tip announcement that is part of the chat history the world sent on connecting', async () => {
-    const { manager, add, runtime, world } = setup();
+    const { sessionOn, add, runtime, world } = setup();
     // The history objects as the world's chat keeps them: what the engine's snapshot handler is given
     let history: any[] = [];
     const fresh: any = { chat: world.chat, events: world.events, network: { send: world.network.send, onSnapshot: (data: { chat: any[] }) => void (history = data.chat) }, entities: world.entities, controls: world.controls };
     installWorldChat(fresh);
-    (runtime.getService() as any).getWorld = () => fresh;
+    const manager = sessionOn(fresh).messages;
     fresh.network.onSnapshot({ chat: [{ id: 'h1', from: null, fromId: null, body: 'Alice tipped Coo 100 JPYC', createdAt: new Date().toISOString() }] });
     expect(history).toHaveLength(1);
     await manager.handleMessage(history[0]);

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventType, ModelType } from '@elizaos/core';
 
 const create = vi.fn();
@@ -48,11 +48,80 @@ describe('anthropicModelsPlugin', () => {
     expect(create.mock.calls[1][0]).toMatchObject({ model: 'claude-sonnet-5-5', output_config: { effort: 'medium' } });
   });
 
-  it('bounds each generation with one overall deadline, and lets the SDK retry nothing', async () => {
+  it('lets the SDK retry nothing', async () => {
     await models[ModelType.TEXT_SMALL](runtime(), { prompt: 'a' });
-    const options = create.mock.calls[0][1];
-    expect(options.signal).toBeInstanceOf(AbortSignal);
-    expect(options.maxRetries).toBe(0);
+    expect(create.mock.calls[0][1].maxRetries).toBe(0);
+  });
+
+  describe('one overall deadline, on a fake clock', () => {
+    /**
+     * AbortSignal.timeout runs on the fake clock here: the signal it gives aborts when the fake
+     * clock has gone `ms` further. The request, as the SDK's fetch does, rejects once its signal aborts.
+     */
+    function onFakeClock() {
+      vi.useFakeTimers();
+      const deadlines: number[] = [];
+      vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms: number) => {
+        deadlines.push(ms);
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), ms);
+        return controller.signal;
+      });
+      const stalls = (_body: unknown, { signal }: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+      const call = () => {
+        const state: { outcome: unknown } = { outcome: 'pending' };
+        void models[ModelType.TEXT_LARGE](runtime(), { prompt: 'x', purpose: 'chat' }).then(
+          (value) => (state.outcome = value),
+          (error) => (state.outcome = error)
+        );
+        return state;
+      };
+      return { deadlines, stalls, call };
+    }
+    const overloaded = () => Object.assign(new Error('overloaded'), { status: 529 });
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    it('gives up on a request that never answers 60 s after the call started', async () => {
+      const { deadlines, stalls, call } = onFakeClock();
+      create.mockImplementation(stalls);
+      const state = call();
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(state.outcome).toBe('pending');
+      await vi.advanceTimersByTimeAsync(1);
+      expect(state.outcome).toMatchObject({ name: 'TimeoutError' });
+      expect(deadlines).toEqual([60_000]);
+    });
+
+    it('counts the time of the first attempt and the wait before the retry against the same deadline', async () => {
+      const { deadlines, stalls, call } = onFakeClock();
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      // Overloaded after 30 s; the retry then never answers
+      create.mockImplementationOnce(() => new Promise((_resolve, reject) => setTimeout(() => reject(overloaded()), 30_000))).mockImplementation(stalls);
+      const state = call();
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(create).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(28_999);
+      expect(state.outcome).toBe('pending');
+      await vi.advanceTimersByTimeAsync(1);
+      expect(state.outcome).toMatchObject({ name: 'TimeoutError' });
+      // One deadline for both attempts
+      expect(deadlines).toEqual([60_000]);
+      expect(create.mock.calls[0][1].signal).toBe(create.mock.calls[1][1].signal);
+    });
+
+    it('makes no retry that could not be answered before the deadline', async () => {
+      const { call } = onFakeClock();
+      const error = overloaded();
+      create.mockImplementation(() => new Promise((_resolve, reject) => setTimeout(() => reject(error), 59_500)));
+      const state = call();
+      await vi.advanceTimersByTimeAsync(59_500);
+      expect(state.outcome).toBe(error);
+      expect(create).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('returns only text blocks (thinking blocks are skipped)', async () => {

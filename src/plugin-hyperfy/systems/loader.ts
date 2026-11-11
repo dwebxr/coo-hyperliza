@@ -13,50 +13,6 @@ import { gltfCharge, modelBudget } from "../lib/gltf-budget";
 import { type AssetLease, assetMemory, workBytes } from "../lib/asset-memory";
 import { PageWork } from "../lib/page-work";
 
-// --- Mock Browser Environment for Loaders ---
-// These might need adjustment based on GLTFLoader/VRMLoaderPlugin requirements
-if (typeof globalThis !== "undefined") {
-  // Mock URL if not globally available or needs specific behavior
-  // globalThis.URL = URL; // Usually available in modern Node
-
-  // Mock self if needed by any dependency
-  // globalThis.self = globalThis;
-
-  // Mock window minimally
-  globalThis.window = globalThis.window || globalThis;
-
-  // Mock document minimally for GLTFLoader
-  globalThis.document = globalThis.document || {
-    createElementNS: (ns, type) => {
-      if (type === "img") {
-        // Basic mock for image elements if texture loading is attempted (though we aim to bypass it)
-        return {
-          src: "",
-          onload: () => { },
-          onerror: () => { },
-        };
-      }
-      // Default mock for other elements like canvas
-      return { style: {} };
-    },
-    createElement: (type) => {
-      if (type === "img") {
-        return { src: "", onload: () => { }, onerror: () => { } };
-      }
-      // Basic canvas mock if needed
-      if (type === "canvas") {
-        return { getContext: () => null, style: {} };
-      }
-      return { style: {} }; // Default
-    },
-    // Add more document mocks if loader errors indicate they are needed
-  };
-
-  // Polyfill fetch if using older Node version without native fetch
-  // globalThis.fetch = fetch;
-}
-// --- End Mocks ---
-
 /** What the agent loads. The engine also asks for images, video and audio, which the agent has no use for. */
 const LOADABLE: ReadonlySet<string> = new Set<AssetKind>(["model", "avatar", "emote", "script"]);
 
@@ -106,7 +62,7 @@ export class AgentLoader extends System {
 
   private limits: LoaderLimits;
 
-  constructor(world, { scripts = null, limits = {} }: { scripts?: WorldScripts | null; limits?: Partial<LoaderLimits> } = {}) {
+  constructor(world: any, { scripts = null, limits = {} }: { scripts?: WorldScripts | null; limits?: Partial<LoaderLimits> } = {}) {
     super(world);
     this.scripts = scripts;
     this.limits = { ...LOADER_LIMITS, ...limits };
@@ -122,7 +78,7 @@ export class AgentLoader extends System {
   }
 
   // --- Dummy Preload Methods ---
-  preload(type, url) {
+  preload(_type: string, _url: string) {
     // No-op for agent
   }
   execPreload() {
@@ -132,11 +88,11 @@ export class AgentLoader extends System {
   }
   // ---------------------------
 
-  has(type, url) {
+  has(type: string, url: unknown) {
     const key = `${type}/${url}`;
     return this.results.has(key) || this.promises.has(key);
   }
-  get(type, url) {
+  get(type: string, url: unknown) {
     const key = `${type}/${url}`;
     const result = this.results.get(key);
     if (result !== undefined) {
@@ -151,7 +107,7 @@ export class AgentLoader extends System {
    * Loads an asset once: a second call for the same type and URL, also while the first is still
    * downloading, gets the same promise. A failed load is forgotten, so it can be tried again.
    */
-  load(type, url): Promise<any> {
+  load(type: string, url: unknown): Promise<any> {
     if (!LOADABLE.has(type)) {
       // Nothing is requested for these
       console.warn(`[AgentLoader] Unsupported type in load(): ${type}`);
@@ -280,7 +236,7 @@ export class AgentLoader extends System {
     // The page's copy comes in memory of its own (managers/puppeteer-manager.ts fromBase64): no second copy
     const arrayBuffer = stripped.byteOffset === 0 && stripped.byteLength === stripped.buffer.byteLength ? stripped.buffer : stripped.slice().buffer;
 
-    const gltf: THREE.GLTF = await new Promise((ok, bad) =>
+    const gltf: any = await new Promise((ok, bad) =>
       this.gltfLoader.parse(arrayBuffer, '', ok, bad)
     );
     this.throwIfStopped();
@@ -293,12 +249,12 @@ export class AgentLoader extends System {
 
     } else if (type === 'emote') {
       const factory = createEmoteFactory(gltf, asset.url);
-      result = { gltf, toClip(o) { return factory.toClip(o); } };
+      result = { gltf, toClip(o: any) { return factory.toClip(o); } };
 
     } else if (type === 'avatar') {
       const factory = null;
       const root = createNode('group', { id: '$root' });
-      root.add(new AgentAvatar({ id: 'avatar', factory }));
+      root.add(new AgentAvatar({ id: 'avatar' }));
       result = { gltf, factory, toNodes() { return root.clone(true); } };
 
     } else {

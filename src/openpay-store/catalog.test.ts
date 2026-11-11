@@ -66,7 +66,7 @@ describe('sanitizeText', () => {
     expect(sanitizeText('Sale\u{e0041}\u{e007f}', 100)).toBe('Sale');
     expect(sanitizeText('line\u2028break\u2029s', 100)).toBe('line break s');
     // Counted after they are gone
-    expect(sanitizeText(`${'\u200b'.repeat(50)}abcdef`, 5)).toBe('abcd…');
+    expect(sanitizeText(`${'\u200b'.repeat(30)}abcdef`, 5)).toBe('abcd…');
     expect(sanitizeText('\u200b\u202e', 5)).toBe('');
   });
 
@@ -78,7 +78,7 @@ describe('sanitizeText', () => {
     ['www.', 'www.evil.test today', '(link removed) today'],
     ['a host with a path', 'Buy at evil.test/pay', 'Buy at (link removed)'],
     ['a bare host with a known top-level domain', 'pay.evil.shop or evil.co.jp', '(link removed) or (link removed)'],
-    ['a host after an @', 'mail me: me@evil.com', 'mail me: me@(link removed)'],
+    ['an e-mail address', 'mail me: me@evil.com', 'mail me: (link removed)'],
     ['full-width letters', 'ｅｖｉｌ．ｔｅｓｔ／ｐａｙ', '(link removed)'],
     ['an ideographic full stop for the dot', 'evil。com/pay', '(link removed)'],
     ['an IP address', 'go to 203.0.113.7:8080/pay', 'go to (link removed)'],

@@ -204,7 +204,8 @@ async function main() {
   };
 
   // The engine's world.open() calls window.open from a timer, which without this ends the process
-  if (scenario.mode === 'engine-compartment') (globalThis as any).open = (url: unknown) => void outbound.push(`window.open:${url}`);
+  // (the agent has no global window; its own script API makes open() do nothing)
+  if (scenario.mode === 'engine-compartment') (globalThis as any).window = { open: (url: unknown) => void outbound.push(`window.open:${url}`) };
 
   const world: any = createNodeClientWorld();
   const sent: [string, unknown][] = [];
@@ -220,7 +221,7 @@ async function main() {
   };
   world.network.send = (name: string, data: unknown) => void sent.push([name, data]);
   world.assetsUrl = ASSETS;
-  // As service.ts does for a world it connects to
+  // As session/create-agent-world.ts does for a world the agent connects to
   installWorldNet(world, new NetPolicy({ worldOrigin: ASSETS }));
   if (!scenario.engineChat) installWorldChat(world);
   // The handlers chat provenance, ranks and the tip wallet are fed from: a script must never call them
@@ -327,7 +328,7 @@ async function main() {
   report.playerPosition = world.entities.player.base.position.toArray();
 
   if (scenario.worldDestroy) {
-    // As service.ts tears a world down: every system, then the socket and the tick timer
+    // As a session's end tears its world down: every system, then the socket and the tick timer
     const reached: string[] = [];
     for (const system of world.systems) {
       const original = system.destroy?.bind(system);

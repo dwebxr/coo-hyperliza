@@ -1,15 +1,17 @@
 import { ChannelType, Content, HandlerCallback, IAgentRuntime, Memory, ModelType, UUID, createUniqueUuid, logger } from "@elizaos/core";
-import { HyperfyService } from "../service";
+import type { ConnectionSession } from "../session/connection-session";
+import { deliverReply } from "../session/deliver-reply";
 import { TtsLimitReached, countOtherPlayers, generateSpeech, getWavHeader } from "../utils";
 import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
 import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
-import { isOpenPayLink } from "../../openpay-store";
-import { getUsageBudget } from "../../usage-budget";
-import { type TurnContext, currentTurn, neverAbortedSignal, noteDelivered, runTurn } from "../lib/turn-context";
-import type { PlaybackOutcome, Played } from "../systems/liveKit";
+import { getUsageBudget, runWithOrigin } from "../../usage-budget";
+import { currentTurn, noteDelivered } from "../lib/turn-context";
+import type { PlaybackOutcome } from "../systems/liveKit";
+import type { Played } from "../lib/playback";
 import { oneLine, shownName, truncateCodePoints } from "../lib/text";
-import { CHAT_BODY_MAX_CODE_POINTS, CHAT_ID_MAX_LENGTH } from "../lib/chat-intake";
+import { errorText } from "../lib/error-text";
+import { CHAT_BODY_MAX_CODE_POINTS, CHAT_ID_MAX_LENGTH, type ChatTurn, type ReceivedChatMessage } from "../lib/chat-intake";
 
 type LiveKitAudioData = {
   participant: string;
@@ -75,8 +77,13 @@ export function spokenPart(text: string): { text: string; cut: boolean } {
   return { text: end > head.length / 2 ? head.slice(0, end + 1).trimEnd() : head, cut: true };
 }
 
+/**
+ * The voice of one connection: what players say (LiveKit audio, transcribed, then queued as a
+ * turn of the connection's conversation, lib/chat-intake.ts) and what the agent says (speak).
+ */
 export class VoiceManager {
   private runtime: IAgentRuntime;
+  private session: ConnectionSession;
   /** The utterance each speaker is in the middle of; gone as soon as it is handed to transcription. */
   private speakers: Map<string, Utterance> = new Map();
   /** Speakers whose previous utterance is being transcribed: at most one request per speaker. */
@@ -95,22 +102,22 @@ export class VoiceManager {
   private pendingPlaybacks = 0;
   private playbackGeneration = 0;
   private activePlayback: AbortController | null = null;
-  // Managers are per connection; once stopped, late async work must not touch the next world.
-  private stopped = false;
+  private halted = false;
   private lastSttLimitNoticeAt = Number.NEGATIVE_INFINITY;
   private lastTtsLimitLogAt = Number.NEGATIVE_INFINITY;
 
-  constructor(runtime: IAgentRuntime) {
+  constructor(runtime: IAgentRuntime, session: ConnectionSession) {
     this.runtime = runtime;
+    this.session = session;
+  }
+
+  /** True once stop() ran or the connection ended: nothing more is heard, transcribed or played. */
+  private get stopped(): boolean {
+    return this.halted || this.session.ended;
   }
 
   start() {
-    const service = this.getService();
-    if (!service) {
-      console.error('[VoiceManager] Cannot start - service not available');
-      return;
-    }
-    const world = service.getWorld();
+    const world = this.session.world;
     if (!world || !world.livekit) {
       console.error('[VoiceManager] Cannot start - world or livekit not available');
       return;
@@ -147,7 +154,7 @@ export class VoiceManager {
     this.leaveListener = null;
     for (const participant of [...this.speakers.keys()]) this.discard(participant);
     this.isSpeaking = false;
-    this.stopped = true;
+    this.halted = true;
     this.playbackGeneration++;
     this.playbackChain = Promise.resolve();
     this.pendingPlaybacks = 0;
@@ -276,8 +283,8 @@ export class VoiceManager {
   }
 
   /**
-   * Hands a speaker's utterance to transcription as a voice turn of its own, and frees the speaker
-   * for the next utterance. Its bytes stay counted until the speech-to-text request has ended.
+   * Hands a speaker's utterance to transcription and frees the speaker for the next utterance. Its
+   * bytes stay counted until the speech-to-text request has ended.
    */
   private flush(participant: string): void {
     const utterance = this.speakers.get(participant);
@@ -285,24 +292,15 @@ export class VoiceManager {
     if (utterance.timer) clearTimeout(utterance.timer);
     utterance.timer = null;
     this.speakers.delete(participant);
-    const service = this.getService();
-    const world = service?.getWorld();
+    const world = this.session.world;
     // Nobody who is not a player in the world now is transcribed (that costs money)
     if (this.stopped || !world || utterance.bytes === 0 || !world.entities?.getPlayer?.(participant)) {
       this.heldVoiceBytes -= utterance.bytes;
       return;
     }
-    const turn: TurnContext = {
-      origin: 'voice',
-      // The LiveKit participant identity, which the world's server sets to the player id
-      requesterId: participant,
-      world,
-      generation: service.getConnectionGeneration(),
-      signal: neverAbortedSignal(),
-    };
     this.transcribing.add(participant);
-    agentActivityLock
-      .run(() => runTurn(turn, () => this.processTranscription(participant, utterance)))
+    // Not a turn yet: the transcript is queued as one below. Its cost counts as voice.
+    runWithOrigin('voice', () => this.processTranscription(participant, utterance))
       .catch((error) => console.error(`Error handling voice from ${participant}:`, error));
   }
 
@@ -337,14 +335,40 @@ export class VoiceManager {
     if (typeof transcript !== 'string' || transcript.includes('[BLANK_AUDIO]')) return;
     // What was said enters memory and prompts like a chat message: one line, at most 500 code points
     const text = oneLine(transcript, CHAT_BODY_MAX_CODE_POINTS);
-    if (!text) return;
+    if (!text || text.length < 3) return;
     // Only someone who is in the world now: a speaker who left while being transcribed starts no turn
-    if (!this.getService()?.getWorld()?.entities?.getPlayer?.(participant)) {
+    const speaker = this.session.world?.entities?.getPlayer?.(participant);
+    if (!speaker) {
       logger.info('[VoiceManager] Dropping a transcript: its speaker is not in the world (any more)');
       return;
     }
     console.log("[VOICE MANAGER] Transcription: ", text)
-    await this.handleMessage(text, participant as UUID);
+    // Into the connection's one conversation queue, as a message of its speaker: it waits its turn
+    // behind what was typed or said before it, by the queue's rules (lib/chat-intake.ts), so two
+    // people speaking at once are answered one after the other instead of the later turn taking
+    // the earlier one's answer away after its model call
+    const admission = this.session.conversation.accept(
+      {
+        id: `voice-${crypto.randomUUID()}`,
+        body: text,
+        fromId: participant,
+        from: shownName(speaker.data?.name) || null,
+        createdAt: new Date().toISOString(),
+      },
+      (msg, slot) => this.handleTranscript(msg, slot)
+    );
+    if (admission !== 'queued') logger.info(`[VoiceManager] Not answering a transcript: ${admission}`);
+  }
+
+  /** One transcript as a voice turn of its speaker. `slot`: the queue's turn (see MessageManager.handleMessage). */
+  private async handleTranscript(msg: ReceivedChatMessage, slot: ChatTurn): Promise<void> {
+    const playerId = msg.fromId as UUID;
+    await this.session.runTurn(
+      // The LiveKit participant identity, which the world's server sets to the player id
+      { origin: 'voice', requesterId: playerId, cancel: slot.signal },
+      // Inside the activity lock, so the behavior loop stays paused until the reply has been spoken
+      () => agentActivityLock.run(() => this.handleMessage(msg.body, playerId))
+    );
   }
 
   private async handleMessage(
@@ -352,22 +376,21 @@ export class VoiceManager {
     playerId: UUID,
   ) {
     try {
-      if (!message || message.trim() === '' || message.length < 3) {
-        return;
-      }
-      const service = this.getService();
-      const world = service.getWorld();
-      if (!world) return;
-      // The connection the voice was heard on (the turn's): nothing is posted on another one
-      const generation = currentTurn()?.generation ?? service.getConnectionGeneration();
-      const live = () => !this.stopped && service.getWorld() === world && service.getConnectionGeneration() === generation;
-      if (!live()) return;
+      const session = this.session;
+      const world = session.world;
+      const turn = currentTurn();
+      if (!turn?.live) return;
 
       const playerInfo = world.entities.getPlayer(playerId);
+      // Someone who left while their transcript waited is not answered
+      if (!playerInfo) {
+        logger.info('[VoiceManager] Dropping a transcript: its speaker is not in the world (any more)');
+        return;
+      }
       // The name goes into memory and prompts: one short line, like a chat sender's
       const userName = shownName(playerInfo?.data?.name) || playerId;
       const name = userName;
-      const _currentWorldId = service.currentWorldId;
+      const _currentWorldId = session.worldId;
       const channelId = _currentWorldId;
       const roomId = createUniqueUuid(this.runtime, _currentWorldId || 'hyperfy-unknown-world')
       const entityId = createUniqueUuid(this.runtime, playerId) as UUID
@@ -385,6 +408,8 @@ export class VoiceManager {
         type: ChannelType.WORLD,
         worldId: _currentWorldId,
       })
+      // Nothing is asked of the model for a turn that was cancelled while it was being set up
+      if (!turn.live) return;
 
       const agentNames = [this.runtime.character.name, ...parseAliases(process.env.HYPERFY_AGENT_ALIASES)];
       const memory: Memory = {
@@ -410,54 +435,14 @@ export class VoiceManager {
         createdAt: Date.now(),
       };
 
-      const callback: HandlerCallback = async (content: Content, _files: any[] = []) => {
-        console.info(`[Hyperfy Voice Chat Callback] Received response: ${JSON.stringify(content)}`)
-        // Checked again after every await below, right before anything is posted or played
-        if (!live()) return [];
-        try {
-          const responseMemory: Memory = {
-            id: createUniqueUuid(this.runtime, `${memory.id}-voice-response-${Date.now()}`),
-            entityId: this.runtime.agentId,
-            agentId: this.runtime.agentId,
-            content: {
-              ...content,
-              name: this.runtime.character.name,
-              inReplyTo: memory.id,
-              isVoiceMessage: true,
-              channelType: type,
-            },
-            roomId,
-            createdAt: Date.now(),
-          };
-
-          await this.runtime.createMemory(responseMemory, 'messages');
-          if (!live()) return [responseMemory];
-
-          if (responseMemory.content.text?.trim() && isOpenPayLink(content)) {
-            // Voice replies are only spoken, but a shop link has to be clickable: post it to chat
-            service.getMessageManager()?.sendMessage(content.text);
-          } else if (responseMemory.content.text?.trim()) {
-            const emoteManager = service.getEmoteManager();
-            const emote = content.emote as string || "TALK";
-            emoteManager.playEmote(emote);
-            // Voice replies are normally only spoken. When not all of it could be (voice limit, TTS
-            // failure, a playback that failed part way), the whole reply is posted too, so none of it is lost
-            const spoken = await this.speak(content.text);
-            if (spoken !== 'all' && live()) {
-              if (spoken === 'partial') logger.info('[VoiceManager] Reply partly spoken, then posted as text');
-              service.getMessageManager()?.sendMessage(content.text);
-            }
-          }
-
-          return [responseMemory];
-        } catch (error) {
-          console.error('Error in voice message callback:', error);
-          return [];
-        }
+      // Every reply of this turn goes out through the one delivery path (session/deliver-reply.ts):
+      // a voice turn's reply is spoken, and posted as text only when not all of it could be said
+      const reply = { turn, runtime: this.runtime, session, roomId, memory: { name: this.runtime.character.name, inReplyTo: memory.id, isVoiceMessage: true } };
+      const callback: HandlerCallback = async (content: Content) => {
+        await deliverReply(reply, content);
+        return [];
       };
 
-      // Awaited inside the activity lock (see processTranscription) so the
-      // behavior loop stays paused until the reply has been spoken.
       await this.runtime.emitEvent(hyperfyEventType.VOICE_MESSAGE_RECEIVED as string, {
         runtime: this.runtime,
         message: memory,
@@ -477,7 +462,9 @@ export class VoiceManager {
   async speak(text: string): Promise<Played> {
     // Never read URLs aloud
     text = text?.replace(/https?:\/\/\S+/g, '').trim();
-    if (!text || this.stopped) return 'none';
+    // Nothing is synthesized (it costs money) or said for a turn that may no longer act
+    const turn = currentTurn();
+    if (!text || this.stopped || (turn && !turn.live)) return 'none';
     // Capped before anything is synthesized or counted
     const spoken = spokenPart(text);
     text = spoken.text;
@@ -502,7 +489,7 @@ export class VoiceManager {
         }
         return 'none';
       }
-      logger.warn('[VoiceManager] TTS failed, text-only response sent:', error);
+      logger.warn(`[VoiceManager] TTS failed, text-only response sent: ${errorText(error)}`);
       return 'none';
     }
   }
@@ -512,9 +499,7 @@ export class VoiceManager {
     if (Date.now() - this.lastSttLimitNoticeAt < VOICE_LIMIT_NOTICE_INTERVAL_MS) return;
     this.lastSttLimitNoticeAt = Date.now();
     logger.info(`[VoiceManager] VOICE_STT_MAX_SECONDS_PER_DAY=${getUsageBudget().limits.sttSecondsPerDay} reached; ignoring voice input`);
-    this.getService()
-      ?.getMessageManager()
-      ?.sendMessage('🎙️ Voice input is paused for now — please type in chat. / 音声入力は一時停止中です。チャットで話しかけてください。');
+    this.session.messages.sendMessage('🎙️ Voice input is paused for now — please type in chat. / 音声入力は一時停止中です。チャットで話しかけてください。');
   }
 
   /**
@@ -539,7 +524,7 @@ export class VoiceManager {
     try {
       return await current;
     } catch (error) {
-      logger.error('[VoiceManager] Audio playback failed:', error);
+      logger.error(`[VoiceManager] Audio playback failed: ${errorText(error)}`);
       return 'none';
     } finally {
       if (generation === this.playbackGeneration) this.pendingPlaybacks--;
@@ -547,8 +532,12 @@ export class VoiceManager {
   }
 
   private async playNow(audioBuffer: Buffer): Promise<Played> {
-    const world = this.getService()?.getWorld();
-    if (!world?.livekit) return 'none';
+    const world = this.session.world;
+    if (this.stopped || !world?.livekit) return 'none';
+    // Cancelled while it was synthesized or waited behind another utterance: it is not said into what came after.
+    // (One that is already playing when its turn is cancelled is not cut off; stop() does that.)
+    const turn = currentTurn();
+    if (turn && !turn.live) return 'none';
 
     // Speaking state makes the engine play the TALK emote
     const player = world.entities?.player;
@@ -585,9 +574,5 @@ export class VoiceManager {
       this.isSpeaking = false;
       player?.setSpeaking?.(false);
     }
-  }
-
-  private getService() {
-    return this.runtime.getService<HyperfyService>(HyperfyService.serviceType);
   }
 }

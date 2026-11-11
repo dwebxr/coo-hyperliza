@@ -1,5 +1,5 @@
 import type { Content } from '@elizaos/core';
-import { OPENPAY_LINK_FLAG, SHARE_ACTION, formatLinkMessage, isSpecificTitle, resolveProduct } from '../../openpay-store';
+import { OPENPAY_LINK_FLAG, SHARE_ACTION, formatLinkMessage, isShareable, isSpecificTitle, resolveProduct } from '../../openpay-store';
 import type { StoreProduct } from '../../openpay-store/catalog';
 import { IDLE_EMOTES } from './idle-behavior';
 
@@ -37,10 +37,11 @@ export function composeOfflineReply({
     };
   }
 
-  // Only names that would be recognised when said (resolveProduct looks for specific titles only)
+  // Only names that would be recognised when said (resolveProduct looks for specific titles only),
+  // of products whose link can be posted
   const examples = products
+    .filter((p) => isSpecificTitle(p.title) && isShareable(p))
     .map((p) => p.title)
-    .filter(isSpecificTitle)
     .slice(0, EXAMPLE_TITLES);
   const shopHint = examples.length
     ? japanese

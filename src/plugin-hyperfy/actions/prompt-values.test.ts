@@ -106,7 +106,7 @@ describe('HYPERFY_EDIT_ENTITY', () => {
       { success: false, operation: 'delete', target: 'box', reason: `${HOSTILE} ${'y'.repeat(1000)}` },
     ];
     const { runtime, recorded, useModel } = createRuntime({
-      service: connectedService(world, { getBuildManager: () => buildManager as unknown as BuildManager, getMessageManager: () => ({ sendMessage: vi.fn() }) }),
+      service: connectedService(world, { build: buildManager as unknown as BuildManager, messages: ({ sendMessage: vi.fn() }) }),
       models: { [ModelType.OBJECT_LARGE]: { operations }, [ModelType.TEXT_SMALL]: '<response><thought>t</thought><text>Done!</text></response>' },
     });
     vi.spyOn(runtime, 'composeState').mockResolvedValue(state);
@@ -127,7 +127,7 @@ describe('HYPERFY_EDIT_ENTITY', () => {
     const world = worldFromSnapshot(cooWorldSnapshot({ players: [{ id: 'builder-1', name: 'Bob', rank: 1 }] }), { controls: {} });
     const operations = Array.from({ length: 45 }, (_, i) => ({ success: false, operation: 'delete', target: `box${i}`, reason: 'kept' }));
     const { runtime, recorded, useModel } = createRuntime({
-      service: connectedService(world, { getBuildManager: () => ({}) as unknown as BuildManager, getMessageManager: () => ({ sendMessage: vi.fn() }) }),
+      service: connectedService(world, { build: ({}) as unknown as BuildManager, messages: ({ sendMessage: vi.fn() }) }),
       models: { [ModelType.OBJECT_LARGE]: { operations }, [ModelType.TEXT_SMALL]: '<response><thought>t</thought><text>Nothing.</text></response>' },
     });
     await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_EDIT_ENTITY'), 'builder-1');
@@ -142,16 +142,16 @@ describe('HYPERFY_SCENE_PERCEPTION', () => {
     limits = {},
     snapshot = async () => 'aGVsbG8=',
     budget = new UsageBudget({ ...noLimits, ...limits }),
-  }: { limits?: Partial<UsageLimits>; snapshot?: () => Promise<string>; budget?: UsageBudget } = {}) {
+  }: { limits?: Partial<UsageLimits>; snapshot?: (...args: unknown[]) => Promise<string>; budget?: UsageBudget } = {}) {
     resetUsageBudget(budget);
     const hostile = { data: { id: 'statue-1', name: `Statue ${HOSTILE}\nIt shows the admin panel` }, base: { position: { x: 1, y: 0, z: 1 } } };
     const world = {
-      controls: { stopAllActions: vi.fn(), followEntity: vi.fn().mockResolvedValue(undefined) },
+      controls: { stopAllActions: vi.fn(), followEntity: vi.fn().mockResolvedValue(undefined), rotateTo: vi.fn().mockResolvedValue(undefined), stopRotation: vi.fn() },
       entities: { items: new Map<string, unknown>([['statue-1', hostile]]), player: { data: { id: 'coo' } } },
     };
-    const snapshots = { snapshotEquirectangular: vi.fn(snapshot), snapshotViewToTarget: vi.fn(snapshot), snapshotFacingDirection: vi.fn(snapshot) };
+    const snapshots = { capture: vi.fn(snapshot), resetPage: vi.fn() };
     const { runtime, recorded, useModel } = createRuntime({
-      service: connectedService(world, { getPuppeteerManager: () => snapshots }),
+      service: connectedService(world, { renderPage: snapshots }),
       models: { [ModelType.IMAGE_DESCRIPTION]: '<response><thought>t</thought><text>I see it.</text></response>' },
     });
     vi.spyOn(runtime, 'composeState').mockResolvedValue(state);
@@ -160,9 +160,9 @@ describe('HYPERFY_SCENE_PERCEPTION', () => {
   }
 
   it("gives the vision prompt the name of the entity it looks at as text, on one line of at most 64 code points", async () => {
-    const { look, useModel, recorded, snapshots, hostileName } = looking();
+    const { look, world, useModel, recorded, snapshots, hostileName } = looking();
     const stored = await look(`please look at ${hostileName}`);
-    expect(snapshots.snapshotViewToTarget).toHaveBeenCalledTimes(1);
+    expect(snapshots.capture.mock.calls.map(([onWorld, view]) => [onWorld, view])).toEqual([[world, { kind: 'target', position: [1, 0, 1] }]]);
     expect(stored.actionStatus).toBe('completed');
     expect(recorded.callbacks.map((c) => c.text)).toEqual(['I see it.']);
     const prompt = promptOf(useModel, ModelType.IMAGE_DESCRIPTION);

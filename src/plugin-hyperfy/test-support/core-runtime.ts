@@ -1,6 +1,7 @@
 import { AgentRuntime, type Action, type Content, type Memory, type UUID } from '@elizaos/core';
 import { expect, vi } from 'vitest';
 import { hyperfyPlugin } from '../index';
+import { type SessionOverrides, serviceFor, sessionFor, withParts } from './session';
 
 /*
  * A real elizaOS core AgentRuntime (1.7.2) for driving real processActions in tests: only the two
@@ -78,6 +79,11 @@ export async function run(runtime: AgentRuntime, recorded: Recorded, actionName:
   return (await runPlan(runtime, recorded, [actionName], options))[0];
 }
 
-export function connectedService(world: Record<string, unknown>, extra: Record<string, unknown> = {}) {
-  return { isConnected: () => true, getWorld: () => world, getConnectionGeneration: () => 0, ...extra };
+/**
+ * What runtime.getService('hyperfy') returns: a service whose one connection is a real
+ * ConnectionSession around `world`. `parts` replace members of that session with the test's own.
+ */
+export function connectedService(world: Record<string, unknown>, parts: SessionOverrides = {}) {
+  const session = withParts(sessionFor(world), parts);
+  return { ...serviceFor(session), session };
 }

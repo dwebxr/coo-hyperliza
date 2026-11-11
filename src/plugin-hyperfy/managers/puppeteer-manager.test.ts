@@ -96,8 +96,8 @@ describe('PuppeteerManager', () => {
   });
 
   it('reuses one browser across sessions and gives each session a fresh page', async () => {
-    const manager = PuppeteerManager.getOrCreate({} as any);
-    expect(PuppeteerManager.getOrCreate({} as any)).toBe(manager);
+    const manager = PuppeteerManager.getOrCreate();
+    expect(PuppeteerManager.getOrCreate()).toBe(manager);
 
     await (manager as any).init();
     await manager.resetPage();
@@ -111,17 +111,17 @@ describe('PuppeteerManager', () => {
   });
 
   it('close() closes the browser and allows a new manager', async () => {
-    const manager = PuppeteerManager.getOrCreate({} as any);
+    const manager = PuppeteerManager.getOrCreate();
     await (manager as any).init();
     await manager.close();
 
     expect(launched[0].close).toHaveBeenCalled();
-    expect(PuppeteerManager.getOrCreate({} as any)).not.toBe(manager);
+    expect(PuppeteerManager.getOrCreate()).not.toBe(manager);
   });
 
   it('retries the launch after a failure instead of rethrowing it forever', async () => {
     failNextLaunch = true;
-    const manager = PuppeteerManager.getOrCreate({} as any);
+    const manager = PuppeteerManager.getOrCreate();
     await vi.waitFor(() => expect((manager as any).initPromise).toBeNull());
 
     await (manager as any).init();
@@ -129,8 +129,8 @@ describe('PuppeteerManager', () => {
   });
 
   it('refuses a second constructor call', () => {
-    PuppeteerManager.getOrCreate({} as any);
-    expect(() => new PuppeteerManager({} as any)).toThrow('already been instantiated');
+    PuppeteerManager.getOrCreate();
+    expect(() => new PuppeteerManager()).toThrow('already been instantiated');
   });
 
   it("starts Chromium without the agent's environment, without a way to the network, and without slowMo", async () => {
@@ -144,7 +144,7 @@ describe('PuppeteerManager', () => {
     };
     for (const [name, value] of Object.entries(agentOnly)) vi.stubEnv(name, value);
     vi.stubEnv('HOME', '/home/agent');
-    await (PuppeteerManager.getOrCreate({} as any) as any).init();
+    await (PuppeteerManager.getOrCreate() as any).init();
 
     const [options] = launchOptions;
     expect(options.slowMo).toBeUndefined();
@@ -159,7 +159,7 @@ describe('PuppeteerManager', () => {
   });
 
   it('writes the page into an empty tab, adds its code inline, and refuses every request the page makes', async () => {
-    await (PuppeteerManager.getOrCreate({} as any) as any).init();
+    await (PuppeteerManager.getOrCreate() as any).init();
     const [page] = launched[0].pages;
 
     expect(page.goto).not.toHaveBeenCalled();
@@ -179,7 +179,7 @@ describe('PuppeteerManager', () => {
 
   it.each(['close', 'error'])('builds a new page on the next use after the page emitted "%s"', async (event) => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const manager = PuppeteerManager.getOrCreate({} as any) as any;
+    const manager = PuppeteerManager.getOrCreate() as any;
     const first = await manager.init();
 
     first.emit(event, new Error('Page crashed!'));
@@ -194,7 +194,7 @@ describe('PuppeteerManager', () => {
   });
 
   it('passes asset bytes to the page as base64 and returns bytes', async () => {
-    const manager = PuppeteerManager.getOrCreate({} as any);
+    const manager = PuppeteerManager.getOrCreate();
     const glb = new Uint8Array([103, 108, 84, 70]);
 
     // With the export budget: a model's unless the caller names one (lib/gltf-budget.ts)
@@ -209,7 +209,7 @@ describe('PuppeteerManager', () => {
   });
 
   it('asks the page nothing once the signal fired while the page was being made ready', async () => {
-    const manager = PuppeteerManager.getOrCreate({} as any) as any;
+    const manager = PuppeteerManager.getOrCreate() as any;
     const page = await manager.init();
     const waiting: (() => void)[] = [];
     const ready = () => waiting.splice(0).forEach((go) => go());
@@ -235,7 +235,7 @@ describe('PuppeteerManager', () => {
   });
 
   it('settles a page call whose signal fired while it ran as taken back, under the id it passed (the page side is checked by smoke-chromium)', async () => {
-    const manager = PuppeteerManager.getOrCreate({} as any) as any;
+    const manager = PuppeteerManager.getOrCreate() as any;
     const page = await manager.init();
     const stop = new AbortController();
     page.evaluate.mockImplementationOnce(async (_fn: unknown, ...args: any[]) => {
@@ -257,7 +257,7 @@ describe('PuppeteerManager', () => {
   });
 
   it('commits every page call that succeeded with its signal unfired, checks the signal again, then forgets it; and takes back one that failed', async () => {
-    const manager = PuppeteerManager.getOrCreate({} as any) as any;
+    const manager = PuppeteerManager.getOrCreate() as any;
     const page = await manager.init();
     const signal = new AbortController().signal;
 
@@ -274,7 +274,7 @@ describe('PuppeteerManager', () => {
   });
 
   it('takes back what a page call kept when the signal fires while its commit is acknowledged', async () => {
-    const manager = PuppeteerManager.getOrCreate({} as any) as any;
+    const manager = PuppeteerManager.getOrCreate() as any;
     const page = await manager.init();
     const stop = new AbortController();
     const steps: string[] = [];
@@ -288,7 +288,7 @@ describe('PuppeteerManager', () => {
   });
 
   it('fails the page call when its settlement fails, with that error (a kill among them)', async () => {
-    const manager = PuppeteerManager.getOrCreate({} as any) as any;
+    const manager = PuppeteerManager.getOrCreate() as any;
     const page = await manager.init();
     page.evaluate.mockImplementation(async (_fn: unknown, ...args: any[]) => {
       if (args.at(-1) === 'commit') throw new Error('Target closed');
@@ -298,7 +298,7 @@ describe('PuppeteerManager', () => {
   });
 
   it('fails a cancelled page call with the error of its take-back when that fails', async () => {
-    const manager = PuppeteerManager.getOrCreate({} as any) as any;
+    const manager = PuppeteerManager.getOrCreate() as any;
     const page = await manager.init();
     const stop = new AbortController();
     page.evaluate.mockImplementation(async (_fn: unknown, ...args: any[]) => {
@@ -310,7 +310,7 @@ describe('PuppeteerManager', () => {
   });
 
   it('ends the generation of a browser that disconnects on its own, and launches another on next use', async () => {
-    const manager = new PuppeteerManager({} as any, { watchdog: { table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
+    const manager = new PuppeteerManager({ watchdog: { table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
     await manager.init();
     expect(manager.watchdog.isLive(1)).toBe(true);
     const [, disconnected] = launched[0].on.mock.calls.find(([event]: [string]) => event === 'disconnected');
@@ -322,7 +322,7 @@ describe('PuppeteerManager', () => {
 
   it('stops waiting for the page when the caller\'s signal fires, and fails fast while the render page is down', async () => {
     const breaker = new RenderBreaker({ log: { warn: () => {} } });
-    const manager = new PuppeteerManager({} as any, { watchdog: { breaker, table: async () => [] } }) as any;
+    const manager = new PuppeteerManager({ watchdog: { breaker, table: async () => [] } }) as any;
     const page = await manager.init();
     let built!: () => void;
     // The page is being built (again) for longer than this caller wants to wait
@@ -334,11 +334,11 @@ describe('PuppeteerManager', () => {
     expect(page.evaluate).not.toHaveBeenCalled();
     built();
     for (let i = 0; i < 3; i++) breaker.recordKill();
-    await expect(manager.snapshotEquirectangular()).rejects.toBeInstanceOf(RenderPageUnavailable);
+    await expect(manager.capture(scene(), { kind: 'around' })).rejects.toBeInstanceOf(RenderPageUnavailable);
   });
 
   it('runs page calls under its watchdog: a call past the deadline fails with RenderPageKilled, and the next use starts a new browser', async () => {
-    const manager = new PuppeteerManager({} as any, { watchdog: { deadlineMs: 100, table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
+    const manager = new PuppeteerManager({ watchdog: { deadlineMs: 100, table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
     const page = await manager.init();
     page.evaluate.mockImplementationOnce(() => new Promise(() => {}));
     vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -357,7 +357,7 @@ describe('PuppeteerManager', () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
     hangNewPage = true;
-    const manager = new PuppeteerManager({} as any, { watchdog: { initDeadlineMs: 100, table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
+    const manager = new PuppeteerManager({ watchdog: { initDeadlineMs: 100, table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
     const error = await manager.init().catch((e: unknown) => e);
     hangNewPage = false;
     expect(error).toMatchObject({ name: 'RenderPageKilled', reason: 'deadline', initInFlight: true });
@@ -369,7 +369,7 @@ describe('PuppeteerManager', () => {
 
   it("does not let the old browser's late disconnect drop the browser that replaced it", async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const manager = new PuppeteerManager({} as any, { watchdog: { deadlineMs: 100, table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
+    const manager = new PuppeteerManager({ watchdog: { deadlineMs: 100, table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
     const first = await manager.init();
     first.evaluate.mockImplementationOnce(() => new Promise(() => {}));
     await expect(manager.loadEnvironmentHDR(new Uint8Array([1]))).rejects.toMatchObject({ name: 'RenderPageKilled' });
@@ -392,7 +392,7 @@ describe('PuppeteerManager', () => {
       { pid: 4_000_000, ppid: 1, pgid: 4_000_000, rssBytes: 1 },
       { pid: 4_000_001, ppid: 1, pgid: 4_000_000, rssBytes: 1 },
     ];
-    const manager = new PuppeteerManager({} as any, { watchdog: { deadlineMs: 100, table: async () => rows, breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
+    const manager = new PuppeteerManager({ watchdog: { deadlineMs: 100, table: async () => rows, breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
     const page = await manager.init();
     launchPid = undefined;
     await vi.waitFor(() => expect(manager.watchdog.ownership(1)).toEqual({ pids: [4_000_000, 4_000_001], group: 4_000_000 }));
@@ -408,7 +408,7 @@ describe('PuppeteerManager', () => {
     let launch!: () => void;
     launchGate = new Promise<void>((resolve) => (launch = resolve));
     vi.spyOn(console, 'error').mockImplementation(() => {});
-    const manager = new PuppeteerManager({} as any, { watchdog: { table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
+    const manager = new PuppeteerManager({ watchdog: { table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
     const warmUp = manager.initPromise;
     await vi.waitFor(() => expect(launchOptions).toHaveLength(1));
     // What a teardown does: the next use starts another browser
@@ -427,7 +427,7 @@ describe('PuppeteerManager', () => {
     let built!: () => void;
     newPageGate = new Promise<void>((resolve) => (built = resolve));
     vi.spyOn(console, 'error').mockImplementation(() => {});
-    const manager = new PuppeteerManager({} as any, { watchdog: { table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
+    const manager = new PuppeteerManager({ watchdog: { table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
     const warmUp = manager.initPromise;
     await vi.waitFor(() => expect(launched[0]?.newPage).toHaveBeenCalled());
     // What a teardown does
@@ -444,7 +444,7 @@ describe('PuppeteerManager', () => {
     let launch!: () => void;
     launchGate = new Promise<void>((resolve) => (launch = resolve));
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const manager = new PuppeteerManager({} as any, { watchdog: { table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
+    const manager = new PuppeteerManager({ watchdog: { table: async () => [], breaker: new RenderBreaker({ log: { warn: () => {} } }) } }) as any;
     await vi.waitFor(() => expect(launchOptions).toHaveLength(1));
     // A world that could not be joined is cleaned up while Chromium still starts
     const reset = manager.resetPage();
@@ -459,36 +459,98 @@ describe('PuppeteerManager', () => {
   });
 
   it('returns the page\'s bytes in memory of their own, exactly as long (not a view into the buffer pool)', async () => {
-    const manager = PuppeteerManager.getOrCreate({} as any);
+    const manager = PuppeteerManager.getOrCreate();
     const bytes = await manager.loadGlbBytes(new Uint8Array([1, 2, 3]));
     expect([bytes.byteOffset, bytes.buffer.byteLength]).toEqual([0, bytes.byteLength]);
     expect(text(bytes)).toMatch(/^page got /);
   });
 
-  it('writes diagnostic snapshots to disk only when HYPERFY_DEBUG_SNAPSHOTS=true', async () => {
-    const vector = { toArray: () => [0, 0, 0], x: 0, y: 0, z: 0, w: 1 };
-    const world = {
-      stage: { scene: { toJSON: () => ({}) } },
-      controls: { rotateTo: async () => {}, stopRotation: () => {} },
-      entities: { player: { data: { id: 'coo' }, base: { position: vector, quaternion: vector } }, players: new Map() },
-    };
-    const manager = PuppeteerManager.getOrCreate({ getService: () => ({ getWorld: () => world }) } as any);
+  it('takes every kind of snapshot of the world it is handed through one page call each, after putting that world\'s scene into the page', async () => {
+    const manager = PuppeteerManager.getOrCreate() as any;
+    const page = await manager.init();
+    const world = scene();
+    for (const view of [{ kind: 'around' }, { kind: 'facing', direction: 'front' }, { kind: 'target', position: [1, 2, 3] }] as const) {
+      page.evaluate.mockClear();
+      expect(await manager.capture(world, view)).toMatch(/^data:image\/jpeg;base64,/);
+      // Two page calls: the scene and the other players as they are now, then the drawing
+      expect(page.evaluate).toHaveBeenCalledTimes(2);
+      const [rehydrate, draw] = page.evaluate.mock.calls;
+      expect(rehydrate.slice(1)).toEqual([{ scene: 'json' }, expect.arrayContaining(['map', 'normalMap']), [{ id: 'p1', avatarUrl: 'https://world.test/assets/alice.vrm', position: [4, 5, 6], scale: [1, 1, 1], quaternion: [0, 0, 0, 1] }]]);
+      expect(draw.slice(1)).toEqual([view.kind, { position: [1, 0, 1], quaternion: [0, 0, 0, 1] }, view.kind === 'target' ? [1, 2, 3] : []]);
+    }
+  });
 
-    await manager.snapshotEquirectangular();
-    await manager.snapshotFacingDirection('front');
-    await manager.snapshotViewToTarget([1, 2, 3]);
+  it('takes one snapshot at a time, in the order they were asked for, and a caller whose signal fires stops waiting without a page call', async () => {
+    const manager = PuppeteerManager.getOrCreate() as any;
+    const page = await manager.init();
+    const gates: (() => void)[] = [];
+    const order: string[] = [];
+    page.evaluate.mockImplementation(async (_fn: unknown, first: unknown) => {
+      // The drawing call of each snapshot (its first argument is the kind of view)
+      if (typeof first === 'string') {
+        order.push(first);
+        await new Promise<void>((resolve) => gates.push(resolve));
+      }
+      return 'aGVsbG8=';
+    });
+    const stop = new AbortController();
+    const first = manager.capture(scene(), { kind: 'around' });
+    const cancelled = manager.capture(scene(), { kind: 'facing', direction: 'front' }, { signal: stop.signal }).catch((error: unknown) => error);
+    const third = manager.capture(scene(), { kind: 'target', position: [0, 0, 0] });
+    await vi.waitFor(() => expect(gates).toHaveLength(1));
+    expect(order).toEqual(['around']);
+    stop.abort(new Error('the turn was cancelled'));
+    expect(await cancelled).toMatchObject({ message: 'the turn was cancelled' });
+    gates[0]();
+    await first;
+    await vi.waitFor(() => expect(gates).toHaveLength(2));
+    expect(order).toEqual(['around', 'target']);
+    gates[1]();
+    await third;
+  });
+
+  it('refuses a snapshot of a world whose agent has no player yet, before anything is drawn', async () => {
+    const manager = PuppeteerManager.getOrCreate() as any;
+    const page = await manager.init();
+    const world = scene();
+    world.entities.player = null;
+    await expect(manager.capture(world, { kind: 'around' })).rejects.toThrow('Player entity not yet available');
+    expect(page.evaluate).not.toHaveBeenCalled();
+  });
+
+  it('writes diagnostic snapshots to disk only when HYPERFY_DEBUG_SNAPSHOTS=true', async () => {
+    const world = scene();
+    const manager = PuppeteerManager.getOrCreate();
+    const all = async () => {
+      await manager.capture(world, { kind: 'around' });
+      await manager.capture(world, { kind: 'facing', direction: 'front' });
+      await manager.capture(world, { kind: 'target', position: [1, 2, 3] });
+    };
+
+    await all();
     expect(writes).toEqual([]);
 
     for (const value of ['1', 'yes', 'TRUE', '']) {
       vi.stubEnv('HYPERFY_DEBUG_SNAPSHOTS', value);
-      await manager.snapshotEquirectangular();
+      await manager.capture(world, { kind: 'around' });
     }
     expect(writes).toEqual([]);
 
     vi.stubEnv('HYPERFY_DEBUG_SNAPSHOTS', 'true');
-    expect(await manager.snapshotEquirectangular()).toMatch(/^data:image\/jpeg;base64,/);
-    await manager.snapshotFacingDirection('front');
-    await manager.snapshotViewToTarget([1, 2, 3]);
+    await all();
     expect(writes.map((file) => file.split('/').pop())).toEqual(['scene_equirectangular.jpeg', 'scene_facing_front.jpeg', 'scene_view_to_target.jpeg']);
   });
 });
+
+/** What a snapshot reads of a world: the agent at (1, 0, 1), one other player with an avatar, and a scene */
+function scene() {
+  const at = (x: number, y: number, z: number) => ({ toArray: () => [x, y, z] });
+  const placed = (position: { toArray(): number[] }) => ({ position, quaternion: { x: 0, y: 0, z: 0, w: 1 }, scale: at(1, 1, 1) });
+  const agent = { data: { id: 'coo' }, base: placed(at(1, 0, 1)) };
+  const alice = { data: { id: 'p1' }, base: placed(at(4, 5, 6)), avatarUrl: 'asset://alice.vrm' };
+  return {
+    assetsUrl: 'https://world.test/assets/',
+    stage: { scene: { toJSON: () => ({ scene: 'json' }) } },
+    entities: { player: agent as typeof agent | null, players: new Map<string, typeof agent & { avatarUrl?: string }>([['coo', agent], ['p1', alice]]) },
+  };
+}

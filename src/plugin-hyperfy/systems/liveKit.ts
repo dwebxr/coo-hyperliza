@@ -14,6 +14,7 @@ import { spawn } from 'node:child_process';
 import { childEnv } from '../lib/child-env';
 import { describeUrl } from '../lib/log-url';
 import { worldNet } from '../lib/net-policy';
+import type { Played } from '../lib/playback';
 
 export interface LiveKitInitOptions {
   wsUrl: string;
@@ -26,8 +27,7 @@ export interface PublishAudioOptions {
   progress?: { frames: number };
 }
 
-/** How much of the audio went out to the room */
-export type Played = 'none' | 'partial' | 'all';
+export type { Played };
 
 /** What publishAudioStream did, and why not all of it played (`reason`, or the `error` it ended with). */
 export interface PlaybackOutcome {
@@ -215,6 +215,7 @@ export class AgentLiveKit extends System {
       const options = new TrackPublishOptions();
       options.source = TrackSource.SOURCE_MICROPHONE;
       console.log('[LiveKit] Publishing track to room...');
+      if (!room.localParticipant) return { played: 'none', reason: 'the voice room has no local participant' };
       await room.localParticipant.publishTrack(localTrack, options);
       if (this.room !== room) return { played: 'none', reason: 'the voice room went away' };
       this.audioSource = audioSource;

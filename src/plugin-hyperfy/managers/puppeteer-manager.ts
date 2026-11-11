@@ -1,19 +1,78 @@
-//@ts-nocheck
 import path from 'path'
 import fs from 'fs'
 import { promises as fsPromises } from 'fs';
-import puppeteer from 'puppeteer'
-import type { IAgentRuntime } from '@elizaos/core'
-import type { HyperfyService } from '../service.js'
+import puppeteer, { type Browser, type Page } from 'puppeteer'
 import { resolveUrl } from '../utils.js';
 import { getModuleDirectory } from '../utils.js';
 import { childEnv } from '../lib/child-env';
 import { modelBudget } from '../lib/gltf-budget';
 import { RenderWatchdog, type RenderWatchdogOptions } from '../lib/render-watchdog';
+import { ScopedLock } from '../lib/scoped-lock';
 
-// HyperfyService.serviceType. Not imported as a value: this module must load without the service
-// (and the whole engine behind it), which is how scripts/smoke-chromium.mjs runs it.
-const HYPERFY_SERVICE = 'hyperfy'
+// This module loads without the service and the engine behind it (scripts/smoke-chromium.mjs runs
+// it that way): what it draws of a world is handed to it (capture), never looked up.
+
+/**
+ * How a snapshot looks at the scene: all around the agent, the way it faces (`direction`: the side
+ * the caller turned it to first, which only names the diagnostic copy), or toward a point.
+ */
+export type CaptureView =
+  | { kind: 'around' }
+  | { kind: 'facing'; direction: 'front' | 'back' | 'left' | 'right' }
+  | { kind: 'target'; position: [number, number, number] }
+
+interface Placed {
+  position: { toArray(): number[] }
+  quaternion: { x: number; y: number; z: number; w: number }
+  scale: { toArray(): number[] }
+}
+
+interface CapturePlayer {
+  data: { id: string }
+  base: Placed
+  avatarUrl?: unknown
+}
+
+/** What a snapshot reads of an engine world. */
+export interface CaptureWorld {
+  assetsUrl?: string | null
+  entities: { player?: CapturePlayer | null; players: Map<string, CapturePlayer> }
+  stage: { scene: { toJSON(): unknown } }
+}
+
+type PlayerView = { position: number[]; quaternion: number[] }
+
+/** What the render page (public/puppeteer/page.js, assets.js, public/scripts) puts on its window. */
+interface RenderPageWindow {
+  THREE?: unknown
+  scene?: unknown
+  camera?: unknown
+  snapshotEquirectangular(player: PlayerView): Promise<string>
+  snapshotFacingDirection(player: PlayerView): Promise<string>
+  snapshotViewToTarget(player: PlayerView, target: number[]): Promise<string>
+  agentPage?: {
+    loadGlb(base64: string, stripSlots: readonly string[], maxExportBytes: number, op?: string): Promise<string>
+    loadVrm(url: string, base64: string, maxExportBytes: number, op?: string): Promise<string>
+    registerTexture(base64: string, contentType: string, slot: string, source: string, op?: string): Promise<string>
+    loadEnvironmentHDR(base64: string, op?: string): Promise<void>
+    rehydrate(sceneJson: unknown, stripSlots: readonly string[], players: unknown[]): unknown
+    settle(op: string, step: string): unknown
+  }
+}
+// Only inside functions handed to page.evaluate, which run in the render page
+declare const window: RenderPageWindow
+
+const debugSnapshotFile = (view: CaptureView) =>
+  view.kind === 'around' ? 'scene_equirectangular.jpeg' : view.kind === 'facing' ? `scene_facing_${view.direction}.jpeg` : 'scene_view_to_target.jpeg'
+
+const STRIP_SLOTS: readonly string[] = [
+  'map', 'aoMap', 'alphaMap',
+  'bumpMap', 'normalMap',
+  'metalnessMap', 'roughnessMap',
+  'emissiveMap', 'lightMap'
+]
+
+const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
 /**
  * The page the renderer runs in. It is written into an empty tab, never navigated to, and its
@@ -83,38 +142,39 @@ export class PageOperationCancelled extends Error {
   }
 }
 
+export interface PuppeteerManagerOptions {
+  /** The built render page, when it is not next to this module (the smoke script). */
+  pageBundlePath?: string
+  /** FOR TESTS: a shorter deadline or another process table. */
+  watchdog?: Pick<RenderWatchdogOptions, 'deadlineMs' | 'initDeadlineMs' | 'limitBytes' | 'table' | 'intervalMs' | 'idleIntervalMs' | 'breaker'>
+}
+
+/**
+ * The render page: one Chromium for the whole process, whatever world the agent is connected to.
+ * A connection's textures and avatars live in the page until the connection ends (resetPage).
+ */
 export class PuppeteerManager {
   private static instance: PuppeteerManager | null = null
   private operations = 0
   /** The current browser generation (each launch is one); what the watchdog, kills and launches are bound to */
   private generation = 0
-  private readonly pageGeneration = new WeakMap<puppeteer.Page, number>()
+  private readonly pageGeneration = new WeakMap<Page, number>()
+  /** One snapshot at a time: the page has one scene, which a snapshot fills and then draws */
+  private readonly captures = new ScopedLock()
   /**
    * The run-time bound on the page (lib/render-watchdog.ts): every page call below runs under it,
    * and Chromium's tree is killed when it uses too much memory or one call takes too long.
    */
   readonly watchdog: RenderWatchdog
   
-  private runtime: IAgentRuntime
-  private browser: puppeteer.Browser
-  private page: puppeteer.Page
-  private browserPromise: Promise<puppeteer.Browser> | null = null
-  private initPromise: Promise<puppeteer.Page> | null = null
+  private browser: Browser | null = null
+  private page: Page | null = null
+  private browserPromise: Promise<Browser> | null = null
+  private initPromise: Promise<Page> | null = null
   private pageScript: Promise<string> | null = null
   private pageBundlePath: string
-  private readonly STRIP_SLOTS = [
-    'map', 'aoMap', 'alphaMap',
-    'bumpMap', 'normalMap',
-    'metalnessMap', 'roughnessMap',
-    'emissiveMap', 'lightMap'
-  ] as const;
 
-
-  /**
-   * `pageBundlePath`: the built render page, when it is not next to this module (the smoke script).
-   * `watchdog`: FOR TESTS, a shorter deadline or another process table.
-   */
-  constructor(runtime: IAgentRuntime, { pageBundlePath, watchdog }: { pageBundlePath?: string; watchdog?: Pick<RenderWatchdogOptions, 'deadlineMs' | 'initDeadlineMs' | 'limitBytes' | 'table' | 'intervalMs' | 'idleIntervalMs' | 'breaker'> } = {}) {
+  constructor({ pageBundlePath, watchdog }: PuppeteerManagerOptions = {}) {
     if (PuppeteerManager.instance) {
       throw new Error('PuppeteerManager has already been instantiated.')
     }
@@ -141,18 +201,17 @@ export class PuppeteerManager {
       // Synchronously, at the teardown: the next use starts a new browser without waiting for puppeteer to notice
       onTornDown: (generation) => this.dropGeneration(generation),
     })
-    this.runtime = runtime
     this.pageBundlePath = pageBundlePath ?? path.join(getModuleDirectory(), 'puppeteer', 'page.js')
     PuppeteerManager.instance = this
     // Warm up Chromium in the background; callers await init() themselves.
     this.init().catch(error => {
-      console.error('[PuppeteerManager] Failed to launch browser:', error?.message || error)
+      console.error('[PuppeteerManager] Failed to launch browser:', messageOf(error))
     })
   }
 
   public static getInstance(): PuppeteerManager {
     if (!this.instance) {
-      throw new Error('PuppeteerManager not yet initialized. Call new PuppeteerManager(runtime) first.')
+      throw new Error('PuppeteerManager not yet initialized. Call PuppeteerManager.getOrCreate() first.')
     }
     return this.instance
   }
@@ -160,8 +219,8 @@ export class PuppeteerManager {
   /**
    * Returns the existing manager, so reconnects reuse one Chromium.
    */
-  public static getOrCreate(runtime: IAgentRuntime, options?: { pageBundlePath?: string }): PuppeteerManager {
-    return this.instance ?? new PuppeteerManager(runtime, options)
+  public static getOrCreate(options?: PuppeteerManagerOptions): PuppeteerManager {
+    return this.instance ?? new PuppeteerManager(options)
   }
 
   public async close(): Promise<void> {
@@ -172,8 +231,8 @@ export class PuppeteerManager {
     const browserPromise = this.browserPromise
     this.browserPromise = null
     const browser = await browserPromise?.catch(() => null)
-    await browser?.close().catch(error => {
-      console.warn('[PuppeteerManager] Error while closing browser:', error?.message || error)
+    await browser?.close().catch((error: unknown) => {
+      console.warn('[PuppeteerManager] Error while closing browser:', messageOf(error))
     })
     this.browser = null
   }
@@ -187,8 +246,8 @@ export class PuppeteerManager {
     this.initPromise = null
     const page = await pending?.catch(() => null)
     if (this.page === page) this.page = null
-    await page?.close().catch(error => {
-      console.warn('[PuppeteerManager] Error while closing page:', error?.message || error)
+    await page?.close().catch((error: unknown) => {
+      console.warn('[PuppeteerManager] Error while closing page:', messageOf(error))
     })
   }
 
@@ -202,7 +261,7 @@ export class PuppeteerManager {
   }
 
   /** Launches a browser (puppeteer's own launch timeout bounds this) as the next generation. */
-  private getBrowser(): Promise<puppeteer.Browser> {
+  private getBrowser(): Promise<Browser> {
     if (!this.browserPromise) {
       const generation = ++this.generation
       const browserPromise = puppeteer.launch({
@@ -217,12 +276,12 @@ export class PuppeteerManager {
         browser => {
           // Superseded while it launched (its generation torn down, or the manager closed): nobody's browser
           if (this.generation !== generation || this.browserPromise !== browserPromise) {
-            browser.process?.()?.kill('SIGKILL')
+            browser.process()?.kill('SIGKILL')
             browser.close().catch(() => { })
             return
           }
           this.browser = browser
-          this.watchdog.started(generation, browser.process?.()?.pid ?? null)
+          this.watchdog.started(generation, browser.process()?.pid ?? null)
           // If Chromium dies, relaunch on the next call instead of reusing a dead handle
           browser.on('disconnected', () => {
             this.watchdog.ended(generation)
@@ -243,11 +302,11 @@ export class PuppeteerManager {
    * others. While the render page is down for a cooldown this fails at once with
    * RenderPageUnavailable. The launch itself is bounded by puppeteer's own launch timeout.
    */
-  private async init(signal?: AbortSignal): Promise<puppeteer.Page> {
+  private async init(signal?: AbortSignal): Promise<Page> {
     this.watchdog.breaker.check()
     // One page per session; reset by resetPage()
     if (!this.initPromise) {
-      const initPromise = (async () => {
+      const initPromise: Promise<Page> = (async () => {
         const browserPromise = this.getBrowser()
         const generation = this.generation
         const browser = await browserPromise
@@ -276,7 +335,7 @@ export class PuppeteerManager {
     return await untilAborted(this.initPromise, signal)
   }
 
-  private async buildPage(browser: puppeteer.Browser, initPromise: Promise<puppeteer.Page>): Promise<puppeteer.Page> {
+  private async buildPage(browser: Browser, initPromise: Promise<Page>): Promise<Page> {
     const page = await browser.newPage()
     // A page that closed or crashed is rebuilt by the next call. The new one starts without
     // the textures and avatars the old one held; those come back with the next connection.
@@ -286,7 +345,7 @@ export class PuppeteerManager {
     }
     page.on('close', lost)
     page.on('error', (error) => {
-      console.warn('[PuppeteerManager] The render page crashed and will be rebuilt on next use:', error?.message || error)
+      console.warn('[PuppeteerManager] The render page crashed and will be rebuilt on next use:', messageOf(error))
       lost()
       page.close().catch(() => { })
     })
@@ -314,7 +373,7 @@ export class PuppeteerManager {
   }
 
   /** `work` on `page` as a watched page call of the generation the page belongs to */
-  private watched<T>(page: puppeteer.Page, work: () => Promise<T>): Promise<T> {
+  private watched<T>(page: Page, work: () => Promise<T>): Promise<T> {
     return this.watchdog.watch(this.pageGeneration.get(page) ?? this.generation, work)
   }
 
@@ -334,102 +393,40 @@ export class PuppeteerManager {
     try {
       fs.writeFileSync(path.resolve(fileName), Buffer.from(base64, 'base64'))
     } catch (error) {
-      console.warn(`[PuppeteerManager] Could not write ${fileName}:`, error?.message || error)
+      console.warn(`[PuppeteerManager] Could not write ${fileName}:`, messageOf(error))
     }
   }
 
-  public async snapshotFacingDirection(
-    direction: 'front' | 'back' | 'left' | 'right'
-  ): Promise<string> {
-    const page = await this.init();
-  
-    const service = this.getService();
-    const world = service.getWorld();
-    const player = world.entities.player;
-  
-    if (!player) {
-      throw new Error('Player entity not yet available');
-    }
+  /**
+   * A picture (JPEG data URL) of `world` as the agent sees it from where it stands: the scene and
+   * the other players as they are now are put into the page, then drawn as `view` says. One at a
+   * time. `signal` (the turn the look is for) ends the wait for the page and for an earlier
+   * snapshot; a drawing in progress is not interrupted. Every page call runs under the watchdog.
+   */
+  public capture(world: CaptureWorld, view: CaptureView, { signal }: { signal?: AbortSignal } = {}): Promise<string> {
+    return this.captures.run(signal, async () => {
+      const page = await this.init(signal)
+      const player = world.entities.player
+      if (!player) {
+        throw new Error('Player entity not yet available')
+      }
+      await this.rehydrateSceneAssets(page, world)
+      if (signal?.aborted) throw new PageOperationCancelled()
 
-    await world.controls.rotateTo(direction, 500);
-    world.controls.stopRotation();  
-  
-    await this.rehydrateSceneAssets(page);
-  
-    const playerData = {
-      position: player.base.position.toArray() as [number, number, number],
-      quaternion: [
-        player.base.quaternion.x,
-        player.base.quaternion.y,
-        player.base.quaternion.z,
-        player.base.quaternion.w
-      ] as const
-    };
+      const { x, y, z, w } = player.base.quaternion
+      const playerData: PlayerView = { position: player.base.position.toArray(), quaternion: [x, y, z, w] }
+      const target = view.kind === 'target' ? view.position : []
+      const base64 = await this.watched(page, () => page.evaluate((kind, playerData, target) => {
+        if (kind === 'around') return window.snapshotEquirectangular(playerData)
+        if (kind === 'facing') return window.snapshotFacingDirection(playerData)
+        return window.snapshotViewToTarget(playerData, target)
+      }, view.kind, playerData, target))
 
-    const base64 = await this.watched(page, () => page.evaluate(async (playerData) => {
-      return await window.snapshotFacingDirection(playerData);
-    }, playerData));
-  
-    this.saveDebugSnapshot(`scene_facing_${direction}.jpeg`, base64);
-  
-    return `data:image/jpeg;base64,${base64}`;
+      this.saveDebugSnapshot(debugSnapshotFile(view), base64)
+      return `data:image/jpeg;base64,${base64}`
+    })
   }
-  
-  public async snapshotViewToTarget(targetPosition: [number, number, number]): Promise<string> {
-    const page = await this.init();
-  
-    const service = this.getService();
-    const world = service.getWorld();
-    const player = world.entities.player;
-  
-    if (!player) {
-      throw new Error('Player entity not yet available');
-    }
-  
-    await this.rehydrateSceneAssets(page);
-  
-    const playerData = {
-      position: player.base.position.toArray() as [number, number, number]
-    };
 
-    const base64 = await this.watched(page, () => page.evaluate(async (playerData, targetPosition) => {
-      return await window.snapshotViewToTarget(playerData, targetPosition);
-    }, playerData, targetPosition));
-  
-    this.saveDebugSnapshot('scene_view_to_target.jpeg', base64);
-  
-    return `data:image/jpeg;base64,${base64}`;
-  }
-  
-
-  public async snapshotEquirectangular(): Promise<string> {
-    const page = await this.init();
-  
-    const service = this.getService();
-    const world = service.getWorld();
-    const player = world.entities.player;
-  
-    if (!player) {
-      throw new Error('Player entity not yet available');
-    }
-  
-    await this.rehydrateSceneAssets(page);
-  
-    const playerData = {
-      position: player.base.position.toArray(),
-      quaternion: [player.base.quaternion.x, player.base.quaternion.y, player.base.quaternion.z, player.base.quaternion.w] as const
-    };
-    
-    const base64 = await this.watched(page, () => page.evaluate(async (playerData) => {
-      return await window.snapshotEquirectangular(playerData);
-    }, playerData));
-  
-    this.saveDebugSnapshot('scene_equirectangular.jpeg', base64);
-  
-    return `data:image/jpeg;base64,${base64}`;
-  }
-  
-  
   /**
    * The asset loaders below take bytes the agent has already downloaded (lib/asset-bytes.ts): the
    * page cannot fetch anything itself. Bytes cross to the page and back as base64.
@@ -445,7 +442,7 @@ export class PuppeteerManager {
    * accounting); only the take-back after a call that already failed ignores its own failure, as
    * the call's error is what counts and a page that cannot be reached holds nothing of it.
    */
-  private async pageCall<T>(signal: AbortSignal | undefined, run: (page: puppeteer.Page, op: string[]) => Promise<T>): Promise<T> {
+  private async pageCall<T>(signal: AbortSignal | undefined, run: (page: Page, op: string[]) => Promise<T>): Promise<T> {
     const page = await this.init(signal)
     if (signal?.aborted) throw new PageOperationCancelled()
     // The id the page files its undo under; only when there is something to cancel
@@ -457,7 +454,7 @@ export class PuppeteerManager {
       if (op.length) await this.settle(page, op[0], 'rollback').catch(() => {})
       throw error
     }
-    if (!op.length) return result
+    if (!signal || !op.length) return result
     if (signal.aborted) {
       await this.settle(page, op[0], 'rollback')
       throw new PageOperationCancelled()
@@ -472,8 +469,8 @@ export class PuppeteerManager {
   }
 
   /** One settlement step of call `op` in the page (assets.js settle) */
-  private async settle(page: puppeteer.Page, op: string, step: 'commit' | 'rollback' | 'forget'): Promise<void> {
-    await this.watched(page, () => page.evaluate((id, step) => window.agentPage.settle(id, step), op, step))
+  private async settle(page: Page, op: string, step: 'commit' | 'rollback' | 'forget'): Promise<void> {
+    await this.watched(page, () => page.evaluate((id, step) => { window.agentPage!.settle(id, step) }, op, step))
   }
 
   /**
@@ -482,12 +479,12 @@ export class PuppeteerManager {
    */
   async evaluateWatched<T>(fn: (...args: any[]) => T | Promise<T>, ...args: unknown[]): Promise<T> {
     const page = await this.init()
-    return this.watched(page, () => page.evaluate(fn, ...args))
+    return this.watched(page, () => page.evaluate(fn, ...args) as Promise<T>)
   }
 
   /** The current browser generation and its pid (for scripts/smoke-chromium.mjs) */
   currentBrowser(): { generation: number; pid: number | null } {
-    return { generation: this.generation, pid: this.browser?.process?.()?.pid ?? null }
+    return { generation: this.generation, pid: this.browser?.process()?.pid ?? null }
   }
 
   /**
@@ -495,10 +492,9 @@ export class PuppeteerManager {
    * refuses to return more than `maxExportBytes` (lib/gltf-budget.ts).
    */
   async loadGlbBytes(bytes: Uint8Array, { maxExportBytes = DEFAULT_MAX_EXPORT_BYTES, signal }: { maxExportBytes?: number; signal?: AbortSignal } = {}): Promise<Uint8Array> {
-    const STRIP_SLOTS = this.STRIP_SLOTS;
     const stripped = await this.pageCall(signal, (page, op) =>
       page.evaluate(
-        (base64, STRIP_SLOTS, maxExportBytes, op) => window.agentPage.loadGlb(base64, STRIP_SLOTS, maxExportBytes, op),
+        (base64, STRIP_SLOTS, maxExportBytes, op?: string) => window.agentPage!.loadGlb(base64, STRIP_SLOTS, maxExportBytes, op),
         toBase64(bytes), STRIP_SLOTS, maxExportBytes, ...op
       )
     );
@@ -512,7 +508,7 @@ export class PuppeteerManager {
   async loadVRMBytes(bytes: Uint8Array, url: string, { maxExportBytes = DEFAULT_MAX_EXPORT_BYTES, signal }: { maxExportBytes?: number; signal?: AbortSignal } = {}): Promise<Uint8Array> {
     const exported = await this.pageCall(signal, (page, op) =>
       page.evaluate(
-        (url, base64, maxExportBytes, op) => window.agentPage.loadVrm(url, base64, maxExportBytes, op),
+        (url, base64, maxExportBytes, op?: string) => window.agentPage!.loadVrm(url, base64, maxExportBytes, op),
         url, toBase64(bytes), maxExportBytes, ...op
       )
     );
@@ -525,7 +521,7 @@ export class PuppeteerManager {
     const source = image.url.startsWith('data:') ? image.url.slice(0, image.url.indexOf(',')) : image.url;
     return this.pageCall(signal, (page, op) =>
       page.evaluate(
-        (base64, contentType, slot, source, op) => window.agentPage.registerTexture(base64, contentType, slot, source, op),
+        (base64, contentType, slot, source, op?: string) => window.agentPage!.registerTexture(base64, contentType, slot, source, op),
         toBase64(image.bytes), image.contentType, slot, source, ...op
       )
     );
@@ -534,46 +530,36 @@ export class PuppeteerManager {
   public async loadEnvironmentHDR(bytes: Uint8Array, { signal }: { signal?: AbortSignal } = {}): Promise<void> {
     await this.pageCall(signal, (page, op) =>
       page.evaluate(
-        (base64, op) => window.agentPage.loadEnvironmentHDR(base64, op),
+        (base64, op?: string) => window.agentPage!.loadEnvironmentHDR(base64, op),
         toBase64(bytes), ...op
       )
     );
   }
 
-  private async rehydrateSceneAssets(page: puppeteer.Page) {
-    const service = this.getService()
-    const world = service.getWorld()
+  /** Puts the scene of `world` and its other players, as they are now, into the page for drawing. */
+  private async rehydrateSceneAssets(page: Page, world: CaptureWorld) {
     const sceneJson = world.stage.scene.toJSON()
 
-    const agentId = world.entities.player.data.id;
+    const agentId = world.entities.player?.data.id;
     const players = await Promise.all(
       Array.from(world.entities.players.entries())
         .filter(([_, value]) => value.data.id !== agentId)
         .map(async ([key, value]) => {
           const avatarUrl = await resolveUrl(value.avatarUrl, world);
+          const { x, y, z, w } = value.base.quaternion;
           return {
             id: key,
             avatarUrl,
             position: value.base.position.toArray(),
             scale: value.base.scale.toArray(),
-            quaternion: [
-              value.base.quaternion.x,
-              value.base.quaternion.y,
-              value.base.quaternion.z,
-              value.base.quaternion.w,
-            ],
+            quaternion: [x, y, z, w],
           };
         })
     );
-    
-    const STRIP_SLOTS = this.STRIP_SLOTS;
+
     await this.watched(page, () => page.evaluate(
-      (sceneJson, STRIP_SLOTS, players) => window.agentPage.rehydrate(sceneJson, STRIP_SLOTS, players),
+      (sceneJson, STRIP_SLOTS, players) => { window.agentPage!.rehydrate(sceneJson, STRIP_SLOTS, players) },
       sceneJson, STRIP_SLOTS, players
     ));
-  }
-
-  private getService() {
-    return this.runtime.getService<HyperfyService>(HYPERFY_SERVICE)
   }
 }

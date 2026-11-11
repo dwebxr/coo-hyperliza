@@ -6,11 +6,13 @@ import {
   describeSceneEditsMode,
   isBuilder,
   operatorIds,
+  privilegedReport,
   readSceneEditsMode,
+  reportsPrivilegedAction,
   sceneEditRefusal,
   sceneEditStillAllowed,
 } from './authorization';
-import { neverAbortedSignal, type TurnContext } from './turn-context';
+import { type TurnContext, type TurnInit, currentTurn, neverAbortedSignal, runTurn } from './turn-context';
 import { TipWallet } from './tip-wallet';
 import { Ranks, trackWorldIdentity, worldIdentity } from './world-identity';
 import { cooWorldSnapshot, upstreamSnapshot } from '../test-support/world-packets';
@@ -131,7 +133,7 @@ describe('identity tracking keeps the other network handlers working', () => {
     const sent: unknown[] = [];
     const world = { network: { onEntityModified: engineOnEntityModified, onSnapshot: engineOnSnapshot, send: (...args: unknown[]) => sent.push(args) } as Record<string, any> };
     trackWorldIdentity(world);
-    // Created per connection after the identity is tracked, as in service.ts
+    // Created per connection after the identity is tracked, as in session/connection-session.ts
     const wallet = new TipWallet(world.network as never, privateKeyToAccount(`0x${'11'.repeat(32)}`), { host: 'world.test', selfId: () => 'coo-agent' });
 
     const snapshot = cooWorldSnapshot({ players });
@@ -148,13 +150,19 @@ describe('identity tracking keeps the other network handlers working', () => {
   });
 });
 
+/** The context of a real turn started with `init` (the turn itself has completed). */
+const realTurn = (init: TurnInit): Promise<TurnContext> => runTurn(init, async () => currentTurn()!);
+
 describe('what a turn may do', () => {
   const builderWorld = worldFromSnapshot(cooWorldSnapshot({ players }));
+  // What the checks below read of a turn; a turn's liveness has its own test further down
   const turn = (extra: Partial<TurnContext>): TurnContext => ({
     origin: 'chat',
     world: builderWorld,
     generation: 0,
     signal: neverAbortedSignal(),
+    live: true,
+    assertLive() {},
     ...extra,
   });
 
@@ -182,17 +190,37 @@ describe('what a turn may do', () => {
     expect(sceneEditRefusal(turn({ world: otherWorld, requesterId: 'builder-1' }), builders)).not.toBeNull();
   });
 
-  it('stops an authorized edit once the connection changed or the requester may no longer build', () => {
+  it('stops an authorized edit once the requester may no longer build', async () => {
     const world = worldFromSnapshot(cooWorldSnapshot({ players }));
-    const authorized = turn({ world, generation: 3, requesterId: 'builder-1' });
-    expect(sceneEditStillAllowed(authorized, { world, generation: 3 }, builders)).toBeNull();
-    expect(sceneEditStillAllowed(authorized, { world: {}, generation: 3 }, builders)).toBe('the connection to the world changed');
-    expect(sceneEditStillAllowed(authorized, { world, generation: 4 }, builders)).toBe('the connection to the world changed');
+    const authorized = await realTurn({ origin: 'chat', world, generation: 3, requesterId: 'builder-1', signal: neverAbortedSignal() });
+    expect(sceneEditStillAllowed(authorized, builders)).toBeNull();
     world.network.onEntityModified({ id: 'builder-1', rank: Ranks.VISITOR });
-    expect(sceneEditStillAllowed(authorized, { world, generation: 3 }, builders)).toBe('the requester is not a builder in this world');
+    expect(sceneEditStillAllowed(authorized, builders)).toBe('the requester is not a builder in this world');
     world.network.onEntityModified({ id: 'builder-1', rank: Ranks.BUILDER });
+    expect(sceneEditStillAllowed(authorized, builders)).toBeNull();
     world.network.onEntityRemoved('builder-1');
-    expect(sceneEditStillAllowed(authorized, { world, generation: 3 }, builders)).toBe('the requester is not a builder in this world');
+    expect(sceneEditStillAllowed(authorized, builders)).toBe('the requester is not a builder in this world');
+  });
+
+  it.each([
+    ['its connection ended', 'signal'],
+    ['its slot ran out', 'cancel'],
+  ] as const)('stops an authorized edit once %s, whoever asked', async (_what, which) => {
+    const world = worldFromSnapshot(cooWorldSnapshot({ players }));
+    const ends = { signal: new AbortController(), cancel: new AbortController() };
+    const authorized = await realTurn({ origin: 'chat', world, generation: 3, requesterId: 'builder-1', signal: ends.signal.signal, cancel: ends.cancel.signal });
+    expect(sceneEditStillAllowed(authorized, builders)).toBeNull();
+    ends[which].abort();
+    expect(sceneEditStillAllowed(authorized, builders)).toBe('the turn was cancelled or its connection ended');
+  });
+
+  it('keeps the check a privileged report was registered with for exactly that reply object', () => {
+    const report = { refusal: () => 'no longer', instead: { text: 'neutral' } };
+    const reply = reportsPrivilegedAction({ text: 'I moved the box' }, report);
+    expect(privilegedReport(reply)).toBe(report);
+    // A copy is another reply: only what the action handed over is checked at delivery
+    expect(privilegedReport({ ...reply })).toBeUndefined();
+    expect(privilegedReport({ text: 'I moved the box' })).toBeUndefined();
   });
 
   it('lets an autonomous turn run only the autonomy actions, and privileged actions never run outside a turn', () => {

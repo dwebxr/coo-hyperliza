@@ -1,4 +1,5 @@
-import { type TurnContext, neverAbortedSignal, runTurn } from '../lib/turn-context';
+import { type TurnInit, neverAbortedSignal, runTurn } from '../lib/turn-context';
+import { sessionAround } from './session-registry';
 import { trackWorldIdentity } from '../lib/world-identity';
 import { cooWorldSnapshot } from './world-packets';
 
@@ -15,7 +16,13 @@ export function worldWithBuilder<T extends Record<string, unknown>>(extra: T = {
   return worldFromSnapshot(cooWorldSnapshot({ players: [{ id: 'player-1', name: 'Alice', rank: 1 }] }), extra);
 }
 
-export function inTurn<T>(turn: Pick<TurnContext, 'origin' | 'world'> & Partial<TurnContext>, fn: () => Promise<T>): Promise<T> {
+/**
+ * Runs `fn` as a turn on `turn.world`: a turn of the session a test built around that world
+ * (test-support/session.ts), or a turn that belongs to no session.
+ */
+export function inTurn<T>(turn: Pick<TurnInit, 'origin' | 'world'> & Partial<TurnInit>, fn: () => Promise<T>): Promise<T> {
+  const session = sessionAround(turn.world);
+  if (session && turn.generation === undefined && turn.signal === undefined) return session.runTurn({ origin: turn.origin, requesterId: turn.requesterId, cancel: turn.cancel }, fn);
   return runTurn({ generation: 0, signal: neverAbortedSignal(), ...turn }, fn);
 }
 

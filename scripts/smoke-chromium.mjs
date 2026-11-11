@@ -71,7 +71,6 @@ export function fakeWorld({ environment, skyTextureId }) {
   return {
     assetsUrl: null,
     stage: { scene },
-    controls: { rotateTo: async () => {}, stopRotation: () => {} },
     entities: { player: agent, players: new Map([['agent', agent], ['visitor', visitor]]) },
   };
 }
@@ -262,7 +261,7 @@ async function main() {
     const { PuppeteerManager, OFFLINE_CHROMIUM_ARGS } = await bundleManager(path.join(dir, 'puppeteer-manager.mjs'));
 
     let world = null;
-    manager = new PuppeteerManager({ getService: () => ({ getWorld: () => world }) }, { pageBundlePath: path.join(dir, 'page.js') });
+    manager = new PuppeteerManager({ pageBundlePath: path.join(dir, 'page.js') });
     const page = await manager.init();
     const chromium = manager.browser.process();
     await sleep(1000);
@@ -437,9 +436,9 @@ async function main() {
     console.log('\n== snapshots');
     world = fakeWorld({ environment, skyTextureId });
     const shots = {
-      equirectangular: await manager.snapshotEquirectangular(),
-      'facing front': await manager.snapshotFacingDirection('front'),
-      'view to target': await manager.snapshotViewToTarget([0, 0, 0]),
+      equirectangular: await manager.capture(world, { kind: 'around' }),
+      'facing front': await manager.capture(world, { kind: 'facing', direction: 'front' }),
+      'view to target': await manager.capture(world, { kind: 'target', position: [0, 0, 0] }),
     };
     const viewport = await page.evaluate(() => [window.renderer.domElement.width, window.renderer.domElement.height]);
     for (const [name, dataUrl] of Object.entries(shots)) {
@@ -473,15 +472,15 @@ async function main() {
     check('the bundled workload stays below three quarters of the watchdog limit', manager.watchdog.peakSampleBytes < 0.75 * manager.watchdog.limitBytes, `peak ${inGiB(manager.watchdog.peakSampleBytes)} of ${inGiB(manager.watchdog.limitBytes)}`);
     check('no diagnostic JPEG is written without HYPERFY_DEBUG_SNAPSHOTS=true', readdirSync(dir).filter((name) => name.endsWith('.jpeg')).length === 0);
     process.env.HYPERFY_DEBUG_SNAPSHOTS = 'true';
-    await manager.snapshotFacingDirection('front');
+    await manager.capture(world, { kind: 'facing', direction: 'front' });
     delete process.env.HYPERFY_DEBUG_SNAPSHOTS;
     check('with HYPERFY_DEBUG_SNAPSHOTS=true it is written to the working directory', existsSync(path.join(dir, 'scene_facing_front.jpeg')));
 
     console.log('\n== nothing piles up');
     const memory = () => page.evaluate(() => ({ ...window.renderer.info.memory, targets: window.renderer.info.memory.textures }));
-    for (let i = 0; i < 2; i++) await manager.snapshotEquirectangular();
+    for (let i = 0; i < 2; i++) await manager.capture(world, { kind: 'around' });
     const before = await memory();
-    for (let i = 0; i < 6; i++) await manager.snapshotEquirectangular();
+    for (let i = 0; i < 6; i++) await manager.capture(world, { kind: 'around' });
     const after = await memory();
     check('six more snapshots leave the GPU with the same number of geometries and textures', before.geometries === after.geometries && before.textures === after.textures, `geometries ${before.geometries} -> ${after.geometries}, textures ${before.textures} -> ${after.textures}`);
     // 1x1 PNG
@@ -493,7 +492,7 @@ async function main() {
     }, pixel, count);
     const idle = await register(1);
     // Drawing the scene uses its textures again, which makes the one just added the least recently used
-    await manager.snapshotFacingDirection('front');
+    await manager.capture(world, { kind: 'facing', direction: 'front' });
     const { limit, size } = await page.evaluate(() => ({ limit: window.agentPage.LIMITS.textures, size: window.texturesMap.size }));
     await register(limit - size + 1);
     const bounded = await page.evaluate((idle, skyId) => ({ size: window.texturesMap.size, idleGone: !window.texturesMap.has(`${idle}:smoke`), skyKept: window.texturesMap.has(`${skyId}:map`) }), idle, skyTextureId);
@@ -508,13 +507,13 @@ async function main() {
     });
     const avatarBytes = file('avatars/avatar.vrm');
     await manager.loadVRMBytes(avatarBytes, 'smoke://idle.vrm');
-    await manager.snapshotFacingDirection('front');
+    await manager.capture(world, { kind: 'facing', direction: 'front' });
     await manager.loadVRMBytes(avatarBytes, 'smoke://newer.vrm');
     const avatars = await page.evaluate((limit) => {
       window.agentPage.LIMITS.avatars = limit;
       return { kept: [...window.avatarMap.keys()], drawn: window.activeVRMInstances.length };
     }, avatarLimit);
-    await manager.snapshotFacingDirection('front');
+    await manager.capture(world, { kind: 'facing', direction: 'front' });
     check(
       'the page keeps at most LIMITS.avatars avatars, dropping the least recently used (not one a player in the scene wears)',
       avatarLimit === 32 && JSON.stringify(avatars.kept) === JSON.stringify([VISITOR_AVATAR_URL, 'smoke://newer.vrm']) && (await page.evaluate(() => window.activeVRMInstances.length)) === 1,
@@ -603,7 +602,7 @@ async function main() {
       runaway.error?.name === 'RenderPageKilled' && runaway.error.reason === 'memory' && measured > manager.watchdog.limitBytes && measured <= manager.watchdog.limitBytes + GiB,
       runaway.error ? `${runaway.error.message}; measured ${inGiB(measured)} after ${killedAfter} ms` : `not killed: the page call returned ${JSON.stringify(runaway.value)}`
     );
-    const afterKill = await manager.snapshotEquirectangular().then((shot) => shot, (error) => `failed: ${error?.message ?? error}`);
+    const afterKill = await manager.capture(world, { kind: 'around' }).then((shot) => shot, (error) => `failed: ${error?.message ?? error}`);
     const freshPid = manager.browser?.process()?.pid;
     check('the next snapshot works, on a new browser and page', afterKill.startsWith('data:image/jpeg;base64,') && freshPid && freshPid !== killedPid, `${afterKill.slice(0, 40)}; browser pid ${killedPid} -> ${freshPid}`);
     // Nothing of the killed generation is left: not the processes it was seen to own, not its process group

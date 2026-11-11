@@ -1,28 +1,32 @@
-import { describe, expect, it, vi } from 'vitest';
-
-vi.mock('../service', () => ({ HyperfyService: { serviceType: 'hyperfy' } }));
+import { describe, expect, it } from 'vitest';
 
 import { hyperfyProvider } from './world';
+import { serviceFor, sessionFor, withParts } from '../test-support/session';
 
 const message: any = { entityId: 'user-1', content: { text: 'Coo, come here' } };
 
 describe('hyperfyProvider', () => {
   it('exposes hyperfyStatus when disconnected', async () => {
-    const runtime: any = { getService: () => ({ isConnected: () => false }) };
-    const result = await hyperfyProvider.get(runtime, message, {} as any);
-    expect(result.values?.hyperfyStatus).toContain('Disconnected');
-    expect(result.values).not.toHaveProperty('hyperfy_status');
+    // No service, no session, a session still being set up, and one that has ended
+    const ended = sessionFor({});
+    await ended.end();
+    for (const service of [null, serviceFor(null), serviceFor(sessionFor({}, { connected: false })), serviceFor(ended)]) {
+      const runtime: any = { getService: () => service };
+      const result = await hyperfyProvider.get(runtime, message, {} as any);
+      expect(result.values?.hyperfyStatus).toContain('Disconnected');
+      expect(result.values).not.toHaveProperty('hyperfy_status');
+    }
   });
 
   it('keeps the received message in hyperfyStatus when building state fails', async () => {
-    const runtime: any = {
-      getService: () => ({
-        isConnected: () => true,
-        getWorld: () => {
+    const world = {
+      entities: {
+        get items(): never {
           throw new Error('world exploded');
         },
-      }),
+      },
     };
+    const runtime: any = { agentId: 'agent', getService: () => serviceFor(sessionFor(world)) };
     const result = await hyperfyProvider.get(runtime, message, {} as any);
     expect(result.values?.hyperfyStatus).toContain('Error retrieving state');
     expect(result.values?.hyperfyStatus).toContain('Coo, come here');
@@ -50,12 +54,7 @@ describe('hyperfyProvider', () => {
       const world = { entities: { items, player: { data: { id: 'coo' } } }, actions: { getNearby: () => [action], currentNode: action } };
       const runtime: any = {
         agentId: 'agent',
-        getService: () => ({
-          isConnected: () => true,
-          getWorld: () => world,
-          currentWorldId: 'w1',
-          getMessageManager: () => ({ getRecentMessages: async () => ({ formattedHistory: '', lastResponseText, lastActions }) }),
-        }),
+        getService: () => serviceFor(withParts(sessionFor(world), { messages: { getRecentMessages: async () => ({ formattedHistory: '', lastResponseText, lastActions }) } })),
         getEntityById: async () => ({ names: [senderName], metadata: { hyperfy: { userName: senderName } } }),
       };
       return hyperfyProvider.get(runtime, { entityId: 'user-1', content: { text } } as any, {} as any);

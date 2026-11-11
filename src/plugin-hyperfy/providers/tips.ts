@@ -1,5 +1,5 @@
 import { type IAgentRuntime, type Provider } from '@elizaos/core';
-import { HyperfyService } from '../service';
+import { observedSession } from '../service';
 
 /** How players can tip the agent; only while the world shows it as receiving tips. */
 export function tipsGuidance(name: string): string {
@@ -14,9 +14,8 @@ export const hyperfyTipsProvider: Provider = {
   name: 'HYPERFY_TIPS',
   description: 'Whether and how players can tip the agent',
   get: async (runtime: IAgentRuntime) => {
-    const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
     // Values are not template-rendered, so the name is filled in here
-    const text = service?.getTipWallet()?.receiving ? tipsGuidance(runtime.character.name) : '';
+    const text = observedSession(runtime)?.tipWallet?.receiving ? tipsGuidance(runtime.character.name) : '';
     return { text, values: { hyperfyTips: text } };
   },
 };
