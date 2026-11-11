@@ -28,12 +28,25 @@ const DEFAULT_EFFORT: Effort = 'low';
 const DEFAULT_MAX_TOKENS = 16000;
 const IMAGE_DESCRIPTION_MAX_TOKENS = 4096;
 // The agent talks in real time and holds an activity lock while generating; this deadline
-// covers SDK retries, Retry-After waits and reading the response body.
+// covers both attempts, the wait between them and reading the response body.
 const GENERATION_DEADLINE_MS = 60_000;
+
+/**
+ * One more attempt is made only after an answer saying the API did not take the request now (429
+ * rate limited, 529 overloaded), which comes before anything is generated. Never after a timeout,
+ * a lost connection or another error: the first attempt may then have been answered and billed,
+ * and a second would pay twice for one reply. Each attempt is reserved on its own; the SDK itself
+ * retries nothing (maxRetries: 0), so every request sent is one the budget admitted.
+ */
+const RETRY_STATUSES = new Set([429, 529]);
+// The wait before it: the answer's retry-after, else this, and never more than RETRY_MAX_WAIT_MS
+const RETRY_WAIT_MS = 1000;
+const RETRY_MAX_WAIT_MS = 5000;
 
 // Reserved against AI_MAX_TOKENS_PER_DAY on top of the prompt's bytes: the request's own framing
 const FRAMING_TOKEN_RESERVE = 64;
 // Reserved per attached image. An estimate, not a bound: the API counts an image by its pixels
+// after its own downscaling, and nothing here measures the image
 const IMAGE_TOKEN_RESERVE = 5000;
 
 /**
@@ -58,6 +71,20 @@ function wasRejected(error: unknown): boolean {
   const status = (error as { status?: unknown } | null)?.status;
   // 408 and 409 can follow work the API already did
   return typeof status === 'number' && status >= 400 && status < 500 && status !== 408 && status !== 409;
+}
+
+/** How long to wait before the one more attempt `error` allows (RETRY_STATUSES), or null for none. */
+function retryWait(error: unknown, deadlineAt: number): number | null {
+  const { status, headers } = (error ?? {}) as { status?: unknown; headers?: { get?: (name: string) => string | null } };
+  if (typeof status !== 'number' || !RETRY_STATUSES.has(status)) return null;
+  const header = (name: string) => {
+    const value = Number(headers?.get?.(name) ?? NaN);
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  };
+  const afterMs = header('retry-after-ms') ?? (header('retry-after') !== null ? header('retry-after')! * 1000 : null);
+  const wait = Math.min(afterMs ?? RETRY_WAIT_MS, RETRY_MAX_WAIT_MS);
+  // Not when the answer could not come within the deadline
+  return Date.now() + wait < deadlineAt ? wait : null;
 }
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
@@ -134,41 +161,58 @@ async function generate(
   const label = isAiPurpose(purpose) ? purpose : modelType;
   const client = getClient(runtime);
 
-  // Admitted and counted before the request, in one step: calls that start together cannot all
-  // pass a limit only one of them fits (usage-budget.ts reserveAi)
-  const reservation = budget.reserveAi({ purpose: label, origin: currentOrigin() }, tokenReserve(system, content ?? prompt, maxOutput));
-  if (typeof reservation === 'string') {
-    budget.recordSkip('ai-call');
-    throw new AiBudgetExceededError(reservation);
-  }
+  const reserve = tokenReserve(system, content ?? prompt, maxOutput);
+  const deadlineAt = Date.now() + GENERATION_DEADLINE_MS;
+  const signal = AbortSignal.timeout(GENERATION_DEADLINE_MS);
+  /** One request, under a reservation of its own; settled with what the API billed, or failed. */
+  const attempt = async (): Promise<Anthropic.Message> => {
+    // Admitted and counted before the request, in one step: calls that start together cannot all
+    // pass a limit only one of them fits (usage-budget.ts reserveAi)
+    const reservation = budget.reserveAi({ purpose: label, origin: currentOrigin() }, reserve);
+    if (typeof reservation === 'string') {
+      budget.recordSkip('ai-call');
+      throw new AiBudgetExceededError(reservation);
+    }
+    let response: Anthropic.Message;
+    try {
+      response = await client.messages.create(
+        {
+          model,
+          max_tokens: maxOutput,
+          ...(system ? { system } : {}),
+          ...(stops.length ? { stop_sequences: stops } : {}),
+          output_config: { effort },
+          messages: [{ role: 'user', content: content ?? prompt }],
+        },
+        { signal, maxRetries: 0 }
+      );
+    } catch (error) {
+      // A request the API refused cost nothing; one that timed out, was aborted or lost its
+      // connection may have been billed, so its whole reservation stays counted
+      reservation.fail(wasRejected(error) ? 'rejected' : 'unknown');
+      throw error;
+    }
+    // Billed even when the output turns out unusable
+    reservation.settle({
+      inputTokens: response.usage.input_tokens,
+      outputTokens: response.usage.output_tokens,
+      cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
+      cacheWriteTokens: response.usage.cache_creation_input_tokens ?? 0,
+    });
+    return response;
+  };
 
   let response: Anthropic.Message;
   try {
-    response = await client.messages.create(
-      {
-        model,
-        max_tokens: maxOutput,
-        ...(system ? { system } : {}),
-        ...(stops.length ? { stop_sequences: stops } : {}),
-        output_config: { effort },
-        messages: [{ role: 'user', content: content ?? prompt }],
-      },
-      { signal: AbortSignal.timeout(GENERATION_DEADLINE_MS), maxRetries: 1 }
-    );
+    response = await attempt();
   } catch (error) {
-    // A request the API refused cost nothing; one that timed out, was aborted or lost its
-    // connection may have been billed, so its whole reservation stays counted
-    reservation.fail(wasRejected(error) ? 'rejected' : 'unknown');
-    throw error;
+    const wait = retryWait(error, deadlineAt);
+    if (wait === null) throw error;
+    logger.warn(`[Anthropic] ${label}: the API answered ${(error as { status: number }).status}; trying once more in ${wait} ms`);
+    await new Promise((resolve) => setTimeout(resolve, wait));
+    // Reserved again: a second attempt the budget does not admit is not made (AiBudgetExceededError)
+    response = await attempt();
   }
-
-  // Billed even when the output turns out unusable
-  reservation.settle({
-    inputTokens: response.usage.input_tokens,
-    outputTokens: response.usage.output_tokens,
-    cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
-    cacheWriteTokens: response.usage.cache_creation_input_tokens ?? 0,
-  });
   if (response.stop_reason === 'max_tokens') {
     logger.warn(
       `[Anthropic] ${label} reply was cut off at max_tokens=${maxOutput}` +

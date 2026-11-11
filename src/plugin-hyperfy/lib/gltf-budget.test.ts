@@ -134,7 +134,8 @@ describe('gltfStorageProblem: what the page would allocate', () => {
     ['accessors that add up', [accessor(80), accessor(80), accessor(80), accessor(80), accessor(80), accessor(80)], 'the model needs more than 5000 bytes'],
     ['a sparse part', [accessor(1, 'SCALAR', 5126, { sparse: { count: 200, indices: { bufferView: 0, componentType: 5121 }, values: { bufferView: 0 } } })], 'accessor 0 needs 1004 bytes'],
   ])('refuses %s', (_name, accessors, why) => {
-    expect(problem(glb({ buffers: [{ byteLength: 4 }], bufferViews: [{ buffer: 0, byteLength: 4 }], accessors }, new Uint8Array(4)))).toContain(why);
+    // A view large enough for the sparse indices (200 bytes) and values (800)
+    expect(problem(glb({ buffers: [{ byteLength: 800 }], bufferViews: [{ buffer: 0, byteLength: 800 }], accessors }, new Uint8Array(800)))).toContain(why);
   });
 
   it.each([
@@ -369,6 +370,8 @@ describe('gltfStorageProblem: what the page would allocate', () => {
     ['a light that does not exist', { nodes: [{ extensions: { KHR_lights_punctual: { light: 3 } } }] }, 'node 0 names no light'],
     ['a material that does not exist', { accessors: [accessor(1)], meshes: [{ primitives: [{ attributes: { POSITION: 0 }, material: 2 }] }] }, 'names no material'],
     ['a sampler that does not exist', { images: [{ uri: 'x.png' }], textures: [{ source: 0, sampler: 4 }] }, 'texture 0 names no sampler'],
+    ['an image that does not exist', { images: [{ uri: 'x.png' }], textures: [{ source: 3 }] }, 'texture 0 names no image'],
+    ['a WebP image that does not exist', { images: [{ uri: 'x.png' }], textures: [{ source: 0, extensions: { EXT_texture_webp: { source: 1 } } }] }, 'texture 0 names no image'],
     ['a default scene that does not exist', { scene: 1, scenes: [{}] }, 'the glTF scene names no scene'],
     ['a skeleton that does not exist', { skins: [{ joints: [], skeleton: 9 }] }, 'skin 0 names no skeleton node'],
   ])('refuses %s', (_name, json, why) => {
@@ -401,6 +404,48 @@ describe('gltfStorageProblem: what the page would allocate', () => {
   it('rejects a third chunk where it starts, without reading the rest of the file', () => {
     const chunks: [number, Uint8Array][] = [[JSON_TYPE, jsonBytes({ asset: { version: '2.0' } })], [BIN_TYPE, new Uint8Array(4)], ...Array.from({ length: 1000 }, (): [number, Uint8Array] => [0x12345678, new Uint8Array(0)])];
     expect(problem(glbOf(chunks))).toBe('the GLB has more than a JSON and a BIN chunk');
+    // After the third chunk, a header that runs past the end: reading on would report that instead
+    const valid = glbOf([[JSON_TYPE, jsonBytes({ asset: { version: '2.0' } })], [BIN_TYPE, new Uint8Array(4)], [0x12345678, new Uint8Array(4)]]);
+    const broken = new Uint8Array(valid.length + 4);
+    broken.set(valid);
+    new DataView(broken.buffer).setUint32(8, broken.length, true);
+    expect(problem(broken)).toBe('the GLB has more than a JSON and a BIN chunk');
+  });
+
+  it('compares the morph targets of primitives that share a geometry by content, not by the order of their members', () => {
+    const json = (second: unknown[]) => ({
+      accessors: [accessor(1), accessor(1), accessor(1), accessor(1)],
+      meshes: [{ primitives: [{ attributes: { POSITION: 0, NORMAL: 1 }, targets: [{ POSITION: 2, NORMAL: 3 }] }, { attributes: { NORMAL: 1, POSITION: 0 }, targets: second }] }],
+    });
+    expect(problem(glb(json([{ NORMAL: 3, POSITION: 2 }])))).toBeNull();
+    // The order of the targets themselves does matter
+    expect(problem(glb({ ...json([]), meshes: [{ primitives: [{ attributes: { POSITION: 0 }, targets: [{ POSITION: 2 }, { POSITION: 3 }] }, { attributes: { POSITION: 0 }, targets: [{ POSITION: 3 }, { POSITION: 2 }] }] }] }))).toContain('declares other morph targets');
+  });
+
+  it("refuses a material's texture that does not exist, wherever the material names it", () => {
+    const base = { images: [{ uri: 'x.png' }], textures: [{ source: 0 }] };
+    expect(problem(glb({ ...base, materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 } }, normalTexture: { index: 0 } }] }))).toBeNull();
+    expect(problem(glb({ ...base, materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 999 } } }] }))).toBe('material 0 names no texture (baseColorTexture)');
+    expect(problem(glb({ ...base, materials: [{}, { extensions: { KHR_materials_clearcoat: { clearcoatTexture: { index: 2 } } } }] }))).toBe('material 1 names no texture (clearcoatTexture)');
+    expect(problem(glb({ ...base, materials: [{ extensions: { VRMC_materials_mtoon: { shadeMultiplyTexture: { index: -1 } } } }] }))).toContain('names no texture');
+  });
+
+  it('refuses a sparse part that runs past the end of its buffer view', () => {
+    const json = (valuesOffset: number) => ({
+      buffers: [{ byteLength: 16 }],
+      bufferViews: [{ buffer: 0, byteLength: 4 }, { buffer: 0, byteOffset: 4, byteLength: 12 }],
+      accessors: [accessor(10, 'VEC3', 5126, { sparse: { count: 1, indices: { bufferView: 0, componentType: 5121 }, values: { bufferView: 1, byteOffset: valuesOffset } } })],
+    });
+    expect(problem(glb(json(0), new Uint8Array(16)))).toBeNull();
+    expect(problem(glb(json(4), new Uint8Array(16)))).toBe('accessor 0 has a sparse part that runs past the end of its buffer view');
+    expect(problem(glb(json(99), new Uint8Array(16)))).toBe('accessor 0 has a sparse part that runs past the end of its buffer view');
+  });
+
+  it('counts the JSON limit in UTF-8 bytes', () => {
+    // Three bytes each in UTF-8, one code unit each in the text
+    const japanese = 'あ'.repeat(Math.ceil(MODEL_LIMITS.jsonBytes / 3) + 10);
+    expect(problem(glb({ extras: japanese }))).toBe(`the glTF JSON is larger than ${MODEL_LIMITS.jsonBytes} bytes (without its data: URIs)`);
+    expect(problem(glb({ extras: 'あ'.repeat(1000) }))).toBeNull();
   });
 
   it('passes ordinary shapes: several root nodes, shared materials, a joint in two skins, a .gltf text file', () => {

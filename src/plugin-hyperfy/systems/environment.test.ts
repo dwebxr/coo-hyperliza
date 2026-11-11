@@ -11,6 +11,8 @@ const page = vi.hoisted(() => ({
   committed: [] as string[],
   ready: null as Promise<void> | null,
   gate: null as Promise<void> | null,
+  /** What registerTexture fails with, while set */
+  fail: null as Error | null,
 }));
 vi.mock('../managers/puppeteer-manager.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../managers/puppeteer-manager.js')>();
@@ -19,6 +21,7 @@ vi.mock('../managers/puppeteer-manager.js', async (importOriginal) => {
     async registerTexture(_base64: string, _type: string, slot: string, source: string, op?: string) {
       page.calls.push(`registerTexture ${source}`);
       await page.gate;
+      if (page.fail) throw page.fail;
       const key = `t${++textures}:${slot}`;
       page.textures.set(key, source);
       if (op) page.undo.set(op, () => page.textures.delete(key));
@@ -29,10 +32,11 @@ vi.mock('../managers/puppeteer-manager.js', async (importOriginal) => {
       page.environment = base64;
       if (op) page.undo.set(op, () => (page.environment = null));
     },
-    settle(op: string, keep: boolean) {
+    settle(op: string, step: 'commit' | 'rollback' | 'forget') {
+      if (step === 'commit') return;
       const undo = page.undo.get(op);
       page.undo.delete(op);
-      if (keep) page.committed.push(op);
+      if (step === 'forget') page.committed.push(op);
       else {
         page.undone.push(op);
         undo?.();
@@ -48,8 +52,10 @@ vi.mock('../managers/puppeteer-manager.js', async (importOriginal) => {
   const { RenderWatchdog } = await import('../lib/render-watchdog');
   const manager = Object.create(actual.PuppeteerManager.prototype);
   manager.operations = 0;
+  manager.generation = 1;
+  manager.pageGeneration = new WeakMap();
   // No browser here: nothing to sample or kill
-  manager.watchdog = new RenderWatchdog({ rootPid: () => null, kill: () => {}, table: async () => [] });
+  manager.watchdog = new RenderWatchdog({ kill: () => {}, table: async () => [] });
   manager.init = async () => {
     await page.ready;
     return fakePage;
@@ -60,6 +66,8 @@ vi.mock('../managers/puppeteer-manager.js', async (importOriginal) => {
 import { AgentEnvironment } from './environment';
 import { NetPolicy, installWorldNet } from '../lib/net-policy';
 import { closeServers, startServer } from '../test-support/net';
+import { assetMemory } from '../lib/asset-memory';
+import { RenderPageKilled } from '../lib/render-watchdog';
 
 const prototype = AgentEnvironment.prototype as any;
 
@@ -121,6 +129,7 @@ describe('AgentEnvironment sky updates', () => {
     page.committed.length = 0;
     page.ready = null;
     page.gate = null;
+    page.fail = null;
     await closeServers();
   });
 
@@ -186,6 +195,35 @@ describe('AgentEnvironment sky updates', () => {
 
     expect(page.calls).toEqual([]);
     expect([page.textures.size, page.environment, env.sky.material.userData.materialId, env.sky.visible, world.stage.scene.fog]).toEqual([0, null, undefined, false, 'untouched']);
+  });
+
+  it("holds the agent's memory reservation for a sky image while it is on its way, and gives it back", async () => {
+    const { env } = await environment();
+    let release!: () => void;
+    page.gate = new Promise<void>((resolve) => (release = resolve));
+    env.addSky(sky('asset://a.jpg'));
+    await expect.poll(() => page.calls.length).toBe(1);
+    // In the page: the download was exchanged for 4 x its 11 bytes of work
+    expect(assetMemory.held).toEqual({ downloads: 0, work: 44 });
+    release();
+    await expect.poll(() => page.committed.length).toBe(1);
+    expect(assetMemory.held).toEqual({ downloads: 0, work: 0 });
+  });
+
+  it('does not hand the page again, for this world, a sky image that got it killed while it was the only page call', async () => {
+    const { env, assets } = await environment();
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    page.fail = new RenderPageKilled('memory', 'killed: too much memory', 4e9, 1, 1);
+    env.addSky(sky('asset://heavy.jpg'));
+    await expect.poll(() => (console.warn as any).mock.calls.length).toBe(1);
+    expect((console.warn as any).mock.calls[0][1]).toBe('killed: too much memory');
+    page.fail = null;
+    env.addSky(sky('asset://heavy.jpg'));
+    await expect.poll(() => (console.warn as any).mock.calls.length).toBe(2);
+    expect((console.warn as any).mock.calls[1][1]).toMatch(/Not handing the image .*heavy\.jpg to the render page again: killed: too much memory/);
+    // Neither downloaded nor handed to the page again
+    expect([page.calls.length, assets.hits.length]).toEqual([1, 1]);
+    expect(console.error).toHaveBeenCalledTimes(1);
   });
 
   it('takes back the texture the page was decoding when the world was destroyed, and changes nothing else', async () => {

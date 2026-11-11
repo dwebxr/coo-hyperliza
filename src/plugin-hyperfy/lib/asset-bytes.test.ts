@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ASSET_BYTE_CAPS, decodeDataUrl, describeUrl, fetchAssetBytes } from './asset-bytes';
 import { MAX_EMOTE_BYTES, MAX_IMAGE_BYTES, MAX_MODEL_BYTES, MAX_SCRIPT_BYTES, NetPolicy, installWorldNet } from './net-policy';
 import { PUBLIC_ADDRESS, closeServers, startServer, testNet } from '../test-support/net';
+import { AssetMemory } from './asset-memory';
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -86,6 +87,45 @@ describe('fetchAssetBytes', () => {
     // The same answer is too much for a script and fine, as far as its size goes, for a model
     await expect(fetchAssetBytes(world, 'asset://a.js', 'script')).rejects.toMatchObject({ kind: 'too-large' });
     await expect(fetchAssetBytes(world, 'asset://a.glb', 'model')).rejects.toMatchObject({ kind: 'network' });
+  });
+});
+
+describe("fetchAssetBytes and the download's memory reservation (lib/asset-memory.ts)", () => {
+  it('shrinks it to twice the declared size once the answer comes, and to twice the actual size once the bytes are in', async () => {
+    let finish!: () => void;
+    const server = await startServer((request, response) => {
+      if (request.url?.includes('declared')) {
+        response.writeHead(200, { 'content-length': '100' });
+        response.write(Buffer.alloc(40));
+        finish = () => response.end(Buffer.alloc(60));
+      } else {
+        // Chunked: no declared size
+        response.write(Buffer.alloc(30));
+        response.end(Buffer.alloc(20));
+      }
+    });
+    const origin = `http://127.0.0.1:${server.port}`;
+    const world = { assetsUrl: `${origin}/assets/` };
+    installWorldNet(world, new NetPolicy({ worldOrigin: origin }));
+    const memory = new AssetMemory();
+
+    const declared = await memory.download(ASSET_BYTE_CAPS.image);
+    expect(declared.bytes).toBe(2 * MAX_IMAGE_BYTES);
+    const loading = fetchAssetBytes(world, 'asset://declared.png', 'image', { lease: declared });
+    await expect.poll(() => declared.bytes).toBe(200);
+    finish();
+    expect((await loading).bytes.byteLength).toBe(100);
+    expect(declared.bytes).toBe(200);
+
+    const chunked = await memory.download(ASSET_BYTE_CAPS.image);
+    await fetchAssetBytes(world, 'asset://chunked.png', 'image', { lease: chunked });
+    expect(chunked.bytes).toBe(100);
+
+    const inline = await memory.download(ASSET_BYTE_CAPS.image);
+    await fetchAssetBytes(world, 'data:image/png;base64,AAECAw==', 'image', { lease: inline });
+    expect(inline.bytes).toBe(8);
+    for (const lease of [declared, chunked, inline]) lease.release();
+    expect(memory.held).toEqual({ downloads: 0, work: 0 });
   });
 });
 

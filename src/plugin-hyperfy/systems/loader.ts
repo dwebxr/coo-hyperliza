@@ -7,13 +7,11 @@ import { createEmoteFactory } from "../hyperfy/src/core/extras/createEmoteFactor
 import { AgentAvatar } from "./avatar.js";
 import { PuppeteerManager } from "../managers/puppeteer-manager.js";
 import type { WorldScripts } from "../lib/script-api";
-import { type AssetBytes, type AssetKind, describeUrl, fetchAssetBytes } from "../lib/asset-bytes";
+import { ASSET_BYTE_CAPS, type AssetBytes, type AssetKind, describeUrl, fetchAssetBytes } from "../lib/asset-bytes";
 import { SafeFetchError } from "../lib/net-policy";
-import { gltfStorageProblem, modelBudget } from "../lib/gltf-budget";
-import { RenderPageKilled } from "../lib/render-watchdog";
-
-/** How many assets that got the render page killed are remembered (per world), the oldest dropped first */
-const KILLERS_KEPT = 256;
+import { gltfCharge, modelBudget } from "../lib/gltf-budget";
+import { type AssetLease, assetMemory, workBytes } from "../lib/asset-memory";
+import { PageWork } from "../lib/page-work";
 
 // --- Mock Browser Environment for Loaders ---
 // These might need adjustment based on GLTFLoader/VRMLoaderPlugin requirements
@@ -101,10 +99,10 @@ export class AgentLoader extends System {
   /** Fires when the world is destroyed: downloads stop and waiting loads fail */
   private stopped = new AbortController();
   /**
-   * Assets whose load ended with the render page killed (lib/render-watchdog.ts), with why: they
-   * fail at once from then on, for this world, instead of being tried (and killing it) again.
+   * This world's page work (lib/page-work.ts): assets blamed for a render page kill fail at once
+   * from then on, and after a kill page loads run one at a time. The sky uses it too.
    */
-  private killers = new Map<string, string>();
+  readonly pageWork = new PageWork();
 
   private limits: LoaderLimits;
 
@@ -160,8 +158,8 @@ export class AgentLoader extends System {
       return Promise.resolve(null);
     }
     const key = `${type}/${url}`;
-    const killed = this.killers.get(key);
-    if (killed) return Promise.reject(new Error(`[AgentLoader] Not loading ${type} from ${describeUrl(url)} again: ${killed}`));
+    const refused = this.pageWork.refusal(key);
+    if (refused) return Promise.reject(new Error(`[AgentLoader] Not loading ${type} from ${describeUrl(url)} again: ${refused}`));
     const existing = this.promises.get(key);
     if (existing) {
       // A load served from the cache counts as a use, as get() does
@@ -191,25 +189,27 @@ export class AgentLoader extends System {
   private async loadOnce(type: AssetKind, url: unknown, key: string) {
     try {
       return await this.inSlot(async () => {
-        const asset = await fetchAssetBytes(this.world, url, type, { signal: this.stopped.signal });
-        this.throwIfStopped();
-        if (type === "script") {
-          const code = new TextDecoder().decode(asset.bytes);
-          // HYPERFY_WORLD_SCRIPTS=off (the default): the code is kept for the engine's bookkeeping
-          // and never evaluated, so the app shows its model and does nothing.
-          const script = this.scripts ? this.scripts.evaluate(code) : { exec() { }, code };
-          this.keep(key, script, asset.bytes.byteLength);
-          return script;
+        // The agent's own memory for this load (lib/asset-memory.ts), from before the download to the end of the parse
+        const lease = await assetMemory.download(ASSET_BYTE_CAPS[type], this.stopped.signal);
+        try {
+          const asset = await fetchAssetBytes(this.world, url, type, { signal: this.stopped.signal, lease });
+          this.throwIfStopped();
+          if (type === "script") {
+            await lease.toWork(workBytes('script', asset.bytes.byteLength), this.stopped.signal);
+            this.throwIfStopped();
+            const code = new TextDecoder().decode(asset.bytes);
+            // HYPERFY_WORLD_SCRIPTS=off (the default): the code is kept for the engine's bookkeeping
+            // and never evaluated, so the app shows its model and does nothing.
+            const script = this.scripts ? this.scripts.evaluate(code) : { exec() { }, code };
+            this.keep(key, script, asset.bytes.byteLength);
+            return script;
+          }
+          return await this.parseGLB(type, key, asset, lease);
+        } finally {
+          lease.release();
         }
-        return await this.parseGLB(type, key, asset);
       });
     } catch (error) {
-      if (error instanceof RenderPageKilled && !this.killers.has(key)) {
-        this.killers.set(key, error.message);
-        while (this.killers.size > KILLERS_KEPT) this.killers.delete(this.killers.keys().next().value as string);
-        console.error(`[AgentLoader] ${type} from ${describeUrl(url)} got the render page killed; it is not loaded again for this world: ${error.message}`);
-        throw error;
-      }
       // A refusal or a network failure needs no stack; anything else might
       const detail = error instanceof SafeFetchError ? `${error.message} (${error.kind})` : error;
       console.error(`[AgentLoader] Failed to load ${type} from ${describeUrl(url)}:`, detail);
@@ -258,20 +258,27 @@ export class AgentLoader extends System {
     this.sizes.delete(key);
   }
 
-  async parseGLB(type: AssetKind, key: string, asset: AssetBytes) {
+  async parseGLB(type: AssetKind, key: string, asset: AssetBytes, lease?: AssetLease) {
     if (type !== 'model' && type !== 'avatar' && type !== 'emote') throw new Error(`[AgentLoader] Unsupported GLTF type: ${type}`);
     // Refused before the render page (or anything else) parses it: lib/gltf-budget.ts
     const budget = modelBudget(type);
-    const problem = gltfStorageProblem(asset.bytes, budget);
-    if (problem) throw new Error(`[AgentLoader] ${problem}`);
+    const admitted = gltfCharge(asset.bytes, budget);
+    if ('problem' in admitted) throw new Error(`[AgentLoader] ${admitted.problem}`);
+    // The rest of the way, from the actual bytes and the export the filter estimates
+    await lease?.toWork(workBytes(type, asset.bytes.byteLength, admitted.charge.exportBytes), this.stopped.signal);
+    this.throwIfStopped();
     const puppeteerManager = PuppeteerManager.getInstance()
     // The render page keeps the textures (and the whole avatar) and hands back a copy without them
-    const stripped =
+    const stripped = await this.pageWork.run(key, `${type} from ${describeUrl(asset.url)}`, () =>
       type === 'avatar' ?
-        await puppeteerManager.loadVRMBytes(asset.bytes, asset.url, { maxExportBytes: budget.exportBytes, signal: this.stopped.signal }) :
-        await puppeteerManager.loadGlbBytes(asset.bytes, { maxExportBytes: budget.exportBytes, signal: this.stopped.signal });
+        puppeteerManager.loadVRMBytes(asset.bytes, asset.url, { maxExportBytes: budget.exportBytes, signal: this.stopped.signal }) :
+        puppeteerManager.loadGlbBytes(asset.bytes, { maxExportBytes: budget.exportBytes, signal: this.stopped.signal })
+    );
     this.throwIfStopped();
-    const arrayBuffer = Uint8Array.from(stripped).buffer;
+    // From here: the download, the page's copy and the engine's copies of its BIN chunk and buffer views
+    lease?.shrink(asset.bytes.byteLength + 3 * stripped.byteLength);
+    // The page's copy comes in memory of its own (managers/puppeteer-manager.ts fromBase64): no second copy
+    const arrayBuffer = stripped.byteOffset === 0 && stripped.byteLength === stripped.buffer.byteLength ? stripped.buffer : stripped.slice().buffer;
 
     const gltf: THREE.GLTF = await new Promise((ok, bad) =>
       this.gltfLoader.parse(arrayBuffer, '', ok, bad)

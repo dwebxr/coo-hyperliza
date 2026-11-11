@@ -4,7 +4,10 @@ import { isNumber, isString } from 'lodash-es'
 import { System } from '../hyperfy/src/core/systems/System.js'
 import * as THREE from 'three';
 import { PuppeteerManager } from "../managers/puppeteer-manager.js";
-import { fetchAssetBytes } from '../lib/asset-bytes';
+import { ASSET_BYTE_CAPS, type AssetBytes, fetchAssetBytes } from '../lib/asset-bytes';
+import { assetMemory, workBytes } from '../lib/asset-memory';
+import { describeUrl } from '../lib/log-url';
+import { PageWork } from '../lib/page-work';
 
 interface SkyHandle {
   node: any
@@ -36,6 +39,8 @@ export class AgentEnvironment extends System {
   /** The sky update in progress: a newer one, or destroy(), stops it */
   private skyWork: AbortController | null = null
   private destroyed = false
+  /** Page work when the world has no loader to share it with (lib/page-work.ts) */
+  private ownPageWork = new PageWork()
 
   constructor(world: any) {
     super(world)
@@ -119,6 +124,29 @@ export class AgentEnvironment extends System {
     }
   }
 
+  /**
+   * Downloads `url` and hands it to the render page with `pageCall`, under the world's page work
+   * (a kill blames it only when it was alone; lib/page-work.ts) and the agent's memory reservation
+   * (lib/asset-memory.ts), held until the page call is over. Null when `signal` fired meanwhile.
+   */
+  private async toPage<T>(url: string, kind: 'image' | 'hdr', signal: AbortSignal, pageCall: (asset: AssetBytes) => Promise<T>): Promise<{ asset: AssetBytes; result: T } | null> {
+    const work: PageWork = this.world.loader?.pageWork ?? this.ownPageWork
+    const key = `${kind}/${url}`
+    const refused = work.refusal(key)
+    if (refused) throw new Error(`[Environment] Not handing the ${kind} ${describeUrl(url)} to the render page again: ${refused}`)
+    const lease = await assetMemory.download(ASSET_BYTE_CAPS[kind], signal)
+    try {
+      const asset = await fetchAssetBytes(this.world, url, kind, { signal, lease })
+      if (signal.aborted || this.destroyed) return null
+      await lease.toWork(workBytes(kind, asset.bytes.byteLength), signal)
+      if (signal.aborted || this.destroyed) return null
+      const result = await work.run(key, `the ${kind} ${describeUrl(url)}`, () => pageCall(asset))
+      return { asset, result }
+    } finally {
+      lease.release()
+    }
+  }
+
   /** Applies the current sky. Every change to the scene or the render page is made only while `signal` holds. */
   async updateSky(signal: AbortSignal = new AbortController().signal) {
     const stopped = () => signal.aborted || this.destroyed
@@ -152,11 +180,10 @@ export class AgentEnvironment extends System {
     let bgUUID
     if (bgUrl) {
       // Downloaded here, under the world's network policy: the render page has no network
-      const image = await fetchAssetBytes(this.world, bgUrl, 'image', { signal });
-      if (stopped()) return
-      bgUrl = image.url;
-      bgUUID = await puppeteerManager.registerTexture(image, 'map', { signal });
-      if (stopped()) return
+      const done = await this.toPage(bgUrl, 'image', signal, (image) => puppeteerManager.registerTexture(image, 'map', { signal }))
+      if (!done || stopped()) return
+      bgUrl = done.asset.url;
+      bgUUID = done.result;
     }
     if (bgUUID) {
       this.sky.material.userData.materialId = bgUUID;
@@ -166,9 +193,8 @@ export class AgentEnvironment extends System {
     }
 
     if (hdrUrl) {
-      const hdr = await fetchAssetBytes(this.world, hdrUrl, 'hdr', { signal });
-      if (stopped()) return
-      await puppeteerManager.loadEnvironmentHDR(hdr.bytes, { signal });
+      const done = await this.toPage(hdrUrl, 'hdr', signal, (hdr) => puppeteerManager.loadEnvironmentHDR(hdr.bytes, { signal }))
+      if (!done) return
     }
     if (n !== this.skyN || stopped()) return
 

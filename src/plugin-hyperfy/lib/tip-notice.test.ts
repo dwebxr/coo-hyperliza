@@ -1,14 +1,24 @@
 import { describe, expect, it } from 'vitest';
-import { TIP_THANKS_TRACKED_NAMES, TipThanksLimiter, parseTipNotice, tipThanks, tipThought } from './tip-notice';
+import { TIP_THANKS_TRACKED_NAMES, TipThanksLimiter, announcedName, namesakeOf, parseTipNotice, tipThanks, tipThought } from './tip-notice';
 
 describe('parseTipNotice', () => {
   it('reads public announcements of tips to the agent', () => {
-    expect(parseTipNotice('Alice tipped Coo 100 JPYC', 'Coo')).toEqual({ fromName: 'Alice', amount: '100', token: 'JPYC' });
-    expect(parseTipNotice('たろう tipped Coo 1.5 USDC', 'Coo')).toEqual({ fromName: 'たろう', amount: '1.5', token: 'USDC' });
+    expect(parseTipNotice('Alice tipped Coo 100 JPYC', 'Coo')).toEqual({ fromName: 'Alice', amount: '100', token: 'JPYC', addressed: 'by-name' });
+    expect(parseTipNotice('たろう tipped Coo 1.5 USDC', 'Coo')).toEqual({ fromName: 'たろう', amount: '1.5', token: 'USDC', addressed: 'by-name' });
   });
 
   it('reads the private notice sent only to the agent', () => {
-    expect(parseTipNotice('(only you) Bob tipped you 10 JPYC', 'Coo')).toEqual({ fromName: 'Bob', amount: '10', token: 'JPYC' });
+    expect(parseTipNotice('(only you) Bob tipped you 10 JPYC', 'Coo')).toEqual({ fromName: 'Bob', amount: '10', token: 'JPYC', addressed: 'privately' });
+  });
+
+  it("matches the agent's name as coo-world writes it into the announcement: invisible characters, runs of spaces, cut to 32", () => {
+    expect(parseTipNotice('Alice tipped Coo the Bird 1 JPYC', 'Coo\u200b the   Bird ')).toMatchObject({ fromName: 'Alice', addressed: 'by-name' });
+    const long = `Coo ${'o'.repeat(40)}`;
+    expect(parseTipNotice(`Alice tipped ${Array.from(long).slice(0, 32).join('')} 1 JPYC`, long)).not.toBeNull();
+    // Cut right after a space, the world keeps the space: the announcement has two before the amount
+    const spaced = `${'c'.repeat(31)} oo`;
+    expect(announcedName(spaced)).toBe(`${'c'.repeat(31)} `);
+    expect(parseTipNotice(`Alice tipped ${'c'.repeat(31)}  1 JPYC`, spaced)).not.toBeNull();
   });
 
   it('ignores tips to others and anything else', () => {
@@ -37,9 +47,22 @@ describe('parseTipNotice limits', () => {
   });
 });
 
+describe('namesakeOf', () => {
+  const players = (...entries: [string, string, string?][]) => entries.map(([id, name, type = 'player']): [string, { data: { id: string; type: string; name: string } }] => [id, { data: { id, type, name } }]);
+
+  it('finds another player present whose name the world would write as the agent\'s', () => {
+    expect(namesakeOf('Coo', players(['coo', 'Coo'], ['p1', 'Alice']), 'coo')).toBeNull();
+    expect(namesakeOf('Coo', players(['coo', 'Coo'], ['p2', 'Coo']), 'coo')).toBe('p2');
+    expect(namesakeOf('Coo', players(['coo', 'Coo'], ['p3', ' Coo\u200b ']), 'coo')).toBe('p3');
+    expect(namesakeOf(`Coo ${'o'.repeat(40)}`, players(['p4', `Coo ${'o'.repeat(50)}`]), 'coo')).toBe('p4');
+    // Not a player
+    expect(namesakeOf('Coo', players(['app1', 'Coo', 'app']), 'coo')).toBeNull();
+  });
+});
+
 describe('tipThought', () => {
   it('says the world announced the tip and that nothing was checked on chain', () => {
-    expect(tipThought({ fromName: 'Alice', amount: '100', token: 'JPYC' })).toBe('The world announced that Alice tipped me 100 JPYC. I did not check it on chain.');
+    expect(tipThought({ fromName: 'Alice', amount: '100', token: 'JPYC', addressed: 'by-name' })).toBe('The world announced that Alice tipped me 100 JPYC. I did not check it on chain.');
   });
 });
 
@@ -72,7 +95,7 @@ describe('TipThanksLimiter', () => {
 
 describe('tipThanks', () => {
   it('thanks in Japanese or English', () => {
-    const tip = { fromName: 'Alice', amount: '100', token: 'JPYC' };
+    const tip = { fromName: 'Alice', amount: '100', token: 'JPYC', addressed: 'privately' } as const;
     expect(tipThanks(tip, true)).toContain('Aliceさん、100 JPYCの投げゼニありがとうございます');
     expect(tipThanks(tip, false)).toContain('Thank you so much for the 100 JPYC tip, Alice');
   });

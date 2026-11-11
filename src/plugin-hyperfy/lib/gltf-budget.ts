@@ -6,20 +6,28 @@
  * three 0.132.2) does something intricate, the feature is refused or its count capped instead of
  * modelled. This is not the limit on what the page may use: that is the run-time watchdog on the
  * page (lib/render-watchdog.ts), which kills Chromium when it uses too much memory or time. This
- * filter keeps the known cheap amplifiers from getting that far, and does not refuse ordinary
- * files (the bundled avatar, environment and emotes are tested against it).
+ * filter keeps the known cheap amplifiers from getting that far.
+ *
+ * Checked against: the 23 bundled models (an avatar exported by UniGLTF with 32 sparse
+ * accessors, the base environment and the emotes; tested in gltf-budget.test.ts), and the owner's
+ * world assets (25 inspected: Blender 4.4 exports with required EXT_texture_webp, and a Blender VRM
+ * export), all of which pass. Refused on purpose, though valid glTF: triangle strips and fans,
+ * animation data in interleaved views, primitives that share attributes but declare different
+ * morph targets, legacy animation.parameters, and compression the page has no decoder for (Draco;
+ * meshopt and BasisU when required). How often other exporters write these is not known here.
  *
  * Checked before parsing: a GLB is read the way the page's loader reads it (magic "glTF", version
  * 2, a declared length equal to the file's, chunks within bounds and multiples of 4 bytes, one JSON
  * chunk first, at most one BIN chunk after it, nothing else); the JSON's nesting depth and its size
- * without data: URIs (MODEL_LIMITS.jsonDepth, .jsonBytes) by one linear scan.
+ * in UTF-8 bytes without data: URIs (MODEL_LIMITS.jsonDepth, .jsonBytes) by one linear scan.
  *
- * Checked after parsing: asset.version 2.x; every reference names something that exists; buffer
- * views lie within their buffers and accessors within their views (byteStride included); the node
- * graph is a forest; primitives the loader would share one geometry for (same indices, attributes
- * and mode) declare the same morph targets; no Draco, no strips or fans (modes 5 and 6), no legacy
- * animation.parameters, no animation data in interleaved views, and no required extension the page
- * cannot decode (meshopt, BasisU, anything it does not know).
+ * Checked after parsing: asset.version 2.x; the references between buffers, buffer views,
+ * accessors (sparse indices and values included), images, samplers, textures (also those a
+ * material names, in any "...Texture" entry), materials, meshes, nodes, skins, cameras, lights,
+ * scenes and animations name something that exists; buffer views lie within their buffers, and
+ * accessors and their sparse parts within their views (byteStride included); the node graph is a
+ * forest; primitives the loader would share one geometry for (same indices, attributes and mode)
+ * declare the same morph targets (compared by content, not by the order of their members).
  *
  * Charged, each named allocation at most the download cap (`singleBytes`), all of them together at
  * most `totalBytes`:
@@ -183,9 +191,18 @@ function container(bytes: Uint8Array): { text: string; bin: number | null } {
   return { text: decode(bytes.subarray(start, start + jsonLength)), bin };
 }
 
+/** The UTF-8 length of the UTF-16 code unit at `i` of `text` (a surrogate pair counts 4 on its first half) */
+function utf8Bytes(code: number): number {
+  if (code < 0x80) return 1;
+  if (code < 0x800) return 2;
+  if (code >= 0xd800 && code <= 0xdbff) return 4;
+  if (code >= 0xdc00 && code <= 0xdfff) return 0;
+  return 3;
+}
+
 /**
- * One pass over the JSON text before it is parsed: its nesting depth, and its size without the
- * contents of string literals that start with "data: (embedded buffers and images).
+ * One pass over the JSON text before it is parsed: its nesting depth, and its size in UTF-8 bytes
+ * without the contents of string literals that start with "data: (embedded buffers and images).
  */
 function scanJson(text: string): number {
   let depth = 0;
@@ -195,11 +212,19 @@ function scanJson(text: string): number {
     if (char === 0x22) {
       // A string literal: find its end, skipping escapes
       const start = i;
-      for (i++; i < text.length && text.charCodeAt(i) !== 0x22; i++) if (text.charCodeAt(i) === 0x5c) i++;
-      if (!text.startsWith('"data:', start)) outsideData += i - start + 1;
+      const data = text.startsWith('"data:', start);
+      let bytes = 2;
+      for (i++; i < text.length && text.charCodeAt(i) !== 0x22; i++) {
+        if (!data) bytes += utf8Bytes(text.charCodeAt(i));
+        if (text.charCodeAt(i) === 0x5c) {
+          i++;
+          if (!data && i < text.length) bytes += utf8Bytes(text.charCodeAt(i));
+        }
+      }
+      if (!data) outsideData += bytes;
       continue;
     }
-    outsideData++;
+    outsideData += utf8Bytes(char);
     if (char === 0x5b || char === 0x7b) {
       if (++depth > MODEL_LIMITS.jsonDepth) refuse(`the glTF JSON nests deeper than ${MODEL_LIMITS.jsonDepth}`);
     } else if (char === 0x5d || char === 0x7d) depth--;
@@ -339,8 +364,10 @@ function charge(bytes: Uint8Array, budget: ModelBudget): ModelCharge {
     if (sparse !== undefined) {
       const indexSize = own(INDEX_BYTES, sparse?.indices?.componentType);
       if (!isObject(sparse) || !isCount(sparse.count) || !indexSize) refuse(`accessor ${index} has a sparse part with no usable count or index type`);
-      for (const part of [sparse.indices, sparse.values]) {
+      for (const [part, entryBytes] of [[sparse.indices, indexSize as number], [sparse.values, itemBytes]] as const) {
         if (!isObject(part) || !isIndex(part.bufferView, views.length)) refuse(`accessor ${index} has a sparse part that names no buffer view`);
+        const partOffset = part.byteOffset ?? 0;
+        if (!isCount(partOffset) || partOffset + sparse.count * entryBytes > views[part.bufferView].byteLength) refuse(`accessor ${index} has a sparse part that runs past the end of its buffer view`);
       }
       bytesOf += sparse.count * ((indexSize as number) + itemBytes);
     }
@@ -379,6 +406,15 @@ function charge(bytes: Uint8Array, budget: ModelBudget): ModelCharge {
     }
   }
   const materials = list(gltf, 'materials', MODEL_LIMITS.materials);
+  // Every texture a material names: an object under a key ending in "Texture" with an index (core, KHR_ and VRMC_ ones alike)
+  const textureRefs = (value: unknown, what: string, depth = 0): void => {
+    if (depth > MODEL_LIMITS.jsonDepth || value === null || typeof value !== 'object') return;
+    for (const [name, entry] of Object.entries(value as Record<string, unknown>)) {
+      if (/Texture$/.test(name) && isObject(entry) && 'index' in entry && !isIndex(entry.index, textures.length)) refuse(`${what} names no texture (${name})`);
+      textureRefs(entry, what, depth + 1);
+    }
+  };
+  for (const [index, material] of materials.entries()) textureRefs(material, `material ${index}`);
   const cameras = list(gltf, 'cameras', MODEL_LIMITS.cameras);
   const lights = gltf.extensions?.KHR_lights_punctual?.lights;
   if (lights !== undefined && !Array.isArray(lights)) refuse("the model's lights are not a list");
@@ -416,14 +452,15 @@ function charge(bytes: Uint8Array, budget: ModelBudget): ModelCharge {
       if (primitive.material !== undefined && !isIndex(primitive.material, materials.length)) refuse(`${what} names no material`);
       const targets = primitive.targets ?? [];
       if (!Array.isArray(targets)) refuse(`${what} has targets that are not a list`);
-      const key = `${primitive.indices}:${Object.keys(primitive.attributes).sort().map((name) => `${name}:${primitive.attributes[name]};`).join('')}:${primitive.mode}`;
-      const declared = JSON.stringify(targets);
-      if (geometryTargets.has(key) && geometryTargets.get(key) !== declared) refuse(`${what} shares its geometry with another primitive but declares other morph targets`);
-      geometryTargets.set(key, declared);
       targetCount += targets.length;
       if (targetCount > MODEL_LIMITS.morphTargets) refuse(`the model has more than ${MODEL_LIMITS.morphTargets} morph targets`);
+      for (const [targetIndex, target] of targets.entries()) if (!isObject(target)) refuse(`${what} target ${targetIndex} is not an object`);
+      const key = `${primitive.indices}:${Object.keys(primitive.attributes).sort().map((name) => `${name}:${primitive.attributes[name]};`).join('')}:${primitive.mode}`;
+      // By content: the order of a target's members does not matter, the order of the targets does
+      const declared = JSON.stringify(targets.map((target: Record<string, unknown>) => Object.keys(target).sort().map((name) => [name, target[name]])));
+      if (geometryTargets.has(key) && geometryTargets.get(key) !== declared) refuse(`${what} shares its geometry with another primitive but declares other morph targets`);
+      geometryTargets.set(key, declared);
       for (const [targetIndex, target] of targets.entries()) {
-        if (!isObject(target)) refuse(`${what} target ${targetIndex} is not an object`);
         for (const value of Object.values(target)) accessorAt(value, `${what} target ${targetIndex}`);
         for (const name of ['POSITION', 'NORMAL']) {
           if (target[name] === undefined) continue;

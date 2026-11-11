@@ -67,3 +67,16 @@ export function shownName(value: unknown, max = SHOWN_NAME_MAX): string {
   // Only the start can survive the cut: an over-long value is not scanned whole
   return truncateCodePoints(stripInvisibleChars(head(value, max * 8), ' ').replace(/\s+/g, ' ').trim(), max).trimEnd();
 }
+
+/**
+ * The first `maxItems` of a list of names (such as a stored reply's action names), each as
+ * shownName(name, maxEach); what is not text or has nothing visible is left out. [] for anything
+ * that is not an array.
+ */
+export function shownNames(values: unknown, maxItems: number, maxEach = SHOWN_NAME_MAX): string[] {
+  if (!Array.isArray(values)) return [];
+  return values
+    .slice(0, maxItems)
+    .map((value) => shownName(value, maxEach))
+    .filter(Boolean);
+}

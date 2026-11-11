@@ -4,6 +4,7 @@
  * (lib/net-policy.ts) with the operator's byte cap for that kind of asset.
  */
 import { resolveUrl } from '../utils';
+import type { AssetLease } from './asset-memory';
 import { describeUrl } from './log-url';
 import { MAX_EMOTE_BYTES, MAX_IMAGE_BYTES, MAX_MODEL_BYTES, MAX_SCRIPT_BYTES, SafeFetchError, worldNet } from './net-policy';
 
@@ -56,17 +57,37 @@ export async function fetchAssetBytes(
   world: { assetsUrl?: string | null },
   url: unknown,
   kind: AssetKind,
-  { signal }: { signal?: AbortSignal } = {}
+  {
+    signal,
+    lease,
+  }: {
+    signal?: AbortSignal;
+    /** The download's reservation (lib/asset-memory.ts): shrunk to the declared, then the actual size */
+    lease?: AssetLease;
+  } = {}
 ): Promise<AssetBytes> {
   const resolved = await resolveUrl(url, world);
   // Also a data: URL or a bundled file is not handed out once the caller has stopped
   if (signal?.aborted) throw new SafeFetchError('aborted', 'the load was cancelled');
   if (!resolved) throw new Error(`could not resolve ${describeUrl(url)}`);
   const maxBytes = ASSET_BYTE_CAPS[kind];
-  if (resolved.startsWith('data:')) return { ...decodeDataUrl(resolved, maxBytes), url: resolved };
+  if (resolved.startsWith('data:')) {
+    const decoded = decodeDataUrl(resolved, maxBytes);
+    lease?.shrink(2 * decoded.bytes.byteLength);
+    return { ...decoded, url: resolved };
+  }
   // Nothing in the agent makes object URLs, so a blob: URL can only name nothing
   if (resolved.startsWith('blob:')) throw new Error('blob: URLs cannot be loaded by the agent');
-  const answer = await worldNet(world).fetch(resolved, { maxBytes, timeoutMs: TIMEOUT_MS[kind], signal });
+  const answer = await worldNet(world).fetch(resolved, {
+    maxBytes,
+    timeoutMs: TIMEOUT_MS[kind],
+    signal,
+    onResponse: (headers) => {
+      const declared = Number(headers['content-length']);
+      if (Number.isSafeInteger(declared) && declared >= 0) lease?.shrink(2 * Math.min(declared, maxBytes));
+    },
+  });
+  lease?.shrink(2 * answer.body.byteLength);
   if (answer.status < 200 || answer.status >= 300) throw new Error(`HTTP ${answer.status}`);
   const contentType = (answer.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
   return { bytes: answer.body, contentType, url: resolved };

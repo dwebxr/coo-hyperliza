@@ -4,7 +4,8 @@
  * in world.chat — app scripts calling world.chat(msg, broadcast), the agent's own posts, the
  * engine's local notices such as "You have been disconnected." — is shown in the local chat
  * history but is not a turn, whatever its fromId says. Snapshot history counts as already seen,
- * so nothing from before the connection is replayed.
+ * so nothing from before the connection is replayed: its objects are never live, and its ids go to
+ * onHistory listeners (the intake treats a live message with one of them as a duplicate).
  *
  * What the server sends is read by readChatMessage (lib/chat-intake.ts) before it is kept: a
  * chatAdded packet or a history element that is not a chat message is dropped, and what is kept is
@@ -20,10 +21,14 @@
  */
 
 import { type ChatMessage, type ReceivedChatMessage, readChatMessage } from './chat-intake';
+import { RateLimitedLog } from './rate-limited-log';
 
 export type { ChatMessage };
 
 type Listener = (msgs: unknown[]) => void;
+
+// At most one line about malformed chat in this time; the line carries the count since the last one
+const MALFORMED_LOG_INTERVAL_MS = 10_000;
 
 /** The engine systems this module touches (hyperfy/src/core/systems/Chat.js, Events.js, ClientNetwork.js). */
 export interface ChatWorld {
@@ -44,7 +49,14 @@ export class WorldChat {
   readonly #arrived = new WeakSet<object>();
   readonly #history = new WeakSet<object>();
   readonly #liveListeners = new Set<(msg: ReceivedChatMessage) => void>();
+  readonly #historyListeners = new Set<(ids: readonly string[]) => void>();
+  /** The ids of the last snapshot's history (at most MAX_MSGS) */
+  #historyIds: readonly string[] = [];
   #malformed = 0;
+  readonly #malformedLog = new RateLimitedLog(
+    (count, what) => `[Chat] Ignored ${count} chat packet(s) or history element(s) that are not chat messages (the latest a ${what}; ${this.#malformed} so far on this connection)`,
+    { intervalMs: MALFORMED_LOG_INTERVAL_MS, log: (line) => console.warn(line) }
+  );
 
   private constructor(world: ChatWorld) {
     this.#world = world;
@@ -91,6 +103,14 @@ export class WorldChat {
         chat.#history.add(msg);
         history.push(msg);
       }
+      chat.#historyIds = history.map((msg) => msg.id);
+      for (const listener of chat.#historyListeners) {
+        try {
+          listener(chat.#historyIds);
+        } catch (error) {
+          console.error(`[Chat] A chat history listener failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
       return engineOnSnapshot?.call(network, { ...data, chat: history });
     };
 
@@ -112,11 +132,20 @@ export class WorldChat {
     return () => void this.#liveListeners.delete(listener);
   }
 
-  /** Says that the world sent something that is not a chat message: the first time, then every 100th. */
+  /**
+   * Calls `listener` with the ids of the snapshot's chat history: at once with the last snapshot's
+   * (when one was received), then with every later one. Returns the unsubscribe.
+   */
+  onHistory(listener: (ids: readonly string[]) => void): () => void {
+    this.#historyListeners.add(listener);
+    if (this.#historyIds.length) listener(this.#historyIds);
+    return () => void this.#historyListeners.delete(listener);
+  }
+
+  /** Counts something the world sent that is not a chat message, and says so (rate-limited). */
   #dropMalformed(what: string): void {
-    if (this.#malformed++ % 100 === 0) {
-      console.warn(`[Chat] Ignoring a ${what} that is not a chat message (${this.#malformed} so far on this connection)`);
-    }
+    this.#malformed++;
+    this.#malformedLog.note(what);
   }
 
   /** The agent's own message: shown locally and sent to the world. */

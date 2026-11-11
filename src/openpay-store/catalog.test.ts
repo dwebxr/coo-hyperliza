@@ -69,9 +69,41 @@ describe('sanitizeText', () => {
     expect(sanitizeText(`${'\u200b'.repeat(50)}abcdef`, 5)).toBe('abcd…');
     expect(sanitizeText('\u200b\u202e', 5)).toBe('');
   });
+
+  it.each([
+    ['a URL', 'Pay here https://evil.test/pay now', 'Pay here (link removed) now'],
+    ['a URL written in capitals', 'HTTPS://EVIL.TEST/PAY', '(link removed)'],
+    ['a misspelt scheme', 'see hxxps://evil.test', 'see (link removed)'],
+    ['a scheme-relative URL', 'see //evil.test/pay', 'see (link removed)'],
+    ['www.', 'www.evil.test today', '(link removed) today'],
+    ['a host with a path', 'Buy at evil.test/pay', 'Buy at (link removed)'],
+    ['a bare host with a known top-level domain', 'pay.evil.shop or evil.co.jp', '(link removed) or (link removed)'],
+    ['a host after an @', 'mail me: me@evil.com', 'mail me: me@(link removed)'],
+    ['full-width letters', 'ｅｖｉｌ．ｔｅｓｔ／ｐａｙ', '(link removed)'],
+    ['an ideographic full stop for the dot', 'evil。com/pay', '(link removed)'],
+    ['an IP address', 'go to 203.0.113.7:8080/pay', 'go to (link removed)'],
+    ['a javascript: link', 'javascript:alert(1)', '(link removed)'],
+    ['a URL hidden by zero-width characters', 'https://evil\u200b.test/pay', '(link removed)'],
+  ])('replaces %s with "(link removed)": nothing a reader could open or copy as an address is left', (_what, text, expected) => {
+    expect(sanitizeText(text, 200)).toBe(expected);
+  });
+
+  it('leaves ordinary text alone, also with dots in it', () => {
+    for (const text of ['抹茶ラテのレシピ', 'こんにちは。おいしい', 'Mt.Fuji Tea', 'Node.js Course', 'Ver.2.0', 'No.1 seller', '3.5mm jack', 'e.g. this', 'Price: 1,000 JPYC']) {
+      expect(sanitizeText(text, 200), text).toBe(text);
+    }
+  });
 });
 
 describe('toStoreProduct', () => {
+  it('removes addresses from every text field a seller writes, and takes no item whose id reads as one', () => {
+    const product = toStoreProduct(item('h_1', 'alice', { title: 'Pay at https://evil.test/pay', desc: 'or www.evil.test', category: 'evil.shop', emoji: 'a.io' }), ORIGIN)!;
+    expect([product.title, product.desc, product.category]).toEqual(['Pay at (link removed)', 'or (link removed)', '(link removed)']);
+    expect(product.emoji).toBe('(li…');
+    expect(toStoreProduct(item('pay.evil.com', 'alice'), ORIGIN)).toBeNull();
+    expect(toStoreProduct(item('h_1.v2', 'alice'), ORIGIN)).not.toBeNull();
+  });
+
   it('whitelists fields and keeps the url as the API sent it', () => {
     const product = toStoreProduct(item('h_1', 'alice', { desc: 'Desc', emoji: '🛹', category: '3d-game', secret: 'x' }), ORIGIN);
     expect(product).toEqual({
@@ -111,7 +143,7 @@ describe('toStoreProduct', () => {
       ['a subdomain', 'https://pay.open-pay.jp/ja/@alice?product=h_1'],
       ['another scheme', 'javascript:alert(1)//open-pay.jp/@alice'],
       ['no scheme', 'open-pay.jp/ja/@alice'],
-      ['more than 512 characters', `${good}&pad=${'a'.repeat(500)}`],
+      ['more than 325 characters', `${good}&pad=${'a'.repeat(325 - good.length - 4)}`],
       ['a number', 42],
       ['nothing', undefined],
     ] as const) {
@@ -125,7 +157,7 @@ describe('toStoreProduct', () => {
     expect(check(`${ORIGIN}/ja/@alice?product=h_1\n`)).toBe('contains whitespace or an invisible character');
     expect(check(` ${ORIGIN}/ja/@alice`)).toBe('contains whitespace or an invisible character');
     expect(check(`${ORIGIN}/ja/@alice?x=\u200b`)).toBe('contains whitespace or an invisible character');
-    expect(check(`${ORIGIN}/ja/@alice?x=${'a'.repeat(600)}`)).toBe('too long');
+    expect(check(`${ORIGIN}/ja/@alice?x=${'a'.repeat(600)}`)).toBe('too long to post whole in one chat message');
     expect(check('https://open-pay.jp:443/ja/@alice')).toBe('not in normal form');
     expect(check('https://user@open-pay.jp/ja/@alice')).toBe('has credentials');
     expect(check('https://evil.test/ja/@alice')).toBe("not on the API's origin");
@@ -136,7 +168,8 @@ describe('toStoreProduct', () => {
   });
 
   it("accepts a purchase URL only when its path names the item's own seller", () => {
-    for (const url of [`${ORIGIN}/ja/@alice`, `${ORIGIN}/@alice/products/h_1`, `${ORIGIN}/en/@Alice?product=h_1`]) {
+    // The handle as a segment `@handle`, or with the @ percent-encoded
+    for (const url of [`${ORIGIN}/ja/@alice`, `${ORIGIN}/@alice/products/h_1`, `${ORIGIN}/en/@Alice?product=h_1`, `${ORIGIN}/ja/%40alice?product=h_1`, `${ORIGIN}/ja/%40Alice`]) {
       expect(toStoreProduct(item('h_1', 'alice', { url }), ORIGIN), url).not.toBeNull();
     }
     for (const [why, url] of [
@@ -146,7 +179,10 @@ describe('toStoreProduct', () => {
       ['the handle as a prefix of the segment', `${ORIGIN}/ja/@alice2?product=h_1`],
       ['the handle without @', `${ORIGIN}/ja/alice?product=h_1`],
       ['no seller at all', `${ORIGIN}/ja/store?product=h_1`],
-      ['an encoded @', `${ORIGIN}/ja/%40alice?product=h_1`],
+      ["another seller with an encoded @", `${ORIGIN}/ja/%40mallory?product=h_1`],
+      ['an encoded @ before a prefix of the segment', `${ORIGIN}/ja/%40alice2?product=h_1`],
+      ['an encoded slash after the handle', `${ORIGIN}/ja/%40alice%2Fx?product=h_1`],
+      ['a segment that does not decode', `${ORIGIN}/ja/%40alice%E0?product=h_1`],
     ] as const) {
       expect(toStoreProduct(item('h_1', 'alice', { url }), ORIGIN), why).toBeNull();
       expect(purchaseUrlProblem(url, { allowedOrigin: ORIGIN, handle: 'alice' }), why).toBe('its path does not name the seller');

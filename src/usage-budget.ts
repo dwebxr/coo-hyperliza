@@ -53,7 +53,8 @@ export function purposeEnvKey(purpose: AiPurpose): string {
 
 /**
  * The output cap for a tagged call; undefined for untagged calls (other plugins). An override
- * that is not a number is refused at startup (usageLimitProblems); here it gives the default cap.
+ * that is not a number above 0 is refused at startup (usageLimitProblems); here it gives the
+ * default cap.
  */
 export function maxTokensFor(purpose: unknown, env: Env = process.env): number | undefined {
   if (!isAiPurpose(purpose)) return undefined;
@@ -153,13 +154,23 @@ const LIMIT_KEYS = [
  * USAGE_REPORT_INTERVAL_MIN. The agent refuses to start on any of these (src/index.ts).
  */
 export function usageLimitProblems(env: Env = process.env): string[] {
-  const keys = [...LIMIT_KEYS, ...(Object.keys(AI_PURPOSE_MAX_TOKENS) as AiPurpose[]).map(purposeEnvKey), 'USAGE_REPORT_INTERVAL_MIN'];
+  const capKeys = (Object.keys(AI_PURPOSE_MAX_TOKENS) as AiPurpose[]).map(purposeEnvKey);
   const problems: string[] = [];
-  for (const key of keys) {
+  for (const key of [...LIMIT_KEYS, ...capKeys, 'USAGE_REPORT_INTERVAL_MIN']) {
+    let value: number | null;
     try {
-      parseCount(env[key], key);
+      value = parseCount(env[key], key);
     } catch (error) {
-      problems.push(`[Usage] ${(error as Error).message}. Leave it empty for the default (for a limit: no limit), or set a number (0 turns that use off).`);
+      problems.push(
+        capKeys.includes(key)
+          ? `[Usage] ${(error as Error).message}. Leave it empty for the default cap, or set a number of output tokens above 0.`
+          : `[Usage] ${(error as Error).message}. Leave it empty for the default (for a limit: no limit), or set a number (0 turns that use off).`
+      );
+      continue;
+    }
+    // A cap is the size of a reply, not a switch: 0 would not turn that use off, so it is refused
+    if (value === 0 && capKeys.includes(key)) {
+      problems.push(`[Usage] ${key}=0: AI_MAX_TOKENS_<PURPOSE> sets how many output tokens such a reply may have; it does not turn that use off. Leave it empty for the default cap, or set a number above 0 (AI_MAX_CALLS_PER_HOUR=0 turns Claude off).`);
     }
   }
   return problems;
@@ -207,8 +218,20 @@ export interface AiReservation {
 export interface VisionReservation {
   release(): void;
 }
+
+/** Characters of text-to-speech that were admitted; release() gives them back when the provider refused the request. */
+export interface AmountReservation {
+  release(): void;
+}
 type AmountEvent = { at: number; amount: number; origin: UsageOrigin };
 export type SkipKind = 'ai-call' | 'offline-reply' | 'vision' | 'tts' | 'stt';
+
+// Uses that were refused are counted per minute, not one entry each: at most a day of minutes is
+// kept however many there are. A report's window starts at a minute boundary (it can count up to
+// a minute more than the window).
+export const SKIP_BUCKET_MS = 60_000;
+type SkipBucket = { at: number; counts: Record<SkipKind, number> };
+const noSkips = (): Record<SkipKind, number> => ({ 'ai-call': 0, 'offline-reply': 0, vision: 0, tts: 0, stt: 0 });
 
 export interface TokenTotals {
   calls: number;
@@ -251,7 +274,8 @@ export class UsageBudget {
   private vision: AmountEvent[] = [];
   private tts: AmountEvent[] = [];
   private stt: AmountEvent[] = [];
-  private skips: { at: number; kind: SkipKind }[] = [];
+  /** Oldest first; `at` is the start of the bucket's minute */
+  private skips: SkipBucket[] = [];
   private lastAutonomyAiAt = Number.NEGATIVE_INFINITY;
   private _limits: UsageLimits | null;
   private readonly now: () => number;
@@ -385,11 +409,19 @@ export class UsageBudget {
   }
 
   /**
-   * Admits `chars` characters of text-to-speech and counts them, or returns false when they do not
-   * fit in what is left of the daily limit. They stay counted whatever becomes of the request.
+   * Admits `chars` characters of text-to-speech for one request to one provider and counts them, or
+   * returns null when they do not fit in what is left of the daily limit. They stay counted unless
+   * release() is called, which is for a request the provider refused without producing audio.
    */
-  reserveTts(chars: number): boolean {
-    return this.reserveAmount(this.tts, this.limits.ttsCharsPerDay, chars);
+  reserveTts(chars: number): AmountReservation | null {
+    const event = this.reserveAmount(this.tts, this.limits.ttsCharsPerDay, chars);
+    if (!event) return null;
+    return {
+      release: () => {
+        const index = this.tts.indexOf(event);
+        if (index !== -1) this.tts.splice(index, 1);
+      },
+    };
   }
 
   /** Whether any speech-to-text is left today. Reserves nothing. */
@@ -404,21 +436,34 @@ export class UsageBudget {
    * (speech-to-text is billed by audio length).
    */
   reserveStt(seconds: number): boolean {
-    return this.reserveAmount(this.stt, this.limits.sttSecondsPerDay, seconds);
+    return this.reserveAmount(this.stt, this.limits.sttSecondsPerDay, seconds) !== null;
   }
 
-  private reserveAmount(events: AmountEvent[], limit: number | null, amount: number): boolean {
-    if (!Number.isFinite(amount) || amount < 0) return false;
+  /** The event counted, or null when `amount` does not fit. */
+  private reserveAmount(events: AmountEvent[], limit: number | null, amount: number): AmountEvent | null {
+    if (!Number.isFinite(amount) || amount < 0) return null;
     // 0 turns that use off, also for an amount of 0
-    if (limit !== null && (limit === 0 || this.sumSince(events, this.now() - DAY_MS) + amount > limit)) return false;
-    events.push({ at: this.now(), amount, origin: currentOrigin() });
+    if (limit !== null && (limit === 0 || this.sumSince(events, this.now() - DAY_MS) + amount > limit)) return null;
+    const event: AmountEvent = { at: this.now(), amount, origin: currentOrigin() };
+    events.push(event);
     this.prune();
-    return true;
+    return event;
   }
 
   recordSkip(kind: SkipKind): void {
-    this.skips.push({ at: this.now(), kind });
-    this.prune();
+    const at = Math.floor(this.now() / SKIP_BUCKET_MS) * SKIP_BUCKET_MS;
+    let bucket = this.skips.at(-1);
+    if (!bucket || bucket.at !== at) {
+      bucket = { at, counts: noSkips() };
+      this.skips.push(bucket);
+      this.prune();
+    }
+    bucket.counts[kind]++;
+  }
+
+  /** How many buckets of refused uses are kept (at most a day of minutes, plus the current one). */
+  get skipBuckets(): number {
+    return this.skips.length;
   }
 
   // --- Reporting ---
@@ -437,8 +482,12 @@ export class UsageBudget {
     for (const e of this.tts) {
       if (e.at > since) ttsCharsByOrigin[e.origin] = (ttsCharsByOrigin[e.origin] ?? 0) + e.amount;
     }
-    const skipped: Record<SkipKind, number> = { 'ai-call': 0, 'offline-reply': 0, vision: 0, tts: 0, stt: 0 };
-    for (const s of this.skips) if (s.at > since) skipped[s.kind]++;
+    const skipped = noSkips();
+    // Every minute that overlaps the window
+    for (const bucket of this.skips) {
+      if (bucket.at + SKIP_BUCKET_MS <= since) continue;
+      for (const kind of Object.keys(skipped) as SkipKind[]) skipped[kind] += bucket.counts[kind];
+    }
     return {
       windowMs,
       ai,
@@ -466,11 +515,15 @@ export class UsageBudget {
   /** Nothing older than the longest window (a day) is needed. */
   private prune(): void {
     const cutoff = this.now() - DAY_MS;
-    for (const list of [this.ai, this.autonomyAi, this.scripted, this.vision, this.tts, this.stt, this.skips] as { at: number }[][]) {
+    for (const list of [this.ai, this.autonomyAi, this.scripted, this.vision, this.tts, this.stt] as { at: number }[][]) {
       let drop = 0;
       while (drop < list.length && list[drop].at <= cutoff) drop++;
       if (drop) list.splice(0, drop);
     }
+    // A minute is dropped once all of it is older than a day
+    let drop = 0;
+    while (drop < this.skips.length && this.skips[drop].at + SKIP_BUCKET_MS <= cutoff) drop++;
+    if (drop) this.skips.splice(0, drop);
   }
 }
 

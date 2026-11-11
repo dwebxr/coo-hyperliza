@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import path from 'path';
 import { describeUrl } from './lib/log-url';
+import { getUsageBudget } from '../usage-budget';
 
 
 export async function hashFileBuffer(buffer: Buffer): Promise<string> {
@@ -238,17 +239,48 @@ async function errorText(response: Response, signal: AbortSignal): Promise<strin
   return head.toString('utf8').replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ').trim();
 }
 
-/**
- * Direct ElevenLabs TTS API call
- * @param text - Text to convert to speech
- * @returns Buffer containing the audio data (PCM format)
- */
+/** One text-to-speech request to one provider, and whether it may be billed when it gave no audio. */
+interface SpeechAttempt {
+  audio: Buffer | null;
+  /**
+   * False when no request was sent (no key) or the provider refused it with a 4xx answer (408 and
+   * 409 excepted: they can follow work already done). True otherwise: audio came, or the request
+   * went out and its outcome is not known (a connection error, a timeout, a 5xx, a body that failed
+   * or stalled after the provider accepted the request).
+   */
+  mayBeBilled: boolean;
+}
 
-export async function generateElevenLabsTTS(text: string): Promise<Buffer | null> {
+const refusedStatus = (status: number) => status >= 400 && status < 500 && status !== 408 && status !== 409;
+
+/**
+ * Runs one speech request under TTS_REQUEST_TIMEOUT_MS: `request` makes it, the answer is read as it
+ * arrives (at most MAX_SPEECH_AUDIO_BYTES). Never throws.
+ */
+async function speechAttempt(label: string, request: (signal: AbortSignal) => Promise<Response>): Promise<SpeechAttempt> {
+  try {
+    return await withDeadline(TTS_REQUEST_TIMEOUT_MS, async (signal) => {
+      const response = await request(signal);
+      if (!response.ok) {
+        console.error(`[${label}] API error ${response.status}: ${await errorText(response, signal)}`);
+        return { audio: null, mayBeBilled: !refusedStatus(response.status) };
+      }
+      // Read as it arrives, at most MAX_SPEECH_AUDIO_BYTES and within the request's deadline
+      const buffer = await readBodyWithin(response, MAX_SPEECH_AUDIO_BYTES, signal);
+      console.log(`[${label}] Successfully generated ${buffer.length} bytes of audio`);
+      return { audio: buffer, mayBeBilled: true };
+    });
+  } catch (error) {
+    console.error(`[${label}] Error:`, error);
+    return { audio: null, mayBeBilled: true };
+  }
+}
+
+function elevenLabsSpeech(text: string): Promise<SpeechAttempt> {
   const apiKey = process.env.ELEVENLABS_XI_API_KEY;
   if (!apiKey) {
     console.error('[ElevenLabs TTS] No ELEVENLABS_XI_API_KEY found in environment');
-    return null;
+    return Promise.resolve({ audio: null, mayBeBilled: false });
   }
 
   const voiceId = process.env.ELEVENLABS_VOICE_ID || 'EXAVITQu4vr4xnSDxMaL';
@@ -263,53 +295,36 @@ export async function generateElevenLabsTTS(text: string): Promise<Buffer | null
 
   console.log(`[ElevenLabs TTS] Generating speech with voiceId=${voiceId}, model=${modelId}, format=${outputFormat}`);
 
-  try {
-    return await withDeadline(TTS_REQUEST_TIMEOUT_MS, async (signal) => {
-      const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=${outputFormat}`, {
-        method: 'POST',
-        signal,
-        headers: {
-          'xi-api-key': apiKey,
-          'Content-Type': 'application/json',
+  return speechAttempt('ElevenLabs TTS', (signal) =>
+    fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=${outputFormat}`, {
+      method: 'POST',
+      signal,
+      headers: {
+        'xi-api-key': apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        text: text,
+        model_id: modelId,
+        voice_settings: {
+          stability: stability,
+          similarity_boost: similarityBoost,
+          style: style,
+          use_speaker_boost: process.env.ELEVENLABS_VOICE_USE_SPEAKER_BOOST === 'true',
         },
-        body: JSON.stringify({
-          text: text,
-          model_id: modelId,
-          voice_settings: {
-            stability: stability,
-            similarity_boost: similarityBoost,
-            style: style,
-            use_speaker_boost: process.env.ELEVENLABS_VOICE_USE_SPEAKER_BOOST === 'true',
-          },
-        }),
-      });
-
-      if (!response.ok) {
-        console.error(`[ElevenLabs TTS] API error ${response.status}: ${await errorText(response, signal)}`);
-        return null;
-      }
-
-      // Read as it arrives, at most MAX_SPEECH_AUDIO_BYTES and within the request's deadline
-      const buffer = await readBodyWithin(response, MAX_SPEECH_AUDIO_BYTES, signal);
-      console.log(`[ElevenLabs TTS] Successfully generated ${buffer.length} bytes of audio`);
-      return buffer;
-    });
-  } catch (error) {
-    console.error('[ElevenLabs TTS] Error:', error);
-    return null;
-  }
+      }),
+    })
+  );
 }
 
 /**
  * Direct OpenAI TTS API call - bypasses the @elizaos/plugin-openai which has issues reading the API key
- * @param text - Text to convert to speech
- * @returns Buffer containing the audio data (MP3 format)
  */
-export async function generateOpenAITTS(text: string): Promise<Buffer | null> {
+function openAISpeech(text: string): Promise<SpeechAttempt> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     console.error('[OpenAI TTS Direct] No OPENAI_API_KEY found in environment');
-    return null;
+    return Promise.resolve({ audio: null, mayBeBilled: false });
   }
 
   const model = process.env.OPENAI_TTS_MODEL || 'tts-1';
@@ -317,36 +332,35 @@ export async function generateOpenAITTS(text: string): Promise<Buffer | null> {
 
   console.log(`[OpenAI TTS Direct] Generating speech with model=${model}, voice=${voice}`);
 
-  try {
-    return await withDeadline(TTS_REQUEST_TIMEOUT_MS, async (signal) => {
-      const response = await fetch('https://api.openai.com/v1/audio/speech', {
-        method: 'POST',
-        signal,
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: model,
-          input: text,
-          voice: voice,
-          response_format: 'mp3',
-        }),
-      });
+  return speechAttempt('OpenAI TTS Direct', (signal) =>
+    fetch('https://api.openai.com/v1/audio/speech', {
+      method: 'POST',
+      signal,
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: model,
+        input: text,
+        voice: voice,
+        response_format: 'mp3',
+      }),
+    })
+  );
+}
 
-      if (!response.ok) {
-        console.error(`[OpenAI TTS Direct] API error ${response.status}: ${await errorText(response, signal)}`);
-        return null;
-      }
+/**
+ * ElevenLabs text-to-speech (one request, nothing reserved here).
+ * @returns the audio (MP3 by default), or null when ElevenLabs isn't configured or the call fails
+ */
+export async function generateElevenLabsTTS(text: string): Promise<Buffer | null> {
+  return (await elevenLabsSpeech(text)).audio;
+}
 
-      const buffer = await readBodyWithin(response, MAX_SPEECH_AUDIO_BYTES, signal);
-      console.log(`[OpenAI TTS Direct] Successfully generated ${buffer.length} bytes of audio`);
-      return buffer;
-    });
-  } catch (error) {
-    console.error('[OpenAI TTS Direct] Error:', error);
-    return null;
-  }
+/** OpenAI text-to-speech (one request, nothing reserved here). The audio, or null. */
+export async function generateOpenAITTS(text: string): Promise<Buffer | null> {
+  return (await openAISpeech(text)).audio;
 }
 
 /**
@@ -387,12 +401,43 @@ export async function transcribeWithElevenLabs(audio: Buffer, fileName = 'speech
   }
 }
 
+/** Thrown by generateSpeech when VOICE_TTS_MAX_CHARS_PER_DAY does not admit the text: nothing was sent. */
+export class TtsLimitReached extends Error {
+  constructor() {
+    super('[TTS] VOICE_TTS_MAX_CHARS_PER_DAY does not admit this text');
+    this.name = 'TtsLimitReached';
+  }
+}
+
+const SPEECH_PROVIDERS = [
+  { name: 'ElevenLabs', key: 'ELEVENLABS_XI_API_KEY', attempt: elevenLabsSpeech },
+  { name: 'OpenAI', key: 'OPENAI_API_KEY', attempt: openAISpeech },
+] as const;
+
 /**
- * Generates speech audio, preferring ElevenLabs and falling back to OpenAI.
+ * Speech audio for `text`: ElevenLabs, then OpenAI when that gave none. Each request is reserved
+ * against VOICE_TTS_MAX_CHARS_PER_DAY on its own, before it is sent. A request the provider refused
+ * (a 4xx answer) is given back; any other failed one stays counted, as it may have been billed. A
+ * fallback the limit does not admit is not made. Resolves to null when no provider gave audio;
+ * throws TtsLimitReached when the limit admits not even the first request.
  */
 export async function generateSpeech(text: string): Promise<Buffer | null> {
-  const audio = await generateElevenLabsTTS(text);
-  if (audio) return audio;
-  console.log('[TTS] ElevenLabs unavailable, trying OpenAI TTS...');
-  return generateOpenAITTS(text);
+  const budget = getUsageBudget();
+  let sent = false;
+  for (const provider of SPEECH_PROVIDERS) {
+    if (!process.env[provider.key]) continue;
+    const reservation = budget.reserveTts(text.length);
+    if (!reservation) {
+      budget.recordSkip('tts');
+      if (!sent) throw new TtsLimitReached();
+      console.log(`[TTS] Not trying ${provider.name}: the daily text-to-speech limit has no room for another request`);
+      return null;
+    }
+    if (sent) console.log(`[TTS] Trying ${provider.name}...`);
+    sent = true;
+    const { audio, mayBeBilled } = await provider.attempt(text);
+    if (audio) return audio;
+    if (!mayBeBilled) reservation.release();
+  }
+  return null;
 }

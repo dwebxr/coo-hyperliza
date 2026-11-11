@@ -1,16 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { NoticeThrottle, composeOfflineReply } from './offline-reply';
+import { NoticeThrottle, OFFLINE_NOTICE_TRACKED_KEYS, composeOfflineReply } from './offline-reply';
 import { isOpenPayLink } from '../../openpay-store';
 
 const product = (id: string, title: string) =>
-  ({ id, title, handle: 'coo', totalJpyc: '1,000', url: `https://store.example/p/${id}`, emoji: '', category: '', desc: '' }) as any;
+  ({ id, title, handle: 'coo', totalJpyc: '1000', url: `https://open-pay.jp/ja/@coo?product=${id}`, emoji: '', category: '', desc: '' }) as any;
 const products = [product('h_board', 'Hyper Board'), product('h_mug', 'Coo Mug'), product('h_tee', 'Coo Tee'), product('h_cap', 'Cap')];
 
 describe('composeOfflineReply', () => {
   it('posts the purchase link when the message names a product', () => {
     const reply = composeOfflineReply({ text: 'I want the Coo Mug', products, japanese: false });
     expect(reply.kind).toBe('link');
-    expect(reply.content.text).toContain('https://store.example/p/h_mug');
+    expect(reply.content.text).toBe('🛒 Coo Mug — 1000 JPYC\nhttps://open-pay.jp/ja/@coo?product=h_mug');
     expect(isOpenPayLink(reply.content)).toBe(true);
   });
 
@@ -49,5 +49,18 @@ describe('NoticeThrottle', () => {
     expect(throttle.allow('b')).toBe(true);
     t = 1000;
     expect(throttle.allow('a')).toBe(true);
+  });
+
+  it('remembers at most 256 keys however many players ask within the interval, forgetting the least recently noticed', () => {
+    let t = 0;
+    const throttle = new NoticeThrottle(5 * 60_000, () => t);
+    for (let i = 0; i < 10 * OFFLINE_NOTICE_TRACKED_KEYS; i++) {
+      t += 10;
+      expect(throttle.allow(`player-${i}`)).toBe(true);
+      expect(throttle.trackedKeys).toBeLessThanOrEqual(OFFLINE_NOTICE_TRACKED_KEYS);
+    }
+    // The most recent ones are still throttled; the first ones were forgotten
+    expect(throttle.allow(`player-${10 * OFFLINE_NOTICE_TRACKED_KEYS - 1}`)).toBe(false);
+    expect(throttle.allow('player-0')).toBe(true);
   });
 });

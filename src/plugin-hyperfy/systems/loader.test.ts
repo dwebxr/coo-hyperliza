@@ -49,6 +49,7 @@ vi.mock('../lib/asset-bytes', async (importOriginal) => {
 
 import { AgentLoader, LOADER_LIMITS, type LoaderLimits } from './loader';
 import { RenderPageKilled } from '../lib/render-watchdog';
+import { assetMemory } from '../lib/asset-memory';
 import { NetPolicy, installWorldNet } from '../lib/net-policy';
 import { type Handler, type TestServer, closeServers, startServer } from '../test-support/net';
 
@@ -355,7 +356,7 @@ describe('AgentLoader', () => {
 
   it.each([
     ['an accessor far larger than the file', { accessors: [{ count: 1e9, type: 'VEC3', componentType: 5126 }] }, 'accessor 0 needs 12000000000 bytes'],
-    ['a sparse accessor', { buffers: [{ byteLength: 0, uri: 'data:,' }], bufferViews: [{ buffer: 0, byteLength: 0 }], accessors: [{ count: 10, type: 'SCALAR', componentType: 5126, sparse: { count: 1e8, indices: { bufferView: 0, componentType: 5125 }, values: { bufferView: 0 } } }] }, 'accessor 0 needs'],
+    ['a sparse accessor', { buffers: [{ byteLength: 0, uri: 'data:,' }], bufferViews: [{ buffer: 0, byteLength: 0 }], accessors: [{ count: 10, type: 'SCALAR', componentType: 5126, sparse: { count: 1e8, indices: { bufferView: 0, componentType: 5125 }, values: { bufferView: 0 } } }] }, 'accessor 0 has a sparse part that runs past the end of its buffer view'],
     ['many accessors that add up', { accessors: Array.from({ length: 9 }, () => ({ count: 4e6, type: 'VEC3', componentType: 5126 })) }, 'the model needs more than'],
     ['an accessor whose size cannot be told', { accessors: [{ count: -1, type: 'VEC3', componentType: 5126 }] }, 'no usable count'],
   ])('refuses a model with %s before the render page sees it', async (_name, extra, why) => {
@@ -418,7 +419,8 @@ describe('AgentLoader', () => {
   it('does not load again, for this world, a model that got the render page killed, and says so once', async () => {
     const glb = minimalGlb();
     const { loader, assets } = await setup({ handler: (_request, response) => response.end(Buffer.from(glb)) });
-    page.fail = new RenderPageKilled('memory', '[RenderWatchdog] the render page used 2000000000 bytes, more than 1610612736', 2e9);
+    // The only page call in flight when the kill came
+    page.fail = new RenderPageKilled('memory', '[RenderWatchdog] the render page used 2000000000 bytes, more than 1610612736', 2e9, 1, 1);
 
     await expect(loader.load('model', 'asset://heavy.glb')).rejects.toBeInstanceOf(RenderPageKilled);
     page.fail = null;
@@ -426,11 +428,60 @@ describe('AgentLoader', () => {
 
     expect(page.glb).toHaveLength(1);
     expect(assets.hits).toHaveLength(1);
-    expect(vi.mocked(console.error).mock.calls.filter(([line]) => String(line).includes('got the render page killed'))).toHaveLength(1);
+    expect(vi.mocked(console.error).mock.calls.filter(([line]) => String(line).includes('got the render page killed while it was the only page call'))).toHaveLength(1);
     // Another asset, and the same one in another world, load as usual
     await expect(loader.load('model', 'asset://light.glb')).resolves.toMatchObject({ gltf: expect.anything() });
     const other = await setup({ handler: (_request, response) => response.end(Buffer.from(glb)) });
     await expect(other.loader.load('model', 'asset://heavy.glb')).resolves.toMatchObject({ gltf: expect.anything() });
+  });
+
+  it("reserves the agent's own memory for a load from before its download to the end of its parse, and gives it all back", async () => {
+    const glb = minimalGlb();
+    const { loader } = await setup({ handler: (_request, response) => response.end(Buffer.from(glb)) });
+    let release!: () => void;
+    page.gate = new Promise<void>((resolve) => (release = resolve));
+    const loading = loader.load('model', 'asset://a.glb');
+    await expect.poll(() => page.glb.length).toBe(1);
+    // While the page works: in the work pool, by what the bytes and the export estimate imply
+    expect(assetMemory.held.downloads).toBe(0);
+    expect(assetMemory.held.work).toBeGreaterThanOrEqual(4 * glb.byteLength);
+    release();
+    await loading;
+    expect(assetMemory.held).toEqual({ downloads: 0, work: 0 });
+    await loader.load('script', 'asset://a.js');
+    await expect(loader.load('model', 'https://10.0.0.1/refused.glb')).rejects.toThrow();
+    expect(assetMemory.held).toEqual({ downloads: 0, work: 0 });
+  });
+
+  it('blames no model for a kill that came while other page calls were in flight, and runs page loads one at a time from then on', async () => {
+    const glb = minimalGlb();
+    const { loader } = await setup({ handler: (_request, response) => response.end(Buffer.from(glb)) });
+    page.fail = new RenderPageKilled('memory', '[RenderWatchdog] over the limit', 2e9, 1, 2);
+    await expect(loader.load('model', 'asset://a.glb')).rejects.toBeInstanceOf(RenderPageKilled);
+    page.fail = null;
+    // Not blamed: it loads again
+    await expect(loader.load('model', 'asset://a.glb')).resolves.toMatchObject({ gltf: expect.anything() });
+    expect(loader.pageWork.serial).toBe(true);
+    // One at a time: the second page call starts only when the first has returned
+    let release!: () => void;
+    page.gate = new Promise<void>((resolve) => (release = resolve));
+    const first = loader.load('model', 'asset://b.glb');
+    const second = loader.load('model', 'asset://c.glb');
+    await expect.poll(() => page.glb.length).toBe(3);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(page.glb).toHaveLength(3);
+    release();
+    await Promise.all([first, second]);
+    expect(page.glb).toHaveLength(4);
+  });
+
+  it('blames no model for a kill while the page was being built', async () => {
+    const glb = minimalGlb();
+    const { loader } = await setup({ handler: (_request, response) => response.end(Buffer.from(glb)) });
+    page.fail = new RenderPageKilled('deadline', '[RenderWatchdog] building the page took too long', null, 1, 1, true);
+    await expect(loader.load('model', 'asset://a.glb')).rejects.toBeInstanceOf(RenderPageKilled);
+    page.fail = null;
+    await expect(loader.load('model', 'asset://a.glb')).resolves.toMatchObject({ gltf: expect.anything() });
   });
 
   it('evaluates and keeps nothing whose download finished just as the world was destroyed', async () => {

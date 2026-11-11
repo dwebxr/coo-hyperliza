@@ -11,8 +11,9 @@ import {
 import { HyperfyService } from '../service';
 import * as THREE from 'three'
 import { Vector3Enhanced } from '../hyperfy/src/core/extras/Vector3Enhanced.js'
-import { SHOWN_NAME_MAX, oneLine, shownName } from '../lib/text'
+import { SHOWN_NAME_MAX, oneLine, shownName, shownNames } from '../lib/text'
 import { CHAT_BODY_MAX_CODE_POINTS } from '../lib/chat-intake'
+import { HISTORY_TEXT_MAX_CODE_POINTS, PROMPT_ACTIONS_MAX, PROMPT_ACTION_NAME_MAX } from '../managers/message-manager'
 
 // Per entity type, how many of the nearest entities get a full line. The rest are listed
 // compactly (name + id) so actions can still target them without flooding the prompt.
@@ -184,9 +185,13 @@ export const hyperfyProvider: Provider = {
           chatText += `\n\n${receivedMessageSection}`;
         }
 
-        const agentMemoryText = lastResponseText
-          ? `### Your Last Response\n${lastResponseText}\n\n_Do not repeat this unless someone asks again._\n\n### Your Last Action\n${JSON.stringify(lastActions, null, 2)}`
-          : `### Your Last Response\nNo recent message.\n\n### Your Last Action\n${JSON.stringify(lastActions, null, 2)}`;
+        // The agent's stored reply can quote world content (an entity's name, a player): one bounded
+        // line, like a line of the history; its action names likewise
+        const lastResponse = oneLine(typeof lastResponseText === 'string' ? lastResponseText : '', HISTORY_TEXT_MAX_CODE_POINTS);
+        const lastActionText = JSON.stringify(shownNames(lastActions, PROMPT_ACTIONS_MAX, PROMPT_ACTION_NAME_MAX), null, 2);
+        const agentMemoryText = lastResponse
+          ? `### Your Last Response\n${lastResponse}\n\n_Do not repeat this unless someone asks again._\n\n### Your Last Action\n${lastActionText}`
+          : `### Your Last Response\nNo recent message.\n\n### Your Last Action\n${lastActionText}`;
 
         // Emphasize nearby players for social interaction
         const playerSummary = nearbyPlayers.length > 0

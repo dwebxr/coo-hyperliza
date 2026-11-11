@@ -46,7 +46,32 @@ export const OFFLINE_CHROMIUM_ARGS = [
 ]
 
 const toBase64 = (bytes: Uint8Array) => Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64')
-const fromBase64 = (text: string) => new Uint8Array(Buffer.from(text, 'base64'))
+/** The bytes in an ArrayBuffer of their own, exactly as long (not a view into Node's buffer pool) */
+const fromBase64 = (text: string) => {
+  const bytes = Buffer.allocUnsafeSlow(Buffer.byteLength(text, 'base64'))
+  const written = bytes.write(text, 'base64')
+  return written === bytes.length ? new Uint8Array(bytes.buffer, 0, written) : new Uint8Array(bytes.buffer.slice(0, written))
+}
+
+/** `promise`, or PageOperationCancelled as soon as `signal` fires (the work itself goes on for others) */
+function untilAborted<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise
+  if (signal.aborted) return Promise.reject(new PageOperationCancelled())
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new PageOperationCancelled())
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(value)
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(error)
+      }
+    )
+  })
+}
 // The largest model the page returns when the caller names no budget (a model's, lib/gltf-budget.ts)
 const DEFAULT_MAX_EXPORT_BYTES = modelBudget('model').exportBytes
 
@@ -61,6 +86,9 @@ export class PageOperationCancelled extends Error {
 export class PuppeteerManager {
   private static instance: PuppeteerManager | null = null
   private operations = 0
+  /** The current browser generation (each launch is one); what the watchdog, kills and launches are bound to */
+  private generation = 0
+  private readonly pageGeneration = new WeakMap<puppeteer.Page, number>()
   /**
    * The run-time bound on the page (lib/render-watchdog.ts): every page call below runs under it,
    * and Chromium's tree is killed when it uses too much memory or one call takes too long.
@@ -86,14 +114,22 @@ export class PuppeteerManager {
    * `pageBundlePath`: the built render page, when it is not next to this module (the smoke script).
    * `watchdog`: FOR TESTS, a shorter deadline or another process table.
    */
-  constructor(runtime: IAgentRuntime, { pageBundlePath, watchdog }: { pageBundlePath?: string; watchdog?: Pick<RenderWatchdogOptions, 'deadlineMs' | 'limitBytes' | 'table'> } = {}) {
+  constructor(runtime: IAgentRuntime, { pageBundlePath, watchdog }: { pageBundlePath?: string; watchdog?: Pick<RenderWatchdogOptions, 'deadlineMs' | 'initDeadlineMs' | 'limitBytes' | 'table' | 'intervalMs' | 'idleIntervalMs' | 'breaker'> } = {}) {
     if (PuppeteerManager.instance) {
       throw new Error('PuppeteerManager has already been instantiated.')
     }
     this.watchdog = new RenderWatchdog({
       ...watchdog,
-      rootPid: () => this.browser?.process?.()?.pid ?? null,
-      kill: (pids) => {
+      kill: (pids, group) => {
+        // puppeteer starts Chromium detached, so the browser leads a process group of its own: that
+        // takes the helpers whose parent is gone too
+        if (group !== null) {
+          try {
+            process.kill(-group, 'SIGKILL')
+          } catch {
+            // gone already
+          }
+        }
         for (const pid of pids) {
           try {
             process.kill(pid, 'SIGKILL')
@@ -101,12 +137,9 @@ export class PuppeteerManager {
             // gone already
           }
         }
-        // The next use starts a new browser at once, without waiting for puppeteer to notice
-        this.browserPromise = null
-        this.browser = null
-        this.initPromise = null
-        this.page = null
       },
+      // Synchronously, at the teardown: the next use starts a new browser without waiting for puppeteer to notice
+      onTornDown: (generation) => this.dropGeneration(generation),
     })
     this.runtime = runtime
     this.pageBundlePath = pageBundlePath ?? path.join(getModuleDirectory(), 'puppeteer', 'page.js')
@@ -159,8 +192,19 @@ export class PuppeteerManager {
     })
   }
 
+  /** Forgets the browser of `generation` if it is still the current one: the next use launches another. */
+  private dropGeneration(generation: number) {
+    if (this.generation !== generation) return
+    this.browserPromise = null
+    this.browser = null
+    this.initPromise = null
+    this.page = null
+  }
+
+  /** Launches a browser (puppeteer's own launch timeout bounds this) as the next generation. */
   private getBrowser(): Promise<puppeteer.Browser> {
     if (!this.browserPromise) {
+      const generation = ++this.generation
       const browserPromise = puppeteer.launch({
         // headless: false,
         defaultViewport: null,
@@ -171,14 +215,18 @@ export class PuppeteerManager {
       this.browserPromise = browserPromise
       browserPromise.then(
         browser => {
+          // Superseded while it launched (its generation torn down, or the manager closed): nobody's browser
+          if (this.generation !== generation || this.browserPromise !== browserPromise) {
+            browser.process?.()?.kill('SIGKILL')
+            browser.close().catch(() => { })
+            return
+          }
           this.browser = browser
+          this.watchdog.started(generation, browser.process?.()?.pid ?? null)
           // If Chromium dies, relaunch on the next call instead of reusing a dead handle
           browser.on('disconnected', () => {
-            if (this.browserPromise !== browserPromise) return
-            this.browserPromise = null
-            this.browser = null
-            this.initPromise = null
-            this.page = null
+            this.watchdog.ended(generation)
+            this.dropGeneration(generation)
           })
         },
         // Let a later call retry the launch
@@ -188,44 +236,33 @@ export class PuppeteerManager {
     return this.browserPromise
   }
 
-  private async init(): Promise<puppeteer.Page> {
+  /**
+   * The page, built when there is none: under a watched call with a deadline of its own
+   * (RENDER_INIT_DEADLINE_MS in lib/render-watchdog.ts), for the browser generation it belongs to.
+   * A caller's `signal` stops its wait (PageOperationCancelled); the building goes on for the
+   * others. While the render page is down for a cooldown this fails at once with
+   * RenderPageUnavailable. The launch itself is bounded by puppeteer's own launch timeout.
+   */
+  private async init(signal?: AbortSignal): Promise<puppeteer.Page> {
+    this.watchdog.breaker.check()
     // One page per session; reset by resetPage()
     if (!this.initPromise) {
       const initPromise = (async () => {
-        const browser = await this.getBrowser()
-        const page = await browser.newPage()
-        // A page that closed or crashed is rebuilt by the next call. The new one starts without
-        // the textures and avatars the old one held; those come back with the next connection.
-        const lost = () => {
-          if (this.page === page) this.page = null
-          if (this.initPromise === initPromise) this.initPromise = null
-        }
-        page.on('close', lost)
-        page.on('error', (error) => {
-          console.warn('[PuppeteerManager] The render page crashed and will be rebuilt on next use:', error?.message || error)
-          lost()
-          page.close().catch(() => { })
-        })
-        try {
-          // The page loads nothing by URL: every request it makes is refused. blob: and data:
-          // URLs, which is how assets reach it, never become requests.
-          await page.setRequestInterception(true)
-          page.on('request', (request) => {
-            request.abort('blockedbyclient').catch(() => { })
-          })
-          await page.setContent(PAGE_HTML, { waitUntil: 'load' })
-          await page.addScriptTag({ content: await this.readPageScript() })
-
-          await page.waitForFunction(() =>
-            window.THREE !== undefined &&
-            window.scene !== undefined &&
-            window.camera !== undefined &&
-            window.agentPage !== undefined
-          )
-        } catch (error) {
+        const browserPromise = this.getBrowser()
+        const generation = this.generation
+        const browser = await browserPromise
+        // Given up: its browser's generation is over (torn down, or the browser dropped). A reset
+        // meanwhile (resetPage) is not that: it takes the page this returns and closes it.
+        const givenUp = () => this.generation !== generation || this.browserPromise !== browserPromise
+        const gone = () => new Error('[PuppeteerManager] The render page was given up while it was being built')
+        // A launch that finished after that is disposed of by getBrowser(); no page is built on it
+        if (givenUp()) throw gone()
+        const page = await this.watchdog.watch(generation, () => this.buildPage(browser, initPromise), { deadlineMs: this.watchdog.initDeadlineMs, init: true })
+        if (givenUp()) {
           await page.close().catch(() => { })
-          throw error
+          throw gone()
         }
+        this.pageGeneration.set(page, generation)
         this.page = page
         console.info('[PuppeteerManager] Render page ready (Chromium has no network access)')
         return page
@@ -236,7 +273,49 @@ export class PuppeteerManager {
         if (this.initPromise === initPromise) this.initPromise = null
       })
     }
-    return await this.initPromise
+    return await untilAborted(this.initPromise, signal)
+  }
+
+  private async buildPage(browser: puppeteer.Browser, initPromise: Promise<puppeteer.Page>): Promise<puppeteer.Page> {
+    const page = await browser.newPage()
+    // A page that closed or crashed is rebuilt by the next call. The new one starts without
+    // the textures and avatars the old one held; those come back with the next connection.
+    const lost = () => {
+      if (this.page === page) this.page = null
+      if (this.initPromise === initPromise) this.initPromise = null
+    }
+    page.on('close', lost)
+    page.on('error', (error) => {
+      console.warn('[PuppeteerManager] The render page crashed and will be rebuilt on next use:', error?.message || error)
+      lost()
+      page.close().catch(() => { })
+    })
+    try {
+      // The page loads nothing by URL: every request it makes is refused. blob: and data:
+      // URLs, which is how assets reach it, never become requests.
+      await page.setRequestInterception(true)
+      page.on('request', (request) => {
+        request.abort('blockedbyclient').catch(() => { })
+      })
+      await page.setContent(PAGE_HTML, { waitUntil: 'load' })
+      await page.addScriptTag({ content: await this.readPageScript() })
+
+      await page.waitForFunction(() =>
+        window.THREE !== undefined &&
+        window.scene !== undefined &&
+        window.camera !== undefined &&
+        window.agentPage !== undefined
+      )
+    } catch (error) {
+      await page.close().catch(() => { })
+      throw error
+    }
+    return page
+  }
+
+  /** `work` on `page` as a watched page call of the generation the page belongs to */
+  private watched<T>(page: puppeteer.Page, work: () => Promise<T>): Promise<T> {
+    return this.watchdog.watch(this.pageGeneration.get(page) ?? this.generation, work)
   }
 
   private readPageScript(): Promise<string> {
@@ -287,7 +366,7 @@ export class PuppeteerManager {
       ] as const
     };
 
-    const base64 = await this.watchdog.watch(() => page.evaluate(async (playerData) => {
+    const base64 = await this.watched(page, () => page.evaluate(async (playerData) => {
       return await window.snapshotFacingDirection(playerData);
     }, playerData));
   
@@ -313,7 +392,7 @@ export class PuppeteerManager {
       position: player.base.position.toArray() as [number, number, number]
     };
 
-    const base64 = await this.watchdog.watch(() => page.evaluate(async (playerData, targetPosition) => {
+    const base64 = await this.watched(page, () => page.evaluate(async (playerData, targetPosition) => {
       return await window.snapshotViewToTarget(playerData, targetPosition);
     }, playerData, targetPosition));
   
@@ -341,7 +420,7 @@ export class PuppeteerManager {
       quaternion: [player.base.quaternion.x, player.base.quaternion.y, player.base.quaternion.z, player.base.quaternion.w] as const
     };
     
-    const base64 = await this.watchdog.watch(() => page.evaluate(async (playerData) => {
+    const base64 = await this.watched(page, () => page.evaluate(async (playerData) => {
       return await window.snapshotEquirectangular(playerData);
     }, playerData));
   
@@ -358,33 +437,43 @@ export class PuppeteerManager {
    * Each takes a `signal` (the world the asset is for going away): checked once the page is ready
    * and right before the page is asked, so nothing is handed to the page after it fired. A page
    * call cannot be interrupted. With a signal, the page files how to take back what the call kept
-   * under the call's id, and every call is then settled: committed when it succeeded and the
-   * signal did not fire (the page drops that record at once), taken back otherwise (the call then
-   * fails with PageOperationCancelled, or with its own error). No record outlives its call.
+   * under the call's id, and every call is then settled, in this order:
+   *   - the call failed, or the signal fired by the time it returned: taken back ("rollback");
+   *   - otherwise committed ("commit": the page keeps the record), then the signal is checked again:
+   *     fired meanwhile, taken back; not, the record is dropped ("forget") and the result returned.
+   * A settlement that fails fails the call (a RenderPageKilled among them, for the loader's
+   * accounting); only the take-back after a call that already failed ignores its own failure, as
+   * the call's error is what counts and a page that cannot be reached holds nothing of it.
    */
   private async pageCall<T>(signal: AbortSignal | undefined, run: (page: puppeteer.Page, op: string[]) => Promise<T>): Promise<T> {
-    const page = await this.init()
+    const page = await this.init(signal)
     if (signal?.aborted) throw new PageOperationCancelled()
     // The id the page files its undo under; only when there is something to cancel
     const op = signal ? [`op-${++this.operations}`] : []
     let result: T
     try {
-      result = await this.watchdog.watch(() => run(page, op))
+      result = await this.watched(page, () => run(page, op))
     } catch (error) {
-      if (op.length) await this.settle(page, op[0], false)
+      if (op.length) await this.settle(page, op[0], 'rollback').catch(() => {})
       throw error
     }
-    if (signal?.aborted) {
-      await this.settle(page, op[0], false)
+    if (!op.length) return result
+    if (signal.aborted) {
+      await this.settle(page, op[0], 'rollback')
       throw new PageOperationCancelled()
     }
-    if (op.length) await this.settle(page, op[0], true)
+    await this.settle(page, op[0], 'commit')
+    if (signal.aborted) {
+      await this.settle(page, op[0], 'rollback')
+      throw new PageOperationCancelled()
+    }
+    await this.settle(page, op[0], 'forget')
     return result
   }
 
-  /** Commits (`keep`) or takes back what call `op` kept in the page. A page that is gone keeps nothing. */
-  private async settle(page: puppeteer.Page, op: string, keep: boolean): Promise<void> {
-    await this.watchdog.watch(() => page.evaluate((id, keep) => window.agentPage.settle(id, keep), op, keep)).catch(() => {})
+  /** One settlement step of call `op` in the page (assets.js settle) */
+  private async settle(page: puppeteer.Page, op: string, step: 'commit' | 'rollback' | 'forget'): Promise<void> {
+    await this.watched(page, () => page.evaluate((id, step) => window.agentPage.settle(id, step), op, step))
   }
 
   /**
@@ -393,7 +482,12 @@ export class PuppeteerManager {
    */
   async evaluateWatched<T>(fn: (...args: any[]) => T | Promise<T>, ...args: unknown[]): Promise<T> {
     const page = await this.init()
-    return this.watchdog.watch(() => page.evaluate(fn, ...args))
+    return this.watched(page, () => page.evaluate(fn, ...args))
+  }
+
+  /** The current browser generation and its pid (for scripts/smoke-chromium.mjs) */
+  currentBrowser(): { generation: number; pid: number | null } {
+    return { generation: this.generation, pid: this.browser?.process?.()?.pid ?? null }
   }
 
   /**
@@ -473,7 +567,7 @@ export class PuppeteerManager {
     );
     
     const STRIP_SLOTS = this.STRIP_SLOTS;
-    await this.watchdog.watch(() => page.evaluate(
+    await this.watched(page, () => page.evaluate(
       (sceneJson, STRIP_SLOTS, players) => window.agentPage.rehydrate(sceneJson, STRIP_SLOTS, players),
       sceneJson, STRIP_SLOTS, players
     ));

@@ -1,6 +1,6 @@
 import { ChannelType, Content, HandlerCallback, IAgentRuntime, Memory, ModelType, UUID, createUniqueUuid, logger } from "@elizaos/core";
 import { HyperfyService } from "../service";
-import { countOtherPlayers, generateSpeech, getWavHeader } from "../utils";
+import { TtsLimitReached, countOtherPlayers, generateSpeech, getWavHeader } from "../utils";
 import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
 import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
@@ -32,8 +32,14 @@ export const MAX_UTTERANCE_BYTES = 30 * PCM_BYTES_PER_SECOND;
 // All speakers together, waiting or being transcribed: four full utterances (11.5 MB of PCM; a
 // request holds its audio about twice while it builds the WAV)
 export const MAX_HELD_VOICE_BYTES = 4 * MAX_UTTERANCE_BYTES;
-// People buffered at once; a ninth speaker is not heard until one of them pauses
+// People held at once, whether their speech waits or is being transcribed: a ninth speaker is not
+// heard until one of them is done
 export const MAX_SPEAKERS = 8;
+// Speech-to-text requests in flight at once, over all speakers. A request takes about a second;
+// three people finishing a sentence at the same moment is a busy conversation. A fourth utterance
+// waits for a free request (at most to its cap, like a speaker's next utterance waits for their
+// previous one)
+export const MAX_CONCURRENT_TRANSCRIPTIONS = 3;
 // LiveKit frames are 10 ms (960 bytes); one second is already not a frame
 export const MAX_FRAME_BYTES = PCM_BYTES_PER_SECOND;
 // Whether speech-to-text is there and within its budget is looked up at most this often
@@ -75,6 +81,8 @@ export class VoiceManager {
   private speakers: Map<string, Utterance> = new Map();
   /** Speakers whose previous utterance is being transcribed: at most one request per speaker. */
   private transcribing: Set<string> = new Set();
+  private leaveListener: ((data: unknown) => void) | null = null;
+  private leaveSource: any = null;
   /** PCM bytes held: buffered for all speakers, plus what is being transcribed. */
   private heldVoiceBytes = 0;
   private ingressGate = { checkedAt: Number.NEGATIVE_INFINITY, open: false };
@@ -114,6 +122,15 @@ export class VoiceManager {
     this.audioListener = (data: unknown) => this.onAudio(data);
     this.audioSource = world.livekit;
     this.audioSource.on('audio', this.audioListener);
+    // A player leaving the world (the engine's 'leave', when their entity is removed): what they
+    // said and was not yet handed to speech-to-text is dropped. A transcript that comes back for
+    // someone no longer in the world starts no turn (processTranscription).
+    this.leaveListener = (data: unknown) => {
+      const playerId = (data as { playerId?: unknown } | null)?.playerId;
+      if (typeof playerId === 'string') this.discard(playerId);
+    };
+    this.leaveSource = world.events;
+    this.leaveSource?.on?.('leave', this.leaveListener);
   }
 
   /**
@@ -125,6 +142,9 @@ export class VoiceManager {
     }
     this.audioSource = null;
     this.audioListener = null;
+    if (this.leaveListener) this.leaveSource?.off?.('leave', this.leaveListener);
+    this.leaveSource = null;
+    this.leaveListener = null;
     for (const participant of [...this.speakers.keys()]) this.discard(participant);
     this.isSpeaking = false;
     this.stopped = true;
@@ -154,8 +174,8 @@ export class VoiceManager {
 
       let utterance = this.speakers.get(participant);
       if (utterance && utterance.bytes + buffer.length > MAX_UTTERANCE_BYTES) {
-        // Their previous utterance is still with speech-to-text: nowhere to put more
-        if (this.transcribing.has(participant)) return this.dropFrame('a speaker went on past the utterance limit while still being transcribed');
+        // Their previous utterance is still with speech-to-text, or every request is taken: nowhere to put more
+        if (!this.canTranscribe(participant)) return this.dropFrame('a speaker went on past the utterance limit while speech-to-text was busy');
         this.flush(participant);
         utterance = undefined;
       }
@@ -165,7 +185,8 @@ export class VoiceManager {
         return this.dropFrame('the voice buffers are full');
       }
       if (!utterance) {
-        if (this.speakers.size >= MAX_SPEAKERS) return this.dropFrame(`more than ${MAX_SPEAKERS} people are speaking at once`);
+        // Someone being transcribed still counts: the limit is on everyone held, not only on who waits
+        if (!this.transcribing.has(participant) && this.heldSpeakers() >= MAX_SPEAKERS) return this.dropFrame(`more than ${MAX_SPEAKERS} people are speaking at once`);
         utterance = { buffers: [], bytes: 0, timer: null };
         this.speakers.set(participant, utterance);
       }
@@ -219,13 +240,26 @@ export class VoiceManager {
     this.heldVoiceBytes -= utterance.bytes;
   }
 
+  /** Everyone held: speakers whose speech waits, and speakers being transcribed (each counted once). */
+  private heldSpeakers(): number {
+    let held = this.speakers.size;
+    for (const participant of this.transcribing) if (!this.speakers.has(participant)) held++;
+    return held;
+  }
+
+  /** Whether an utterance of `participant` may go to speech-to-text now. */
+  private canTranscribe(participant: string): boolean {
+    return !this.transcribing.has(participant) && this.transcribing.size < MAX_CONCURRENT_TRANSCRIPTIONS;
+  }
+
   /** The speaker has been silent for UTTERANCE_PAUSE_MS. */
   private onPause(participant: string): void {
     const utterance = this.speakers.get(participant);
     if (!utterance) return;
     utterance.timer = null;
-    if (this.transcribing.has(participant)) {
-      // One request per speaker: this utterance waits for the previous one, growing at most to its cap
+    if (!this.canTranscribe(participant)) {
+      // One request per speaker, MAX_CONCURRENT_TRANSCRIPTIONS in all: this utterance waits for a
+      // free one, growing at most to its cap
       utterance.timer = setTimeout(() => this.onPause(participant), UTTERANCE_PAUSE_MS);
       return;
     }
@@ -235,7 +269,7 @@ export class VoiceManager {
   private flushLargest(): void {
     let largest: string | undefined;
     for (const [participant, utterance] of this.speakers) {
-      if (this.transcribing.has(participant)) continue;
+      if (!this.canTranscribe(participant)) continue;
       if (largest === undefined || utterance.bytes > this.speakers.get(largest)!.bytes) largest = participant;
     }
     if (largest !== undefined) this.flush(largest);
@@ -253,7 +287,8 @@ export class VoiceManager {
     this.speakers.delete(participant);
     const service = this.getService();
     const world = service?.getWorld();
-    if (this.stopped || !world || utterance.bytes === 0) {
+    // Nobody who is not a player in the world now is transcribed (that costs money)
+    if (this.stopped || !world || utterance.bytes === 0 || !world.entities?.getPlayer?.(participant)) {
       this.heldVoiceBytes -= utterance.bytes;
       return;
     }
@@ -303,6 +338,11 @@ export class VoiceManager {
     // What was said enters memory and prompts like a chat message: one line, at most 500 code points
     const text = oneLine(transcript, CHAT_BODY_MAX_CODE_POINTS);
     if (!text) return;
+    // Only someone who is in the world now: a speaker who left while being transcribed starts no turn
+    if (!this.getService()?.getWorld()?.entities?.getPlayer?.(participant)) {
+      logger.info('[VoiceManager] Dropping a transcript: its speaker is not in the world (any more)');
+      return;
+    }
     console.log("[VOICE MANAGER] Transcription: ", text)
     await this.handleMessage(text, participant as UUID);
   }
@@ -441,20 +481,10 @@ export class VoiceManager {
     // Capped before anything is synthesized or counted
     const spoken = spokenPart(text);
     text = spoken.text;
-    const budget = getUsageBudget();
-    // Counted before the request, and whatever becomes of it; text that does not fit in what is
-    // left of the daily limit is not spoken
-    if (!budget.reserveTts(text.length)) {
-      budget.recordSkip('tts');
-      if (Date.now() - this.lastTtsLimitLogAt >= VOICE_LIMIT_NOTICE_INTERVAL_MS) {
-        this.lastTtsLimitLogAt = Date.now();
-        logger.info(`[VoiceManager] VOICE_TTS_MAX_CHARS_PER_DAY=${budget.limits.ttsCharsPerDay} reached; replying in text only`);
-      }
-      return 'none';
-    }
     // Captured before synthesis so a stop() during the TTS request discards the result
     const generation = this.playbackGeneration;
     try {
+      // Each provider request is counted against the daily limit before it is sent (utils.ts)
       const audioBuffer = await generateSpeech(text);
       if (!audioBuffer) {
         console.log('[VoiceManager] No audio generated - check ELEVENLABS_XI_API_KEY or OPENAI_API_KEY in .env');
@@ -465,6 +495,13 @@ export class VoiceManager {
       // All of the capped text was played, but not all of the reply
       return played === 'all' && spoken.cut ? 'partial' : played;
     } catch (error) {
+      if (error instanceof TtsLimitReached) {
+        if (Date.now() - this.lastTtsLimitLogAt >= VOICE_LIMIT_NOTICE_INTERVAL_MS) {
+          this.lastTtsLimitLogAt = Date.now();
+          logger.info(`[VoiceManager] VOICE_TTS_MAX_CHARS_PER_DAY=${getUsageBudget().limits.ttsCharsPerDay} reached; replying in text only`);
+        }
+        return 'none';
+      }
       logger.warn('[VoiceManager] TTS failed, text-only response sent:', error);
       return 'none';
     }

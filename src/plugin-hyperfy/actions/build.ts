@@ -355,6 +355,9 @@ Don't list every action like a log — instead, summarize the overall outcome na
           // Not the plan itself: it can hold the URLs an import names
           logger.warn(`[EDIT_ENTITY Action] Unexpected structure on attempt ${attempts + 1}: ${operationResults === null ? 'null' : typeof operationResults}`);
         } catch (error) {
+          // Before anything else: a requester who lost the right while the call ran gets the
+          // neutral line, whatever the error was
+          if ((noLongerPlanning = stillAllowed())) break;
           // Retrying cannot help: the budget is used up (the turn's caller falls back to scripted or
           // offline behavior) or the model declined this request
           if (error instanceof AiBudgetExceededError || error instanceof AnthropicRefusalError) throw error;

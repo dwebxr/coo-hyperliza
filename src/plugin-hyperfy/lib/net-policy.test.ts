@@ -576,6 +576,22 @@ describe('the voice server URL the world sends (voiceUrlProblem)', () => {
   });
 });
 
+describe('the body', () => {
+  it('comes in memory of its own, exactly as long as the body (never a view into the buffer pool), small or large', async () => {
+    for (const size of [0, 7, 3000, 200_000]) {
+      const payload = Buffer.alloc(size, 7);
+      const server = await startServer((_request, response) => response.end(payload), { tls: true });
+      const { policy } = testNet({ hosts: { 'cdn.test': PUBLIC_ADDRESS }, routes: { 'cdn.test:443': { port: server.port, direct: true } } });
+      const headers: Record<string, string>[] = [];
+      const answer = await policy.fetch('https://cdn.test/a', { maxBytes: 1_000_000, onResponse: (seen) => void headers.push(seen) });
+      expect([answer.body.byteLength, answer.body.byteOffset, answer.body.buffer.byteLength]).toEqual([size, 0, size]);
+      expect(Buffer.from(answer.body).equals(payload)).toBe(true);
+      // The headers were seen before the body was read
+      expect(headers.map((seen) => seen['content-length'])).toEqual([String(size)]);
+    }
+  });
+});
+
 describe('bounds', () => {
   it('refuses a body that declares more than the cap without reading it', async () => {
     const server = await startServer((_request, response) => response.writeHead(200, { 'content-length': '1000' }).end(Buffer.alloc(1000)), { tls: true });

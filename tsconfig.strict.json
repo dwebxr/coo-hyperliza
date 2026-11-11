@@ -12,6 +12,7 @@
     "src/agent-secrets.ts",
     "src/anthropic-models.ts",
     "src/anthropic-models.test.ts",
+    "src/anthropic-models.sdk.test.ts",
     "src/elevenlabs-speech.ts",
     "src/elevenlabs-speech.test.ts",
     "src/llm-provider.ts",

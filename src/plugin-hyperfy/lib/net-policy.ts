@@ -216,6 +216,8 @@ export interface SafeFetchOptions {
   worldException?: boolean;
   /** false: a redirect is not followed; the 3xx answer itself is returned (default true). */
   followRedirects?: boolean;
+  /** Called with the headers of the answer whose body is read, before it is (e.g. to act on Content-Length) */
+  onResponse?: (headers: Record<string, string>) => void;
 }
 
 export interface SafeResponse {
@@ -347,7 +349,7 @@ export class NetPolicy {
     try {
       for (let hop = 0; ; hop++) {
         const target = this.#admit(url, worldException);
-        const answer = await this.#exchange(target, method, headers, body, maxBytes, followRedirects, stop.signal);
+        const answer = await this.#exchange(target, method, headers, body, maxBytes, followRedirects, stop.signal, options.onResponse);
         if (answer.body) return { url: url.href, status: answer.status, statusText: answer.statusText, headers: answer.headers, body: answer.body };
 
         if (hop >= MAX_REDIRECTS) refuse(`more than ${MAX_REDIRECTS} redirects`);
@@ -412,7 +414,7 @@ export class NetPolicy {
   }
 
   /** One request and its answer: the body, or (for a redirect to follow) the headers only. */
-  async #exchange(target: Target, method: string, headers: Record<string, string>, body: Uint8Array | undefined, maxBytes: number, follow: boolean, signal: AbortSignal): Promise<Exchange> {
+  async #exchange(target: Target, method: string, headers: Record<string, string>, body: Uint8Array | undefined, maxBytes: number, follow: boolean, signal: AbortSignal, onResponse?: (headers: Record<string, string>) => void): Promise<Exchange> {
     const { url, hostname, isWorld } = target;
     const secure = url.protocol === 'https:';
     const dialled = this.#dial?.(hostname, target.port);
@@ -494,6 +496,11 @@ export class NetPolicy {
         if (encoding !== 'identity' && encoding !== '') return fail(new SafeFetchError('network', `the server sent a ${encoding}-encoded body although none was asked for`));
         const declared = Number(answer.headers['content-length']);
         if (method !== 'HEAD' && Number.isFinite(declared) && declared > maxBytes) return fail(tooLarge(maxBytes));
+        try {
+          onResponse?.(answer.headers);
+        } catch (error) {
+          return fail(error);
+        }
 
         const chunks: Buffer[] = [];
         let received = 0;
@@ -503,7 +510,15 @@ export class NetPolicy {
           chunks.push(chunk);
         });
         response.on('error', fail);
-        response.on('end', () => finish(null, { ...answer, body: new Uint8Array(Buffer.concat(chunks)) }));
+        // One copy, into memory of its own: never a view into Node's buffer pool, whose other
+        // contents `.buffer` would hand on
+        response.on('end', () => {
+          const joined = Buffer.allocUnsafeSlow(received);
+          let offset = 0;
+          for (const chunk of chunks) offset += chunk.copy(joined, offset);
+          chunks.length = 0;
+          finish(null, { ...answer, body: new Uint8Array(joined.buffer, 0, received) });
+        });
         // The connection went away before the body was complete
         response.on('close', () => fail(new SafeFetchError('network', 'the connection closed before the response was complete')));
       });

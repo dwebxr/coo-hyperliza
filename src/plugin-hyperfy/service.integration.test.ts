@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeServers, startServer } from './test-support/net';
 import { inspect } from 'node:util';
 
@@ -409,6 +409,63 @@ describe('HyperfyService chat provenance', () => {
     expect(runtime.emitEvent).toHaveBeenCalledWith(hyperfyEventType.MESSAGE_RECEIVED, expect.objectContaining({ message: expect.objectContaining({ content: expect.objectContaining({ text: 'm1' }) }) }));
   });
 
+  describe('which announcements are for the agent', () => {
+    /** The chat service with the real tip wallet signed in and shown as receiving tips by the world */
+    async function receivingTips() {
+      const ctx = chatService();
+      const account = privateKeyToAccount(generatePrivateKey());
+      ctx.s.tipWallet = new TipWallet(ctx.world.network, account, { host: 'play.world.test', selfId: () => 'coo' });
+      await signIn(ctx.s.tipWallet, ctx.world.network, ctx.sent, account);
+      ctx.world.network.onEvmWalletStatus({ verified: true, wallet: account.address });
+      // The engine finds no 'coo' entity to modify (console.error, silenced)
+      ctx.world.network.onEntityModified({ id: 'coo', evmTips: true });
+      expect(ctx.s.tipWallet.receiving).toBe(true);
+      ctx.sent.length = 0;
+      const manager = new MessageManager(ctx.runtime);
+      const handleMessage = vi.spyOn(manager, 'handleMessage');
+      ctx.s.messageManager = manager;
+      ctx.s.startChatSubscription();
+      const thanks = () => ctx.sent.filter(([name, data]) => name === 'chatAdded' && String(data.body).includes('投げゼニ'));
+      return { ...ctx, handleMessage, thanks };
+    }
+    const player = (world: any, id: string, name: string) => world.entities.items.set(id, { data: { id, type: 'player', name } });
+
+    beforeEach(() => void vi.spyOn(console, 'error').mockImplementation(() => {}));
+
+    it('does not thank for a public announcement to its name while another player present has that name, however it is spelled', async () => {
+      for (const namesake of ['Coo', ' Coo​ ', 'Coo‮']) {
+        const { s, world, handleMessage, thanks } = await receivingTips();
+        player(world, 'p2', namesake);
+        world.network.onChatAdded(worldNotice('n1', 'Alice tipped Coo 100 JPYC'));
+        await vi.waitFor(() => expect(handleMessage).toHaveBeenCalledTimes(1));
+        await s.chatIntake.idle();
+        s.tipWallet.stop();
+        expect(thanks()).toEqual([]);
+      }
+    });
+
+    it('thanks for the "(only you)" notice, which the world sends to the recipient alone, also while a namesake is present', async () => {
+      const { s, world, handleMessage, thanks } = await receivingTips();
+      player(world, 'p2', 'Coo');
+      world.network.onChatAdded(worldNotice('n1', '(only you) Alice tipped you 100 JPYC'));
+      await vi.waitFor(() => expect(handleMessage).toHaveBeenCalledTimes(1));
+      await s.chatIntake.idle();
+      s.tipWallet.stop();
+      expect(thanks()).toHaveLength(1);
+    });
+
+    it("thanks for a public announcement to the agent's name as the world writes it, while nobody else present has it", async () => {
+      const { s, world, handleMessage, thanks } = await receivingTips();
+      world.entities.player.data.name = `Coo​  the ${'o'.repeat(40)}`;
+      player(world, 'p2', 'Coo');
+      world.network.onChatAdded(worldNotice('n1', `Alice tipped ${Array.from(`Coo the ${'o'.repeat(40)}`).slice(0, 32).join('')} 100 JPYC`));
+      await vi.waitFor(() => expect(handleMessage).toHaveBeenCalledTimes(1));
+      await s.chatIntake.idle();
+      s.tipWallet.stop();
+      expect(thanks()).toHaveLength(1);
+    });
+  });
+
   it('still thanks for a tip confirmed after "Receive tips" was switched off again on the same connection', async () => {
     const { s, runtime, world, sent } = chatService();
     const account = privateKeyToAccount(generatePrivateKey());
@@ -562,10 +619,24 @@ describe('HyperfyService chat intake (the path from a chatAdded packet to a turn
     const history = Array.from({ length: 50 }, (_, i) => (i % 5 === 0 ? worldNotice(`h${i}`, 'Alice tipped Coo 1 JPYC', soon) : cooWorldChat(`h${i}`, 'p1', 'Alice', `Coo, line ${i}`, soon)));
     world.network.onSnapshot({ ...cooWorldSnapshot({ chat: history }), entities: [] });
     expect(world.chat.msgs).toHaveLength(50);
-    // The same ids coming again live are new messages to a client that only saw them as history
     send('live');
     await s.chatIntake.idle();
     expect(ids()).toEqual(['live']);
+  });
+
+  it.each([
+    ['the subscription starts before the snapshot', true],
+    ['the snapshot came before the subscription', false],
+  ])('does not make a history message a turn when the world sends it again live with the same id: %s', async (_what, subscribeFirst) => {
+    const { s, world, ids } = chatSetup();
+    if (subscribeFirst) s.startChatSubscription();
+    world.network.onSnapshot({ ...cooWorldSnapshot({ chat: [cooWorldChat('h1', 'p1', 'Alice', 'Coo, earlier')] }), entities: [] });
+    if (!subscribeFirst) s.startChatSubscription();
+    world.network.onChatAdded(cooWorldChat('h1', 'p1', 'Alice', 'Coo, earlier'));
+    world.network.onChatAdded(cooWorldChat('m2', 'p1', 'Alice', 'Coo, now'));
+    await s.chatIntake.idle();
+    expect(ids()).toEqual(['m2']);
+    expect(s.chatIntake.stats()).toMatchObject({ duplicate: 1, rateLimited: 0 });
   });
 
   it('keeps malformed chat out of the history and keeps working: bad history elements, a history that is no list, bad packets', async () => {
@@ -588,6 +659,26 @@ describe('HyperfyService chat intake (the path from a chatAdded packet to a turn
     await s.chatIntake.idle();
     expect(ids()).toEqual(['after']);
     expect(world.chat.msgs.map((m: any) => m.id)).toEqual(['after']);
+  });
+
+  it('says that the world sent malformed chat at most once per 10 s, with the count since the last line', () => {
+    vi.useFakeTimers();
+    try {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      // An earlier test's spy on console.warn may still hold its calls
+      warn.mockClear();
+      const { world } = chatSetup();
+      for (let i = 0; i < 500; i++) world.network.onChatAdded({ id: i, body: 'numeric id' });
+      world.network.onSnapshot({ ...cooWorldSnapshot({ chat: Array.from({ length: 50 }, () => ({ body: 'no id' })) }), entities: [] });
+      const lines = () => warn.mock.calls.flat().map(String).filter((line) => line.startsWith('[Chat] Ignored'));
+      expect(lines()).toEqual(['[Chat] Ignored 1 chat packet(s) or history element(s) that are not chat messages (the latest a chatAdded packet; 1 so far on this connection)']);
+      vi.advanceTimersByTime(10_000);
+      world.network.onChatAdded({ id: 'x', body: 42 });
+      expect(lines()).toHaveLength(2);
+      expect(lines()[1]).toBe('[Chat] Ignored 550 chat packet(s) or history element(s) that are not chat messages (the latest a chatAdded packet; 551 so far on this connection)');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps at most the last 50 elements of a longer history', () => {
@@ -648,13 +739,12 @@ describe('HyperfyService chat intake (the path from a chatAdded packet to a turn
     world.network.onChatAdded(cooWorldChat('alice-1', 'p1', 'Alice', 'Coo?'));
     await s.chatIntake.idle();
     expect(ids()).toEqual([...Array.from({ length: 8 }, (_, i) => `flood-${i}`), 'alice-1']);
-    expect(warn.mock.calls.flat().filter((line) => String(line).includes('rate limit'))).toEqual([
-      '[Chat] Dropped 1 message from senders over their rate limit',
-      '[Chat] Dropped 21 messages from senders over their rate limit',
-    ]);
+    // The other 21 are counted (and said with the next line, 10 s later at the earliest)
+    expect(warn.mock.calls.flat().filter((line) => String(line).includes('rate limit'))).toEqual(['[Chat] Dropped 1 message from senders over their rate limit']);
+    expect(s.chatIntake.stats().rateLimited).toBe(22);
   });
 
-  it('keeps at most 20 messages waiting behind a slow turn, dropping the oldest', async () => {
+  it('keeps at most 20 messages waiting behind a slow turn: with one each from 25 people, the last five are turned away', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const { s, world } = chatSetup();
     const order: string[] = [];
@@ -672,7 +762,7 @@ describe('HyperfyService chat intake (the path from a chatAdded packet to a turn
     expect(s.chatIntake.waiting).toBe(20);
     finishFirst();
     await s.chatIntake.idle();
-    expect(order).toEqual(['slow', ...Array.from({ length: 20 }, (_, i) => `w${i + 5}`)]);
+    expect(order).toEqual(['slow', ...Array.from({ length: 20 }, (_, i) => `w${i}`)]);
   });
 
   it('handles nothing before the agent has a player of its own', async () => {

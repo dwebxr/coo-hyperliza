@@ -5,7 +5,9 @@
  * (src/core/systems/ServerNetwork.js tipConfirmed / announceTip)
  *
  * An announcement is all the agent has: it checks nothing on chain. What is read from one is what
- * the world announced, not a payment the agent verified.
+ * the world announced, not a payment the agent verified. The public announcement names the
+ * recipient only by display name, and display names are not identities: it is the agent's only
+ * when no other player present has the same name (namesakeOf).
  */
 
 import { SHOWN_NAME_MAX, escapeRegExp, shownName } from './text';
@@ -15,6 +17,8 @@ export interface TipNotice {
   fromName: string;
   amount: string;
   token: string;
+  /** 'privately': the "(only you)" notice the world sends the recipient alone; 'by-name': the public announcement */
+  addressed: 'privately' | 'by-name';
 }
 
 export const TIP_NAME_MAX_CODE_POINTS = SHOWN_NAME_MAX;
@@ -26,23 +30,50 @@ const AMOUNT_AND_TOKEN = `(${AMOUNT}) (${TOKEN})`;
 const PRIVATE_NOTICE = new RegExp(`^\\(only you\\) (.+) tipped you ${AMOUNT_AND_TOKEN}$`);
 
 /**
+ * A name as coo-world writes it into a tip announcement (ServerNetwork.js tipConfirmed, shown()):
+ * control, format and line/paragraph separator characters become spaces, whitespace runs one
+ * space, trimmed, the first 32 code points, 'Anonymous' when nothing is left.
+ */
+export function announcedName(name: unknown): string {
+  const text = String(name ?? '')
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return Array.from(text).slice(0, 32).join('') || 'Anonymous';
+}
+
+/**
  * The tip in a world notice when it was sent to the agent (named agentName in the world); else
- * null. The tipper's name is cut to TIP_NAME_MAX_CODE_POINTS code points without control or
- * format characters, whatever the notice held.
+ * null. The public announcement is matched against the agent's name as the world writes it
+ * (announcedName). The tipper's name is cut to TIP_NAME_MAX_CODE_POINTS code points without
+ * control or format characters, whatever the notice held.
  */
 export function parseTipNotice(body: string | undefined | null, agentName: string): TipNotice | null {
   if (!body) return null;
   const text = body.trim();
   const privateMatch = text.match(PRIVATE_NOTICE);
-  if (privateMatch) return tipNotice(privateMatch);
+  if (privateMatch) return tipNotice(privateMatch, 'privately');
   if (!agentName.trim()) return null;
-  const publicMatch = text.match(new RegExp(`^(.+) tipped ${escapeRegExp(agentName.trim())} ${AMOUNT_AND_TOKEN}$`));
-  return publicMatch ? tipNotice(publicMatch) : null;
+  const publicMatch = text.match(new RegExp(`^(.+) tipped ${escapeRegExp(announcedName(agentName))} ${AMOUNT_AND_TOKEN}$`));
+  return publicMatch ? tipNotice(publicMatch, 'by-name') : null;
 }
 
-function tipNotice(match: RegExpMatchArray): TipNotice {
+function tipNotice(match: RegExpMatchArray, addressed: TipNotice['addressed']): TipNotice {
   // coo-world writes 'Anonymous' for a name with nothing visible in it
-  return { fromName: shownName(match[1], TIP_NAME_MAX_CODE_POINTS) || 'Anonymous', amount: match[2], token: match[3] };
+  return { fromName: shownName(match[1], TIP_NAME_MAX_CODE_POINTS) || 'Anonymous', amount: match[2], token: match[3], addressed };
+}
+
+/**
+ * The id of a player other than the agent (`selfId`) who is present with the agent's name as the
+ * world writes it into announcements, or null. While there is one, a public announcement of a tip
+ * "to" that name may be for them.
+ */
+export function namesakeOf(agentName: string, players: Iterable<[string, { data?: { type?: unknown; name?: unknown } } | undefined]>, selfId: unknown): string | null {
+  const shown = announcedName(agentName);
+  for (const [id, entity] of players) {
+    if (id !== selfId && entity?.data?.type === 'player' && announcedName(entity.data.name) === shown) return id;
+  }
+  return null;
 }
 
 export function tipThanks(tip: TipNotice, japanese: boolean): string {

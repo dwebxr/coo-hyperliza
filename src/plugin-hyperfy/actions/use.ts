@@ -14,8 +14,11 @@ import { AnthropicRefusalError } from '../../anthropic-models';
 import { AgentActions, type PerformActionOutcome } from '../systems/actions';
 import { AgentControls } from '../systems/controls';
 import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
+import { shownName } from '../lib/text';
 
 const USE_ITEM = 'HYPERFY_USE_ITEM';
+// An entity id in a reply (chosen by the model or a caller): one short line, nothing invisible
+const ENTITY_ID_MAX = 64;
 
 // What the player is told when the agent reached the item but nothing was used
 const USE_FAILURE_TEXT: Record<Exclude<PerformActionOutcome, 'started'>, string> = {
@@ -102,7 +105,7 @@ export const hyperfyUseItemAction: Action = {
     const entity = world.entities?.items?.get(targetEntityId);
     const targetPosition = entity?.root?.position
     if (!targetPosition) {
-      await tellFailure(callback, USE_ITEM, `Could not locate entity ${targetEntityId}.`, { metadata: { error: 'entity_not_found' } });
+      await tellFailure(callback, USE_ITEM, `Could not locate entity ${shownName(String(targetEntityId), ENTITY_ID_MAX)}.`, { metadata: { error: 'entity_not_found' } });
       return actionFailed(USE_ITEM, 'entity not found', { targetEntityId });
     }
 
@@ -123,7 +126,7 @@ export const hyperfyUseItemAction: Action = {
     }
 
     await callback({
-      text: `Using item: ${targetEntityId}`,
+      text: `Using item: ${shownName(String(targetEntityId), ENTITY_ID_MAX)}`,
       actions: [USE_ITEM],
       source: 'hyperfy',
       metadata: { targetEntityId, status: 'triggered' }

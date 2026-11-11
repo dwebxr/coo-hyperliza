@@ -741,6 +741,8 @@ export class HyperfyService extends Service {
       },
     })
     this.chatIntake = intake
+    // A message of the snapshot's history that the world sends again live is not a new turn
+    chat.onHistory((ids) => intake.markSeen(ids))
     // Only what the world's server sent on this connection: not app scripts' chat (any fromId),
     // not the agent's own posts, not the snapshot's history (lib/world-chat.ts)
     chat.onLive((msg) => void intake.accept(msg))

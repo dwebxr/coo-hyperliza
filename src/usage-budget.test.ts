@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   AI_PURPOSE_MAX_TOKENS,
   type AiReservation,
+  SKIP_BUCKET_MS,
   UsageBudget,
   UsageLimitError,
   type UsageLimits,
@@ -108,9 +109,21 @@ describe('usageLimitProblems', () => {
     const problems = usageLimitProblems({ AI_MAX_CALLS_PER_HOUR: 'abc', AI_MAX_TOKENS_SHOULD_RESPOND: '-5', USAGE_REPORT_INTERVAL_MIN: 'hourly', VISION_MAX_PER_HOUR: '3' });
     expect(problems).toEqual([
       '[Usage] AI_MAX_CALLS_PER_HOUR="abc" is not a number of 0 or more. Leave it empty for the default (for a limit: no limit), or set a number (0 turns that use off).',
-      '[Usage] AI_MAX_TOKENS_SHOULD_RESPOND="-5" is not a number of 0 or more. Leave it empty for the default (for a limit: no limit), or set a number (0 turns that use off).',
+      '[Usage] AI_MAX_TOKENS_SHOULD_RESPOND="-5" is not a number of 0 or more. Leave it empty for the default cap, or set a number of output tokens above 0.',
       '[Usage] USAGE_REPORT_INTERVAL_MIN="hourly" is not a number of 0 or more. Leave it empty for the default (for a limit: no limit), or set a number (0 turns that use off).',
     ]);
+  });
+
+  it('refuses 0 for a per-purpose cap, which sets the size of a reply and is not a switch, and says so', () => {
+    for (const key of ['AI_MAX_TOKENS_CHAT', 'AI_MAX_TOKENS_SHOULD_RESPOND', 'AI_MAX_TOKENS_USE_ITEM']) {
+      for (const value of ['0', ' 0 ', '0.4']) {
+        expect(usageLimitProblems({ [key]: value }), `${key}=${value}`).toEqual([
+          `[Usage] ${key}=0: AI_MAX_TOKENS_<PURPOSE> sets how many output tokens such a reply may have; it does not turn that use off. Leave it empty for the default cap, or set a number above 0 (AI_MAX_CALLS_PER_HOUR=0 turns Claude off).`,
+        ]);
+      }
+    }
+    // 0 still means off for a limit, and a cap of 1 is a cap
+    expect(usageLimitProblems({ AI_MAX_CALLS_PER_HOUR: '0', AI_MAX_TOKENS_PER_DAY: '0', AI_MAX_TOKENS_CHAT: '1' })).toEqual([]);
   });
 
   it('shows only the start of a value, on one line (it could be a secret pasted into the wrong line)', () => {
@@ -258,29 +271,40 @@ describe('UsageBudget', () => {
     const budget = new UsageBudget({ ...noLimits, visionPerHour: 1, ttsCharsPerDay: 100, sttSecondsPerDay: 60 }, c.now);
     expect(budget.reserveVision()).not.toBeNull();
     expect(budget.reserveVision()).toBeNull();
-    expect(budget.reserveTts(99)).toBe(true);
+    expect(budget.reserveTts(99)).not.toBeNull();
     expect(budget.reserveStt(59.5)).toBe(true);
     expect([budget.visionAvailable(), budget.ttsAvailable(), budget.sttAvailable()]).toEqual([false, true, true]);
     // One character and half a second are left
-    expect(budget.reserveTts(2)).toBe(false);
+    expect(budget.reserveTts(2)).toBeNull();
     expect(budget.reserveStt(0.6)).toBe(false);
     expect(budget.snapshot(DAY)).toMatchObject({ ttsChars: 99, sttSeconds: 59.5 });
-    expect(budget.reserveTts(1)).toBe(true);
+    expect(budget.reserveTts(1)).not.toBeNull();
     expect(budget.reserveStt(0.5)).toBe(true);
     expect([budget.ttsAvailable(), budget.sttAvailable(), budget.aiAvailable()]).toEqual([false, false, true]);
     c.advance(HOUR);
     expect(budget.visionAvailable()).toBe(true);
     expect(budget.ttsAvailable()).toBe(false);
     c.advance(DAY);
-    expect(budget.reserveTts(100)).toBe(true);
+    expect(budget.reserveTts(100)).not.toBeNull();
+  });
+
+  it('gives text-to-speech characters back when their reservation is released, once', () => {
+    const budget = new UsageBudget({ ...noLimits, ttsCharsPerDay: 100 }, clock().now);
+    const refused = budget.reserveTts(100)!;
+    expect(budget.reserveTts(1)).toBeNull();
+    refused.release();
+    refused.release();
+    expect(budget.snapshot(DAY).ttsChars).toBe(0);
+    expect(budget.reserveTts(100)).not.toBeNull();
+    expect(budget.reserveTts(1)).toBeNull();
   });
 
   it('admits no voice or vision at a limit of 0, and nothing that is not an amount', () => {
     const off = new UsageBudget({ ...noLimits, visionPerHour: 0, ttsCharsPerDay: 0, sttSecondsPerDay: 0, aiCallsPerHour: 0 }, clock().now);
-    expect([off.reserveVision(), off.reserveTts(1), off.reserveTts(0), off.reserveStt(0.01), off.reserveStt(0)]).toEqual([null, false, false, false, false]);
+    expect([off.reserveVision(), off.reserveTts(1), off.reserveTts(0), off.reserveStt(0.01), off.reserveStt(0)]).toEqual([null, null, null, false, false]);
     expect(off.reserveAi(call(), 0)).toBe('AI_MAX_CALLS_PER_HOUR=0');
     const open = new UsageBudget(noLimits, clock().now);
-    expect([open.reserveTts(Number.NaN), open.reserveStt(-1), open.reserveTts(Number.POSITIVE_INFINITY)]).toEqual([false, false, false]);
+    expect([open.reserveTts(Number.NaN), open.reserveStt(-1), open.reserveTts(Number.POSITIVE_INFINITY)]).toEqual([null, false, null]);
     expect(open.snapshot(DAY)).toMatchObject({ ttsChars: 0, sttSeconds: 0 });
   });
 
@@ -327,5 +351,30 @@ describe('UsageBudget', () => {
     c.advance(HOUR + 1);
     expect(budget.snapshot(HOUR).ai.calls).toBe(0);
     expect(budget.snapshot(DAY).ai.calls).toBe(2);
+  });
+
+  it('counts refused uses in at most a day of one-minute buckets, however many there are, and reports them per window', () => {
+    const c = clock();
+    const budget = new UsageBudget(noLimits, c.now);
+    // Two days of a refused use every second, of each kind in turn
+    const kinds = ['ai-call', 'offline-reply', 'vision', 'tts', 'stt'] as const;
+    for (let second = 0; second < 2 * 24 * 3600; second++) {
+      budget.recordSkip(kinds[second % kinds.length]);
+      c.advance(1000);
+      expect(budget.skipBuckets).toBeLessThanOrEqual(DAY / SKIP_BUCKET_MS + 1);
+    }
+    expect(budget.skipBuckets).toBeGreaterThanOrEqual(DAY / SKIP_BUCKET_MS);
+    // The last hour: 3,600 refusals, 720 of each kind, give or take the minute the window starts in
+    const hour = budget.snapshot(HOUR).skipped;
+    for (const kind of kinds) {
+      expect(hour[kind]).toBeGreaterThanOrEqual(720);
+      expect(hour[kind]).toBeLessThanOrEqual(720 + 12);
+    }
+    expect(formatUsageReport(budget.snapshot(HOUR))).toMatch(/over limit: (ai-call|offline-reply|vision|tts|stt) \d+, /);
+    // Nothing older than a day is counted
+    const day = budget.snapshot(DAY).skipped;
+    expect(Object.values(day).reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(24 * 3600 + 60);
+    c.advance(DAY + SKIP_BUCKET_MS);
+    expect(Object.values(budget.snapshot(DAY).skipped).every((n) => n === 0)).toBe(true);
   });
 });

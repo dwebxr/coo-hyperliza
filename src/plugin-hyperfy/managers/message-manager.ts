@@ -10,8 +10,8 @@ import { type TurnContext, neverAbortedSignal, noteDelivered, runTurn } from "..
 import { postAgentChat, worldChat } from "../lib/world-chat";
 import type { ChatMessage, ChatTurn } from "../lib/chat-intake";
 import { isJapanese } from "../lib/simple-commands";
-import { type TipNotice, TipThanksLimiter, parseTipNotice, tipThanks, tipThought } from "../lib/tip-notice";
-import { oneLine, shownName } from "../lib/text";
+import { type TipNotice, TipThanksLimiter, announcedName, namesakeOf, parseTipNotice, tipThanks, tipThought } from "../lib/tip-notice";
+import { oneLine, shownName, shownNames } from "../lib/text";
 import moment from 'moment'
 import { uuid } from '../hyperfy/src/core/utils';
 
@@ -19,7 +19,10 @@ export type { ChatTurn };
 
 // One message of the history in a prompt: what a stored memory holds was bounded when it was
 // received, but rows stored by earlier versions were not
-const HISTORY_TEXT_MAX_CODE_POINTS = 1000;
+export const HISTORY_TEXT_MAX_CODE_POINTS = 1000;
+// The action names of one stored reply in a prompt: a reply names a few; each is one short line
+export const PROMPT_ACTIONS_MAX = 8;
+export const PROMPT_ACTION_NAME_MAX = 48;
 // How often the log says that tip announcements were not thanked for (they are counted)
 const TIP_SKIP_LOG_INTERVAL_MS = 60_000;
 
@@ -83,6 +86,9 @@ export class MessageManager {
         if (!tip) return
         if (!worldChat(world)?.isLiveFromNetwork(msg)) {
           logger.warn(`[Tips] Ignoring a tip announcement that did not come from the world's server`)
+        } else if (tip.addressed === 'by-name' && namesakeOf(agentName, world.entities.items?.entries?.() ?? [], agentPlayerId)) {
+          // The world names the recipient only by display name: this one may be the namesake's
+          logger.info(`[Tips] Ignoring a tip announcement to "${announcedName(agentName)}": another player here has that name`)
         } else if (!service.getTipWallet?.()?.receivedOnThisConnection) {
           logger.info(`[Tips] Ignoring a tip announcement: the agent has not been receiving tips on this connection`)
         } else if (!this.tipThanksLimiter.allow(tip.fromName)) {
@@ -361,10 +367,8 @@ export class MessageManager {
   
         const timestamp = formatTimestamp(message.createdAt); // assuming this is already defined
   
-        const actionString =
-          messageActions && messageActions.length > 0
-            ? ` (${messageActions.join(", ")})`
-            : "";
+        const actionNames = shownNames(messageActions, PROMPT_ACTIONS_MAX, PROMPT_ACTION_NAME_MAX);
+        const actionString = actionNames.length > 0 ? ` (${actionNames.join(", ")})` : "";
   
         const textPart = messageText ? `: ${messageText}` : "";
   

@@ -16,8 +16,9 @@
  * the API is called with it. One more run (`off-locked`, skipped with --no-locked) sets neither: the
  * agent must then listen on loopback only and keep its API locked (401 without a token) while it
  * still boots, which is checked from its log. A last run (`off-bad-limit`, skipped with
- * --no-bad-limit) sets AI_MAX_CALLS_PER_HOUR to something that is not a number: the agent must
- * say which variable it cannot read and exit by itself, without connecting to a world.
+ * --no-bad-limit) sets AI_MAX_CALLS_PER_HOUR to something that is not a number and
+ * AI_MAX_TOKENS_CHAT to 0: the agent must say which variables it refuses and exit by itself,
+ * without connecting to a world.
  *
  * Per run, in <dir>/run-<mode>/ (created, and removed afterwards unless --keep):
  *   package.json   the repository's, with `scripts` replaced (see below)
@@ -275,7 +276,7 @@ async function smoke(mode, { locked = false, badLimit = false } = {}) {
       ANTHROPIC_API_KEY: dummyAnthropicKey,
       TIP_WALLET_PRIVATE_KEY: dummyTipKey,
       HYPERFY_WORLD_SCRIPTS: mode,
-      ...(badLimit ? { AI_MAX_CALLS_PER_HOUR: BAD_LIMIT } : {}),
+      ...(badLimit ? { AI_MAX_CALLS_PER_HOUR: BAD_LIMIT, AI_MAX_TOKENS_CHAT: '0' } : {}),
       // Nothing may be installed: node_modules is a link to the repository's
       ELIZA_NO_AUTO_INSTALL: 'true',
       ELIZA_NO_PLUGIN_AUTO_INSTALL: 'true',
@@ -354,6 +355,7 @@ async function smoke(mode, { locked = false, badLimit = false } = {}) {
       await waitFor('the agent to exit', () => false);
       check('the agent exits by itself, with a failure status, when a usage limit is not a number', !!exited && exited.code !== 0 && exited.signal === null, exited ? JSON.stringify(exited) : `still running after ${BOOT_TIMEOUT_MS / 1000}s`);
       check('it says which variable it cannot read', logText().includes(`[Usage] AI_MAX_CALLS_PER_HOUR="${BAD_LIMIT}" is not a number of 0 or more`), (logText().match(/\[Usage\] AI_MAX_CALLS_PER_HOUR[^\n]*/) ?? [''])[0].slice(0, 200));
+      check('it refuses a per-purpose cap of 0, which is a size and not a switch', logText().includes('[Usage] AI_MAX_TOKENS_CHAT=0: AI_MAX_TOKENS_<PURPOSE> sets how many output tokens'), (logText().match(/\[Usage\] AI_MAX_TOKENS_CHAT[^\n]*/) ?? [''])[0].slice(0, 200));
       check('it says that it is not starting', logText().includes('[Usage] Not starting'));
       check('it never tried to connect to a world', !logText().includes('Attempting automatic connection') && !logText().includes('Starting Hyperfy service'));
       let answered = false;

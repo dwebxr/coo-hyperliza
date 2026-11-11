@@ -140,6 +140,51 @@ function treeMemory(root) {
 const GiB = 1024 * 1024 * 1024;
 const inGiB = (bytes) => `${(bytes / GiB).toFixed(2)} GiB`;
 
+/** Every process now: pid, parent and process group */
+function processTable() {
+  return spawnSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], { encoding: 'utf8' }).stdout.split('\n').map((line) => line.trim().split(/\s+/).map(Number)).filter((row) => row.length === 3 && row.every(Number.isFinite));
+}
+
+/**
+ * A GLB of one mesh with two primitives: the first material has a texture (a 1x1 PNG), the second
+ * brings `extras` as given. Built here, in memory.
+ */
+function twoMaterialGlb(secondExtras) {
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+  const positions = Buffer.from(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]).buffer);
+  const imageBytes = Math.ceil(png.length / 4) * 4;
+  const bin = Buffer.alloc(imageBytes + positions.length);
+  png.copy(bin, 0);
+  positions.copy(bin, imageBytes);
+  const json = {
+    asset: { version: '2.0' },
+    buffers: [{ byteLength: bin.length }],
+    bufferViews: [{ buffer: 0, byteLength: png.length }, { buffer: 0, byteOffset: imageBytes, byteLength: positions.length }],
+    accessors: [{ bufferView: 1, count: 3, type: 'VEC3', componentType: 5126, min: [0, 0, 0], max: [1, 1, 0] }],
+    images: [{ bufferView: 0, mimeType: 'image/png' }],
+    textures: [{ source: 0 }],
+    materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 } } }, { extras: secondExtras }],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0 }, material: 0 }, { attributes: { POSITION: 0 }, material: 1 }] }],
+    nodes: [{ mesh: 0 }],
+    scenes: [{ nodes: [0] }],
+    scene: 0,
+  };
+  const text = Buffer.from(JSON.stringify(json));
+  const jsonChunk = Buffer.alloc(Math.ceil(text.length / 4) * 4, 0x20);
+  text.copy(jsonChunk);
+  const glb = Buffer.alloc(12 + 8 + jsonChunk.length + 8 + bin.length);
+  glb.writeUInt32LE(0x46546c67, 0);
+  glb.writeUInt32LE(2, 4);
+  glb.writeUInt32LE(glb.length, 8);
+  glb.writeUInt32LE(jsonChunk.length, 12);
+  glb.writeUInt32LE(0x4e4f534a, 16);
+  jsonChunk.copy(glb, 20);
+  glb.writeUInt32LE(bin.length, 20 + jsonChunk.length);
+  glb.writeUInt32LE(0x004e4942, 24 + jsonChunk.length);
+  bin.copy(glb, 28 + jsonChunk.length);
+  return new Uint8Array(glb);
+}
+
 /** Remote ends of the TCP/UDP sockets a process tree holds right now */
 export function remoteEnds(rootPid) {
   const out = spawnSync('lsof', ['-nP', '-a', '-p', processTree(rootPid).join(','), '-iTCP', '-iUDP', '-Fn'], { encoding: 'utf8' }).stdout;
@@ -284,11 +329,41 @@ async function main() {
       cancelled.every((outcome) => outcome === 'AbortError') && keptAfter.textures === keptBefore.textures && !keptAfter.avatar,
       `${cancelled.join(', ')}; textures ${keptBefore.textures} -> ${keptAfter.textures}, avatar kept: ${keptAfter.avatar}`
     );
+    // A material id from the file that cannot be used as one fails the load, and what the load had kept by then goes too
+    const keysBefore = await page.evaluate(() => window.texturesMap.size);
+    const texturesBeforeMaterialCheck = await page.evaluate(() => [...window.texturesMap.keys()]);
+    const goodGlb = await manager.loadGlbBytes(twoMaterialGlb({ note: 'fine' }), { signal: new AbortController().signal }).then(() => 'loaded', (error) => String(error?.message ?? error));
+    const keysWithGood = await page.evaluate(() => window.texturesMap.size);
+    const badGlb = await manager.loadGlbBytes(twoMaterialGlb({ materialId: { toString: null } }), { signal: new AbortController().signal }).then(() => 'loaded', (error) => String(error?.message ?? error));
+    const keysAfterBad = await page.evaluate(() => window.texturesMap.size);
+    check(
+      "a model whose second material brings extras.materialId { toString: null } fails to load, and the first material's texture is not kept",
+      goodGlb === 'loaded' && keysWithGood === keysBefore + 1 && /materialId the page cannot use/.test(badGlb) && keysAfterBad === keysWithGood,
+      `good: ${goodGlb} (textures ${keysBefore} -> ${keysWithGood}); bad: ${badGlb.slice(0, 120)} (textures ${keysWithGood} -> ${keysAfterBad})`
+    );
+    // The good one's texture would change which one the texture-limit check below finds least recently used
+    await page.evaluate((before) => {
+      for (const key of [...window.texturesMap.keys()]) if (!before.includes(key)) window.texturesMap.delete(key);
+    }, texturesBeforeMaterialCheck);
     // Successful loads are committed at once: the page keeps no record (and so no scene) for any of them
     const texturesBeforeLoads = await page.evaluate(() => [...window.texturesMap.keys()]);
     for (let i = 0; i < 5; i++) await manager.loadGlbBytes(environmentSource, { signal: new AbortController().signal });
     const pendingAfterLoads = await page.evaluate(() => window.agentPage.pendingSettlements());
     check('after five successful model loads with a signal, the page holds no load waiting to be settled', pendingAfterLoads === 0, `${pendingAfterLoads} pending`);
+    // A commit keeps the record: a world that goes away while the commit is acknowledged still gets the load taken back
+    const commitThenRollback = await page.evaluate(async () => {
+      const pixel = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+      const id = await window.agentPage.registerTexture(pixel, 'image/png', 'smoke', 'https://world.invalid/c.png', 'op-smoke-commit');
+      window.agentPage.settle('op-smoke-commit', 'commit');
+      const afterCommit = { pending: window.agentPage.pendingSettlements(), kept: window.texturesMap.has(`${id}:smoke`) };
+      window.agentPage.settle('op-smoke-commit', 'rollback');
+      return { afterCommit, gone: !window.texturesMap.has(`${id}:smoke`), pending: window.agentPage.pendingSettlements() };
+    });
+    check(
+      'a committed load stays on record until it is forgotten: taken back after its commit, its texture goes',
+      commitThenRollback.afterCommit.pending === 1 && commitThenRollback.afterCommit.kept && commitThenRollback.gone && commitThenRollback.pending === 0,
+      JSON.stringify(commitThenRollback)
+    );
     // Their textures would change which one the texture-limit check below finds least recently used
     await page.evaluate((before) => {
       for (const key of [...window.texturesMap.keys()]) if (!before.includes(key)) window.texturesMap.delete(key);
@@ -303,6 +378,23 @@ async function main() {
     const hdrBytes = file('assets/day2.hdr');
     await manager.loadEnvironmentHDR(hdrBytes);
     check('day2.hdr: parsed from bytes and set as environment and background', await page.evaluate(() => window.environment?.isDataTexture === true && window.scene.environment === window.environment && window.environment.image.width > 0));
+    // An HDR load that fails after it was parsed (here: drawing throws) leaves the environment the page had
+    await page.evaluate(() => {
+      window.__smokeEnvironment = window.environment;
+      window.__smokeRender = window.renderer.render;
+      window.renderer.render = () => {
+        throw new Error('drawing failed (smoke)');
+      };
+    });
+    const failedHdr = await manager.loadEnvironmentHDR(hdrBytes, { signal: new AbortController().signal }).then(() => 'loaded', (error) => String(error?.message ?? error));
+    const afterFailedHdr = await page.evaluate(() => {
+      window.renderer.render = window.__smokeRender;
+      const kept = window.environment === window.__smokeEnvironment && window.scene.environment === window.environment && window.scene.background === window.environment;
+      delete window.__smokeRender;
+      delete window.__smokeEnvironment;
+      return { kept, pending: window.agentPage.pendingSettlements() };
+    });
+    check('an HDR load that fails in the page leaves the environment it had, and no record', /drawing failed/.test(failedHdr) && afterFailedHdr.kept && afterFailedHdr.pending === 0, `${failedHdr.slice(0, 80)}; ${JSON.stringify(afterFailedHdr)}`);
 
     console.log("\n== loading from memory gives what three's own URL loaders give (through blob: URLs, which need no network)");
     const toBase64 = (bytes) => Buffer.from(bytes).toString('base64');
@@ -489,6 +581,7 @@ async function main() {
     const HARD_STOP_BYTES = 3.5 * GiB;
     const HARD_STOP_MS = 20_000;
     const killedPid = manager.browser.process().pid;
+    const killedGeneration = manager.currentBrowser().generation;
     const started = Date.now();
     const runaway = await manager.evaluateWatched(async (hardStopBytes, hardStopMs) => {
       const kept = [];
@@ -513,6 +606,15 @@ async function main() {
     const afterKill = await manager.snapshotEquirectangular().then((shot) => shot, (error) => `failed: ${error?.message ?? error}`);
     const freshPid = manager.browser?.process()?.pid;
     check('the next snapshot works, on a new browser and page', afterKill.startsWith('data:image/jpeg;base64,') && freshPid && freshPid !== killedPid, `${afterKill.slice(0, 40)}; browser pid ${killedPid} -> ${freshPid}`);
+    // Nothing of the killed generation is left: not the processes it was seen to own, not its process group
+    const { pids: ownedPids, group } = manager.watchdog.ownership(killedGeneration);
+    await sleep(1000);
+    const left = processTable().filter(([pid, , pgid]) => ownedPids.includes(pid) || (group !== null && pgid === group));
+    check(
+      'after the kill no process of the killed browser is left, by the pids it was seen to own and by its process group',
+      ownedPids.length > 1 && group === killedPid && left.length === 0,
+      `${ownedPids.length} processes owned, group ${group}; left: ${JSON.stringify(left)}`
+    );
   } catch (error) {
     check('the smoke ran to the end', false, error instanceof Error ? (error.stack ?? error.message) : String(error));
   } finally {

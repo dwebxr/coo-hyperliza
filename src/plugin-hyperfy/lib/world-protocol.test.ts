@@ -1,12 +1,35 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Packr } from 'msgpackr';
 
-// The engine's ClientNetwork imports its storage module, which reads the agent's saved session
-vi.mock('../hyperfy/src/core/storage.js', () => ({ storage: { get: () => null, set: () => {}, remove: () => {} } }));
+// The engine's ClientNetwork imports its storage module, which reads and writes the agent's saved
+// session: a stub in memory instead, never the real storage file
+const { saved } = vi.hoisted(() => ({ saved: new Map<string, unknown>() }));
+vi.mock('../hyperfy/src/core/storage.js', () => ({
+  storage: {
+    get: (key: string) => saved.get(key) ?? null,
+    // As the engine's NodeStorage does: null or undefined removes the key
+    set: (key: string, value: unknown) => void (value === null || value === undefined ? saved.delete(key) : saved.set(key, value)),
+    remove: (key: string) => void saved.delete(key),
+  },
+}));
 
 import { ClientNetwork } from '../hyperfy/src/core/systems/ClientNetwork.js';
-import { MAX_REPORTED_PACKET_IDS, MAX_SERVER_FRAME_BYTES, PACKET_NAMES, PROTOCOL_VERSION, adaptToWorldProtocol, describeClose, readServerPacket, resetReportedPacketIds, writeClientPacket } from './world-protocol';
+import {
+  MAX_QUEUED_BYTES,
+  MAX_QUEUED_PACKETS,
+  MAX_REPORTED_PACKET_IDS,
+  MAX_SERVER_FRAME_BYTES,
+  PACKET_NAMES,
+  PROTOCOL_VERSION,
+  QUEUE_OVERFLOW_CLOSE_CODE,
+  adaptToWorldProtocol,
+  describeClose,
+  readServerPacket,
+  resetReportedPacketIds,
+  writeClientPacket,
+} from './world-protocol';
 import { sessionTokenProblem } from './world-url';
+import { cooWorldSnapshot } from '../test-support/world-packets';
 
 const TOKEN = 'test-session-token';
 // How the world encodes what it sends
@@ -154,7 +177,23 @@ describe('readServerPacket', () => {
     const frame = serverPackr.pack([2, { body: TOKEN }]);
     const withTrailer = new Uint8Array([...frame, 0xc1, 0xc1]);
     readServerPacket(withTrailer);
+    expect(error).toHaveBeenCalled();
     expect(JSON.stringify(error.mock.calls)).not.toContain(TOKEN);
+  });
+
+  it('says that packets could not be read at most once per 10 s, with the count since the last line', () => {
+    vi.useFakeTimers();
+    try {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      for (let i = 0; i < 500; i++) readServerPacket(new Uint8Array([0xc1]));
+      expect(error.mock.calls.map(([line]) => line)).toEqual(['[Hyperfy] Could not read 1 packet(s) from the world (the latest 1 bytes)']);
+      vi.advanceTimersByTime(10_000);
+      readServerPacket(new Uint8Array([0xc1, 0xc1]));
+      expect(error.mock.calls.map(([line]) => line).at(-1)).toBe('[Hyperfy] Could not read 500 packet(s) from the world (the latest 2 bytes)');
+      expect(error).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('does not echo a non-numeric id', () => {
@@ -270,17 +309,50 @@ describe('adaptToWorldProtocol on the engine ClientNetwork', () => {
     expect(protocol.sessionToken()).toBeNull();
     const lines = logs.flatMap((log) => log.mock.calls.flat()).map(String);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain('[Hyperfy] Not sending the saved session token');
+    expect(lines[0]).toContain('[Hyperfy] No session token on this connection');
     expect(lines[0]).toContain('is not encrypted and is not a loopback or private address');
     expect(lines.join('\n')).not.toContain(TOKEN);
   });
 
-  it('says nothing and withholds nothing when there is no saved token to protect', () => {
-    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const protocol = adaptToWorldProtocol(network, () => null);
-    network.init({ wsUrl: 'ws://world.test/ws' });
-    expect(error).not.toHaveBeenCalled();
-    expect(protocol.sessionToken()).toBeNull();
+  describe("the engine's own snapshot handler, with nothing saved yet", () => {
+    beforeEach(() => saved.clear());
+    afterEach(() => saved.clear());
+
+    /**
+     * The engine's ClientNetwork joined at `wsUrl` through the adapter, the storage being the stub
+     * above; the world systems its onSnapshot hands the snapshot to take it and do nothing.
+     */
+    function join(wsUrl: string) {
+      const takes = { deserialize() {} };
+      const engineWorld: any = { loader: { preload() {}, execPreload() {} }, environment: {}, collections: takes, settings: takes, chat: takes, blueprints: takes, entities: takes };
+      const engineNetwork: any = new ClientNetwork(engineWorld);
+      // As the service reads it: storage.get('authToken'), here the stub's map
+      const protocol = adaptToWorldProtocol(engineNetwork, () => (saved.get('authToken') as string | undefined) ?? null);
+      engineNetwork.init({ wsUrl });
+      // What the engine's flush() calls for the world's snapshot: its own ClientNetwork.onSnapshot
+      engineNetwork.onSnapshot({ ...cooWorldSnapshot(), authToken: 'guest-token-1' });
+      return { protocol, url: new URL(FakeWebSocket.instances.at(-1)!.url) };
+    }
+
+    it('keeps no guest token from a cleartext public world and gives uploads none: the agent is a new guest on every connection there', () => {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const first = join('ws://world.test/ws');
+      expect(saved.has('authToken')).toBe(false);
+      expect(first.protocol.sessionToken()).toBeNull();
+      expect(first.url.searchParams.has('authToken')).toBe(false);
+      const again = join('ws://world.test/ws');
+      expect(again.url.searchParams.has('authToken')).toBe(false);
+      expect(saved.has('authToken')).toBe(false);
+      // One line per connection, naming why
+      expect(error.mock.calls.map(([line]) => String(line))).toEqual([expect.stringContaining('[Hyperfy] No session token on this connection'), expect.stringContaining('[Hyperfy] No session token on this connection')]);
+    });
+
+    it('stores the token an encrypted world issues and uses it from then on (control)', () => {
+      const first = join('wss://world.test/ws');
+      expect(saved.get('authToken')).toBe('guest-token-1');
+      expect(first.protocol.sessionToken()).toBe('guest-token-1');
+      expect(join('wss://world.test/ws').url.searchParams.get('authToken')).toBe('guest-token-1');
+    });
   });
 
   it("does not let the engine replace the saved token with the guest token of a connection made without it", () => {
@@ -352,6 +424,84 @@ describe('adaptToWorldProtocol on the engine ClientNetwork', () => {
     socket().dispatch('message', { data: serverPackr.pack([100, {}]) });
     expect(warn).toHaveBeenCalledTimes(1);
     expect(network.queue).toEqual([['onKick', 'outdated']]);
+  });
+
+  describe('what waits for the engine to flush', () => {
+    const entityModified = (i: number, pad = 0) => serverPackr.pack([7, { id: `e${i}`, p: [i, 0, 0], ...(pad ? { pad: 'x'.repeat(pad) } : {}) }]);
+
+    function connected() {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.spyOn(console, 'log').mockImplementation(() => {});
+      adaptToWorldProtocol(network, () => TOKEN);
+      network.init({ wsUrl: 'wss://world.test/ws' });
+      const ws = socket();
+      ws.close = vi.fn(() => void (ws.readyState = 3));
+      return { ws, error, send: (frame: Uint8Array) => ws.dispatch('message', { data: frame }) };
+    }
+
+    it(`closes the connection, once, when more than ${MAX_QUEUED_PACKETS} packets wait, keeping a queued kick for the service`, () => {
+      const { ws, error, send } = connected();
+      send(serverPackr.pack([18, 'player_limit']));
+      for (let i = 0; i < MAX_QUEUED_PACKETS - 1; i++) send(entityModified(i));
+      expect(network.queue).toHaveLength(MAX_QUEUED_PACKETS);
+      expect(world.emit).not.toHaveBeenCalled();
+      send(entityModified(-1));
+      // What waited is gone but the kick; nothing more is taken from this socket
+      expect(network.queue).toEqual([['onKick', 'player_limit']]);
+      expect(ws.close).toHaveBeenCalledWith(QUEUE_OVERFLOW_CLOSE_CODE, expect.any(String));
+      expect(world.emit.mock.calls.filter(([name]: [string]) => name === 'disconnect')).toEqual([['disconnect', { code: QUEUE_OVERFLOW_CLOSE_CODE, reason: expect.any(String), wasClean: false }]]);
+      for (let i = 0; i < 10; i++) send(entityModified(i));
+      expect(network.queue).toHaveLength(1);
+      // The socket's own close event, when it comes, reports nothing more
+      ws.dispatch('close', { code: 1006, reason: '', wasClean: false });
+      expect(world.emit.mock.calls.filter(([name]: [string]) => name === 'disconnect')).toHaveLength(1);
+      expect(error.mock.calls.flat().map(String).filter((line) => line.includes('Closing the connection'))).toHaveLength(1);
+    });
+
+    it(`closes the connection when the frames waiting add up to more than ${MAX_QUEUED_BYTES / 1024 / 1024} MiB`, () => {
+      const { ws, send } = connected();
+      const big = entityModified(0, 7 * 1024 * 1024);
+      const fit = Math.floor(MAX_QUEUED_BYTES / big.byteLength);
+      for (let i = 0; i < fit; i++) send(big);
+      expect(network.queue).toHaveLength(fit);
+      expect(ws.close).not.toHaveBeenCalled();
+      send(big);
+      expect(ws.close).toHaveBeenCalledTimes(1);
+      expect(network.queue).toEqual([]);
+    });
+
+    it('counts what waited as gone once the engine has flushed it: a busy world that is kept up with is never closed', () => {
+      const { ws, send } = connected();
+      network.onEntityModified = vi.fn();
+      const big = entityModified(0, 7 * 1024 * 1024);
+      const small = entityModified(1);
+      // Per tick within both limits; over five ticks far more than either
+      for (let tick = 0; tick < 5; tick++) {
+        for (let i = 0; i < 4; i++) send(big);
+        for (let i = 0; i < 1000; i++) send(small);
+        network.flush();
+      }
+      expect(network.onEntityModified).toHaveBeenCalledTimes(5 * 1004);
+      expect(ws.close).not.toHaveBeenCalled();
+    });
+
+    it('cuts a chat message down before it waits: twenty 2 MB chat frames hold 500 code points each and do not close the connection', () => {
+      const { ws, send } = connected();
+      const frames = 20;
+      for (let i = 0; i < frames; i++) send(serverPackr.pack([2, { id: `m${i}`, fromId: 'p1', from: 'Alice', body: '🛹'.repeat(512 * 1024), createdAt: '' }]));
+      expect(frames * 2 * 1024 * 1024).toBeGreaterThan(MAX_QUEUED_BYTES);
+      expect(ws.close).not.toHaveBeenCalled();
+      expect(network.queue).toHaveLength(frames);
+      for (const [method, msg] of network.queue) {
+        expect(method).toBe('onChatAdded');
+        expect(Array.from(msg.body)).toHaveLength(500);
+        expect(Object.keys(msg).sort()).toEqual(['body', 'createdAt', 'from', 'fromId', 'id']);
+      }
+      // One that is not a chat message does not wait at all
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      send(serverPackr.pack([2, { id: 7, body: 'x'.repeat(1024 * 1024) }]));
+      expect(network.queue).toHaveLength(frames);
+    });
   });
 
   it('drops a frame above 8 MB before decoding it, and frames that are not binary, with one line for the burst', () => {

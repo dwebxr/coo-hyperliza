@@ -13,9 +13,13 @@ import { AiBudgetExceededError, forPurpose } from '../../usage-budget';
 import { AnthropicRefusalError } from '../../anthropic-models';
 import { AgentControls } from '../systems/controls'; // Import AgentControls type
 import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
-import { oneLine } from '../lib/text';
+import { oneLine, shownName } from '../lib/text';
 
 const GOTO_ENTITY = 'HYPERFY_GOTO_ENTITY';
+// What a reply says of a world name or an id, as the world state shows other entities' names
+const ENTITY_NAME_MAX = 64;
+// What a failure reply says of an error
+const ERROR_TEXT_MAX = 200;
 
 export enum NavigationType {
   ENTITY = 'entity',
@@ -153,10 +157,11 @@ export const hyperfyGotoEntityAction: Action = {
             await controls.followEntity(entityId);
 
             const targetEntity = world.entities.items.get(parameter.entityId);
+            // World content (and an id the model chose): one short line, nothing invisible
             const entityName =
-              targetEntity?.data?.name ||
-              targetEntity?.blueprint?.name ||
-              `entity ${entityId}`;
+              shownName(targetEntity?.data?.name, ENTITY_NAME_MAX) ||
+              shownName(targetEntity?.blueprint?.name, ENTITY_NAME_MAX) ||
+              `entity ${shownName(String(entityId), ENTITY_NAME_MAX)}`;
 
             await callback({
               text: `Arrived at ${entityName}.`,
@@ -184,11 +189,11 @@ export const hyperfyGotoEntityAction: Action = {
           }
 
           default:
-            throw new Error(`Unsupported navigation type: ${navigationType}`);
+            throw new Error(`Unsupported navigation type: ${shownName(String(navigationType), ENTITY_NAME_MAX)}`);
         }
       } catch (error: any) {
         logger.error(`[GOTO Action] Navigation failed:`, error);
-        await tellFailure(callback, GOTO_ENTITY, `Navigation failed: ${error.message}`, {
+        await tellFailure(callback, GOTO_ENTITY, `Navigation failed: ${oneLine(String(error?.message ?? error), ERROR_TEXT_MAX)}`, {
           metadata: { error: 'navigation_error', detail: error.message },
         });
         return actionFailed(GOTO_ENTITY, `navigation failed: ${error.message}`);

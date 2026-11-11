@@ -1,6 +1,8 @@
 import { Packr } from 'msgpackr';
 import { WORLD_URL_PROTOCOLS, sessionTokenProblem } from './world-url';
 import { describeUrl } from './log-url';
+import { readChatMessage } from './chat-intake';
+import { RateLimitedLog } from './rate-limited-log';
 
 /**
  * The network protocol of coo-world (github.com/dwebxr/coo-world, src/core/packets.js as of
@@ -95,16 +97,42 @@ export const MAX_SERVER_FRAME_BYTES = 8 * 1024 * 1024;
 // Unknown packet ids are each reported once; after this many different ones, no more
 export const MAX_REPORTED_PACKET_IDS = 32;
 
-const reportedIds = new Set<string>();
+/**
+ * What may wait for the engine's next flush (ClientNetwork.flush, every tick: 30 a second once the
+ * world runs). A tick's worth is a handful of packets; this is room for seconds of a busy world
+ * before the first tick and a snapshot of the largest size four times over. Counted per packet:
+ * its frame's size, or for a chat message QUEUED_CHAT_BYTES (it is cut down before it waits).
+ */
+export const MAX_QUEUED_PACKETS = 4096;
+export const MAX_QUEUED_BYTES = 4 * MAX_SERVER_FRAME_BYTES;
+// A chat message as readChatMessage leaves it: 500 code points of body and four short fields
+const QUEUED_CHAT_BYTES = 4096;
+// Close code the agent gives a connection it ends because the world sent more than it can take
+export const QUEUE_OVERFLOW_CLOSE_CODE = 4000;
+// At most one line about undecodable or dropped frames in this time; it carries the count
+const FRAME_LOG_INTERVAL_MS = 10_000;
 
-/** Forgets which unknown packet ids were reported (tests). */
+const reportedIds = new Set<string>();
+let undecodable = undecodableLog();
+
+function undecodableLog(): RateLimitedLog {
+  // Decoder messages can quote the payload, which may hold credentials: only the size is said
+  return new RateLimitedLog((count, size) => `[Hyperfy] Could not read ${count} packet(s) from the world (the latest ${size} bytes)`, {
+    intervalMs: FRAME_LOG_INTERVAL_MS,
+    log: (line) => console.error(line),
+  });
+}
+
+/** Forgets which unknown packet ids were reported, and when an unreadable packet was (tests). */
 export function resetReportedPacketIds(): void {
   reportedIds.clear();
+  undecodable = undecodableLog();
 }
 
 /**
- * [handler method, data], or [] when the packet cannot be read (logged; once per unknown id, for
- * the first MAX_REPORTED_PACKET_IDS different ones).
+ * [handler method, data], or [] when the packet cannot be read (logged at most once per
+ * FRAME_LOG_INTERVAL_MS with the count; once per unknown id, for the first
+ * MAX_REPORTED_PACKET_IDS different ones).
  */
 export function readServerPacket(packet: ArrayBuffer | Uint8Array): [string, unknown] | [] {
   let id: unknown;
@@ -112,8 +140,7 @@ export function readServerPacket(packet: ArrayBuffer | Uint8Array): [string, unk
   try {
     [id, data] = serverPackr.unpack(packet instanceof Uint8Array ? packet : new Uint8Array(packet));
   } catch {
-    // Decoder messages can quote the payload, which may hold credentials
-    console.error(`[Hyperfy] Could not read a ${packet.byteLength}-byte packet from the world`);
+    undecodable.note(String(packet.byteLength));
     return [];
   }
   const name = typeof id === 'number' ? PACKET_NAMES[id] : undefined;
@@ -143,31 +170,64 @@ export interface WorldProtocol {
   sessionToken(): string | null;
 }
 
-// At most one line about dropped frames in this time; the line carries the count
-const FRAME_DROP_LOG_INTERVAL_MS = 10_000;
-
 /**
  * Makes the engine's ClientNetwork speak the world's protocol. Call before world.init(): it replaces
- * init/send and the onPacket/onClose listeners on the instance, so init registers them and the
- * engine's destroy() removes the same functions.
+ * init/send/flush and the onPacket/onClose listeners on the instance, so init registers them and
+ * the engine's destroy() removes the same functions.
  *
- * The session token goes into the socket URL's query only where sessionTokenProblem allows it
- * (lib/world-url.ts). Otherwise the connection is made without it: the world then treats the agent
- * as a new guest, and the token the world issues for that guest session is not stored (the engine
- * would replace the saved one with it).
+ * Whether the connection may carry a session token is decided from the URL alone
+ * (sessionTokenProblem, lib/world-url.ts), whether or not a token is saved. Where it may not, the
+ * connection is made without one: the world treats the agent as a new guest, the token it issues
+ * for that guest is neither stored (the engine would store it, replacing a saved one) nor used for
+ * uploads, so the agent is a new guest on every connection there.
+ *
+ * What waits for the engine's flush is bounded (MAX_QUEUED_PACKETS, MAX_QUEUED_BYTES). When more
+ * would wait, the connection is closed instead of dropping packets: a dropped packet would leave
+ * the agent's copy of the world silently different from the server's (an entity missing or stale,
+ * a blueprint not updated, a rank change in lib/world-identity.ts not applied) with nothing to
+ * repair it short of a new snapshot. Closing reports the disconnect like any other, and the
+ * reconnect logic joins again with a fresh snapshot. A queued kick is kept, so the service still
+ * sees why the world wanted the agent gone.
  */
 export function adaptToWorldProtocol(network: any, getAuthToken: () => string | null | undefined): WorldProtocol {
   const engineOnClose = network.onClose;
+  const engineFlush = network.flush;
   const reportedOversized = new Set<string>();
   let tokenWithheld = false;
-  let droppedFrames = 0;
-  let droppedFramesLoggedAt = Number.NEGATIVE_INFINITY;
-  const dropFrame = (why: string) => {
-    droppedFrames++;
-    if (Date.now() - droppedFramesLoggedAt < FRAME_DROP_LOG_INTERVAL_MS) return;
-    droppedFramesLoggedAt = Date.now();
-    console.warn(`[Hyperfy] Dropped ${droppedFrames} frame(s) from the world: ${why}`);
-    droppedFrames = 0;
+  let queuedBytes = 0;
+  let overflowed = false;
+  let closeReported = false;
+  const dropped = new RateLimitedLog((count, why) => `[Hyperfy] Dropped ${count} frame(s) from the world: ${why}`, {
+    intervalMs: FRAME_LOG_INTERVAL_MS,
+    log: (line) => console.warn(line),
+  });
+  const dropFrame = (why: string) => dropped.note(why);
+
+  const reportClose = (event: unknown) => {
+    if (closeReported) return;
+    closeReported = true;
+    engineOnClose(describeClose(event));
+  };
+
+  const overflow = () => {
+    overflowed = true;
+    const kicks = network.queue.filter((entry: unknown) => Array.isArray(entry) && entry[0] === 'onKick');
+    network.queue.length = 0;
+    network.queue.push(...kicks);
+    queuedBytes = 0;
+    console.error(
+      `[Hyperfy] Closing the connection: the world sent more than ${MAX_QUEUED_PACKETS} packets or ${MAX_QUEUED_BYTES} bytes ` +
+        'faster than the agent handles them. Reconnecting starts again from a fresh snapshot of the world.'
+    );
+    const reason = 'the world sent more than the agent can take';
+    try {
+      network.ws?.close(QUEUE_OVERFLOW_CLOSE_CODE, reason);
+    } catch {
+      // Closed already
+    }
+    // Reported now: the socket's own close event may come late, or not at all from a peer that
+    // does not answer the close
+    reportClose({ code: QUEUE_OVERFLOW_CLOSE_CODE, reason, wasClean: false });
   };
 
   network.init = ({ wsUrl, name, avatar }: { wsUrl: string; name?: string; avatar?: string }) => {
@@ -181,16 +241,17 @@ export function adaptToWorldProtocol(network: any, getAuthToken: () => string | 
       throw new Error(`Unsupported Hyperfy WebSocket protocol: ${url.protocol}`);
     }
     url.hash = '';
-    const authToken = getAuthToken();
-    const problem = authToken ? sessionTokenProblem(url) : null;
+    const problem = sessionTokenProblem(url);
     tokenWithheld = problem !== null;
+    const authToken = problem ? null : getAuthToken();
     if (problem) {
       console.error(
-        `[Hyperfy] Not sending the saved session token: ${problem}, and the token would travel readable in the URL. ` +
-          'Connecting without it, as a new guest (no saved identity, rank or avatar upload). Use a wss:// WS_URL to connect as the saved user.'
+        `[Hyperfy] No session token on this connection: ${problem}, and the token would travel readable in the URL. ` +
+          'Connecting as a new guest (no saved identity, rank or avatar upload); the guest token the world issues is not kept or used. ' +
+          'Use a wss:// WS_URL to connect as the saved user.'
       );
     }
-    if (authToken && !problem) url.searchParams.set('authToken', authToken);
+    if (authToken) url.searchParams.set('authToken', authToken);
     else url.searchParams.delete('authToken');
     if (name) url.searchParams.set('name', name);
     if (avatar) url.searchParams.set('avatar', avatar);
@@ -220,20 +281,43 @@ export function adaptToWorldProtocol(network: any, getAuthToken: () => string | 
   };
 
   network.onPacket = (event: { data: unknown }) => {
+    if (overflowed) return;
     const frame = event?.data;
     // The world's packets are binary frames (the socket's binaryType is arraybuffer)
     if (!(frame instanceof ArrayBuffer) && !(frame instanceof Uint8Array)) return dropFrame('not a binary frame');
     // Before unpack: see MAX_SERVER_FRAME_BYTES for what this does and does not bound
     if (frame.byteLength > MAX_SERVER_FRAME_BYTES) return dropFrame(`${frame.byteLength} bytes exceeds the ${MAX_SERVER_FRAME_BYTES}-byte limit`);
     const [method, data] = readServerPacket(frame);
-    if (method) network.enqueue(method, data);
+    if (!method) return;
+    let queued = data;
+    let size = frame.byteLength;
+    if (method === 'onChatAdded') {
+      // Cut down before it waits: a chat body is 500 code points however large the frame was
+      // (world-chat.ts reads it again when the engine hands it over)
+      const msg = readChatMessage(data);
+      if (!msg) return dropFrame('a chat packet that is not a chat message');
+      queued = msg;
+      size = Math.min(size, QUEUED_CHAT_BYTES);
+    }
+    if (network.queue.length + 1 > MAX_QUEUED_PACKETS || queuedBytes + size > MAX_QUEUED_BYTES) return overflow();
+    queuedBytes += size;
+    network.enqueue(method, queued);
   };
 
-  network.onClose = (event: unknown) => engineOnClose(describeClose(event));
+  // The engine's flush hands every queued packet to its handler and empties the queue
+  network.flush = () => {
+    try {
+      engineFlush.call(network);
+    } finally {
+      if (!network.queue.length) queuedBytes = 0;
+    }
+  };
+
+  network.onClose = (event: unknown) => reportClose(event);
 
   // The engine's onSnapshot stores the token the world issued (storage.set('authToken', ...)). On a
-  // connection made without the saved token that is a new guest's: it must not replace the saved
-  // one, so the engine is handed the saved one to store again.
+  // connection made without a token that is a new guest's: it must not be stored, so the engine is
+  // handed what is saved (a saved token, or nothing) to store again.
   const engineOnSnapshot = network.onSnapshot;
   network.onSnapshot = (data: unknown) =>
     engineOnSnapshot.call(network, tokenWithheld && data && typeof data === 'object' ? { ...data, authToken: getAuthToken() } : data);

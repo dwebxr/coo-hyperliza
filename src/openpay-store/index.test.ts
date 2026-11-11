@@ -10,7 +10,11 @@ import {
   isOpenPayLink,
   resolveProduct,
 } from './index';
-import type { StoreProduct } from './catalog';
+import * as catalog from './catalog';
+import { LINK_REMOVED, LINK_TITLE_MAX_CODE_POINTS, MAX_URL_LENGTH, type StoreProduct, linkLikeParts, toStoreProduct } from './catalog';
+import { splitChatText, WORLD_CHAT_MAX_LENGTH } from '../plugin-hyperfy/lib/chat-chunks';
+import { composeOfflineReply } from '../plugin-hyperfy/lib/offline-reply';
+import { logger } from '@elizaos/core';
 
 const product = (id: string, title: string, extra: Partial<StoreProduct> = {}): StoreProduct => ({
   id,
@@ -115,10 +119,10 @@ describe('createOpenPayStorePlugin', () => {
     expect(createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: ' ' })).toBeNull();
   });
 
-  async function loadedPlugin() {
+  async function loadedPlugin(items: object[] = [board]) {
     // The listings API, answered here: the plugin's own request would go to the real Store
     const fetchImpl = (async () =>
-      new Response(JSON.stringify({ ok: true, items: [{ ...board, priceJpyc: '500', feeJpyc: '5', usdcEnabled: false, tags: [], updatedAt: 1 }] }), { status: 200 })) as typeof fetch;
+      new Response(JSON.stringify({ ok: true, items: items.map((item) => ({ priceJpyc: '500', feeJpyc: '5', usdcEnabled: false, tags: [], updatedAt: 1, ...item })) }), { status: 200 })) as typeof fetch;
     const plugin = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'masia02' }, { fetchImpl })!;
     await plugin.init!({}, {} as any);
     const provider = plugin.providers![0];
@@ -169,6 +173,103 @@ describe('createOpenPayStorePlugin', () => {
     expect(content.text).toBe(formatSpokenProduct(board));
     expect(content.text).not.toContain('http');
     expect(isOpenPayLink(content)).toBe(false);
+  });
+
+  // A seller's title or description naming another place to pay, in the spellings a reader would follow
+  const ELSEWHERE = [
+    'https://evil.test/pay',
+    'HTTPS://EVIL.TEST/PAY',
+    'hxxps://evil.test/pay',
+    'www.evil.test',
+    'evil.test/pay',
+    'pay.evil.shop',
+    '//evil.test/pay',
+    'ｅｖｉｌ．ｔｅｓｔ／ｐａｙ',
+    'evil。com/pay',
+    '203.0.113.7:8080/pay',
+    'javascript:alert(1)',
+  ];
+
+  it.each(ELSEWHERE)('posts a link message that holds the purchase URL alone when the seller wrote %s into the title and description', async (elsewhere) => {
+    const listing = { ...board, title: `Pay here ${elsewhere} HoverBoard`, desc: `Cheaper at ${elsewhere}`, category: elsewhere, emoji: '🛹' };
+    const { provider, action } = await loadedPlugin([listing]);
+    const callback = vi.fn();
+    await action.handler(runtime(), userMessage('hyperfy'), undefined, {}, callback, reply('h_board'));
+    const text: string = callback.mock.calls[0][0].text;
+    expect(linkLikeParts(text)).toEqual([board.url]);
+    expect(text).toContain(LINK_REMOVED);
+    // Nor does the shelf in the prompt hold it
+    const shelf = String((await provider.get(runtime(), userMessage('hyperfy'), {} as any)).text);
+    expect(linkLikeParts(shelf)).toEqual([]);
+  });
+
+  it.each(ELSEWHERE)('posts the purchase URL alone from the offline reply, and offers no address among its examples, when a title holds %s', async (elsewhere) => {
+    const products = [toStoreProduct({ ...board, title: `HoverBoard ${elsewhere}`, totalJpyc: '505' }, 'https://open-pay.jp')!, toStoreProduct({ ...dome, title: `Bio Dome ${elsewhere}` }, 'https://open-pay.jp')!];
+    expect(products[0].title).toBe(`HoverBoard ${LINK_REMOVED}`);
+    const link = composeOfflineReply({ text: `I want the ${products[0].title}`, products, japanese: false });
+    expect(link.kind).toBe('link');
+    expect(linkLikeParts(String(link.content.text))).toEqual([board.url]);
+    const notice = composeOfflineReply({ text: 'hello', products, japanese: false });
+    expect(notice.kind).toBe('notice');
+    expect(linkLikeParts(String(notice.content.text))).toEqual([]);
+  });
+
+  it('posts no link message that would hold another link than the purchase URL, and says why in the log', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    // Not read by the catalog, so nothing removed the address from its title
+    const forged = product('h_forged', 'Pay here https://evil.test/pay');
+    expect(formatLinkMessage(forged)).toBeNull();
+    expect(formatLinkMessage({ ...board, url: 'https://open-pay.jp/ja/@someone-else?product=h_board' })).toBeNull();
+    expect(formatLinkMessage({ ...board, url: `${board.url} https://evil.test` })).toBeNull();
+    expect(warn.mock.calls.map(([line]) => String(line))).toEqual([
+      '[OpenPayStore] Not posting the link of product h_forged: the message would hold 2 link(s) where it must hold the purchase URL alone',
+      expect.stringContaining("[OpenPayStore] Not posting the link of product h_board: its purchase URL (https://open-pay.jp/ja/@someone-else?product=…) is its path does not name the seller"),
+      expect.stringContaining('[OpenPayStore] Not posting the link of product h_board: its purchase URL'),
+    ]);
+    expect(composeOfflineReply({ text: 'the Pay here https://evil.test/pay please', products: [forged], japanese: false }).kind).toBe('notice');
+  });
+
+  it('posts no link message longer than one chat message, whatever a product not read by the catalog holds', () => {
+    vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    expect(formatLinkMessage({ ...board, totalJpyc: '9'.repeat(600) })).toBeNull();
+    expect(formatLinkMessage({ ...board, emoji: '🛹'.repeat(300) })).toBeNull();
+    expect(formatLinkMessage(board)).not.toBeNull();
+  });
+
+  it("shows a seller's handle in the shelf and in spoken text without the address it may read as", () => {
+    const dotted = product('h_dot', 'Dotted Seller Item', { handle: 'pay.evil.com' });
+    expect(linkLikeParts(formatShelf([dotted], { autonomous: false }))).toEqual([]);
+    expect(formatShelf([dotted], { autonomous: false })).toContain(`@${LINK_REMOVED}`);
+    expect(linkLikeParts(formatSpokenProduct(dotted))).toEqual([]);
+    // An ordinary handle is shown as it is
+    expect(formatSpokenProduct(board)).toContain('@masia02');
+  });
+
+  it('tells the player it posts no link, and posts nothing else, when the link message cannot be made safely', async () => {
+    const { action } = await loadedPlugin();
+    // What formatLinkMessage answers for a message it refuses (the cases above)
+    vi.spyOn(catalog, 'formatLinkMessage').mockReturnValueOnce(null);
+    const callback = vi.fn();
+    const refused = await action.handler(runtime(), userMessage('hyperfy'), undefined, {}, callback, reply('h_board'));
+    expect(refused).toMatchObject({ success: false, data: { actionName: SHARE_ACTION } });
+    expect(callback.mock.calls.map(([content]) => content.text)).toEqual(["Sorry, I can't post that product's link right now."]);
+  });
+
+  it('posts the link of the longest purchase URL it accepts whole, as one chat message, next to the longest title, emoji and amount', () => {
+    const base = 'https://open-pay.jp/ja/@masia02?product=h_board&from=agent&pad=';
+    const longest = `${base}${'a'.repeat(MAX_URL_LENGTH - base.length)}`;
+    expect(longest).toHaveLength(MAX_URL_LENGTH);
+    const listing = { ...board, url: longest, title: '🛹'.repeat(200), emoji: '🛹🛹🛹🛹🛹', totalJpyc: `${'9'.repeat(15)}.${'9'.repeat(18)}` };
+    const accepted = toStoreProduct(listing, 'https://open-pay.jp')!;
+    expect(accepted.url).toBe(longest);
+    const text = formatLinkMessage(accepted)!;
+    expect(text.length).toBeLessThanOrEqual(WORLD_CHAT_MAX_LENGTH);
+    expect(text).toContain(`🛹`.repeat(LINK_TITLE_MAX_CODE_POINTS - 1));
+    const chunks = splitChatText(text);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].endsWith(`\n${longest}`)).toBe(true);
+    // One character more is not accepted at all
+    expect(toStoreProduct({ ...listing, url: `${longest}a` }, 'https://open-pay.jp')).toBeNull();
   });
 
   it('never shares on autonomous turns or for an unresolvable product (the player is told it posted no link)', async () => {

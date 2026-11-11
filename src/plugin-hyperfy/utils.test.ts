@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MAX_SPEECH_AUDIO_BYTES, MAX_TRANSCRIPT_RESPONSE_BYTES, countOtherPlayers, generateElevenLabsTTS, generateOpenAITTS, resolveUrl, transcribeWithElevenLabs } from './utils';
+import { MAX_SPEECH_AUDIO_BYTES, MAX_TRANSCRIPT_RESPONSE_BYTES, TtsLimitReached, countOtherPlayers, generateElevenLabsTTS, generateOpenAITTS, generateSpeech, resolveUrl, transcribeWithElevenLabs } from './utils';
+import { UsageBudget, resetUsageBudget } from '../usage-budget';
 
 const world = { assetsUrl: 'https://assets.example.com/' };
 
@@ -232,5 +233,89 @@ describe('speech API answers are read within a byte cap and a deadline', () => {
     expect(line).not.toContain('\n');
     expect(state.cancelled).toBe(true);
     expect(state.pulled).toBeLessThanOrEqual(4096);
+  });
+});
+
+describe('generateSpeech: each provider request is reserved on its own', () => {
+  const realFetch = globalThis.fetch;
+  const env = { ...process.env };
+  const noLimits = { aiCallsPerHour: null, aiTokensPerDay: null, visionPerHour: null, ttsCharsPerDay: null, sttSecondsPerDay: null, autonomyAiPerHour: null, autonomyAiMinIntervalMs: 0 };
+  const TEXT = 'x'.repeat(100);
+  const ELEVENLABS = 'https://api.elevenlabs.io/';
+  const OPENAI = 'https://api.openai.com/';
+
+  /** The speech APIs, answered here: no request leaves the machine */
+  function providers(elevenLabs: () => Response | Promise<Response>) {
+    const fetch = vi.fn(async (url: string) => (String(url).startsWith(ELEVENLABS) ? elevenLabs() : new Response(Buffer.from('openai-mp3'), { status: 200 })));
+    globalThis.fetch = fetch as never;
+    return { hosts: () => fetch.mock.calls.map(([url]) => (String(url).startsWith(ELEVENLABS) ? 'elevenlabs' : String(url).startsWith(OPENAI) ? 'openai' : String(url))) };
+  }
+  const budgetOf = (ttsCharsPerDay: number | null) => {
+    const budget = new UsageBudget({ ...noLimits, ttsCharsPerDay });
+    resetUsageBudget(budget);
+    return budget;
+  };
+  /** Accepted (200), and then the body fails while it is read */
+  const bodyFails = () =>
+    new Response(new ReadableStream({ pull: (controller) => controller.error(new Error('connection reset')) }), { status: 200 });
+
+  beforeEach(() => {
+    process.env.ELEVENLABS_XI_API_KEY = 'test-key';
+    process.env.OPENAI_API_KEY = 'test-openai-key';
+    for (const method of ['log', 'error'] as const) vi.spyOn(console, method).mockImplementation(() => {});
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    for (const key of ['ELEVENLABS_XI_API_KEY', 'OPENAI_API_KEY']) {
+      if (env[key] === undefined) delete process.env[key];
+      else process.env[key] = env[key];
+    }
+    resetUsageBudget();
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ['accepted, its body failing as it was read', bodyFails],
+    ['a connection error', () => Promise.reject(new TypeError('fetch failed'))],
+    ['a server error', () => new Response('busy', { status: 503 })],
+  ])('keeps an ElevenLabs request that ended in %s counted, and makes no fallback the daily limit has no room for', async (_what, answer) => {
+    const budget = budgetOf(100);
+    const { hosts } = providers(answer);
+    await expect(generateSpeech(TEXT)).resolves.toBeNull();
+    expect(hosts()).toEqual(['elevenlabs']);
+    expect(budget.snapshot(60_000)).toMatchObject({ ttsChars: 100, skipped: { tts: 1 } });
+  });
+
+  it('falls back to OpenAI under a reservation of its own when the limit has room for both requests', async () => {
+    const budget = budgetOf(200);
+    const { hosts } = providers(bodyFails);
+    expect((await generateSpeech(TEXT))?.toString()).toBe('openai-mp3');
+    expect(hosts()).toEqual(['elevenlabs', 'openai']);
+    expect(budget.snapshot(60_000).ttsChars).toBe(200);
+  });
+
+  it('gives back the characters of a request ElevenLabs refused (a 4xx answer), so the fallback fits the same limit', async () => {
+    const budget = budgetOf(100);
+    const { hosts } = providers(() => new Response('{"detail":"quota_exceeded"}', { status: 401 }));
+    expect((await generateSpeech(TEXT))?.toString()).toBe('openai-mp3');
+    expect(hosts()).toEqual(['elevenlabs', 'openai']);
+    expect(budget.snapshot(60_000)).toMatchObject({ ttsChars: 100, skipped: { tts: 0 } });
+  });
+
+  it('sends nothing and throws TtsLimitReached when the limit has no room even for the first request', async () => {
+    const budget = budgetOf(99);
+    const { hosts } = providers(() => new Response(Buffer.from('mp3'), { status: 200 }));
+    await expect(generateSpeech(TEXT)).rejects.toBeInstanceOf(TtsLimitReached);
+    expect(hosts()).toEqual([]);
+    expect(budget.snapshot(60_000)).toMatchObject({ ttsChars: 0, skipped: { tts: 1 } });
+  });
+
+  it('counts nothing for a provider without a key: no request is made to it', async () => {
+    delete process.env.ELEVENLABS_XI_API_KEY;
+    const budget = budgetOf(100);
+    const { hosts } = providers(() => new Response(Buffer.from('mp3'), { status: 200 }));
+    expect((await generateSpeech(TEXT))?.toString()).toBe('openai-mp3');
+    expect(hosts()).toEqual(['openai']);
+    expect(budget.snapshot(60_000).ttsChars).toBe(100);
   });
 });

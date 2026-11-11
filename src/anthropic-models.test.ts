@@ -48,11 +48,11 @@ describe('anthropicModelsPlugin', () => {
     expect(create.mock.calls[1][0]).toMatchObject({ model: 'claude-sonnet-5-5', output_config: { effort: 'medium' } });
   });
 
-  it('bounds each generation with one overall deadline and a single retry', async () => {
+  it('bounds each generation with one overall deadline, and lets the SDK retry nothing', async () => {
     await models[ModelType.TEXT_SMALL](runtime(), { prompt: 'a' });
     const options = create.mock.calls[0][1];
     expect(options.signal).toBeInstanceOf(AbortSignal);
-    expect(options.maxRetries).toBe(1);
+    expect(options.maxRetries).toBe(0);
   });
 
   it('returns only text blocks (thinking blocks are skipped)', async () => {
@@ -270,12 +270,12 @@ describe('anthropicModelsPlugin', () => {
     it.each([
       ['a timeout', Object.assign(new Error('Request timed out.'), { name: 'APIConnectionTimeoutError' }), 1],
       ['an abort', Object.assign(new Error('Request was aborted.'), { name: 'APIUserAbortError' }), 1],
-      ['a server error', Object.assign(new Error('overloaded'), { status: 529 }), 1],
+      ['a server error', Object.assign(new Error('internal error'), { status: 500 }), 1],
       ['a conflict', Object.assign(new Error('conflict'), { status: 409 }), 1],
       ['a request the API refused (400)', Object.assign(new Error('bad request'), { status: 400 }), 0],
       ['an invalid key (401)', Object.assign(new Error('invalid x-api-key'), { status: 401 }), 0],
-      ['rate limiting by the API (429)', Object.assign(new Error('rate limited'), { status: 429 }), 0],
-    ])('counts a call that failed with %s as a call, and its reservation as used unless the API refused it', async (_what, error, held) => {
+      ['a request the API forbade (403)', Object.assign(new Error('forbidden'), { status: 403 }), 0],
+    ])('counts a call that failed with %s as a call, and its reservation as used unless the API refused it; it is not tried again', async (_what, error, held) => {
       const each = tokenReserve('You are Coo.', 'x', 2048);
       const budget = limits({ aiCallsPerHour: 2, aiTokensPerDay: each * 2 });
       resetUsageBudget(budget);

@@ -19,17 +19,26 @@ const avatarMap = (window.avatarMap = new Map()); // avatar URL -> VRM factory
 window.activeVRMInstances = [];
 
 // How to take back what a load kept, by the operation id the agent passed with it. The agent
-// settles every such load as soon as it returns: settle(op, true) commits it (the record goes at
-// once), settle(op, false) takes it back (the world it was for went away, or the call failed).
-// A record lives only between a load's return and its settlement; there is no expiry.
+// settles every such load as soon as it returns (managers/puppeteer-manager.ts pageCall):
+// "rollback" takes it back (the call failed, or the world it was for went away), "commit" keeps
+// the record while the agent checks once more, "forget" drops it. A record lives only between a
+// load's return and its last settlement; there is no expiry.
 const undoable = new Map();
 function keepUndo(op, undoIt) {
   if (op !== undefined) undoable.set(op, undoIt);
 }
-function settle(op, keep) {
+function settle(op, step) {
+  if (step === 'commit') return;
   const undoIt = undoable.get(op);
   undoable.delete(op);
-  if (undoIt && !keep) undoIt();
+  if (undoIt && step === 'rollback') undoIt();
+}
+/** The id a material's textures are kept under here: always a new one; one the file brings is checked and not used */
+const MATERIAL_ID = /^[A-Za-z0-9-]{1,64}$/;
+function newMaterialId(material) {
+  const given = material.userData.materialId;
+  if (given !== undefined && !(typeof given === 'string' && MATERIAL_ID.test(given))) throw new Error('a material in the model brings a materialId the page cannot use');
+  return uuid();
 }
 /** Loads waiting for the agent to settle them (for scripts/smoke-chromium.mjs) */
 const pendingSettlements = () => undoable.size;
@@ -116,43 +125,48 @@ function disposeTree(root, keep) {
  * rehydrate() puts the textures back for drawing.
  */
 async function loadGlb(base64, stripSlots, maxExportBytes, op) {
-  const gltf = await parseGltf(new window.GLTFLoader(), bytesOf(base64));
+  // Everything this load keeps, from its first texture on, is taken back if anything after fails
   const kept = [];
-
-  gltf.scene.traverse(obj => {
-    if (!obj.isMesh || !obj.material) return;
-
-    const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-
-    mats.forEach(mat => {
-      if (!mat.userData.materialId) {
-        mat.userData.materialId = uuid();
-      }
-      const id = mat.userData.materialId;
-
-      stripSlots.forEach(slot => {
-        const tex = mat[slot];
-        if (tex && tex.isTexture) {
-          remember(texturesMap, `${id}:${slot}`, tex, LIMITS.textures, (dropped) => dropped.dispose());
-          kept.push([`${id}:${slot}`, tex]);
-          mat[slot] = null;
-        }
-      });
-
-      mat.needsUpdate = true;
-    });
-  });
-
+  let gltf = null;
   const takeBack = () => {
     for (const [key, texture] of kept) forgetTexture(key, texture);
-    disposeTree(gltf.scene, new Set());
+    if (gltf) disposeTree(gltf.scene, new Set());
   };
   try {
+    gltf = await parseGltf(new window.GLTFLoader(), bytesOf(base64));
+    // A material used by several meshes gets one id
+    const ids = new Map();
+    gltf.scene.traverse(obj => {
+      if (!obj.isMesh || !obj.material) return;
+
+      const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+
+      mats.forEach(mat => {
+        let id = ids.get(mat);
+        if (id === undefined) {
+          id = newMaterialId(mat);
+          ids.set(mat, id);
+          mat.userData.materialId = id;
+        }
+
+        stripSlots.forEach(slot => {
+          const tex = mat[slot];
+          if (tex && tex.isTexture) {
+            remember(texturesMap, `${id}:${slot}`, tex, LIMITS.textures, (dropped) => dropped.dispose());
+            kept.push([`${id}:${slot}`, tex]);
+            mat[slot] = null;
+          }
+        });
+
+        mat.needsUpdate = true;
+      });
+    });
+
     const glb = exportedBase64(await exportGlb(gltf.scene), maxExportBytes);
     keepUndo(op, takeBack);
     return glb;
   } catch (error) {
-    // Refused: its textures are not kept either
+    // Refused or failed: nothing of it is kept
     takeBack();
     throw error;
   }
@@ -160,20 +174,23 @@ async function loadGlb(base64, stripSlots, maxExportBytes, op) {
 
 /** Parses a VRM, keeps a factory for it under `key` (the avatar's URL), and returns it as a GLB (at most `maxExportBytes`). */
 async function loadVrm(key, base64, maxExportBytes, op) {
-  const gltf = await parseGltf(window.VRMLoader, bytesOf(base64));
-  const factory = window.createVRMFactory(gltf, (m) => m);
-
-  window.renderer.render(window.scene, window.camera);
-
-  // Instances share the avatar's geometry, materials and textures; all of it goes when the avatar does
-  factory.dispose = () => disposeTree(gltf.scene, new Set());
-  remember(avatarMap, key, factory, LIMITS.avatars, (dropped) => dropped.dispose());
-
+  let gltf = null;
+  let factory = null;
   const takeBack = () => {
-    if (avatarMap.get(key) === factory) avatarMap.delete(key);
-    factory.dispose();
+    if (factory && avatarMap.get(key) === factory) avatarMap.delete(key);
+    if (gltf) disposeTree(gltf.scene, new Set());
   };
   try {
+    gltf = await parseGltf(window.VRMLoader, bytesOf(base64));
+    const scene = gltf.scene;
+    factory = window.createVRMFactory(gltf, (m) => m);
+
+    window.renderer.render(window.scene, window.camera);
+
+    // Instances share the avatar's geometry, materials and textures; all of it goes when the avatar does
+    factory.dispose = () => disposeTree(scene, new Set());
+    remember(avatarMap, key, factory, LIMITS.avatars, (dropped) => dropped.dispose());
+
     const glb = exportedBase64(await exportGlb(gltf.scene), maxExportBytes);
     keepUndo(op, takeBack);
     return glb;
@@ -272,13 +289,19 @@ function hdrTexture(buffer) {
 
 function loadEnvironmentHDR(base64, op) {
   const previous = window.environment;
+  const before = [window.environment, window.scene.environment, window.scene.background];
   const hdr = hdrTexture(bytesOf(base64).buffer);
-
-  window.environment = hdr;
-  window.scene.environment = hdr;
-  window.scene.background = hdr;
-
-  window.renderer.render(window.scene, window.camera);
+  try {
+    window.environment = hdr;
+    window.scene.environment = hdr;
+    window.scene.background = hdr;
+    window.renderer.render(window.scene, window.camera);
+  } catch (error) {
+    // Failed: the page keeps what it had
+    [window.environment, window.scene.environment, window.scene.background] = before;
+    hdr.dispose();
+    throw error;
+  }
   if (previous && previous !== hdr) previous.dispose();
   // Taken back, the page has no environment until the next one is set
   keepUndo(op, () => {
@@ -308,7 +331,7 @@ function rehydrate(sceneJson, stripSlots, players) {
 
     mats.forEach(mat => {
       const id = mat.userData.materialId;
-      if (!id) return;
+      if (typeof id !== 'string' || !id) return;
 
       stripSlots.forEach(slot => {
         const key = `${id}:${slot}`;

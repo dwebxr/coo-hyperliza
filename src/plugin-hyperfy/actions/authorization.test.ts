@@ -524,6 +524,8 @@ describe('a scene edit that loses its authorization while it runs', () => {
   it.each([
     ['an answer that is no plan', () => ({ nothing: true })],
     ['an error', () => { throw new Error('model down'); }],
+    ['a budget error', () => { throw new AiBudgetExceededError('AI_MAX_CALLS_PER_HOUR=2'); }],
+    ['a model refusal', () => { throw new AnthropicRefusalError('claude', 'cyber'); }],
   ])('makes no further planning call for a requester demoted during a planning call that ended in %s, and tells them one neutral line', async (_what, answer) => {
     vi.spyOn(logger, 'error').mockImplementation(() => {});
     vi.spyOn(logger, 'warn').mockImplementation(() => {});

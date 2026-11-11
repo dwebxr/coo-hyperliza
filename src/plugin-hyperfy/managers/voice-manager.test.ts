@@ -15,7 +15,8 @@ vi.mock('@livekit/rtc-node', () => ({
   AudioStream: class {},
 }));
 
-import { MAX_HELD_VOICE_BYTES, MAX_SPEAKERS, MAX_SPOKEN_CODE_POINTS, MAX_UTTERANCE_BYTES, UTTERANCE_PAUSE_MS, VoiceManager, spokenPart } from './voice-manager';
+import { MAX_CONCURRENT_TRANSCRIPTIONS, MAX_HELD_VOICE_BYTES, MAX_SPEAKERS, MAX_SPOKEN_CODE_POINTS, MAX_UTTERANCE_BYTES, UTTERANCE_PAUSE_MS, VoiceManager, spokenPart } from './voice-manager';
+import { Events } from '../hyperfy/src/core/systems/Events.js';
 import { UsageBudget, resetUsageBudget } from '../../usage-budget';
 import { currentTurn, neverAbortedSignal, runTurn, turnDelivered } from '../lib/turn-context';
 import { AgentLiveKit } from '../systems/liveKit';
@@ -164,11 +165,20 @@ function listening({
   transcribe = async (_wav: Buffer) => 'hello there',
   hasModel = true,
   limits = noLimits,
-}: { transcribe?: (wav: Buffer) => Promise<unknown>; hasModel?: boolean; limits?: typeof noLimits | Record<string, number | null> } = {}) {
+  absent = [],
+}: { transcribe?: (wav: Buffer) => Promise<unknown>; hasModel?: boolean; limits?: typeof noLimits | Record<string, number | null>; absent?: string[] } = {}) {
   const budget = new UsageBudget({ ...noLimits, ...limits } as any);
   resetUsageBudget(budget);
   const livekit = { on: vi.fn(), off: vi.fn(), publishAudioStream: vi.fn(async () => PLAYED) };
-  const world = { livekit, entities: { player: { setSpeaking: vi.fn() } } };
+  // Everyone who speaks is a player in the world until they leave (or never was: `absent`)
+  const gone = new Set<string>(absent);
+  const events = new Events({});
+  const world = { livekit, events, entities: { player: { setSpeaking: vi.fn() }, getPlayer: (id: string) => (gone.has(id) ? undefined : { data: { id, name: id } }) } };
+  /** What the engine does when a player's entity is removed: the entity is gone, and 'leave' is emitted */
+  const leave = (playerId: string) => {
+    gone.add(playerId);
+    events.emit('leave', { playerId });
+  };
   const sendMessage = vi.fn();
   const useModel = vi.fn((_type: string, wav: Buffer) => transcribe(wav));
   const runtime: any = {
@@ -185,7 +195,7 @@ function listening({
   const state = () => ({ speakers: (manager as any).speakers.size, transcribing: (manager as any).transcribing.size, held: (manager as any).heldVoiceBytes });
   /** PCM seconds in each transcription request so far */
   const requests = () => useModel.mock.calls.map(([, wav]) => (wav.length - 44) / 96_000);
-  return { manager, budget, runtime, useModel, emit, say, state, requests, heard, sendMessage, world };
+  return { manager, budget, runtime, useModel, emit, say, state, requests, heard, sendMessage, world, leave, events };
 }
 
 describe('VoiceManager voice input', () => {
@@ -266,13 +276,55 @@ describe('VoiceManager voice input', () => {
     expect(heard.map(({ text }) => text)).toEqual(['first', 'second']);
   });
 
-  it('forgets a speaker once their utterance has been handled: nothing is kept for someone who left', async () => {
+  it("keeps nothing of a speaker once their utterance has been handled", async () => {
     const { say, state } = listening();
     say('p1', loud(500));
     say('p2', loud(500));
     expect(state()).toEqual({ speakers: 2, transcribing: 0, held: 2 * 500 * 96 });
     await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS);
     expect(state()).toEqual({ speakers: 0, transcribing: 0, held: 0 });
+  });
+
+  it('drops what a speaker said when they leave the world before their pause: nothing of it is transcribed', async () => {
+    const { say, state, useModel, heard, leave } = listening();
+    say('p1', loud(500));
+    say('p2', loud(500));
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS - 500);
+    leave('p1');
+    expect(state()).toEqual({ speakers: 1, transcribing: 0, held: 500 * 96 });
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS);
+    expect(useModel).toHaveBeenCalledTimes(1);
+    expect(heard.map(({ speaker }) => speaker)).toEqual(['p2']);
+  });
+
+  it('starts no turn for a transcript whose speaker left the world while it was being transcribed', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    let finish!: (text: string) => void;
+    const { say, heard, leave } = listening({ transcribe: () => new Promise((resolve) => (finish = resolve)) });
+    say('p1', loud(300));
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS);
+    leave('p1');
+    finish('hello there');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(heard).toEqual([]);
+  });
+
+  it('does not transcribe a voice that is not a player in the world', async () => {
+    const { say, heard, useModel, requests, state } = listening({ absent: ['stranger'] });
+    say('stranger', loud(300));
+    say('p1', loud(200));
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS);
+    expect(requests()).toEqual([0.2]);
+    expect(useModel).toHaveBeenCalledTimes(1);
+    expect(heard.map(({ speaker }) => speaker)).toEqual(['p1']);
+    expect(state()).toEqual({ speakers: 0, transcribing: 0, held: 0 });
+  });
+
+  it('stops listening for departures on stop()', () => {
+    const { manager, events } = listening();
+    expect((events as any).listeners.leave.size).toBe(1);
+    manager.stop();
+    expect((events as any).listeners.leave.size).toBe(0);
   });
 
   it('transcribes a speaker who never pauses every 30 s: at most 30 s of them wait, plus the 30 s being transcribed', async () => {
@@ -325,8 +377,50 @@ describe('VoiceManager voice input', () => {
     const { say, state, heard } = listening();
     for (let i = 0; i < 12; i++) say(`p${i}`, loud(100));
     expect(state().speakers).toBe(MAX_SPEAKERS);
-    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS);
+    // Three requests at a time: everyone is heard within three pauses
+    await vi.advanceTimersByTimeAsync(3 * UTTERANCE_PAUSE_MS);
     expect(heard.map(({ speaker }) => speaker).sort()).toEqual(['p0', 'p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7']);
+  });
+
+  it('counts people being transcribed toward the 8: while eight are held, waiting or in slow requests, a ninth is not heard', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // Speech-to-text never answers
+    const { say, state, useModel } = listening({ transcribe: () => new Promise(() => {}) });
+    for (let i = 0; i < MAX_SPEAKERS; i++) say(`p${i}`, loud(100));
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS * 4);
+    expect(state()).toMatchObject({ speakers: MAX_SPEAKERS - MAX_CONCURRENT_TRANSCRIPTIONS, transcribing: MAX_CONCURRENT_TRANSCRIPTIONS });
+    say('p8', loud(100));
+    expect(state().speakers + state().transcribing).toBe(MAX_SPEAKERS);
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS * 4);
+    // Someone already held can go on speaking: their next utterance waits for their request
+    say('p0', loud(100));
+    expect(state().speakers).toBe(MAX_SPEAKERS - MAX_CONCURRENT_TRANSCRIPTIONS + 1);
+    expect(useModel).toHaveBeenCalledTimes(MAX_CONCURRENT_TRANSCRIPTIONS);
+  });
+
+  it('sends at most 3 speech-to-text requests at once, over all speakers; the others wait and are transcribed as requests end', async () => {
+    const finish: ((text: string) => void)[] = [];
+    let inFlight = 0;
+    let most = 0;
+    const { say, heard, useModel } = listening({
+      transcribe: () =>
+        new Promise((resolve) => {
+          most = Math.max(most, ++inFlight);
+          finish.push((text) => {
+            inFlight--;
+            resolve(text);
+          });
+        }),
+    });
+    for (let i = 0; i < 6; i++) say(`p${i}`, loud(100));
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS * 3);
+    expect(useModel).toHaveBeenCalledTimes(MAX_CONCURRENT_TRANSCRIPTIONS);
+    while (finish.length) {
+      finish.shift()!('said something');
+      await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS);
+    }
+    expect(heard).toHaveLength(6);
+    expect(most).toBe(MAX_CONCURRENT_TRANSCRIPTIONS);
   });
 
   it('keeps nothing when no speech-to-text model is registered', async () => {
@@ -515,73 +609,75 @@ describe('VoiceManager shop links', () => {
 });
 
 describe('VoiceManager voice limits', () => {
-  afterEach(() => resetUsageBudget());
+  const realFetch = globalThis.fetch;
+  beforeEach(() => {
+    // Only ElevenLabs: the speech request is answered by the stub fetch below, never sent
+    vi.stubEnv('ELEVENLABS_XI_API_KEY', 'test-key');
+    vi.stubEnv('OPENAI_API_KEY', '');
+    for (const method of ['log', 'error'] as const) vi.spyOn(console, method).mockImplementation(() => {});
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+    resetUsageBudget();
+  });
 
-  it('skips text-to-speech once the daily character limit is reached', async () => {
-    const budget = new UsageBudget({
-      aiCallsPerHour: null,
-      aiTokensPerDay: null,
-      visionPerHour: null,
-      ttsCharsPerDay: 0,
-      sttSecondsPerDay: null,
-      autonomyAiPerHour: null,
-      autonomyAiMinIntervalMs: 0,
-    });
+  it('skips text-to-speech once the daily character limit is reached, sending nothing', async () => {
+    const fetch = vi.fn();
+    globalThis.fetch = fetch as never;
+    const budget = new UsageBudget({ ...noLimits, ttsCharsPerDay: 0 });
     resetUsageBudget(budget);
     const { manager, livekit } = setup(async () => {});
     await expect(manager.speak('Hello there')).resolves.toBe('none');
+    expect(fetch).not.toHaveBeenCalled();
     expect(livekit.publishAudioStream).not.toHaveBeenCalled();
     expect(budget.snapshot(60_000).skipped.tts).toBe(1);
   });
 
   it('counts the characters before the request: of two replies spoken at once only the one that fits the daily limit is synthesized', async () => {
-    const utils = await import('../utils');
-    let finish!: (audio: Buffer) => void;
-    const tts = vi.spyOn(utils, 'generateSpeech').mockImplementation(() => new Promise((resolve) => (finish = resolve)));
+    let answer!: (response: Response) => void;
+    const fetch = vi.fn(() => new Promise<Response>((resolve) => (answer = resolve)));
+    globalThis.fetch = fetch as never;
     const budget = new UsageBudget({ ...noLimits, ttsCharsPerDay: 20 });
     resetUsageBudget(budget);
     const { manager } = setup(async () => PLAYED);
     const both = [manager.speak('Hello there!'), manager.speak('Hello again!')];
     await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(tts).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
     expect(budget.snapshot(60_000)).toMatchObject({ ttsChars: 12, skipped: { tts: 1 } });
-    finish(Buffer.from('audio'));
+    answer(new Response(Buffer.from('audio'), { status: 200 }));
     expect(await Promise.all(both)).toEqual(['all', 'none']);
-    tts.mockRestore();
   });
 
-  it('keeps the characters of a failed synthesis counted', async () => {
-    const utils = await import('../utils');
-    const tts = vi.spyOn(utils, 'generateSpeech').mockRejectedValue(new Error('TTS down'));
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  it('keeps the characters of a synthesis that failed after it was sent counted', async () => {
+    const fetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'));
+    globalThis.fetch = fetch as never;
     const budget = new UsageBudget({ ...noLimits, ttsCharsPerDay: 20 });
     resetUsageBudget(budget);
     const { manager } = setup(async () => PLAYED);
     await expect(manager.speak('Hello there!')).resolves.toBe('none');
     expect(budget.snapshot(60_000).ttsChars).toBe(12);
     await expect(manager.speak('Hello again!')).resolves.toBe('none');
-    expect(tts).toHaveBeenCalledTimes(1);
-    tts.mockRestore();
-    vi.restoreAllMocks();
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it('speaks at most 600 code points of a reply, up to a sentence end, and reports the reply as partly spoken', async () => {
-    const utils = await import('../utils');
-    const tts = vi.spyOn(utils, 'generateSpeech').mockResolvedValue(Buffer.from('audio'));
+    const fetch = vi.fn(async () => new Response(Buffer.from('audio'), { status: 200 }));
+    globalThis.fetch = fetch as never;
     const budget = new UsageBudget(noLimits);
     resetUsageBudget(budget);
     const { manager } = setup(async () => PLAYED);
     const sentence = 'This is one sentence of the reply. ';
     const reply = sentence.repeat(40);
     await expect(manager.speak(reply)).resolves.toBe('partial');
-    const [spoken] = tts.mock.calls[0];
+    const spoken: string = JSON.parse((fetch.mock.calls[0] as unknown as [string, { body: string }])[1].body).text;
     expect(spoken).toBe(sentence.repeat(17).trimEnd());
     expect(spoken.length).toBeLessThanOrEqual(MAX_SPOKEN_CODE_POINTS);
     // Only what was sent is counted
     expect(budget.snapshot(60_000).ttsChars).toBe(spoken.length);
     // A reply within the cap is spoken whole
     await expect(manager.speak(sentence.repeat(17))).resolves.toBe('all');
-    tts.mockRestore();
   });
 
   it('cuts speech at the cap itself when there is no sentence end, never through a surrogate pair', () => {

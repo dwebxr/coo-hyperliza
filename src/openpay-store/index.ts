@@ -15,9 +15,13 @@ import {
   DEFAULT_OPENPAY_STORE_API_URL,
   StoreCatalog,
   type StoreProduct,
+  formatLinkMessage,
   parseHandles,
   parseLocale,
+  sanitizeText,
 } from './catalog';
+
+export { formatLinkMessage };
 
 /**
  * Coo as a shop clerk for OpenPay Store: knows the configured products, recommends them, and
@@ -50,12 +54,15 @@ function isAutonomous(runtime: IAgentRuntime, message: Memory): boolean {
   return message.entityId === runtime.agentId || !message.content?.text?.trim();
 }
 
+/** A seller's handle as it is shown (in a prompt, or spoken): `@handle`, with no web address in it (sanitizeText). */
+const shownHandle = (handle: string) => sanitizeText(`@${handle}`, 65);
+
 export function formatShelf(products: StoreProduct[], { autonomous }: { autonomous: boolean }): string {
   if (!products.length) return '';
   const lines: string[] = [];
   let size = 0;
   for (const p of products.slice(0, SHELF_LIMIT)) {
-    const meta = [p.category, `@${p.handle}`].filter(Boolean).join(', ');
+    const meta = [p.category, shownHandle(p.handle)].filter(Boolean).join(', ');
     const line = `- [${p.id}] ${p.emoji ? `${p.emoji} ` : ''}${p.title} — ${p.totalJpyc} JPYC (${meta})${p.desc ? `: ${p.desc.slice(0, 80)}` : ''}`;
     if (size + line.length > SHELF_MAX_CHARS) break;
     lines.push(line);
@@ -120,13 +127,9 @@ export function resolveProduct(
   return null;
 }
 
-export function formatLinkMessage(product: StoreProduct): string {
-  return `🛒 ${product.emoji ? `${product.emoji} ` : ''}${product.title} — ${product.totalJpyc} JPYC\n${product.url}`;
-}
-
 /** For voice-only replies outside Hyperfy (e.g. Discord voice), which are spoken and never posted. */
 export function formatSpokenProduct(product: StoreProduct): string {
-  return `${product.title} — ${product.totalJpyc} JPYC. OpenPay Store, @${product.handle}.`;
+  return `${product.title} — ${product.totalJpyc} JPYC. OpenPay Store, ${shownHandle(product.handle)}.`;
 }
 
 /** `fetchImpl` replaces the request to the listings API (tests); the default goes through the outbound policy. */
@@ -203,8 +206,14 @@ export function createOpenPayStorePlugin(env: Record<string, string | undefined>
       // Hyperfy's callbacks post flagged links to chat (voice turns included) without speaking them.
       // Other platforms' voice callbacks speak the text and post nothing, so they get no URL.
       const spokenOnly = message.content.source !== 'hyperfy' && (message.content as { isVoiceMessage?: boolean }).isVoiceMessage === true;
+      const link = spokenOnly ? null : formatLinkMessage(product);
+      if (!spokenOnly && !link) {
+        // formatLinkMessage logged why
+        await tellFailure(callback, SHARE_ACTION, "Sorry, I can't post that product's link right now.");
+        return actionFailed(SHARE_ACTION, 'the link message for that product could not be made safely', { productId: product.id });
+      }
       await callback?.({
-        text: spokenOnly ? formatSpokenProduct(product) : formatLinkMessage(product),
+        text: spokenOnly ? formatSpokenProduct(product) : link!,
         actions: [SHARE_ACTION],
         source: message.content.source,
         metadata: spokenOnly ? { productId: product.id } : { [OPENPAY_LINK_FLAG]: true, productId: product.id },
