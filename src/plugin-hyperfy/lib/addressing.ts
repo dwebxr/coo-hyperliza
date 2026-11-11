@@ -1,8 +1,6 @@
-const ASCII_ONLY = /^[\x00-\x7F]+$/;
+import { escapeRegExp } from './text';
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
+const ASCII_ONLY = /^[\x00-\x7F]+$/;
 
 /**
  * Parses a comma-separated alias list (e.g. HYPERFY_AGENT_ALIASES="クー,くー").

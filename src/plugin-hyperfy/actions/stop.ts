@@ -8,9 +8,12 @@ import {
 } from '@elizaos/core';
 import { HyperfyService } from '../service';
 import { AgentControls } from '../systems/controls'; // Import AgentControls type
+import { actionFailed, actionSucceeded } from '../lib/action-result';
+
+const STOP_MOVING = 'HYPERFY_STOP_MOVING';
 
 export const hyperfyStopMovingAction: Action = {
-    name: 'HYPERFY_STOP_MOVING',
+    name: STOP_MOVING,
     similes: ['STOP', 'HALT', 'STOP_WALKING', 'CANCEL_MOVEMENT', 'STOP_PATROLLING'],
     description: 'Instantly stops your current walking or pathing; use to pause movement before speaking or performing another action.',
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
@@ -34,14 +37,14 @@ export const hyperfyStopMovingAction: Action = {
         // Should not happen if validate works, but good practice
         logger.error('Hyperfy service or controls not found for HYPERFY_STOP_MOVING action.');
         await callback({ text: "Error: Cannot stop movement. Hyperfy connection/controls unavailable." });
-        return;
+        return actionFailed(STOP_MOVING, 'Hyperfy connection/controls unavailable');
       }
 
       // Check for required method
       if (typeof controls.stopAllActions !== 'function') {
            logger.error('AgentControls missing stopAllActions method.');
            await callback({ text: "Error: Stop functionality not available in controls." });
-           return;
+           return actionFailed(STOP_MOVING, 'stop functionality not available in controls');
       }
 
       const reason = options?.reason || "stop action called";
@@ -52,14 +55,16 @@ export const hyperfyStopMovingAction: Action = {
 
         await callback({
            text: ``,
-           actions: ['HYPERFY_STOP_MOVING'],
+           actions: [STOP_MOVING],
            source: 'hyperfy',
            metadata: { status: 'movement_stopped', reason: reason }
         });
+        return actionSucceeded(STOP_MOVING);
 
       } catch (error: any) {
         logger.error(`Error during HYPERFY_STOP_MOVING:`, error);
         await callback({ text: `Error stopping movement: ${error.message}` });
+        return actionFailed(STOP_MOVING, `error stopping movement: ${error.message}`);
       }
     },
      examples: [

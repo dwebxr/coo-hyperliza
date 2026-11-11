@@ -1,11 +1,19 @@
-import { Content, EventType, HandlerCallback, IAgentRuntime, Memory, MessageReceivedHandlerParams, ModelType, asUUID, composePromptFromState, createUniqueUuid, logger, parseKeyValueXml, truncateToCompleteSentence } from "@elizaos/core";
-import { v4 } from 'uuid';
+import { Content, EventType, HandlerCallback, IAgentRuntime, Memory, ModelType, asUUID, composePromptFromState, createUniqueUuid, logger, parseKeyValueXml, truncateToCompleteSentence } from "@elizaos/core";
 import { hyperfyShouldRespondTemplate, hyperfyMessageHandlerTemplate } from "../templates";
 import { AiBudgetExceededError, forPurpose, getUsageBudget } from "../../usage-budget";
 import { getShopProducts } from "../../openpay-store";
 import { parseAliases } from "../lib/addressing";
 import { isJapanese, matchSimpleCommand, simpleCommandReply } from "../lib/simple-commands";
 import { NoticeThrottle, composeOfflineReply } from "../lib/offline-reply";
+import { readString, readStringList } from "../lib/model-output";
+
+/** What the Hyperfy chat and voice events hand the handler (see ../events.ts). */
+export interface MessageReceivedHandlerParams {
+  runtime: IAgentRuntime;
+  message: Memory;
+  callback: HandlerCallback;
+  onComplete?: () => void;
+}
 
 const latestResponseIds = new Map<string, Map<string, string>>();
 
@@ -86,7 +94,7 @@ export const messageReceivedHandler = async ({
   try {
     logger.info(`[Bootstrap] Message received from ${message.entityId} in room ${message.roomId}`);
     // Generate a new response ID
-    const responseId = v4();
+    const responseId = crypto.randomUUID();
     // Get or create the agent-specific map
     if (!latestResponseIds.has(runtime.agentId)) {
       latestResponseIds.set(runtime.agentId, new Map<string, string>());
@@ -100,7 +108,7 @@ export const messageReceivedHandler = async ({
     agentResponses.set(message.roomId, responseId);
 
     // Generate a unique run ID for tracking this message handler execution
-    const runId = asUUID(v4());
+    const runId = asUUID(crypto.randomUUID());
     const startTime = Date.now();
 
     // Emit run started event
@@ -245,11 +253,11 @@ export const messageReceivedHandler = async ({
 
             // Attempt to parse the XML response
             const parsedXml = parseKeyValueXml(response);
-            logger.debug('[Bootstrap] *** Parsed XML Content ***\n', parsedXml);
+            logger.debug({ parsedXml }, '[Bootstrap] *** Parsed XML Content ***');
 
             // Map parsed XML to Content type, handling potential missing fields
             if (parsedXml) {
-              let actions = parsedXml.actions || ['IGNORE'];
+              let actions = readStringList(parsedXml, 'actions') || ['IGNORE'];
 
               // Reorder actions so 'REPLY' always comes first if present
               const replyIndex = actions.findIndex(a => a.toUpperCase() === 'REPLY');
@@ -262,11 +270,11 @@ export const messageReceivedHandler = async ({
 
               responseContent = {
                 ...parsedXml,
-                thought: parsedXml.thought || '',
+                thought: readString(parsedXml, 'thought') || '',
                 actions,
-                providers: parsedXml.providers || [],
-                text: parsedXml.text || '',
-                simple: parsedXml.simple || false,
+                providers: readStringList(parsedXml, 'providers') || [],
+                text: readString(parsedXml, 'text') || '',
+                simple: parsedXml.simple === true,
               };
             } else {
               responseContent = null;
@@ -291,7 +299,7 @@ export const messageReceivedHandler = async ({
             responseContent.inReplyTo = createUniqueUuid(runtime, message.id);
 
             const responseMesssage = {
-              id: asUUID(v4()),
+              id: asUUID(crypto.randomUUID()),
               entityId: runtime.agentId,
               agentId: runtime.agentId,
               content: responseContent,

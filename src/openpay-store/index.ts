@@ -8,6 +8,7 @@ import {
   logger,
 } from '@elizaos/core';
 import { isDirectlyAddressed } from '../plugin-hyperfy/lib/addressing';
+import { actionFailed, actionSucceeded } from '../plugin-hyperfy/lib/action-result';
 import {
   DEFAULT_OPENPAY_STORE_API_URL,
   StoreCatalog,
@@ -170,7 +171,7 @@ export function createOpenPayStorePlugin(env: Record<string, string | undefined>
       // autonomous list, so unsolicited links are refused here
       if (isAutonomous(runtime, message)) {
         logger.info(`[OpenPayStore] Ignoring ${SHARE_ACTION} outside a conversation`);
-        return;
+        return actionFailed(SHARE_ACTION, 'links are only shared in a conversation');
       }
       const reply = responses?.[0]?.content as Record<string, unknown> | undefined;
       const product = resolveProduct(catalog.list(), {
@@ -180,7 +181,7 @@ export function createOpenPayStorePlugin(env: Record<string, string | undefined>
       });
       if (!product) {
         logger.info(`[OpenPayStore] Could not tell which product to share (productId: ${String(reply?.productId ?? '')})`);
-        return;
+        return actionFailed(SHARE_ACTION, 'could not tell which product to share');
       }
 
       // Delivery stays with the platform callback, which knows whether this turn is still current.
@@ -193,6 +194,7 @@ export function createOpenPayStorePlugin(env: Record<string, string | undefined>
         source: message.content.source,
         metadata: spokenOnly ? { productId: product.id } : { [OPENPAY_LINK_FLAG]: true, productId: product.id },
       });
+      return actionSucceeded(SHARE_ACTION, { productId: product.id });
     },
     examples: [],
   };

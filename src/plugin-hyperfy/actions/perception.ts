@@ -14,6 +14,10 @@ import { HyperfyService } from '../service';
 import { AiBudgetExceededError, forPurpose, getUsageBudget } from '../../usage-budget';
 import { chooseSnapshot, type NamedEntity } from '../lib/snapshot-choice';
 import { isJapanese } from '../lib/simple-commands';
+import { actionFailed, actionSucceeded } from '../lib/action-result';
+import { readString } from '../lib/model-output';
+
+const SCENE_PERCEPTION = 'HYPERFY_SCENE_PERCEPTION';
 
 export enum SnapshotType {
   LOOK_AROUND     = 'LOOK_AROUND',
@@ -96,7 +100,7 @@ Respond using this format:
 /* HYPERFY_SCENE_PERCEPTION action                                            */
 /* -------------------------------------------------------------------------- */
 export const hyperfyScenePerceptionAction: Action = {
-  name: 'HYPERFY_SCENE_PERCEPTION',
+  name: SCENE_PERCEPTION,
   similes: ['LOOK_AROUND', 'OBSERVE_SURROUNDINGS', 'LOOK_AT_SCENE', 'CHECK_VIEW'],
   description: 'Choose this when the user asks the agent to look around, look in a specific direction, or examine a visible object — it captures and interprets a scene snapshot to generate a context-aware response.',
   validate: async (runtime: IAgentRuntime): Promise<boolean> => {
@@ -118,7 +122,7 @@ export const hyperfyScenePerceptionAction: Action = {
     if (!service || !world || !puppeteerManager) {
       logger.error('Hyperfy service/world unavailable.');
       await callback({ text: 'Unable to observe environment. Hyperfy world not available.' });
-      return;
+      return actionFailed(SCENE_PERCEPTION, 'Hyperfy world not available');
     }
 
     const text = message.content?.text ?? '';
@@ -133,7 +137,7 @@ export const hyperfyScenePerceptionAction: Action = {
           : "Sorry, I'm resting my eyes for a bit. Ask me again a little later!",
         metadata: { error: 'vision_budget' },
       });
-      return;
+      return actionFailed(SCENE_PERCEPTION, 'vision budget used up');
     }
 
     world.controls?.stopAllActions();
@@ -174,7 +178,7 @@ export const hyperfyScenePerceptionAction: Action = {
     } catch (err) {
       logger.error('Snapshot failed:', err);
       await callback({ thought: 'Snapshot failed.', metadata: { error: 'snapshot_failure', snapshotType } });
-      return;
+      return actionFailed(SCENE_PERCEPTION, 'snapshot failed', { snapshotType });
     }
 
     let viewHeader: string;
@@ -207,27 +211,28 @@ export const hyperfyScenePerceptionAction: Action = {
           text: japanese ? 'ごめんなさい、今はよく見られないみたいです。' : "Sorry, I can't take a proper look right now.",
           metadata: { error: 'ai_budget' },
         });
-        return;
+        return actionFailed(SCENE_PERCEPTION, 'AI budget used up', { snapshotType });
       }
       logger.error('Vision response failed:', err);
       await callback({ thought: 'Cannot understand the scene.', metadata: { error: 'vision_failure' } });
-      return;
+      return actionFailed(SCENE_PERCEPTION, 'vision model failed', { snapshotType });
     }
 
     const parsed = parseKeyValueXml(xmlRaw);
 
     if (!parsed) {
       await callback({ thought: 'Malformed XML.', metadata: { error: 'xml_parse_failure', xmlRaw } });
-      return;
+      return actionFailed(SCENE_PERCEPTION, 'could not parse the vision reply', { snapshotType });
     }
 
     await callback({
       ...parsed,
-      thought: parsed.thought || '',
-      text: parsed.text || '',
-      emote: parsed.emote || '',
+      thought: readString(parsed, 'thought') || '',
+      text: readString(parsed, 'text') || '',
+      emote: readString(parsed, 'emote') || '',
       metadata: { snapshotType, ...(parameter ? { parameter } : {}) }
     });
+    return actionSucceeded(SCENE_PERCEPTION, { snapshotType });
   },
 
   examples: [

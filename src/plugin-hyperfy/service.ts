@@ -3,7 +3,6 @@ import 'ses'
 import type { UUID } from '@elizaos/core'
 import {
   createUniqueUuid,
-  EventType,
   type IAgentRuntime,
   Service,
 } from '@elizaos/core'
@@ -28,11 +27,12 @@ import { type AssetUploadError, ensureAsset, uploadAsset } from './lib/asset-upl
 import { PROTOCOL_VERSION, adaptToWorldProtocol } from './lib/world-protocol'
 import { storage } from './hyperfy/src/core/storage.js'
 import { TipWallet, readTipWalletAccount, signInHost } from './lib/tip-wallet'
+import { resolveWorldWsUrl } from './lib/world-url'
+import { type HyperfyDisconnectedPayload, hyperfyEventType } from './events'
 
 const moduleDirPath = getModuleDirectory();
 const LOCAL_AVATAR_PATH = `${moduleDirPath}/avatars/avatar.vrm`;
 
-const HYPERFY_WS_URL = process.env.WS_URL || 'wss://chill.hyperfy.xyz/ws'
 const HYPERFY_APPEARANCE_POLL_INTERVAL = 30000
 
 type AvatarResult = { outcome: 'applied' | 'gave-up'; error?: string } | { outcome: 'retry'; error?: string }
@@ -103,11 +103,19 @@ export class HyperfyService extends Service {
   static async start(runtime: IAgentRuntime): Promise<HyperfyService> {
     console.info('*** Starting Hyperfy service ***')
     const service = new HyperfyService(runtime)
-    console.info(`Attempting automatic connection to default Hyperfy URL: ${HYPERFY_WS_URL}`)
+    let wsUrl: string
+    try {
+      wsUrl = resolveWorldWsUrl(process.env.WS_URL)
+    } catch (error: any) {
+      // No connection, and so no retries, until WS_URL is fixed and the agent restarted
+      console.error(`[Hyperfy] ${error.message}. Not connecting to any world.`)
+      return service
+    }
+    console.info(`Attempting automatic connection to default Hyperfy URL: ${wsUrl}`)
     const defaultWorldId = createUniqueUuid(runtime, runtime.agentId + '-default-hyperfy') as UUID
 
     service
-      .connect({ wsUrl: HYPERFY_WS_URL, worldId: defaultWorldId })
+      .connect({ wsUrl, worldId: defaultWorldId })
       .then(() => console.info(`Automatic Hyperfy connection initiated.`))
       .catch(err => {
         console.error(`Automatic Hyperfy connection failed: ${err.message}`)
@@ -343,11 +351,14 @@ export class HyperfyService extends Service {
     // ClientNetwork passes the raw CloseEvent
     reason = reason?.code ?? reason
     console.warn(`Hyperfy world disconnected: ${reason}`)
-    this.runtime.emitEvent(EventType.WORLD_LEFT, {
+    const disconnected: HyperfyDisconnectedPayload = {
       runtime: this.runtime,
-      eventName: 'HYPERFY_DISCONNECTED',
-      data: { worldId: this._currentWorldId, reason: reason },
-    }).catch(error => console.warn('[Hyperfy] WORLD_LEFT handler failed:', error))
+      source: 'hyperfy',
+      worldId: this._currentWorldId,
+      reason,
+    }
+    this.runtime.emitEvent(hyperfyEventType.DISCONNECTED, disconnected)
+      .catch(error => console.warn(`[Hyperfy] ${hyperfyEventType.DISCONNECTED} handler failed:`, error))
 
     await this.handleDisconnect()
     this.scheduleReconnect()

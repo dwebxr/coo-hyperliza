@@ -9,6 +9,9 @@ import {
 // No longer need THREE here
 import { AgentControls } from '../systems/controls'; // Still need type for casting
 import { HyperfyService } from '../service';
+import { actionFailed, actionSucceeded } from '../lib/action-result';
+
+const WALK_RANDOMLY = 'HYPERFY_WALK_RANDOMLY';
 
 // Restore constants for default values
 const RANDOM_WALK_DEFAULT_INTERVAL = 4000; // ms (4 seconds)
@@ -17,7 +20,7 @@ const RANDOM_WALK_DEFAULT_MAX_DISTANCE = 30; // meters
 // State management is now in AgentControls
 
 export const hyperfyWalkRandomlyAction: Action = {
-    name: 'HYPERFY_WALK_RANDOMLY',
+    name: WALK_RANDOMLY,
     similes: ['WANDER', 'PACE_AROUND', 'WALK_AROUND', 'MOVE_RANDOMLY'], // Reverted similes/desc
     description: 'Makes your character wander to random points nearby; use for idle behavior or ambient movement.',
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
@@ -39,14 +42,14 @@ export const hyperfyWalkRandomlyAction: Action = {
       if (!service || !world || !controls) {
         logger.error('Hyperfy service, world, or controls not found for HYPERFY_WALK_RANDOMLY action.');
         await callback({ text: "Error: Cannot wander. Hyperfy connection/controls unavailable." });
-        return;
+        return actionFailed(WALK_RANDOMLY, 'Hyperfy connection/controls unavailable');
       }
 
       // Check for specific methods from the reverted AgentControls
        if (typeof controls.startRandomWalk !== 'function' || typeof controls.stopRandomWalk !== 'function') {
            logger.error('AgentControls missing startRandomWalk or stopRandomWalk methods.');
            await callback({ text: "Error: Wander functionality not available in controls." });
-           return;
+           return actionFailed(WALK_RANDOMLY, 'wander functionality not available in controls');
        }
 
       const command = options?.command || 'start';
@@ -61,16 +64,18 @@ export const hyperfyWalkRandomlyAction: Action = {
           } else {
               //  await callback({ text: "Was not wandering.", source: 'hyperfy' });
           }
+          return actionSucceeded(WALK_RANDOMLY, { status: 'stopped' });
       } else { // command === 'start'
           // Call startRandomWalk with calculated interval and distance
           controls.startRandomWalk(intervalMs, maxDistance);
 
           await callback({
              text: ``,
-             actions: ['HYPERFY_WALK_RANDOMLY'],
+             actions: [WALK_RANDOMLY],
              source: 'hyperfy',
              metadata: { status: 'started', intervalMs: intervalMs, maxDistance: maxDistance }
           });
+          return actionSucceeded(WALK_RANDOMLY, { status: 'started' });
       }
     },
      examples: [

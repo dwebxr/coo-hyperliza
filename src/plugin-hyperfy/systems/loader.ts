@@ -6,10 +6,8 @@ import { glbToNodes } from "../hyperfy/src/core/extras/glbToNodes.js";
 import { createEmoteFactory } from "../hyperfy/src/core/extras/createEmoteFactory.js";
 import { AgentAvatar } from "./avatar.js";
 import { PuppeteerManager } from "../managers/puppeteer-manager.js";
-import { promises as fsPromises } from 'fs';
 import { resolveUrl } from "../utils.js";
 
-// import { VRMLoaderPlugin } from "@pixiv/three-vrm";
 // --- Mock Browser Environment for Loaders ---
 // These might need adjustment based on GLTFLoader/VRMLoaderPlugin requirements
 if (typeof globalThis !== "undefined") {
@@ -70,17 +68,6 @@ export class AgentLoader extends System {
     this.dummyScene = new THREE.Object3D();
     this.dummyScene.name = "AgentLoaderDummyScene";
     // -----------------------------
-
-    // --- Attempt to register VRM plugin ---
-    // try {
-    //     this.gltfLoader.register(parser => new VRMLoaderPlugin(parser, {
-    //         autoUpdateHumanBones: false
-    //     }));
-    //     console.log("[AgentLoader] VRMLoaderPlugin registered.");
-    // } catch (vrmError) {
-    //     console.error("[AgentLoader] Warning: Failed to register VRMLoaderPlugin. VRM-specific features might be unavailable.", vrmError);
-    // }
-    // ---------------------------------------
   }
 
   // --- Dummy Preload Methods ---

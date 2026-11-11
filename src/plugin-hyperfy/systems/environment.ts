@@ -2,7 +2,6 @@
 import { CSM } from '../hyperfy/src/core/libs/csm/CSM'
 import { isNumber, isString } from 'lodash-es'
 import { System } from '../hyperfy/src/core/systems/System.js'
-import { logger } from '@elizaos/core';
 import * as THREE from 'three';
 import { PuppeteerManager } from "../managers/puppeteer-manager.js";
 import { resolveUrl } from '../utils.js';

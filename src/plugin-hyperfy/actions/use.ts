@@ -10,8 +10,11 @@ import {
 } from '@elizaos/core';
 import { HyperfyService } from '../service';
 import { forPurpose } from '../../usage-budget';
-import { AgentActions } from '../systems/actions';
+import { AgentActions, type PerformActionOutcome } from '../systems/actions';
 import { AgentControls } from '../systems/controls';
+import { actionFailed, actionSucceeded } from '../lib/action-result';
+
+const USE_ITEM = 'HYPERFY_USE_ITEM';
 
 // Template to extract entity to interact with
 const useItemTemplate = `
@@ -33,7 +36,7 @@ Response format:
 `;
 
 export const hyperfyUseItemAction: Action = {
-  name: 'HYPERFY_USE_ITEM',
+  name: USE_ITEM,
   similes: ['INTERACT_WITH_ITEM', 'USE_NEARBY_OBJECT', 'PICK_UP_ITEM'],
   description: 'Walks to and interacts with a nearby usable item (like picking it up); use when a player asks you to use or grab something.',
   validate: async (runtime: IAgentRuntime): Promise<boolean> => {
@@ -50,13 +53,13 @@ export const hyperfyUseItemAction: Action = {
   ) => {
     const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
     const world = service?.getWorld();
-    const controls = world?.controls as AgentControls;
+    const controls = world?.controls as AgentControls | undefined;
     const actions = world?.actions as AgentActions | undefined;
 
-    if (!service || !world || !actions) {
+    if (!service || !world || !actions || !controls) {
       logger.error('Hyperfy service, world, or actions not found for HYPERFY_USE_ITEM action.');
       await callback({ text: "Error: Cannot use item. Agent action system unavailable." });
-      return;
+      return actionFailed(USE_ITEM, 'agent action system unavailable');
     }
 
     let targetEntityId = options?.entityId;
@@ -81,31 +84,41 @@ export const hyperfyUseItemAction: Action = {
 
     if (!targetEntityId) {
       logger.warn('[USE ITEM] No suitable item found to use based on the context.');
-      return;
+      return actionFailed(USE_ITEM, 'no suitable item found');
     }
 
     
-    const entity = world.entities.items.get(targetEntityId);
+    const entity = world.entities?.items?.get(targetEntityId);
     const targetPosition = entity?.root?.position
     if (!targetPosition) {
       await callback({
         text: `Could not locate entity ${targetEntityId}.`,
         metadata: { error: 'entity_not_found' }
       });
-      return;
+      return actionFailed(USE_ITEM, 'entity not found', { targetEntityId });
     }
 
-    await controls.goto(targetPosition.x, targetPosition.z);
-
-    logger.info(`[USE ITEM] Attempting to use item with entity ID: ${targetEntityId}`);
-    actions.performAction(targetEntityId);
+    let outcome: PerformActionOutcome;
+    try {
+      await controls.goto(targetPosition.x, targetPosition.z);
+      logger.info(`[USE ITEM] Attempting to use item with entity ID: ${targetEntityId}`);
+      outcome = actions.performAction(targetEntityId);
+    } catch (error: any) {
+      logger.error('[USE ITEM] Walking to or using the item failed:', error);
+      return actionFailed(USE_ITEM, `could not reach or use the item: ${error?.message ?? error}`, { targetEntityId });
+    }
+    if (outcome !== 'started') {
+      logger.warn(`[USE ITEM] Nothing to use on ${targetEntityId} (${outcome}).`);
+      return actionFailed(USE_ITEM, `nothing was used (${outcome})`, { targetEntityId, outcome });
+    }
 
     await callback({
       text: `Using item: ${targetEntityId}`,
-      actions: ['HYPERFY_USE_ITEM'],
+      actions: [USE_ITEM],
       source: 'hyperfy',
       metadata: { targetEntityId, status: 'triggered' }
     });
+    return actionSucceeded(USE_ITEM, { targetEntityId });
   },
   examples: [
     [

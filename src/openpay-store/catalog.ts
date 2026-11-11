@@ -1,4 +1,5 @@
 import { logger } from '@elizaos/core';
+import { stripControlChars, truncateCodePoints } from '../plugin-hyperfy/lib/text';
 
 /**
  * Products from the public OpenPay Store listings API
@@ -42,13 +43,11 @@ export interface StoreCatalogConfig {
  */
 export function sanitizeText(value: unknown, max: number): string {
   if (typeof value !== 'string') return '';
-  const clean = value
-    .replace(/[\u0000-\u001f\u007f<>`]/g, ' ')
+  const clean = stripControlChars(value, ' ')
+    .replace(/[<>`]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  // Count code points, so an emoji is never cut in half into a lone surrogate
-  const chars = Array.from(clean);
-  return chars.length > max ? `${chars.slice(0, max - 1).join('').trimEnd()}…` : clean;
+  return truncateCodePoints(clean, max, '…');
 }
 
 const HANDLE = /^[\w.-]{1,64}$/;

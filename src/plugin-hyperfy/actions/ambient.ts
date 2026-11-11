@@ -1,7 +1,6 @@
-import { Content } from '@elizaos/core';
 import {
   type Action,
-  type ActionExample,
+  type Content,
   composePromptFromState,
   type HandlerCallback,
   type IAgentRuntime,
@@ -10,6 +9,10 @@ import {
   type State,
 } from '@elizaos/core';
 import { forPurpose } from '../../usage-budget';
+import { actionSucceeded } from '../lib/action-result';
+import { plannedContent, readString } from '../lib/model-output';
+
+const AMBIENT_SPEECH = 'HYPERFY_AMBIENT_SPEECH';
 
 const ambientTemplate = `# Task: Generate ambient speech for the character {{agentName}}.
 {{providers}}
@@ -27,30 +30,8 @@ Only output a valid JSON block:
 }
 \`\`\``;
 
-function getFirstAvailableField(obj: Record<string, any>, fields: string[]): string | null {
-  for (const field of fields) {
-    if (typeof obj[field] === 'string' && obj[field].trim() !== '') {
-      return obj[field];
-    }
-  }
-  return null;
-}
-
-function extractAmbientContent(response: Memory, fieldKeys: string[]): Content | null {
-  const hasAmbientAction = response.content.actions?.includes('HYPERFY_AMBIENT_SPEECH');
-  const text = getFirstAvailableField(response.content, fieldKeys);
-  if (!hasAmbientAction || !text) return null;
-
-  return {
-    ...response.content,
-    thought: response.content.thought,
-    text,
-    actions: ['HYPERFY_AMBIENT_SPEECH'],
-  };
-}
-
-export const hyperfyAmbientSpeechAction = {
-  name: 'HYPERFY_AMBIENT_SPEECH',
+export const hyperfyAmbientSpeechAction: Action = {
+  name: AMBIENT_SPEECH,
   similes: ['MONOLOGUE', 'OBSERVE', 'SELF_TALK', 'ENVIRONMENTAL_REMARK'],
   description: 'Says something aloud without addressing anyone; use for idle thoughts, atmosphere, or commentary when not in conversation.',
   validate: async (_runtime: IAgentRuntime) => true,
@@ -62,16 +43,14 @@ export const hyperfyAmbientSpeechAction = {
     callback: HandlerCallback,
     responses?: Memory[]
   ) => {
-    const fieldKeys = ['message', 'text'];
-
     const existing =
       responses
-        ?.map((r) => extractAmbientContent(r, fieldKeys))
+        ?.map((r) => plannedContent(r, AMBIENT_SPEECH))
         .filter((c): c is Content => c !== null) ?? [];
 
     if (existing.length > 0) {
       for (const c of existing) await callback(c);
-      return;
+      return actionSucceeded(AMBIENT_SPEECH);
     }
 
     state = await runtime.composeState(message, [
@@ -87,10 +66,11 @@ export const hyperfyAmbientSpeechAction = {
     const response = await runtime.useModel(ModelType.OBJECT_LARGE, forPurpose('ambient', { prompt }));
 
     await callback({
-      thought: response.thought,
-      text: (response.message as string) || '',
-      actions: ['HYPERFY_AMBIENT_SPEECH'],
+      thought: readString(response, 'thought'),
+      text: readString(response, 'message') || '',
+      actions: [AMBIENT_SPEECH],
     });
+    return actionSucceeded(AMBIENT_SPEECH);
   },
   examples: [
     [
@@ -119,5 +99,5 @@ export const hyperfyAmbientSpeechAction = {
         },
       },
     ],
-  ] as ActionExample[][],
-} as Action;
+  ],
+};

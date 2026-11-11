@@ -212,13 +212,13 @@ export class AgentControls extends System {
   }
 
   /**
-   * Teleports the agent to the specified position and optional rotation.
+   * Teleports the agent to the specified position and optional rotation. False when there is no player.
    */
-  public teleportTo(position: THREE.Vector3, rotationY?: number): void {
+  public teleportTo(position: THREE.Vector3, rotationY?: number): boolean {
     const player = this.world?.entities?.player;
     if (!player) {
       logger.warn("[Controls] Cannot teleport: Player entity not found.");
-      return;
+      return false;
     }
 
     logger.info(`[Controls] Teleporting to ${position.x}, ${position.y}, ${position.z}`);
@@ -228,22 +228,23 @@ export class AgentControls extends System {
       position: position,
       rotationY: rotationY,
     });
+    return true;
   }
 
   /**
-   * Teleports the agent to the location of a specific entity.
+   * Teleports the agent to the location of a specific entity. False when it did not teleport.
    */
-  public teleportToEntity(entityId: string): void {
+  public teleportToEntity(entityId: string): boolean {
     const target = this.world?.entities?.items?.get(entityId);
     if (!target) {
       logger.warn(`[Controls] Cannot teleport to entity ${entityId}: Entity not found.`);
-      return;
+      return false;
     }
 
     const position = target.base?.position?.clone() || target.root?.position?.clone();
     if (!position) {
       logger.warn(`[Controls] Cannot teleport to entity ${entityId}: Position not found.`);
-      return;
+      return false;
     }
 
     // Teleport slightly offset to avoid clipping inside the target
@@ -252,7 +253,7 @@ export class AgentControls extends System {
     const safePosition = position.clone();
     // safePosition.y += 0.1; // Slight lift
 
-    this.teleportTo(safePosition);
+    return this.teleportTo(safePosition);
   }
 
 

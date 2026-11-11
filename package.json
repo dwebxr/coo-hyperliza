@@ -1,17 +1,15 @@
 {
   "name": "plugin-hyperfy",
-  "description": "Project starter for elizaOS",
+  "description": "Coo: an elizaOS agent that lives in a Hyperfy world",
   "version": "1.0.0-beta.40",
   "type": "module",
   "private": true,
   "main": "dist/index.js",
   "module": "dist/index.js",
-  "types": "dist/index.d.ts",
   "exports": {
     "./package.json": "./package.json",
     ".": {
       "import": {
-        "types": "./dist/index.d.ts",
         "default": "./dist/index.js"
       }
     }
@@ -27,6 +25,7 @@
     "@elizaos/plugin-sql": "^1.7.2",
     "@livekit/rtc-node": "^0.13.13",
     "@pixiv/three-vrm": "^3.4.0",
+    "dotenv": "17.4.2",
     "hls.js": "^1.6.2",
     "jsonrepair": "3.13.1",
     "livekit-client": "^2.11.4",
@@ -58,15 +57,12 @@
     "build": "tsup && cp src/plugin-hyperfy/physx/physx-js-webidl.js src/plugin-hyperfy/physx/physx-js-webidl.wasm dist/ && cp -r src/plugin-hyperfy/public/scripts dist/ && cp -r src/plugin-hyperfy/public/assets dist/ && cp -r src/plugin-hyperfy/public/avatars dist/ && cp -r src/plugin-hyperfy/public/emotes dist/ && cp -r src/plugin-hyperfy/public/puppeteer dist/",
     "lint": "prettier --write ./src",
     "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json; base=$?; tsc --noEmit -p tsconfig.strict.json && exit $base",
     "test:coverage": "vitest run --coverage",
     "test:watch": "vitest",
     "format": "prettier --write ./src",
     "format:check": "prettier --check ./src"
   },
-  "publishConfig": {
-    "access": "public"
-  },
-  "gitHead": "b165ad83e5f7a21bc1edbd83374ca087e3cd6b33",
   "overrides": {
     "simple-git": "4.0.2",
     "@elizaos/plugin-openai": "file:./stubs/unused-elizaos-plugin",

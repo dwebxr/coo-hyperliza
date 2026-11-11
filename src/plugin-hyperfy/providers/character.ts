@@ -35,7 +35,7 @@ export const characterProvider: Provider = {
     const bio = addHeader(`# About ${character.name}`, bioText);
 
     // System prompt
-    const system = `# System Behavior\n${character.system}` ?? '';
+    const system = character.system ? `# System Behavior\n${character.system}` : '';
 
     // Select random topic if available
     const topicString =

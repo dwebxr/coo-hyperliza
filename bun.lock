@@ -12,6 +12,7 @@
         "@elizaos/plugin-sql": "^1.7.2",
         "@livekit/rtc-node": "^0.13.13",
         "@pixiv/three-vrm": "^3.4.0",
+        "dotenv": "17.4.2",
         "hls.js": "^1.6.2",
         "jsonrepair": "3.13.1",
         "livekit-client": "^2.11.4",

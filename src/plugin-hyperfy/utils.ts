@@ -1,4 +1,3 @@
-import { Readable } from 'node:stream';
 import { promises as fsPromises } from 'fs';
 import type { Action, IAgentRuntime, Memory, State } from '@elizaos/core';
 import { fileURLToPath } from 'url';
@@ -15,54 +14,13 @@ export async function hashFileBuffer(buffer: Buffer): Promise<string> {
   return hash
 }
 
-export async function convertToAudioBuffer(speechResponse: any): Promise<Buffer> {
-  if (Buffer.isBuffer(speechResponse)) {
-    return speechResponse;
-  }
-
-  if (typeof speechResponse?.getReader === 'function') {
-    // Handle Web ReadableStream
-    const reader = (speechResponse as ReadableStream<Uint8Array>).getReader();
-    const chunks: Uint8Array[] = [];
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) chunks.push(value);
-      }
-      return Buffer.concat(chunks);
-    } finally {
-      reader.releaseLock();
-    }
-  }
-
-  if (
-    speechResponse instanceof Readable ||
-    (speechResponse &&
-      speechResponse.readable === true &&
-      typeof speechResponse.pipe === 'function' &&
-      typeof speechResponse.on === 'function')
-  ) {
-    // Handle Node Readable Stream
-    return new Promise<Buffer>((resolve, reject) => {
-      const chunks: Buffer[] = [];
-      speechResponse.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-      speechResponse.on('end', () => resolve(Buffer.concat(chunks)));
-      speechResponse.on('error', (err) => reject(err));
-    });
-  }
-
-  throw new Error('Unexpected response type from TEXT_TO_SPEECH model');
-}
-
 export function getModuleDirectory(): string {
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = dirname(__filename);
   return __dirname
 }
 
-const mimeTypes = {
+const mimeTypes: Record<string, string> = {
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
   '.png': 'image/png',
@@ -77,14 +35,14 @@ const mimeTypes = {
   '.hyp': 'application/octet-stream',
 };
 
-function getMimeTypeFromPath(filePath) {
+function getMimeTypeFromPath(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
   return mimeTypes[ext] || 'application/octet-stream';
 }
 
 export const resolveUrl = async (
-  url,
-  world,
+  url: unknown,
+  world: { assetsUrl?: string | null },
   { allowLocal = true }: { allowLocal?: boolean } = {}
 ): Promise<string | null> => {
   if (typeof url !== "string") {

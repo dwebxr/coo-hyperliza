@@ -37,6 +37,7 @@ vi.mock('./managers/puppeteer-manager', () => {
 
 import { HyperfyService, findQueuedKick } from './service';
 import { RECONNECT_MAX_DELAY_MS } from './lib/reconnect';
+import { hyperfyEventType } from './events';
 
 // Nothing listens here, so the socket closes during or right after init.
 const UNREACHABLE = { wsUrl: 'ws://127.0.0.1:9/ws', worldId: '00000000-0000-0000-0000-000000000001' as any };
@@ -145,8 +146,32 @@ describe('HyperfyService connection lifecycle (offline)', () => {
       await connectIgnoringClose(service);
       await vi.waitFor(() => expect(service!.getWorld()).toBeNull(), { timeout: 15_000, interval: 50 });
     }
-    const worldLeft = runtime.emitEvent.mock.calls.filter(([event]: any[]) => event === 'WORLD_LEFT');
-    expect(worldLeft).toHaveLength(2);
+    const disconnected = runtime.emitEvent.mock.calls.filter(([event]: any[]) => event === hyperfyEventType.DISCONNECTED);
+    expect(disconnected).toHaveLength(2);
+    expect(disconnected[0][1]).toEqual({ runtime, source: 'hyperfy', worldId: UNREACHABLE.worldId, reason: expect.anything() });
+  });
+
+  it.each([
+    ['play.example.com/ws', 'WS_URL is not a valid URL'],
+    ['   ', 'WS_URL is set but blank'],
+  ])('start() with WS_URL=%j logs why and never connects (not even to the default world) or retries', async (wsUrl, reason) => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    vi.stubEnv('WS_URL', wsUrl);
+    const WebSocketSpy = vi.fn();
+    vi.stubGlobal('WebSocket', WebSocketSpy);
+    const { runtime } = createRuntime();
+    try {
+      service = await HyperfyService.start(runtime);
+      const controller = (service as any).reconnectController;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(service.getWorld()).toBeNull();
+      expect(controller.isPending).toBe(false);
+      expect(WebSocketSpy).not.toHaveBeenCalled();
+      expect(errors.mock.calls.flat().join(' ')).toContain(reason);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('stop() cancels a pending reconnect', async () => {

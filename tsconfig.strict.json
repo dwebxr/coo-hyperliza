@@ -1,0 +1,23 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "strict": true,
+    // The base config sets this to false explicitly, which strict alone would not override
+    "noImplicitAny": true
+  },
+  // Every file listed here, and every file it imports, must be strict-clean. src/index.ts is
+  // left out: it imports the whole Hyperfy plugin. Add each new module that can be strict.
+  "include": [
+    "src/anthropic-models.ts",
+    "src/anthropic-models.test.ts",
+    "src/elevenlabs-speech.ts",
+    "src/elevenlabs-speech.test.ts",
+    "src/llm-provider.ts",
+    "src/llm-provider.test.ts",
+    "src/usage-budget.ts",
+    "src/usage-budget.test.ts",
+    "src/openpay-store/**/*.ts",
+    "src/plugin-hyperfy/lib/**/*.ts",
+    "src/plugin-hyperfy/utils.ts"
+  ]
+}

@@ -127,7 +127,8 @@ describe('createOpenPayStorePlugin', () => {
     for (const message of [userMessage('hyperfy'), userMessage('hyperfy', { isVoiceMessage: true }), userMessage('discord')]) {
       const callback = vi.fn();
       const rt = runtime();
-      await action.handler(rt, message, undefined, {}, callback, reply('h_board'));
+      const result = await action.handler(rt, message, undefined, {}, callback, reply('h_board'));
+      expect(result).toEqual({ success: true, data: { actionName: SHARE_ACTION, productId: 'h_board' } });
       expect(callback).toHaveBeenCalledWith(
         expect.objectContaining({ text: formatLinkMessage(board), metadata: { [OPENPAY_LINK_FLAG]: true, productId: 'h_board' } })
       );
@@ -148,8 +149,10 @@ describe('createOpenPayStorePlugin', () => {
   it('never shares on autonomous turns or for an unresolvable product', async () => {
     const { action } = await loadedPlugin();
     const callback = vi.fn();
-    await action.handler(runtime(), { entityId: 'agent', content: { text: '' } } as any, undefined, {}, callback, reply('h_board'));
-    await action.handler(runtime(), userMessage('hyperfy', { text: 'それのリンクちょうだい' }), undefined, {}, callback, reply('h_unknown'));
+    const autonomous = await action.handler(runtime(), { entityId: 'agent', content: { text: '' } } as any, undefined, {}, callback, reply('h_board'));
+    const unknown = await action.handler(runtime(), userMessage('hyperfy', { text: 'それのリンクちょうだい' }), undefined, {}, callback, reply('h_unknown'));
     expect(callback).not.toHaveBeenCalled();
+    expect(autonomous).toMatchObject({ success: false, data: { actionName: SHARE_ACTION } });
+    expect(unknown).toMatchObject({ success: false, data: { actionName: SHARE_ACTION } });
   });
 });

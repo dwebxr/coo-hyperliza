@@ -50,6 +50,10 @@ describe('sanitizeText', () => {
     expect(cut).toBe('🛹…');
     expect(cut).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
   });
+
+  it('also replaces C1 controls such as NEL (U+0085), which \\s does not match', () => {
+    expect(sanitizeText('Nice\u0085board\u009b2J', 100)).toBe('Nice board 2J');
+  });
 });
 
 describe('toStoreProduct', () => {

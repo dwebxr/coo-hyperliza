@@ -1,7 +1,6 @@
-import { Content } from '@elizaos/core';
 import {
   type Action,
-  type ActionExample,
+  type Content,
   composePromptFromState,
   type HandlerCallback,
   type IAgentRuntime,
@@ -10,12 +9,9 @@ import {
   type State,
 } from '@elizaos/core';
 import { forPurpose } from '../../usage-budget';
+import { actionSucceeded } from '../lib/action-result';
+import { plannedContent, readString } from '../lib/model-output';
 
-/**
- * Template for generating dialog and actions for a character.
- *
- * @type {string}
- */
 /**
  * Template for generating dialog and actions for a character.
  *
@@ -37,29 +33,6 @@ Response format should be formatted in a valid JSON block like this:
 
 Your response should include the valid JSON block and nothing else.`;
 
-function getFirstAvailableField(obj: Record<string, any>, fields: string[]): string | null {
-  for (const field of fields) {
-    if (typeof obj[field] === 'string' && obj[field].trim() !== '') {
-      return obj[field];
-    }
-  }
-  return null;
-}
-
-function extractReplyContent(response: Memory, replyFieldKeys: string[]): Content | null {
-  const hasReplyAction = response.content.actions?.includes('REPLY');
-  const text = getFirstAvailableField(response.content, replyFieldKeys);
-
-  if (!hasReplyAction || !text) return null;
-
-  return {
-    ...response.content,
-    thought: response.content.thought,
-    text,
-    actions: ['REPLY'],
-  };
-}
-
 /**
  * Represents an action that allows the agent to reply to the current conversation with a generated message.
  *
@@ -73,7 +46,7 @@ function extractReplyContent(response: Memory, replyFieldKeys: string[]): Conten
  * @property {Function} handler - An asynchronous function for handling the action logic.
  * @property {ActionExample[][]} examples - An array of example scenarios for the action.
  */
-export const replyAction = {
+export const replyAction: Action = {
   name: 'REPLY',
   similes: ['GREET', 'REPLY_TO_MESSAGE', 'SEND_REPLY', 'RESPOND', 'RESPONSE'],
   description: `Sends a direct message into in-game chat to a player; always use this first when you're speaking in response to someone.`,
@@ -88,18 +61,16 @@ export const replyAction = {
     callback: HandlerCallback,
     responses?: Memory[]
   ) => {
-    const replyFieldKeys = ['message', 'text'];
-
     const existingReplies =
       responses
-        ?.map((r) => extractReplyContent(r, replyFieldKeys))
+        ?.map((r) => plannedContent(r, 'REPLY'))
         .filter((reply): reply is Content => reply !== null) ?? [];
 
     if (existingReplies.length > 0) {
       for (const reply of existingReplies) {
         await callback(reply);
       }
-      return;
+      return actionSucceeded('REPLY');
     }
 
     // Only generate response using LLM if no suitable response was found
@@ -115,12 +86,13 @@ export const replyAction = {
     }));
 
     const responseContent = {
-      thought: response.thought,
-      text: (response.message as string) || '',
+      thought: readString(response, 'thought'),
+      text: readString(response, 'message') || '',
       actions: ['REPLY'],
     };
 
     await callback(responseContent);
+    return actionSucceeded('REPLY');
   },
   examples: [
     [
@@ -183,5 +155,5 @@ export const replyAction = {
         },
       },
     ],
-  ] as ActionExample[][],
-} as Action;
+  ],
+};

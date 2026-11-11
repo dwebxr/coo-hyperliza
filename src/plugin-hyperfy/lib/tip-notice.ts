@@ -5,13 +5,14 @@
  * (src/core/systems/ServerNetwork.js tipConfirmed / announceTip)
  */
 
+import { escapeRegExp } from './text';
+
 export interface TipNotice {
   fromName: string;
   amount: string;
   token: string;
 }
 
-const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const AMOUNT_AND_TOKEN = '(\\d+(?:\\.\\d+)?) ([A-Za-z0-9.]{1,16})';
 const PRIVATE_NOTICE = new RegExp(`^\\(only you\\) (.+) tipped you ${AMOUNT_AND_TOKEN}$`);
 

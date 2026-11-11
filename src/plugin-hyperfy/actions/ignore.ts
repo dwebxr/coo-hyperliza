@@ -1,11 +1,11 @@
 import type {
   Action,
-  ActionExample,
   IAgentRuntime,
   Memory,
   HandlerCallback,
   State,
 } from '@elizaos/core';
+import { actionSucceeded } from '../lib/action-result';
 
 /**
  * Action representing the IGNORE action. This action is used when ignoring the user in a conversation.
@@ -24,7 +24,7 @@ import type {
  * This action is used to ignore the user in a conversation. It should be used when the user is aggressive, creepy, or when the conversation has naturally ended.
  * Avoid using this action if the user has engaged directly or if there is a need to communicate with them. Use IGNORE only when the user should be ignored.
  *
- * The action includes a validation function that always returns true and a handler function that also returns true.
+ * The action includes a validation function that always returns true and a handler that always succeeds.
  *
  * Examples of using the IGNORE action are provided in the 'examples' array. Each example includes messages between two parties and the use of the IGNORE action.
  *
@@ -51,8 +51,7 @@ export const ignoreAction: Action = {
       // Pass the agent's original response content (thought, IGNORE action, etc.)
       await callback(responses[0].content);
     }
-    // Still return true to indicate the action handler succeeded
-    return true;
+    return actionSucceeded('IGNORE');
   },
   examples: [
     [
@@ -100,7 +99,7 @@ export const ignoreAction: Action = {
         name: '{{name2}}',
         content: { text: 'See ya' },
       },
-      { name: '{{name1}}', content: { text: '' }, actions: ['IGNORE'] },
+      { name: '{{name1}}', content: { text: '', actions: ['IGNORE'] } },
     ],
 
     [
@@ -262,5 +261,5 @@ export const ignoreAction: Action = {
         },
       },
     ],
-  ] as ActionExample[][],
-} as Action;
+  ],
+};

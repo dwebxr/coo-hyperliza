@@ -1,4 +1,4 @@
-import type { Action, IAgentRuntime, Memory, Provider, State } from '@elizaos/core';
+import type { IAgentRuntime, Memory, Provider, State } from '@elizaos/core';
 import { addHeader, composeActionExamples, formatActionNames } from '@elizaos/core';
 import { getHyperfyActions, formatActions } from '../utils';
 

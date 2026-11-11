@@ -1,6 +1,5 @@
 import {
     Action,
-    ActionExample,
     HandlerCallback,
     IAgentRuntime,
     Memory,
@@ -8,9 +7,12 @@ import {
     logger,
 } from "@elizaos/core";
 import { HyperfyService } from "../service";
+import { actionFailed, actionSucceeded } from "../lib/action-result";
+
+const TELEPORT_TO_USER = "HYPERFY_TELEPORT_TO_USER";
 
 export const teleportToUserAction: Action = {
-    name: "HYPERFY_TELEPORT_TO_USER",
+    name: TELEPORT_TO_USER,
     similes: ["TELEPORT_TO_PLAYER", "WARP_TO_USER", "FOLLOW_USER_INSTANTLY"],
     description: "Teleport instantly to the location of the user who sent the message or a specified user. Use this when the user asks you to come to them, follow them immediately, or when they are too far away to walk.",
     validate: async (runtime: IAgentRuntime) => {
@@ -28,13 +30,13 @@ export const teleportToUserAction: Action = {
         const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
         if (!service) {
             logger.error("[Teleport Action] HyperfyService not found.");
-            return false;
+            return actionFailed(TELEPORT_TO_USER, "HyperfyService not found");
         }
 
         const world = service.getWorld();
         if (!world) {
             logger.warn("[Teleport Action] World not ready.");
-            return false;
+            return actionFailed(TELEPORT_TO_USER, "world not ready");
         }
 
         // Hyperfy entity id of the chat sender; absent for autonomous runs, in which case
@@ -43,71 +45,81 @@ export const teleportToUserAction: Action = {
 
         logger.info(`[Teleport Action] Attempting to teleport to user: ${targetUserId ?? "(nearest player)"}`);
 
-        if (world.actions && typeof world.actions.teleportToUser === 'function') {
-            world.actions.teleportToUser(targetUserId);
-        } else if (world.controls && typeof world.controls.teleportToEntity === 'function') {
-            // Fallback direct control
-            world.controls.teleportToEntity(targetUserId);
-        } else {
-            logger.error("[Teleport Action] Teleport capability not found on world.actions or world.controls.");
-            return false;
+        let teleported: boolean;
+        try {
+            if (world.actions && typeof world.actions.teleportToUser === 'function') {
+                teleported = world.actions.teleportToUser(targetUserId) === true;
+            } else if (world.controls && typeof world.controls.teleportToEntity === 'function') {
+                // Fallback direct control
+                teleported = world.controls.teleportToEntity(targetUserId) === true;
+            } else {
+                logger.error("[Teleport Action] Teleport capability not found on world.actions or world.controls.");
+                return actionFailed(TELEPORT_TO_USER, "teleport capability not found");
+            }
+        } catch (error: any) {
+            logger.error("[Teleport Action] Teleport failed:", error);
+            return actionFailed(TELEPORT_TO_USER, `teleport failed: ${error?.message ?? error}`);
+        }
+        if (!teleported) {
+            logger.warn("[Teleport Action] No player to teleport to; nothing happened.");
+            return actionFailed(TELEPORT_TO_USER, "no player to teleport to");
         }
 
         if (callback) {
             await callback({
                 text: `Teleporting to you!`,
-                actions: ["HYPERFY_TELEPORT_TO_USER"],
+                actions: [TELEPORT_TO_USER],
                 source: "hyperfy",
             });
         }
 
-        return;
+        return actionSucceeded(TELEPORT_TO_USER);
     },
     examples: [
         [
             {
-                user: "{{user1}}",
+                name: "{{name1}}",
                 content: {
                     text: "Come here!",
                 },
             },
             {
-                user: "{{user2}}",
+                name: "{{name2}}",
                 content: {
                     text: "On my way! *teleports*",
-                    action: "HYPERFY_TELEPORT_TO_USER",
+                    actions: ["HYPERFY_TELEPORT_TO_USER"],
                 },
             },
         ],
         [
             {
-                user: "{{user1}}",
+                name: "{{name1}}",
                 content: {
                     text: "Teleport to me.",
                 },
             },
             {
-                user: "{{user2}}",
+                name: "{{name2}}",
                 content: {
                     text: "Warping to your location now!",
-                    action: "HYPERFY_TELEPORT_TO_USER",
+                    actions: ["HYPERFY_TELEPORT_TO_USER"],
                 },
             },
         ],
         [
             {
-                user: "{{user1}}",
+                name: "{{name1}}",
                 content: {
                     text: "I'm at the spawn point, come find me.",
                 },
             },
             {
-                user: "{{user2}}",
+                name: "{{name2}}",
                 content: {
                     text: "Okay, I'll teleport there immediately.",
-                    action: "HYPERFY_TELEPORT_TO_USER",
+                    actions: ["HYPERFY_TELEPORT_TO_USER"],
                 },
             },
         ],
-    ] as ActionExample[][],
+    ],
 };

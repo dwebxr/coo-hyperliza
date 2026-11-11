@@ -1,4 +1,3 @@
-import path from 'node:path';
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
@@ -11,13 +10,7 @@ export default defineConfig({
     // Vitest 4 only reports files the tests load unless coverage.include lists the rest
     coverage: {
       include: ['src/**/*.ts'],
-      // src/tests.ts is elizaOS's in-agent test suite, not application code
-      exclude: ['src/**/*.test.ts', 'src/tests.ts', 'src/plugin-hyperfy/hyperfy/**'],
-    },
-  },
-  resolve: {
-    alias: {
-      '@': path.resolve(__dirname, './src'),
+      exclude: ['src/**/*.test.ts', 'src/plugin-hyperfy/hyperfy/**'],
     },
   },
 });

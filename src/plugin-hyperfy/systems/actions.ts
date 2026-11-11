@@ -5,6 +5,9 @@ interface ActionNode extends THREE.Object3D {
   [key: string]: any;
 }
 
+/** What performAction did: 'started' when it began an interaction, otherwise why it did nothing. */
+export type PerformActionOutcome = 'started' | 'busy' | 'no-action-nodes' | 'entity-has-no-action-node';
+
 export class AgentActions extends System {
   private nodes: ActionNode[] = []
   private currentNode: ActionNode | null = null;
@@ -38,13 +41,13 @@ export class AgentActions extends System {
   }
 
 
-  performAction(entityID?: string) {
+  performAction(entityID?: string): PerformActionOutcome {
     if (this.currentNode) {
       console.log('Already interacting with an entity. Release it first.');
-      return;
+      return 'busy';
     }
     const nearby = this.getNearby();
-    if (!nearby.length) return;
+    if (!nearby.length) return 'no-action-nodes';
 
     let target: ActionNode | undefined;
 
@@ -52,7 +55,7 @@ export class AgentActions extends System {
       target = nearby.find(node => node.ctx.entity?.data?.id === entityID);
       if (!target) {
         console.log(`No nearby action node found with entity ID: ${entityID}`);
-        return;
+        return 'entity-has-no-action-node';
       }
     } else {
       target = nearby[0];
@@ -68,14 +71,15 @@ export class AgentActions extends System {
       control.setKey('keyE', false);
       this.currentNode = target;
     }, target._duration ?? 3000);
-
+    return 'started';
   }
 
 
-  releaseAction() {
+  /** False when there was nothing to release. */
+  releaseAction(): boolean {
     if (!this.currentNode) {
       console.log('No current action to release.');
-      return;
+      return false;
     }
 
     console.log('Releasing current action.');
@@ -94,15 +98,16 @@ export class AgentActions extends System {
       control.keyX.onRelease?.();
       this.currentNode = null;
     }, 500);
+    return true;
   }
 
-  teleportToUser(userId?: string) {
+  /** False when there was no player to teleport to (or the teleport could not be made). */
+  teleportToUser(userId?: string): boolean {
     console.log(`[Actions] Teleporting to user: ${userId}`);
 
     // userId is the Hyperfy entity id of the sender when known
     if (userId && this.world.entities.items.has(userId)) {
-      this.world.controls.teleportToEntity(userId);
-      return;
+      return this.world.controls.teleportToEntity(userId) === true;
     }
 
     // Fallback: the other player nearest to the agent
@@ -119,10 +124,10 @@ export class AgentActions extends System {
     });
 
     if (targetId) {
-      this.world.controls.teleportToEntity(targetId);
-    } else {
-      console.warn(`[Actions] Could not find user entity to teleport to.`);
+      return this.world.controls.teleportToEntity(targetId) === true;
     }
+    console.warn(`[Actions] Could not find user entity to teleport to.`);
+    return false;
   }
 
   // Framework stubs

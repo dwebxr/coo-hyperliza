@@ -14,6 +14,7 @@ import {
   chooseIdleStep,
   readAutonomyConfig,
 } from "../lib/idle-behavior";
+import { readString, readStringList } from "../lib/model-output";
 
 const TIME_INTERVAL_IDLE_MIN = 60000; // 60 seconds when no players around
 const TIME_INTERVAL_IDLE_MAX = 120000; // 120 seconds when no players around
@@ -329,11 +330,11 @@ export class BehaviorManager {
     const responseMemory: Memory = {
       id: createUniqueUuid(this.runtime, Date.now().toString()),
       content: {
-        thought: parsedXml.thought as string,
-        text: parsedXml.text as string,
-        actions: parsedXml.actions as string[],
-        providers: parsedXml.providers as string[],
-        emote: parsedXml.emote as string,
+        thought: readString(parsedXml, 'thought'),
+        text: readString(parsedXml, 'text'),
+        actions: readStringList(parsedXml, 'actions'),
+        providers: readStringList(parsedXml, 'providers'),
+        emote: readString(parsedXml, 'emote'),
       },
       entityId: createUniqueUuid(this.runtime, this.runtime.agentId),
       roomId: elizaRoomId,

@@ -7,14 +7,13 @@ import {
     type Memory,
     type State,
     logger,
-    EventType,
-    type EventHandler
 } from '@elizaos/core';
 import { HyperfyService } from '../service';
 import { forPurpose } from '../../usage-budget';
 import { AgentControls } from '../systems/controls'; // Import AgentControls type
-// Import THREE types if needed, e.g., for metadata typing
-// import type * as THREE from 'three';
+import { actionFailed, actionSucceeded } from '../lib/action-result';
+
+const GOTO_ENTITY = 'HYPERFY_GOTO_ENTITY';
 
 export enum NavigationType {
   ENTITY = 'entity',
@@ -70,7 +69,7 @@ Only return the JSON object. Do not include any extra text or comments.
 
 
 export const hyperfyGotoEntityAction: Action = {
-    name: 'HYPERFY_GOTO_ENTITY',
+    name: GOTO_ENTITY,
     similes: ['GO_TO_ENTITY_IN_WORLD', 'MOVE_TO_ENTITY', 'NAVIGATE_TO_ENTITY'],
     description: 'Moves your character to a specified player, object, or world position; use when you need to approach something or go somewhere before interacting.',
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
@@ -99,7 +98,7 @@ export const hyperfyGotoEntityAction: Action = {
       if (!service || !world || !controls) {
         logger.error('[GOTO Action] Hyperfy service, world, or controls not found.');
         await callback({ thought: 'Prerequisites failed.', error: "Cannot navigate. Hyperfy connection/controls unavailable." });
-        return;
+        return actionFailed(GOTO_ENTITY, 'Hyperfy connection/controls unavailable');
       }
       
       let navigationResult: any = null;
@@ -120,7 +119,7 @@ export const hyperfyGotoEntityAction: Action = {
           text: 'Action failed: Could not determine a navigation target.',
           metadata: { error: 'extraction_failed' },
         });
-        return;
+        return actionFailed(GOTO_ENTITY, 'could not determine a navigation target');
       }
 
       if (
@@ -133,7 +132,7 @@ export const hyperfyGotoEntityAction: Action = {
           text: 'Action failed: Invalid navigation target.',
           metadata: { error: 'invalid_navigation_target' },
         });
-        return;
+        return actionFailed(GOTO_ENTITY, 'invalid navigation target');
       }
 
       const { navigationType, parameter } = navigationResult;
@@ -155,10 +154,10 @@ export const hyperfyGotoEntityAction: Action = {
 
             await callback({
               text: `Arrived at ${entityName}.`,
-              actions: ['HYPERFY_GOTO_ENTITY'],
+              actions: [GOTO_ENTITY],
               source: 'hyperfy',
             });
-            break;
+            return actionSucceeded(GOTO_ENTITY, { navigationType, entityId });
           }
 
           case NavigationType.POSITION: {
@@ -172,10 +171,10 @@ export const hyperfyGotoEntityAction: Action = {
 
             await callback({
               text: `Reached position (${pos.x}, ${pos.z}).`,
-              actions: ['HYPERFY_GOTO_ENTITY'],
+              actions: [GOTO_ENTITY],
               source: 'hyperfy',
             });
-            break;
+            return actionSucceeded(GOTO_ENTITY, { navigationType, position: { x: pos.x, z: pos.z } });
           }
 
           default:
@@ -187,6 +186,7 @@ export const hyperfyGotoEntityAction: Action = {
           text: `Navigation failed: ${error.message}`,
           metadata: { error: 'navigation_error', detail: error.message },
         });
+        return actionFailed(GOTO_ENTITY, `navigation failed: ${error.message}`);
       }
     },
      examples: [

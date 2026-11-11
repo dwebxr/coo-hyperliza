@@ -11,8 +11,24 @@ import {
   } from '@elizaos/core';
   import { HyperfyService } from '../service';
   import { forPurpose } from '../../usage-budget';
-  import { AgentControls } from '../systems/controls';
+  import { actionFailed, actionSucceeded } from '../lib/action-result';
+  import { readString } from '../lib/model-output';
   const MAX_RETRIES = 3;
+  const EDIT_ENTITY = 'HYPERFY_EDIT_ENTITY';
+
+  /**
+   * What happened to one entry of the model's edit plan: run without throwing, skipped because the
+   * plan itself marked it as not possible, or failed (threw, unsupported type, or not an object).
+   * "executed" only means the manager call returned; the managers do not report whether it took effect.
+   */
+  interface OperationOutcome {
+    operation?: string;
+    target?: string;
+    outcome: 'executed' | 'skipped' | 'failed';
+    reason?: string;
+  }
+
+  const stringOrUndefined = (value: unknown) => (typeof value === 'string' ? value : undefined);
 
   export enum EditOperationType {
     DUPLICATE = 'duplicate',
@@ -165,7 +181,7 @@ ${summary}
   
   
   export const hyperfyEditEntityAction: Action = {
-    name: 'HYPERFY_EDIT_ENTITY',
+    name: EDIT_ENTITY,
     similes: ['EDIT_ENTITY_IN_WORLD', 'MODIFY_SCENE', 'BUILD_STRUCTURE'],
     description: `Performs scene edits in Hyperfy, including duplicating, moving, rotating, scaling, deleting, or importing entities. Use when the user asks to modify or add something in the 3D world.`,
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
@@ -186,7 +202,7 @@ ${summary}
     
       if (!service || !world || !buildManager) {
         logger.error('[EDIT_ENTITY Action] Hyperfy service, world, or buildManager not found.');
-        return;
+        return actionFailed(EDIT_ENTITY, 'Hyperfy service, world, or buildManager not found');
       }
     
       let operationResults: any = null;
@@ -215,12 +231,28 @@ ${summary}
       
       if (!Array.isArray(operationResults?.operations)) {
         logger.error(`[EDIT_ENTITY Action] Scene editing failed — could not understand instructions properly.`);
-        return;
+        return actionFailed(EDIT_ENTITY, 'no edit plan from the model');
       }
     
-      for (const op of operationResults.operations) {
-        if (!op?.success) {
-          logger.warn(`[EDIT_ENTITY Action] Skipping failed operation:`, op?.reason || op);
+      const operations: unknown[] = operationResults.operations;
+      const outcomes: OperationOutcome[] = [];
+      for (const entry of operations) {
+        if (!entry || typeof entry !== 'object') {
+          logger.warn(`[EDIT_ENTITY Action] Ignoring an edit plan entry that is not an object (${entry === null ? 'null' : typeof entry})`);
+          outcomes.push({ outcome: 'failed', reason: 'not an operation object' });
+          continue;
+        }
+        const op = entry as Record<string, any>;
+        const outcome: OperationOutcome = {
+          operation: stringOrUndefined(op.operation),
+          target: stringOrUndefined(op.target),
+          outcome: 'executed',
+        };
+        outcomes.push(outcome);
+        if (!op.success) {
+          logger.warn(`[EDIT_ENTITY Action] Skipping failed operation:`, op.reason || op);
+          outcome.outcome = 'skipped';
+          outcome.reason = stringOrUndefined(op.reason);
           continue;
         }
     
@@ -258,18 +290,38 @@ ${summary}
 
             default:
               logger.warn(`[EDIT_ENTITY Action] Unsupported operation type: ${operation}`);
+              outcome.outcome = 'failed';
+              outcome.reason = 'unsupported operation type';
               break;
           }
           if (description) {
             const messageManager = service.getMessageManager();
             messageManager.sendMessage(description);
           }
-        } catch (error) {
+        } catch (error: any) {
           logger.error(`[EDIT_ENTITY Action] Operation ${operation} on "${target}" failed:`, error);
+          outcome.outcome = 'failed';
+          outcome.reason = String(error?.message ?? error);
         }
       }
-      const summaryText = operationResults.operations.map(op => {
-        if (op?.success) {
+
+      // Succeeds only when something ran and nothing failed; plan-skipped entries alone are not a failure
+      const executed = outcomes.filter((o) => o.outcome === 'executed').length;
+      const skipped = outcomes.filter((o) => o.outcome === 'skipped').length;
+      const failed = outcomes.filter((o) => o.outcome === 'failed').length;
+      const resultData = { executed, skipped, failed, outcomes };
+      const result = executed > 0 && failed === 0
+        ? actionSucceeded(EDIT_ENTITY, resultData)
+        : actionFailed(
+            EDIT_ENTITY,
+            failed > 0 ? `${failed} of ${outcomes.length} operations failed` : 'no operation was executed',
+            resultData
+          );
+
+      const summaryText = operations.map((entry) => {
+        if (!entry || typeof entry !== 'object') return 'FAILURE: unreadable operation entry';
+        const op = entry as Record<string, any>;
+        if (op.success) {
           return `SUCCESS: ${op.description}`;
         } else {
           return `FAILURE: Tried to ${op.operation} "${op.requestedEntityName}" → ${op.reason}`;
@@ -291,7 +343,7 @@ ${summary}
           thought: 'Scene edits completed, but final summary generation failed.',
           text: 'Edits are done, but I had trouble summarizing the results clearly.',
         });
-        return;
+        return result;
       }
       
       const response = parseKeyValueXml(finalXml);
@@ -301,15 +353,16 @@ ${summary}
           thought: 'Could not interpret response XML.',
           text: 'Edits completed, but I couldn’t finish the summary properly.',
         });
-        return;
+        return result;
       }
       
       await callback({
         ...response,
-        thought: response.thought || 'Finished with scene edits.',
-        text: response.text || 'Scene updates complete!',
-        emote: response.emote || '',
+        thought: readString(response, 'thought') || 'Finished with scene edits.',
+        text: readString(response, 'text') || 'Scene updates complete!',
+        emote: readString(response, 'emote') || '',
       });
+      return result;
     },
     examples: [
       [
