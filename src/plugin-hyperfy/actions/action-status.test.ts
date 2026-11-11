@@ -534,25 +534,41 @@ describe('action status recorded by core for every Hyperfy action', () => {
       expect(summaryPrompts[0]).toContain('DONE: Duplicated the block (the copy is entity copy-of-block)');
     });
 
-    it('does not guess at a copy: a reference to one that was not made fails, and nothing is done to the original', async () => {
+    it('fails a step on a copy whose duplicate did not make one: "the copy this refers to was not made", and nothing is done to the original', async () => {
       const duplicate = vi.fn().mockResolvedValue({ outcome: 'skipped', reason: "it is the world's scene" });
       const { calls, data } = await edit(
         [
-          { operation: 'translate', targetRef: 'copy1', parameters: { position: [0, 3, 0] } },
           { operation: 'duplicate', target: 'scene-app', as: 'copy1' },
           { operation: 'translate', targetRef: 'copy1', parameters: { position: [0, 3, 0] } },
-          { operation: 'delete', targetRef: 'copy2' },
+          { operation: 'delete', targetRef: 'copy1' },
         ],
         { duplicate }
       );
-      expect(calls.translate).toEqual([]);
-      expect(calls.delete).toEqual([]);
+      expect([calls.translate, calls.delete]).toEqual([[], []]);
       expect(data.outcomes.map((o) => [o.operation, o.target, o.outcome, o.reason])).toEqual([
-        ['translate', 'copy1', 'failed', 'no copy named "copy1" was made earlier in this request'],
         ['duplicate', 'scene-app', 'skipped', "it is the world's scene"],
-        ['translate', 'copy1', 'failed', 'no copy named "copy1" was made earlier in this request'],
-        ['delete', 'copy2', 'failed', 'no copy named "copy2" was made earlier in this request'],
+        ['translate', 'copy1', 'failed', 'the copy this refers to was not made'],
+        ['delete', 'copy1', 'failed', 'the copy this refers to was not made'],
       ]);
+    });
+
+    it.each([
+      [
+        'a label given to two copies (the second duplicate failing would leave the first as the target)',
+        [
+          { operation: 'duplicate', target: 'A', as: 'copy1' },
+          { operation: 'duplicate', target: 'B', as: 'copy1' },
+          { operation: 'delete', targetRef: 'copy1' },
+        ],
+        'two copies are named "copy1"',
+      ],
+      ['a reference to a label no earlier step gives', [{ operation: 'delete', targetRef: 'copy2' }, { operation: 'duplicate', target: 'A', as: 'copy2' }], '"copy2" names no copy an earlier step makes'],
+      ['a reference to a label nothing gives', [move('a'), { operation: 'translate', targetRef: 'nope', parameters: { position: [0, 1, 0] } }], '"nope" names no copy an earlier step makes'],
+    ])('runs nothing of a plan with %s, and says the plan does not hold together', async (_what, operations, problem) => {
+      const { stored, calls } = await edit(operations);
+      expect(Object.values(calls).flat()).toEqual([]);
+      expect(stored.actionStatus).toBe('failed');
+      expect(stored.actionResult.error).toBe(`invalid edit plan: ${problem}`);
     });
   });
 

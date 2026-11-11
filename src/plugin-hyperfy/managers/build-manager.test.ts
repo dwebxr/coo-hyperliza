@@ -5,6 +5,7 @@ import { SceneEditStopped } from '../lib/authorization';
 import { uploadAsset } from '../lib/asset-upload';
 import { MAX_MODEL_BYTES, NetPolicy, installWorldNet } from '../lib/net-policy';
 import { PUBLIC_ADDRESS, type TestServer, closeServers, startServer, testNet } from '../test-support/net';
+import { adaptToWorldProtocol } from '../lib/world-protocol';
 
 /*
  * The real BuildManager, with uploads going through the real upload helper (lib/asset-upload.ts,
@@ -599,5 +600,46 @@ describe('BuildManager imports through the real upload helper', () => {
     const [data] = world.entities.add.mock.calls[0];
     expect(blueprint).toMatchObject({ name: 'Thing', version: 0 });
     expect(data).toMatchObject({ type: 'app', blueprint: blueprint.id, position: [1, 0, 2], quaternion: [0, 0, 0, 1], uploader: 'coo', pinned: false });
+  });
+});
+
+describe('BuildManager and packets the world would drop', () => {
+  /** setup() with the real protocol adapter on its network, and the engine's add-and-announce */
+  function announcing() {
+    const ctx = setup();
+    const frames: Uint8Array[] = [];
+    const network = ctx.world.network;
+    Object.assign(network, { queue: [], onClose: () => {}, flush: () => {}, ws: { send: (frame: Uint8Array) => void frames.push(frame) } });
+    adaptToWorldProtocol(network, () => null);
+    // As the engine's Blueprints.add and Entities.add do for a local change
+    ctx.world.blueprints.add = vi.fn((data: unknown, local?: boolean) => void (local && network.send('blueprintAdded', data)));
+    ctx.world.entities.add = vi.fn((data: unknown, local?: boolean) => (local && network.send('entityAdded', data), ctx.app));
+    return { ...ctx, frames };
+  }
+
+  it('fails a duplicate whose blueprint is over what the world takes in one packet, and changes nothing here or there', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { manager, guard, entity, world, frames } = announcing();
+    Object.assign(entity.blueprint, { unique: true, name: 'Big', model: 'asset://box.glb', props: { notes: 'x'.repeat(70 * 1024) } });
+    const result = await manager.duplicate(guard, 'box');
+    expect(result).toEqual({ outcome: 'failed', reason: expect.stringMatching(/^the blueprintAdded packet would be \d+ bytes, more than the 65536 the world accepts$/) });
+    expect([world.blueprints.add.mock.calls.length, world.entities.add.mock.calls.length, frames.length]).toEqual([0, 0, 0]);
+    // A copy that fits is announced: its blueprint and its entity
+    (entity.blueprint as Record<string, unknown>).props = { notes: 'short' };
+    await expect(manager.duplicate(guard, 'box')).resolves.toMatchObject({ outcome: 'applied' });
+    expect(frames).toHaveLength(2);
+  });
+  it('fails the import of a .hyp whose blueprint is over what the world takes in one packet, and adds nothing', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { manager, guard, world, frames, answer } = announcing();
+    const header = new TextEncoder().encode(JSON.stringify({ blueprint: { name: 'Big', props: { notes: 'x'.repeat(70 * 1024) } }, assets: [{ type: 'model', url: 'asset://thing.glb', size: 4, mime: 'model/gltf-binary' }] }));
+    const bytes = new Uint8Array(4 + header.length + 4);
+    new DataView(bytes.buffer).setUint32(0, header.length, true);
+    bytes.set(header, 4);
+    bytes.set([9, 9, 9, 9], 4 + header.length);
+    const importing = manager.addApp(guard, new File([bytes], 'big.hyp'), { position: [0, 0, 0], quaternion: [0, 0, 0, 1] });
+    await answer(0, 200, { exists: true });
+    await expect(importing).resolves.toEqual({ outcome: 'failed', reason: expect.stringContaining('the blueprintAdded packet would be') });
+    expect([world.blueprints.add.mock.calls.length, world.entities.add.mock.calls.length, frames.length]).toEqual([0, 0, 0]);
   });
 });

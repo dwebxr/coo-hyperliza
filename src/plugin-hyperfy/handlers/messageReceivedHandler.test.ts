@@ -182,6 +182,41 @@ describe('messageReceivedHandler cost controls', () => {
     expect(callback.mock.calls.map(([content]) => content.actions)).toEqual([['HYPERFY_STOP_MOVING'], ['HYPERFY_STOP_MOVING']]);
   });
 
+  it('ignores a bare "stop" in a MUTED room, by the rule a stop on arrival also follows (lib/room-state.ts), and takes "Coo, stop"', async () => {
+    const { runtime, message } = setup({ embeddingModel: false });
+    const w = world();
+    runtime.getService = vi.fn(() => serviceFor(sessionFor(w)));
+    runtime.getParticipantUserState = vi.fn().mockResolvedValue('MUTED');
+    const callback = vi.fn();
+    message.content = { text: 'stop', metadata: { soloPlayer: true, hyperfyFromId: 'player-bob' } };
+    await messageReceivedHandler({ runtime, message, callback } as any);
+    expect([w.controls.stopAllActions.mock.calls.length, callback.mock.calls.length]).toEqual([0, 0]);
+    message.content = { text: 'Coo, stop', metadata: { directlyAddressed: true, hyperfyFromId: 'player-bob' } };
+    await messageReceivedHandler({ runtime, message: { ...message, id: '00000000-0000-0000-0000-000000000004' }, callback } as any);
+    expect([w.controls.stopAllActions.mock.calls.length, callback.mock.calls.length]).toEqual([1, 1]);
+  });
+
+  it('says it cannot find the speaker, and walks nowhere, when they left while "come here" waited for the avatar', async () => {
+    const { runtime, message } = setup({ embeddingModel: false });
+    const w = world();
+    const session = sessionFor(w);
+    runtime.getService = vi.fn(() => serviceFor(session));
+    // Something else has the avatar for now
+    let done!: () => void;
+    const busy = session.withBody(() => new Promise<void>((resolve) => (done = resolve)));
+    message.content = { text: 'Coo, come here!', metadata: { directlyAddressed: true, hyperfyFromId: 'player-bob' } };
+    const callback = vi.fn();
+    const handling = messageReceivedHandler({ runtime, message, callback } as any);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    w.entities.items.delete('player-bob');
+    done();
+    await busy;
+    await handling;
+    expect(w.controls.followEntity).not.toHaveBeenCalled();
+    expect(callback).toHaveBeenCalledWith(expect.objectContaining({ text: "Hmm, I can't find you right now.", actions: ['REPLY'] }));
+    expect(runtime.useModel).not.toHaveBeenCalled();
+  });
+
   it('leaves "come here" to the model when it is not addressed to the agent', async () => {
     const { runtime, message } = setup({ embeddingModel: false });
     runtime.getService = vi.fn(() => serviceFor(sessionFor(world())));

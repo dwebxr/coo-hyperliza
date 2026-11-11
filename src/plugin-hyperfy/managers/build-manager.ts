@@ -7,6 +7,7 @@ import { SceneEditStopped } from "../lib/authorization";
 import { describeUrl } from "../lib/log-url";
 import { MAX_MODEL_BYTES, SafeFetchError, worldNet } from "../lib/net-policy";
 import type { MoveOutcome } from "../systems/controls";
+import { outgoingPacketProblem } from "../lib/world-protocol";
 
 const IMPORT_DOWNLOAD_TIMEOUT_MS = 60_000;
 
@@ -42,6 +43,16 @@ export type EditResult =
   | { outcome: 'failed'; reason: string };
 
 const applied: EditResult = { outcome: 'applied' };
+
+/**
+ * Why announcing a new app (its blueprint, when it has one of its own, and its entity) would not
+ * reach the world, or null: the world drops a packet over its size limit unread, and the agent's
+ * network does not send it (lib/world-protocol.ts). Asked before anything is added locally, so an
+ * edit that cannot reach the world changes nothing here either.
+ */
+function announcementProblem(blueprint: unknown, entity: unknown): string | null {
+  return (blueprint ? outgoingPacketProblem('blueprintAdded', blueprint) : null) ?? outgoingPacketProblem('entityAdded', entity);
+}
 const skipped = (reason: string): EditResult => ({ outcome: 'skipped', reason });
 const failed = (reason: string): EditResult => ({ outcome: 'failed', reason });
 
@@ -208,11 +219,11 @@ export class BuildManager {
       if (reference !== undefined) return failed("the app's blueprint names a file the world would refuse in a copy");
     }
     {
-      guard.check();
       let blueprintId = entity.data.blueprint
+      let blueprint: Record<string, unknown> | null = null
       // if unique, we also duplicate the blueprint
       if (entity.blueprint.unique) {
-        const blueprint = {
+        blueprint = {
           id: uuid(),
           version: 0,
           name: entity.blueprint.name,
@@ -230,8 +241,7 @@ export class BuildManager {
           unique: entity.blueprint.unique,
           disabled: entity.blueprint.disabled,
         }
-        world.blueprints.add(blueprint, true)
-        blueprintId = blueprint.id
+        blueprintId = blueprint.id as string
       }
       const data = {
         id: uuid(),
@@ -245,6 +255,10 @@ export class BuildManager {
         pinned: false,
         state: {},
       }
+      const tooLarge = announcementProblem(blueprint, data)
+      if (tooLarge) return failed(tooLarge)
+      guard.check();
+      if (blueprint) world.blueprints.add(blueprint, true)
       world.entities.add(data, true)
       // The copy's id, for whoever asked (a later operation of the same plan can act on it)
       return { outcome: 'applied', newId: data.id };
@@ -372,7 +386,6 @@ export class BuildManager {
       unique: info.blueprint.unique,
       disabled: info.blueprint.disabled,
     }
-    world.blueprints.add(blueprint, true)
     const data = {
       id: uuid(),
       type: 'app',
@@ -385,6 +398,9 @@ export class BuildManager {
       pinned: false,
       state: {},
     }
+    const tooLarge = announcementProblem(blueprint, data)
+    if (tooLarge) return failed(tooLarge)
+    world.blueprints.add(blueprint, true)
     const app = world.entities.add(data, true)
     app.onUploaded()
     return applied
@@ -425,7 +441,6 @@ export class BuildManager {
       disabled: false,
     }
 
-    world.blueprints.add(blueprint, true)
     const data = {
       id: uuid(),
       type: 'app',
@@ -438,6 +453,9 @@ export class BuildManager {
       pinned: false,
       state: {},
     }
+    const tooLarge = announcementProblem(blueprint, data)
+    if (tooLarge) return failed(tooLarge)
+    world.blueprints.add(blueprint, true)
     const app = world.entities.add(data, true)
     app.onUploaded()
     return applied

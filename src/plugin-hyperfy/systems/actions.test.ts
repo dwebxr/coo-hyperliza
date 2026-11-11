@@ -90,6 +90,40 @@ describe("an action node's duration is in seconds, as the engine counts it", () 
   });
 });
 
+describe('letting go of an item whose script rebuilds its action node meanwhile', () => {
+  it("releases X on time and stays usable when the node's cancel handler unregisters it and makes a new one (the engine's real Action node)", () => {
+    const w = world();
+    const entity = { data: { id: 'seat' }, root: { position: new THREE.Vector3(101, 0, 100) } };
+    w.entities.items.set('seat', entity);
+    const make = (onCancel: () => void) => {
+      const node: any = new Action({ duration: 0.1, onTrigger: vi.fn(), onCancel });
+      node.ctx = { entity, world: w };
+      w.actions.register(node);
+      return node;
+    };
+    let rebuilt: any = null;
+    // As an app does when its script rebuilds the node: the old one goes, a new one comes
+    const first = make(() => {
+      w.actions.unregister(first);
+      rebuilt = make(() => {});
+    });
+    expect(w.actions.performAction('seat')).toBe('started');
+    vi.advanceTimersByTime(100);
+    expect(w.actions.releaseAction()).toBe(true);
+    expect(rebuilt).not.toBeNull();
+    expect(w.controls.keyX.down).toBe(true);
+    // A second release while X is down is the same release
+    expect(w.actions.releaseAction()).toBe(true);
+    vi.advanceTimersByTime(500);
+    expect(w.controls.keyX.down).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+    // And the rebuilt node can be used
+    expect(w.actions.performAction('seat')).toBe('started');
+    vi.advanceTimersByTime(100);
+    expect(rebuilt._onTrigger).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('one interaction at a time, reserved from the moment the hold starts', () => {
   it('a second use while E is held is busy: one hold, one trigger', () => {
     const w = world();
@@ -186,6 +220,32 @@ describe('timers and callbacks', () => {
     expect(vi.getTimerCount()).toBe(0);
     expect(releasing.controls.keyX.down).toBe(false);
     expect(releasing.actions.getNearby()).toEqual([]);
+  });
+
+  it('lets go of the item when its cancel handler throws: the caller is told, X comes up on time, and the agent is free again', () => {
+    const w = world();
+    item(w, 'seat', { _duration: 0, _onCancel: () => { throw new Error('cancel handler'); } });
+    w.actions.performAction('seat');
+    vi.advanceTimersByTime(0);
+    expect(() => w.actions.releaseAction()).toThrow('cancel handler');
+    expect(w.controls.keyX.down).toBe(true);
+    vi.advanceTimersByTime(500);
+    expect(w.controls.keyX.down).toBe(false);
+    expect(w.actions.performAction('seat')).toBe('started');
+  });
+
+  it("lets go of the item when the X key's own press handler unregisters its node (an app rebuilding it)", () => {
+    const w = world();
+    const node = item(w, 'seat', { _duration: 0 });
+    w.actions.performAction('seat');
+    vi.advanceTimersByTime(0);
+    w.controls.keyX.onPress = () => w.actions.unregister(node);
+    expect(w.actions.releaseAction()).toBe(true);
+    // The cancel handler of the node being let go of is still told
+    expect(node._onCancel).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(500);
+    expect(w.controls.keyX.down).toBe(false);
+    expect(w.actions.releaseAction()).toBe(false);
   });
 
   it("contains the X key's own press and release handlers: the release completes whatever they throw", () => {

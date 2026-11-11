@@ -24,6 +24,7 @@ import {
   QUEUED_NODE_BYTES,
   QUEUE_OVERFLOW_CLOSE_CODE,
   adaptToWorldProtocol,
+  outgoingPacketProblem,
   describeClose,
   readServerPacket,
   resetReportedPacketIds,
@@ -648,5 +649,20 @@ describe('sessionTokenProblem', () => {
     expect(sessionTokenProblem(new URL('ws://[::ffff:127.0.0.1]/ws'))).toBeNull();
     expect(sessionTokenProblem(new URL('ws://localhost./ws'))).toBe('ws://localhost. is not encrypted and is not a loopback or private address');
     expect(sessionTokenProblem(new URL('ws://user:pw@world.test:8080/ws'))).toBe('ws://world.test:8080 is not encrypted and is not a loopback or private address');
+  });
+});
+
+describe('outgoingPacketProblem', () => {
+  it('says why the world would drop a packet over its limit, and the adapter does not send it', () => {
+    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: { a: 'x'.repeat(100) } })).toBeNull();
+    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: { a: 'x'.repeat(70 * 1024) } })).toMatch(/^the blueprintAdded packet would be \d+ bytes, more than the 65536 the world accepts$/);
+    expect(outgoingPacketProblem('entityAdded', { id: 'e', state: { a: 'x'.repeat(33 * 1024) } })).toMatch(/more than the 32768/);
+    const frames: unknown[] = [];
+    const network: any = { queue: [], onClose: () => {}, flush: () => {}, ws: { send: (frame: unknown) => void frames.push(frame) } };
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    adaptToWorldProtocol(network, () => null);
+    expect(network.send('entityAdded', { id: 'e', state: { a: 'x'.repeat(33 * 1024) } })).toBe(false);
+    expect(network.send('entityAdded', { id: 'e' })).toBe(true);
+    expect(frames).toHaveLength(1);
   });
 });

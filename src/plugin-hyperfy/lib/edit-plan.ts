@@ -75,3 +75,23 @@ export function readPlanEntry(entry: unknown): PlanEntry {
   const where = issue.path.map(String).join('.');
   return { kind: 'invalid', problem: `invalid operation (${where ? `${where}: ` : ''}${issue.message})`.slice(0, PROBLEM_MAX_LENGTH) };
 }
+
+/**
+ * Why a plan's copy labels do not hold together, or null. Checked before anything of the plan is
+ * run: a label (`as`) is given to one copy only, and a `targetRef` names a label an earlier entry of
+ * the plan gives. Only entries that are operations count (an entry that is not one gives no label).
+ */
+export function planLabelProblem(entries: readonly unknown[]): string | null {
+  const labels = new Set<string>();
+  for (const entry of entries) {
+    const read = readPlanEntry(entry);
+    if (read.kind !== 'operation') continue;
+    const op = read.op;
+    if (op.operation !== 'import' && op.targetRef !== undefined && !labels.has(op.targetRef)) return `"${op.targetRef}" names no copy an earlier step makes`;
+    if (op.operation === 'duplicate' && op.as !== undefined) {
+      if (labels.has(op.as)) return `two copies are named "${op.as}"`;
+      labels.add(op.as);
+    }
+  }
+  return null;
+}

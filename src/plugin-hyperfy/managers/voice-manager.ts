@@ -89,6 +89,9 @@ export function spokenPart(text: string): { text: string; cut: boolean } {
  * The voice of one connection: what players say (LiveKit audio, transcribed, then queued as a
  * turn of the connection's conversation, lib/chat-intake.ts) and what the agent says (speak).
  */
+/** Something said: at least one letter or digit, in any script */
+const WORD = /[\p{L}\p{N}]/u;
+
 export class VoiceManager {
   private runtime: IAgentRuntime;
   private session: ConnectionSession;
@@ -367,7 +370,9 @@ export class VoiceManager {
     if (typeof transcript !== 'string' || transcript.includes('[BLANK_AUDIO]')) return;
     // What was said enters memory and prompts like a chat message: one line, at most 500 code points
     const text = oneLine(transcript, CHAT_BODY_MAX_CODE_POINTS);
-    if (!text || text.length < 3) return;
+    // Noise comes back as punctuation alone ("." or "…"); a word is anything with a letter or a
+    // digit, however short ("ok", "no", はい)
+    if (!WORD.test(text)) return;
     // Only someone who is in the world now, and has been since they said it: a speaker who left
     // while being transcribed starts no turn, also when they have come back under the same id
     const speaker = this.session.world?.entities?.getPlayer?.(participant);
@@ -405,7 +410,7 @@ export class VoiceManager {
       // The LiveKit participant identity, which the world's server sets to the player id
       { origin: 'voice', requesterId: playerId, cancel: slot.signal },
       // Inside the activity lock, so the behavior loop stays paused until the reply has been spoken
-      () => agentActivityLock.run(() => this.handleMessage(msg.body, playerId, this.session.stoppedOnArrival(msg.id)))
+      () => agentActivityLock.run(() => this.handleMessage(msg.body, playerId, this.session.claimStop(msg)))
     );
   }
 
@@ -618,7 +623,9 @@ export class VoiceManager {
     const progress = { frames: 0 };
     try {
       const outcome: PlaybackOutcome = await Promise.race([
-        world.livekit.publishAudioStream(audioBuffer, { signal: abort.signal, progress }),
+        // Asked again by the streamer once the audio is decoded and its track published, right
+        // before the first frame: the answer may have changed while it got ready
+        world.livekit.publishAudioStream(audioBuffer, { signal: abort.signal, progress, admit }),
         timeout,
       ]);
       const played: Played = outcome?.played === 'all' || outcome?.played === 'partial' ? outcome.played : progress.frames > 0 ? 'partial' : 'none';

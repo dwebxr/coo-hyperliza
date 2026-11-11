@@ -146,7 +146,7 @@ export class MessageManager {
               directlyAddressed: isDirectlyAddressed(messageBody, agentNames),
               soloPlayer: countOtherPlayers(world) === 1,
               // A stop command that already stopped the agent when it arrived: this turn only acknowledges it
-              ...(session.stoppedOnArrival(msg.id) ? { hyperfyStopTaken: true } : {}),
+              ...(session.claimStop(msg) ? { hyperfyStopTaken: true } : {}),
             },
           },
           createdAt: Date.now(),

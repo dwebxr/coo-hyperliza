@@ -1,13 +1,14 @@
-import type { IAgentRuntime, UUID } from '@elizaos/core'
+import { type IAgentRuntime, type UUID, createUniqueUuid } from '@elizaos/core'
 import { BehaviorManager } from '../managers/behavior-manager'
 import { BuildManager } from '../managers/build-manager'
 import { EmoteManager } from '../managers/emote-manager'
 import { MessageManager } from '../managers/message-manager'
 import { VoiceManager } from '../managers/voice-manager'
 import type { CaptureView } from '../managers/puppeteer-manager'
-import { CHAT_QUEUE_MAX, ChatIntake } from '../lib/chat-intake'
+import { ChatIntake } from '../lib/chat-intake'
 import { isDirectlyAddressed, parseAliases } from '../lib/addressing'
 import { matchSimpleCommand } from '../lib/simple-commands'
+import { ignoredAsMuted, namesAgent } from '../lib/room-state'
 import { countOtherPlayers } from '../utils'
 import type { UploadOptions } from '../lib/asset-upload'
 import { describeUrl } from '../lib/log-url'
@@ -49,9 +50,6 @@ export interface SessionEvents {
   /** The world's socket closed. `kickCode`: the kick the server sent before it, if it was read. */
   onDisconnect?(session: ConnectionSession, reason: unknown, kickCode: string | null): void
 }
-
-// Stop commands remembered until their turn: more than the queue holds
-const STOPS_TAKEN_KEPT = 2 * CHAT_QUEUE_MAX
 
 let lastGeneration = 0
 const sessions = new WeakMap<object, ConnectionSession>()
@@ -100,8 +98,8 @@ export class ConnectionSession {
   private readonly abort = new AbortController()
   private readonly subscriptions: Array<() => void> = []
   private ending: Promise<void> | null = null
-  /** Ids of stop commands that took effect on arrival, until their turn asks (stoppedOnArrival) */
-  private readonly stopsTaken = new Set<string>()
+  /** Stop commands, by the queued message itself: taken on arrival, or claimed by their turn (no eviction) */
+  private readonly stops = new WeakMap<object, 'stopped' | 'claimed'>()
   private started = false
   private init: ((authToken?: string) => Promise<void>) | null = null
 
@@ -252,27 +250,46 @@ export class ConnectionSession {
    * "Stop" does not wait its turn: an admitted chat message or transcript (lib/chat-intake.ts
    * admitted) that the message handler would take as a stop command addressed to the agent
    * (lib/simple-commands.ts matchSimpleCommand; addressed by name, or the only other player present,
-   * as handlers/messageReceivedHandler.ts decides) stops walking, following and wandering at once,
-   * as the stop command does (controls.stopAllActions). Its turn comes later as usual and only
-   * acknowledges it (stoppedOnArrival), so it never stops what was asked for after it.
+   * as handlers/messageReceivedHandler.ts decides; not ignored as in a MUTED room,
+   * lib/room-state.ts) stops walking, following and wandering at once, as the stop command does
+   * (controls.stopAllActions). When the room state has to be read first, that is awaited here, not
+   * behind the turn queue. Its turn comes later as usual and only acknowledges it (claimStop): the
+   * mark is on the queued message itself, for as long as it exists.
    */
   private stopOnArrival(msg: { id: string; body: string; fromId: string | null }): void {
     if (this.ended || !msg.fromId || msg.fromId === this.world.entities?.player?.data?.id) return
     const names = [this.runtime.character.name, ...parseAliases(process.env.HYPERFY_AGENT_ALIASES)]
     if (matchSimpleCommand(msg.body, names) !== 'stop') return
     if (!isDirectlyAddressed(msg.body, names) && countOtherPlayers(this.world) !== 1) return
-    const controls = this.world.controls
-    if (typeof controls?.stopAllActions !== 'function') return
-    controls.stopAllActions('asked to stop')
-    this.stopsTaken.add(msg.id)
-    // Bounded: a stop whose turn never comes (dropped as stale) is forgotten in time
-    if (this.stopsTaken.size > STOPS_TAKEN_KEPT) this.stopsTaken.delete(this.stopsTaken.values().next().value as string)
+    if (typeof this.world.controls?.stopAllActions !== 'function') return
+    // Naming the agent answers a muted room too: no room state to read
+    if (namesAgent(this.runtime, msg.body)) return this.takeStop(msg)
+    const roomId = createUniqueUuid(this.runtime, this.worldId || 'hyperfy-unknown-world')
+    ignoredAsMuted(this.runtime, roomId, msg.body).then(
+      (ignored) => {
+        if (!ignored) this.takeStop(msg)
+      },
+      (error: unknown) => console.warn(`[Hyperfy] Could not read the room state for a stop on arrival; its turn handles it: ${error instanceof Error ? error.message : String(error)}`)
+    )
+  }
+
+  /** Stops on arrival of `msg`, unless the session ended or the message's own turn has begun meanwhile (claimStop). */
+  private takeStop(msg: object): void {
+    if (this.ended || this.stops.get(msg) === 'claimed') return
+    this.world.controls.stopAllActions('asked to stop')
+    this.stops.set(msg, 'stopped')
     console.info('[Hyperfy] Stopped on arrival of a stop command; its turn will acknowledge it')
   }
 
-  /** Whether the stop command `msgId` already took effect on arrival (asked once, by its turn). */
-  stoppedOnArrival(msgId: string): boolean {
-    return this.stopsTaken.delete(msgId)
+  /**
+   * Called once by the turn of `msg` as it begins: whether its stop already took effect on arrival
+   * (the turn then only acknowledges it). From here, a room-state read still pending for it stops
+   * nothing: the turn decides.
+   */
+  claimStop(msg: object): boolean {
+    const taken = this.stops.get(msg) === 'stopped'
+    this.stops.set(msg, 'claimed')
+    return taken
   }
 
   /** Runs `fn` as a turn of this session (lib/turn-context.ts). `cancel`: the turn's slot in the conversation queue. */

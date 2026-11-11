@@ -23,6 +23,11 @@ export interface LiveKitInitOptions {
 
 export interface PublishAudioOptions {
   signal?: AbortSignal;
+  /**
+   * Asked right before the first frame of the audio, once it is decoded and its track published
+   * (a reply that reports a privileged action: session/deliver-reply.ts). No: nothing is played.
+   */
+  admit?: () => boolean;
   /** Counts the frames of the audio the room took as they go out, so it holds also when the stream fails or hangs */
   progress?: { frames: number };
 }
@@ -207,10 +212,10 @@ export class AgentLiveKit extends System {
   start() { }
 
   /** Plays audio into the room. Never rejects: a failure ends the outcome with how much had played. */
-  async publishAudioStream(audioBuffer: Buffer, { signal, progress = { frames: 0 } }: PublishAudioOptions = {}): Promise<PlaybackOutcome> {
+  async publishAudioStream(audioBuffer: Buffer, { signal, progress = { frames: 0 }, admit }: PublishAudioOptions = {}): Promise<PlaybackOutcome> {
     const before = progress.frames;
     try {
-      return await this.streamAudio(audioBuffer, signal, progress);
+      return await this.streamAudio(audioBuffer, signal, progress, admit);
     } catch (error: any) {
       const message = String(error?.message ?? error);
       console.warn('[LiveKit] Audio playback failed:', message);
@@ -218,7 +223,7 @@ export class AgentLiveKit extends System {
     }
   }
 
-  private async streamAudio(audioBuffer: Buffer, signal: AbortSignal | undefined, progress: { frames: number }): Promise<PlaybackOutcome> {
+  private async streamAudio(audioBuffer: Buffer, signal: AbortSignal | undefined, progress: { frames: number }, admit?: () => boolean): Promise<PlaybackOutcome> {
     console.log('[LiveKit] publishAudioStream called with buffer size:', audioBuffer.length);
     if (!this.room) {
       console.warn('[LiveKit] Not connected to a room - skipping audio playback');
@@ -268,6 +273,8 @@ export class AgentLiveKit extends System {
 
     const silence = new Int16Array(samplesPerFrame);
     await audioSource.captureFrame(new AudioFrame(silence, sampleRate, numChannels, silence.length));
+    // After everything that was awaited to get ready, right before the first frame of the audio
+    if (admit && !admit()) return { played: 'none', reason: 'no longer admitted' };
 
     console.log('[LiveKit] Streaming audio frames...');
     const totalFrames = Math.ceil(int16.length / samplesPerFrame);

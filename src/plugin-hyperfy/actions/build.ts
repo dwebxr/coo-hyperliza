@@ -15,7 +15,7 @@ import {
   import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
   import { EDIT_ENTITY_ACTION, SceneEditStopped, readSceneEditsMode, reportsPrivilegedAction, sceneEditRefusal, sceneEditStillAllowed } from '../lib/authorization';
   import type { EditGuard, EditResult } from '../managers/build-manager';
-  import { MAX_OPERATIONS_PER_REQUEST, readPlanEntry } from '../lib/edit-plan';
+  import { MAX_OPERATIONS_PER_REQUEST, planLabelProblem, readPlanEntry } from '../lib/edit-plan';
   import { readString } from '../lib/model-output';
   import { isJapanese } from '../lib/simple-commands';
   import { TurnCancelled, currentTurn } from '../lib/turn-context';
@@ -394,6 +394,14 @@ Don't list every action like a log — instead, summarize the overall outcome na
       }
     
       const operations: unknown[] = operationResults.operations;
+      // The plan's copy labels, before anything of it is run (lib/edit-plan.ts)
+      const labelProblem = planLabelProblem(operations);
+      if (labelProblem) {
+        logger.warn(`[EDIT_ENTITY Action] Not running an edit plan whose copy labels do not hold together: ${labelProblem}`);
+        // Says nothing was done (nothing is awaited between the check above and here)
+        await tellFailure(callback, EDIT_ENTITY, japanese ? 'ごめんなさい、編集の手順に食い違いがあったので、何も変えませんでした。' : `Sorry, that edit didn't hold together (${labelProblem}), so I changed nothing.`);
+        return actionFailed(EDIT_ENTITY, `invalid edit plan: ${labelProblem}`);
+      }
       const outcomes: OperationOutcome[] = [];
       // For the summary prompt: what each executed operation was meant to do
       const descriptions: (string | undefined)[] = [];
@@ -401,8 +409,9 @@ Don't list every action like a log — instead, summarize the overall outcome na
       let stopped: string | null = null;
       // Operations this request has run or tried to run: at most MAX_OPERATIONS_PER_REQUEST
       let attempted = 0;
-      // The copies this plan made, by the label the plan gave each (`as`), for its later entries (`targetRef`)
-      const copies = new Map<string, string>();
+      // The copies this plan made, by the label the plan gave each (`as`), for its later entries
+      // (`targetRef`); null for a label whose copy was not made
+      const copies = new Map<string, string | null>();
       const record = (outcome: OperationOutcome, description?: string) => {
         outcomes.push(outcome);
         descriptions.push(description);
@@ -428,6 +437,8 @@ Don't list every action like a log — instead, summarize the overall outcome na
         }
         const op = read.op;
         const { operation } = op;
+        // Its label stands for no copy until this duplicate has made one (also when it is not run)
+        if (op.operation === 'duplicate' && op.as !== undefined) copies.set(op.as, null);
         if (++attempted > MAX_OPERATIONS_PER_REQUEST) {
           record({ ...describe(entry), outcome: 'failed', reason: `not run: one request runs at most ${MAX_OPERATIONS_PER_REQUEST} operations` });
           continue;
@@ -436,8 +447,8 @@ Don't list every action like a log — instead, summarize the overall outcome na
         let target: string;
         if (op.operation !== 'import' && op.targetRef !== undefined) {
           const copy = copies.get(op.targetRef);
-          if (copy === undefined) {
-            record({ operation, target: op.targetRef, outcome: 'failed', reason: `no copy named "${op.targetRef}" was made earlier in this request` });
+          if (copy === undefined || copy === null) {
+            record({ operation, target: op.targetRef, outcome: 'failed', reason: copy === null ? 'the copy this refers to was not made' : `no copy named "${op.targetRef}" was made earlier in this request` });
             continue;
           }
           target = copy;

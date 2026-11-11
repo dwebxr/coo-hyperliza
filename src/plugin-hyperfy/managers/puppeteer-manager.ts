@@ -461,8 +461,9 @@ export class PuppeteerManager {
    * Each takes a `signal` (the world the asset is for going away) and an `accept` step (the
    * caller's own work on the result: for a model, parsing and converting it in Node). The signal is
    * checked once the page is ready and right before the page is asked, so nothing is handed to the
-   * page after it fired. A page call cannot be interrupted. With a signal, the page files how to
-   * take back what the call kept under the call's id and keeps it until the call is settled:
+   * page after it fired. A page call cannot be interrupted. With a signal or an `accept` step, the
+   * page files how to take back what the call kept under the call's id and keeps it until the call
+   * is settled:
    *   - the call failed, `accept` failed, or the signal fired before `accept` began or by the time
    *     it finished: taken back ("rollback");
    *   - otherwise the record is dropped ("forget") and what `accept` returned is returned. That is
@@ -475,11 +476,12 @@ export class PuppeteerManager {
    * A record lives from the call's return to its settlement: at most one per page call in
    * progress, and a kill or page rebuild discards them all.
    */
-  private async pageCall<T, R>(signal: AbortSignal | undefined, run: (page: Page, op: string[]) => Promise<T>, accept: (result: T) => R | Promise<R>): Promise<R> {
+  private async pageCall<T, R>(signal: AbortSignal | undefined, run: (page: Page, op: string[]) => Promise<T>, accept: (result: T) => R | Promise<R>, { settled = !!signal }: { settled?: boolean } = {}): Promise<R> {
     const page = await this.ready(signal)
     if (signal?.aborted) throw new PageOperationCancelled()
-    // The id the page files its undo under; only when there is something to cancel
-    const op = signal ? [`op-${++this.operations}`] : []
+    // The id the page files its undo under: when there is something to cancel, or a caller's
+    // acceptance that may fail (`settled`)
+    const op = settled ? [`op-${++this.operations}`] : []
     const takeBack = () => (op.length ? this.settle(page, op[0], 'rollback') : Promise.resolve())
     let result: T
     try {
@@ -538,7 +540,8 @@ export class PuppeteerManager {
           (base64, STRIP_SLOTS, maxExportBytes, op?: string) => window.agentPage!.loadGlb(base64, STRIP_SLOTS, maxExportBytes, op),
           toBase64(bytes), STRIP_SLOTS, maxExportBytes, ...op
         ),
-      (stripped) => (accept ?? asIs<Uint8Array, R>)(fromBase64(stripped))
+      (stripped) => (accept ?? asIs<Uint8Array, R>)(fromBase64(stripped)),
+      { settled: !!signal || !!accept }
     );
   }
 
@@ -554,7 +557,8 @@ export class PuppeteerManager {
           (url, base64, maxExportBytes, op?: string) => window.agentPage!.loadVrm(url, base64, maxExportBytes, op),
           url, toBase64(bytes), maxExportBytes, ...op
         ),
-      (exported) => (accept ?? asIs<Uint8Array, R>)(fromBase64(exported))
+      (exported) => (accept ?? asIs<Uint8Array, R>)(fromBase64(exported)),
+      { settled: !!signal || !!accept }
     );
   }
 

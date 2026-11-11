@@ -24,17 +24,38 @@ function random(seed: number) {
   };
 }
 
-/** Data like the world's: nested objects of many shapes, arrays, strings in several scripts, numbers of every size */
+const TYPED = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array] as const;
+
+/** A value an app may keep in its state that the server writes with an extension of its own (structuredClone turns on moreTypes) */
+function serverTyped(next: () => number): unknown {
+  const kind = Math.floor(next() * 12);
+  const count = Math.floor(next() * 300);
+  if (kind < 11) {
+    const Kind = TYPED[kind];
+    const out = new Kind(count);
+    for (let i = 0; i < count; i++) (out as any)[i] = Kind === BigInt64Array || Kind === BigUint64Array ? BigInt(Math.floor(next() * 1e9)) : Math.floor(next() * 200) - (Kind === Int8Array ? 100 : 0);
+    return out;
+  }
+  return next() < 0.5 ? new Uint8Array(count).fill(7).buffer : new DataView(new Uint8Array(count).fill(9).buffer);
+}
+
+/** Data like the world's: nested objects of many shapes, arrays, strings in several scripts, numbers of every size, and the other types an app's state can hold */
 function worldLike(next: () => number, depth = 0): unknown {
   const pick = next();
   if (depth > 5 || pick < 0.3) {
-    const leaf = Math.floor(next() * 14);
-    return [
+    const leaves = [
       null, true, false, 0, 63, 64, 127, 128, 255, 256, 65535, 65536, -1, -32, -33, -129, 4294967295, 4294967296, 1_700_000_000_000, 0.5, -1234.5678, 1e300,
       '', 'coo', 'VLvCb3w5G2', 'こんにちは、世界', '🛹 skate', 'x'.repeat(40), 'y'.repeat(300), 'asset://3f2a9c.glb', undefined, new Date(1_700_000_000_000), new Date(1_700_000_000_123),
-    ][Math.floor(next() * 33) + (leaf > 100 ? 0 : 0)];
+      '\uFEFFwith a BOM', new Date(Number.NaN), new Date(-1), new Date(8.64e15), 5n, -(2n ** 63n), 2n ** 64n - 1n, 2n ** 70n, -(2n ** 70n) - 12345n, 7n ** 300n, -(3n ** 500n), Buffer.from([1, 2, 3]),
+    ];
+    if (next() < 0.25) return serverTyped(next);
+    return leaves[Math.floor(next() * leaves.length)];
   }
-  if (pick < 0.55) return Array.from({ length: Math.floor(next() * 6) }, () => worldLike(next, depth + 1));
+  if (pick < 0.45) return Array.from({ length: Math.floor(next() * 6) }, () => worldLike(next, depth + 1));
+  if (pick < 0.5) return new Set(Array.from({ length: Math.floor(next() * 5) }, () => worldLike(next, depth + 1)));
+  if (pick < 0.55) return new Map(Array.from({ length: Math.floor(next() * 4) }, (_, i) => [next() < 0.5 ? `m${i}` : i, worldLike(next, depth + 1)]));
+  if (pick < 0.57) return [new TypeError(`bad ${Math.floor(next() * 9)}`), new Error('plain', { cause: worldLike(next, depth + 1) }), Object.assign(new Error('named'), { name: 'AppError' })][Math.floor(next() * 3)];
+  if (pick < 0.59) return [/a+b*/g, /^こんにちは$/u, new RegExp('[x-z]{2,}', 'im')][Math.floor(next() * 3)];
   const object: Record<string, unknown> = {};
   const keys = Math.floor(next() * 7);
   for (let i = 0; i < keys; i++) object[`k${Math.floor(next() * 40)}`] = worldLike(next, depth + 1);
@@ -98,6 +119,41 @@ describe('decodeServerFrame reads what the world sends exactly as msgpackr does'
     expect([...mine[1].bin]).toEqual([1, 2, 3]);
     expect(mine[1].big).toBe(2n ** 60n);
     expect(mine[1].at.getTime()).toBe(1_800_000_000_500);
+  });
+
+  it("a snapshot whose app state holds a Uint8Array, a Float32Array, a Set, a Map, a Date and a bigint, as msgpackr reads it", () => {
+    const snapshot = cooWorldSnapshot({ selfId: 'coo', players: [{ id: 'p1', name: 'Bob' }] }) as any;
+    const state = { bits: new Uint8Array([1, 2, 3]), weights: new Float32Array([0.5, -1.25]), seen: new Set(['p1', 'p2']), scores: new Map<unknown, unknown>([['p1', 3], [7, { best: true }]]), since: new Date(1_800_000_000_000), total: 2n ** 80n + 1n };
+    snapshot.entities.push({ id: 'app1', type: 'app', blueprint: 'bp1', position: [0, 0, 0], quaternion: [0, 0, 0, 1], scale: [1, 1, 1], mover: null, uploader: null, pinned: false, state });
+    const frame = pack([0, snapshot]);
+    const mine = decode(frame) as [number, any];
+    expect(mine).toEqual(unpack(frame));
+    expect(mine[1].entities.at(-1).state).toEqual(state);
+    expect(mine[1].entities.at(-1).state.bits).toBeInstanceOf(Uint8Array);
+    expect(mine[1].entities.at(-1).state.weights).toBeInstanceOf(Float32Array);
+  });
+
+  it('every kind of typed array, ArrayBuffer and DataView, Set, Error and RegExp, inside snapshot-shaped packets, as msgpackr reads them', () => {
+    const next = random(424242);
+    for (let i = 0; i < 300; i++) {
+      const state: Record<string, unknown> = {};
+      for (let k = 0; k < 4; k++) state[`v${k}`] = k % 2 ? serverTyped(next) : worldLike(next);
+      const frame = pack([0, { id: 'coo', entities: [{ id: `app${i}`, type: 'app', state }], blueprints: [{ id: 'bp', props: { list: new Set([state.v1, 'x']), at: new Date(1_700_000_000_000 + i) } }] }]);
+      expect(decode(frame), `packet ${i}`).toEqual(unpack(frame));
+    }
+    // A value held twice is one object at both places, whatever its kind
+    const shared = new Float64Array([1, 2]);
+    const twice = pack([7, { a: shared, b: shared, s: new Set([shared]) }]);
+    const read = decode(twice) as [number, any];
+    expect(read).toEqual(unpack(twice));
+    expect(read[1].b).toBe(read[1].a);
+    expect([...read[1].s][0]).toBe(read[1].a);
+  });
+
+  it('keeps a leading BOM in strings and keys, as msgpackr does', () => {
+    const frame = pack([7, { '\uFEFFmode': '\uFEFFhello', mode: 'plain' }]);
+    expect(decode(frame)).toEqual(unpack(frame));
+    expect(Object.keys((decode(frame) as [number, object])[1])).toEqual(['\uFEFFmode', 'mode']);
   });
 
   it('a property named __proto__ becomes an ordinary one, as in msgpackr: nothing is put on a prototype', () => {
@@ -231,6 +287,55 @@ describe('decodeServerFrame limits', () => {
     expect(() => decode(Uint8Array.from(out))).toThrow(PacketOverLimit);
   });
 
+  it('reads a record definition\'s names without recursing: definitions nested where the names belong are refused at once', () => {
+    // d4 72 40 d4 72 41 d4 72 42 90: three definitions, each where the previous one's names should be
+    expect(() => decode(bytes(0xd4, 0x72, 0x40, 0xd4, 0x72, 0x41, 0xd4, 0x72, 0x42, 0x90), { maxNodes: 100, maxDepth: 1 })).toThrow('a record definition whose keys are not a list');
+    // A million of them: refused at the first, not recursed into
+    const chain = new Uint8Array(3_000_000);
+    for (let i = 0; i < 1_000_000; i++) chain.set([0xd4, 0x72, 0x40 + (i % 64)], i * 3);
+    expect(() => decode(chain)).toThrow(PacketRefused);
+    // Names that are references to an earlier list are read, as msgpackr writes them when it reuses record ids
+    const shapes = Array.from({ length: 70 }, (_, i) => ({ [`k${i}`]: i }));
+    const reused = pack([0, [...shapes, { k0: 'again' }]]);
+    expect(Buffer.from(reused).toString('hex')).toContain('d670');
+    expect(decode(reused)).toEqual(unpack(reused));
+  });
+
+  it("counts a shared subtree's levels wherever it is put: a reference cannot carry nesting past the limit", () => {
+    const shared = [null];
+    // The reviewer's input: five arrays deep, though each part alone is shallower
+    const frame = pack([shared, [[[shared]]]]);
+    expect(frame.byteLength).toBeLessThan(20);
+    expect(() => decode(frame, { maxNodes: 100, maxDepth: 4 })).toThrow('it nests more than 4 levels deep');
+    expect(() => decode(frame, { maxNodes: 100, maxDepth: 5 })).not.toThrow();
+    // Scaled: a 40-level subtree put 40 levels down, in a small frame
+    let deep: unknown = null;
+    for (let i = 0; i < 40; i++) deep = [deep];
+    let holder: unknown = deep;
+    for (let i = 0; i < 40; i++) holder = [holder];
+    const big = pack([deep, holder]);
+    expect(big.byteLength).toBeLessThan(200);
+    expect(() => decode(big)).toThrow('it nests more than 64 levels deep');
+  });
+
+  it("counts a typed array's elements and a big integer's 64-bit words as values", () => {
+    expect(decodeServerFrame(pack(new Uint8Array(10))).nodes).toBe(11);
+    expect(decodeServerFrame(pack(new Float64Array(10))).nodes).toBe(11);
+    expect(decodeServerFrame(pack(new ArrayBuffer(6))).nodes).toBe(7);
+    // 2^130: three 64-bit words (msgpackr writes 24 bytes)
+    expect(decodeServerFrame(pack(2n ** 130n)).nodes).toBe(3);
+    expect(() => decode(pack(new Uint8Array(600_000)))).toThrow('it holds more than 500000 values');
+  });
+
+  it('rebuilds an Error by its name only from the errors msgpackr knows: any other name is an Error with that name', () => {
+    for (const name of ['constructor', 'toString', '__proto__', 'AppError']) {
+      const error = decode(bytes(0xd4, 0x65, 0x00, 0x93, 0xa0 + name.length, ...Buffer.from(name), 0xa1, 0x6d, 0xc0)) as Error;
+      expect(error).toBeInstanceOf(Error);
+      expect([error.name, error.message]).toEqual([name, 'm']);
+    }
+    expect(decode(pack(new RangeError('r')))).toBeInstanceOf(RangeError);
+  });
+
   it('takes other limits when given them', () => {
     const frame = pack([7, { id: 'e1', p: [1, 2, 3] }]);
     expect(() => decode(frame, { maxNodes: 7, maxDepth: 64 })).toThrow(PacketOverLimit);
@@ -248,10 +353,14 @@ describe('decodeServerFrame refuses what is not the protocol', () => {
       return pack([0, loop]);
     }],
     ['a reference to nothing', () => bytes(0x92, 0x00, 0xd6, 0x70, 0, 0, 0, 9)],
-    ['a Set', () => pack([0, new Set([1, 2])])],
-    ['a RegExp', () => pack([0, /x/g])],
-    ['an Error', () => pack([0, new Error('boom')])],
-    ['a typed array', () => pack([0, new Float32Array([1, 2])])],
+    ['a typed array of a kind msgpackr has no code for (its own decoder fails on it too)', () => pack([0, new Float16Array([1])])],
+    ['a typed array whose bytes are not whole elements', () => bytes(0xc7, 0x04, 0x74, 0x07, 0x00, 0x00, 0x00)],
+    ['a Set that is not followed by an array', () => bytes(0xd4, 0x73, 0x00, 0x01)],
+    ['a Set marker with another filler byte', () => bytes(0xd4, 0x73, 0x05, 0x90)],
+    ['a RegExp whose pattern does not compile', () => bytes(0xd4, 0x78, 0x00, 0x92, 0xa1, 0x28, 0xa0)],
+    ['bundled strings (an option neither server sets)', () => bytes(0xd6, 0x62, 0x00, 0x00, 0x00, 0x05, 0xc0)],
+    ['a value that refers to a record definition\'s names', () => bytes(0x92, 0xd4, 0x72, 0x40, 0xd6, 0x69, 0, 0, 0, 1, 0x91, 0xa1, 0x61, 0x01, 0xd6, 0x70, 0, 0, 0, 1)],
+    ["a record definition whose names refer to a value", () => bytes(0x92, 0xd6, 0x69, 0, 0, 0, 1, 0x91, 0xa1, 0x61, 0xd4, 0x72, 0x40, 0xd6, 0x70, 0, 0, 0, 1, 0x01)],
     ['the reserved byte 0xc1', () => bytes(0xc1)],
     ['a two-byte record definition', () => bytes(0xd5, 0x72, 0x60, 0x00, 0x90)],
     ['an unknown extension', () => bytes(0xd4, 0x41, 0x00)],

@@ -258,6 +258,88 @@ describe('AgentLiveKit playback outcome', () => {
     await expect(livekit.publishAudioStream(mp3(), { signal: stop.signal })).resolves.toEqual({ played: 'none', reason: 'stopped' });
   });
 
+  it('plays nothing when asked so right before the first frame: after decoding and publishing the track', async () => {
+    const livekit = await joined();
+    let admitted = true;
+    let decoded!: () => void;
+    const decode = (livekit as any).convertToPcm.bind(livekit);
+    vi.spyOn(livekit as any, 'convertToPcm').mockImplementationOnce(async (...args: unknown[]) => {
+      await new Promise<void>((resolve) => (decoded = resolve));
+      return decode(...args);
+    });
+    const playing = livekit.publishAudioStream(mp3(2), { admit: () => admitted });
+    await vi.waitFor(() => expect(decoded).toBeDefined());
+    admitted = false;
+    decoded();
+    await expect(playing).resolves.toEqual({ played: 'none', reason: 'no longer admitted' });
+    // The lead-in silence went out, no frame of the audio did
+    expect((livekit as any).audioSource.captureFrame).toHaveBeenCalledTimes(1);
+  });
+
+  describe('a privileged report through the real delivery and voice', () => {
+    /** A voice turn delivering `content` over the real VoiceManager and this AgentLiveKit; posts and memories recorded */
+    async function deliverOver(livekit: AgentLiveKit, content: any) {
+      const { sessionFor } = await import('../test-support/session');
+      const { deliverReply } = await import('../session/deliver-reply');
+      const { currentTurn } = await import('../lib/turn-context');
+      const world = { livekit, entities: { player: { setSpeaking: vi.fn() } } };
+      const session = sessionFor(world);
+      const posted: string[] = [];
+      const stored: string[] = [];
+      const delivery = await session.runTurn({ origin: 'voice', requesterId: 'p1' }, () =>
+        deliverReply(
+          {
+            turn: currentTurn()!,
+            session: { ended: false, emotes: { playEmote: () => {} }, messages: { sendMessage: async (text: string) => (posted.push(text), true) }, voice: session.voice },
+            runtime: { agentId: '00000000-0000-0000-0000-0000000000aa' as any, createMemory: async (memory: any) => (stored.push(memory.content.text), 'id' as any) },
+            roomId: '00000000-0000-0000-0000-0000000000bb' as any,
+          },
+          content
+        )
+      );
+      return { delivery, posted, stored };
+    }
+    const REPORT = 'I moved the box up!';
+    const NEUTRAL = 'I cannot go any further with that request.';
+
+    it.each([
+      ['while its audio is decoded', 'decode'],
+      ['while its track is published', 'publish'],
+    ])('says the neutral line instead when the requester loses the right %s', async (_when, step) => {
+      const livekit = await joined();
+      const { reportsPrivilegedAction } = await import('../lib/authorization');
+      const utils = await import('../utils');
+      // The report is three frames long, the neutral line one
+      vi.spyOn(utils, 'generateSpeech').mockImplementation(async (text: string) => mp3(text === REPORT ? 3 : 1));
+      let allowed = true;
+      let ready!: () => void;
+      const held = new Promise<void>((resolve) => (ready = resolve));
+      if (step === 'decode') {
+        const decode = (livekit as any).convertToPcm.bind(livekit);
+        vi.spyOn(livekit as any, 'convertToPcm').mockImplementationOnce(async (...args: unknown[]) => {
+          allowed = false;
+          await held;
+          return decode(...args);
+        });
+      } else {
+        rooms[0].localParticipant.publishTrack.mockImplementationOnce(async () => {
+          allowed = false;
+          await held;
+        });
+      }
+      const report = reportsPrivilegedAction({ text: REPORT } as any, { refusal: () => (allowed ? null : 'the requester is no longer a builder'), instead: { text: NEUTRAL } });
+      const delivering = deliverOver(livekit, report);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      ready();
+      const { delivery, posted, stored } = await delivering;
+      expect(delivery).toMatchObject({ spoken: 'all', posted: false, stored: true });
+      // Two lead-in silences and the neutral line's one frame: none of the report's three
+      expect((livekit as any).audioSource.captureFrame).toHaveBeenCalledTimes(3);
+      expect(posted).toEqual([]);
+      expect(stored).toEqual([NEUTRAL]);
+    });
+  });
+
   it('reports nothing played for audio that decodes to nothing', async () => {
     const livekit = await joined();
     await expect(livekit.publishAudioStream(mp3(0))).resolves.toEqual({ played: 'none', reason: 'no audio was decoded' });

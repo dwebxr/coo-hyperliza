@@ -96,7 +96,8 @@ vi.mock('../lib/asset-bytes', async (importOriginal) => {
   };
 });
 
-import { AgentLoader, LOADER_LIMITS, type LoaderLimits } from './loader';
+import { AgentLoader, LOADER_LIMITS, type LoaderLimits, createGltfLoader } from './loader';
+import { EMOTES_LIST } from '../constants';
 import { GLTFLoader } from '../hyperfy/src/core/libs/gltfloader/GLTFLoader.js';
 import { RenderPageKilled } from '../lib/render-watchdog';
 import { assetMemory, modelReservation } from '../lib/asset-memory';
@@ -583,6 +584,43 @@ describe('AgentLoader', () => {
     await expect(loader.load('model', 'asset://a.glb')).rejects.toBeInstanceOf(RenderPageKilled);
     page.fail = null;
     await expect(loader.load('model', 'asset://a.glb')).resolves.toMatchObject({ gltf: expect.anything() });
+  });
+
+  it('refuses an emote that names a buffer by URL before parsing it: no request is made, by the policy or by the engine', async () => {
+    const elsewhere = await startServer((_request, response) => response.end('private'));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    // What passes the filter: an external buffer, an empty buffer view, an animation of empty accessors
+    const json = {
+      asset: { version: '2.0' },
+      buffers: [{ byteLength: 0, uri: `http://127.0.0.1:${elsewhere.port}/private` }],
+      bufferViews: [{ buffer: 0, byteLength: 0 }],
+      accessors: [{ bufferView: 0, count: 0, type: 'SCALAR', componentType: 5126, min: [0], max: [0] }, { bufferView: 0, count: 0, type: 'VEC4', componentType: 5126 }],
+      nodes: [{ name: 'Root' }],
+      scenes: [{ nodes: [0] }],
+      scene: 0,
+      animations: [{ channels: [{ sampler: 0, target: { node: 0, path: 'rotation' } }], samplers: [{ input: 0, output: 1 }] }],
+    };
+    const glb = glbOfChunks([jsonChunk(json)]);
+    expect(gltfCharge(glb, modelBudget('emote'))).toMatchObject({ charge: expect.anything() });
+    const { loader } = await setup({ handler: (_request, response) => response.end(Buffer.from(glb)) });
+    await expect(loader.load('emote', 'asset://wave.glb')).rejects.toThrow('buffer 0 is a file of its own (a URI), which the agent does not fetch');
+    // A model's copy back from the page goes the same way (taken back in the page)
+    page.returns = glb;
+    await expect(loader.load('model', 'asset://box.glb')).rejects.toThrow('buffer 0 is a file of its own');
+    expect(page.steps).toEqual(['rollback']);
+    expect([elsewhere.hits.length, fetchSpy.mock.calls.length]).toEqual([0, 0]);
+    // And the engine's loader itself loads nothing by URL, should it ever be handed such a file
+    await expect(new Promise((ok, bad) => createGltfLoader().parse(glb.slice().buffer, '', ok, bad))).rejects.toThrow('nothing the agent parses loads a file by URL');
+    expect([elsewhere.hits.length, fetchSpy.mock.calls.length]).toEqual([0, 0]);
+  });
+
+  it('lists every emote for one full play of its clip, as the agent parses the bundled file (constants.ts EMOTES_LIST)', async () => {
+    const { loader } = await setup();
+    for (const emote of EMOTES_LIST) {
+      const parsed = await loader.load('emote', `public${emote.path}`);
+      const clip = parsed.toClip({ rootToHips: 1, version: '1', getBoneName: (name: string) => name });
+      expect(emote.duration, emote.name).toBeCloseTo(clip.duration, 2);
+    }
   });
 
   it('evaluates and keeps nothing whose download finished just as the world was destroyed', async () => {

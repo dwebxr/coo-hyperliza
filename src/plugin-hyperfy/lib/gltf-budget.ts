@@ -660,6 +660,27 @@ function charge(bytes: Uint8Array, budget: ModelBudget): ModelCharge {
   return { bytes: total, largest, exportBytes: exported, instances, tracks, work, metadataBytes };
 }
 
+/**
+ * Why a glTF that is parsed in the agent (Node: an emote, or the copy the render page hands back)
+ * would load a file by URL, or null: a buffer or an image whose URI is not a data: URI. The filter
+ * above lets such URIs through because the render page cannot fetch them; the agent's engine could.
+ */
+export function externalUriProblem(bytes: Uint8Array): string | null {
+  try {
+    const gltf = JSON.parse(container(bytes).text);
+    for (const [kind, entries] of [['buffer', gltf?.buffers], ['image', gltf?.images]] as const) {
+      if (!Array.isArray(entries)) continue;
+      for (const [index, entry] of entries.entries()) {
+        if (typeof entry?.uri === 'string' && !entry.uri.startsWith('data:')) return `${kind} ${index} is a file of its own (a URI), which the agent does not fetch`;
+      }
+    }
+    return null;
+  } catch (error) {
+    if (error instanceof Refused) return error.message;
+    return 'the glTF JSON does not parse';
+  }
+}
+
 /** What the filter finds the model in `bytes` asks for, or why it must not be loaded. */
 export function gltfCharge(bytes: Uint8Array, budget: ModelBudget): { charge: ModelCharge } | { problem: string } {
   try {

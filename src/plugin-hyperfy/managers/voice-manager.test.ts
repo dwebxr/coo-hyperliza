@@ -573,6 +573,23 @@ describe('VoiceManager voice input', () => {
     finishChat();
   });
 
+  it.each([
+    ['はい', true],
+    ['うん', true],
+    ['no', true],
+    ['ok', true],
+    ['5', true],
+    ['.', false],
+    ['…', false],
+    ['?!', false],
+    ['', false],
+  ])('answers the transcript "%s": %s (a word has a letter or a digit, however short)', async (said, answered) => {
+    const { say, heard } = listening({ transcribe: async () => said });
+    say('p1', loud(300));
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS);
+    expect(heard.map(({ text }) => text)).toEqual(answered ? [said] : []);
+  });
+
   it('does not transcribe a voice that is not a player in the world', async () => {
     const { say, heard, useModel, requests, state } = listening({ absent: ['stranger'] });
     say('stranger', loud(300));

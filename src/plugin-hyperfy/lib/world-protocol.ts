@@ -80,6 +80,17 @@ const clientPackr = new Packr({ useRecords: false, structuredClone: false, moreT
 const idByName = new Map<string, number>(PACKET_NAMES.map((name, id) => [name, id]));
 const methodOf = (name: string) => `on${name.charAt(0).toUpperCase()}${name.slice(1)}`; // 'kick' -> 'onKick'
 
+/**
+ * Why the world would drop packet `name` with `data` unread (its inbound byte limit), or null.
+ * network.send does not send such a packet (adaptToWorldProtocol); a caller that must know whether
+ * its change reaches the world (managers/build-manager.ts) asks first.
+ */
+export function outgoingPacketProblem(name: string, data: unknown): string | null {
+  const bytes = writeClientPacket(name, data).byteLength;
+  const limit = INBOUND_BYTE_LIMITS[name] ?? INBOUND_DEFAULT_BYTE_LIMIT;
+  return bytes > limit ? `the ${name} packet would be ${bytes} bytes, more than the ${limit} the world accepts` : null;
+}
+
 export function writeClientPacket(name: string, data: unknown): Uint8Array {
   const id = idByName.get(name);
   if (id === undefined) throw new Error(`writeClientPacket failed: ${name} (not in the world's protocol)`);
@@ -280,7 +291,8 @@ export function adaptToWorldProtocol(network: any, getAuthToken: () => string | 
     network.ws.addEventListener('close', network.onClose);
   };
 
-  network.send = (name: string, data: unknown) => {
+  // Whether the packet was sent: one over the world's limit is not (outgoingPacketProblem)
+  network.send = (name: string, data: unknown): boolean => {
     const packet = writeClientPacket(name, data);
     const limit = INBOUND_BYTE_LIMITS[name] ?? INBOUND_DEFAULT_BYTE_LIMIT;
     if (packet.byteLength > limit) {
@@ -288,9 +300,10 @@ export function adaptToWorldProtocol(network: any, getAuthToken: () => string | 
         reportedOversized.add(name);
         console.warn(`[Hyperfy] Not sending ${name}: ${packet.byteLength} bytes exceeds the ${limit}-byte limit`);
       }
-      return;
+      return false;
     }
     network.ws.send(packet);
+    return true;
   };
 
   network.onPacket = (event: { data: unknown }) => {

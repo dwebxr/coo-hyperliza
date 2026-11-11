@@ -1,29 +1,35 @@
 /**
  * Decodes one frame from the world under limits on what it may become in memory.
  *
- * The world's server packs its packets with msgpackr (`new Packr({ structuredClone: true })`):
- * MessagePack with msgpackr's record extension (an object is written as a record: its keys once,
- * then only values) and its extensions for `undefined`, dates and repeated references. msgpackr's
- * own decoder has no limit: a frame of N bytes can hold N empty arrays or objects, each of which
- * costs tens of bytes once decoded, and its reference extension lets one small subtree appear any
- * number of times in the value.
+ * The world's server packs its packets with msgpackr (`new Packr({ structuredClone: true })`, both
+ * coo-world's src/core/packets.js and the bundled engine's): MessagePack with msgpackr's record
+ * extension (an object is written as a record: its keys once, then only values), its reference
+ * extensions for a value held twice, and, as structuredClone turns on moreTypes, extensions for the
+ * other values an app may keep in its state. msgpackr's own decoder has no limit: a frame of N
+ * bytes can hold N empty arrays or objects, each of which costs tens of bytes once decoded, and its
+ * reference extension lets one small subtree appear any number of times in the value.
  *
  * This decoder reads the same format and counts while it reads:
- *  - nodes: every value it produces (each number, string, null, array, map, object, each element
- *    and each property value; a map's keys too). A subtree that is referred to again (the pointer
- *    extension) is counted again in full for every reference, so the count is the size of the
- *    value as code that walks it sees it. Containers are charged at their header, before anything
- *    is allocated for them, and may not announce more elements than the frame has bytes left.
- *  - depth: how deep arrays, maps, records and reference wrappers nest.
+ *  - nodes: every value it produces (each number, string, null, array, map, object, Set, each
+ *    element and each property value; a map's keys too; a typed array's elements; a big integer's
+ *    64-bit words). A subtree that is referred to again (the pointer extension) is counted again in
+ *    full for every reference, so the count is the size of the value as code that walks it sees it.
+ *    Containers are charged at their header, before anything is allocated for them, and may not
+ *    announce more elements than the frame has bytes left; a typed array's bytes are checked
+ *    against what is left of the frame before they are copied.
+ *  - depth: how deep arrays, maps, records, Sets and reference wrappers nest; a reference to a
+ *    subtree counts that subtree's height at the depth it is put at.
  * Over either limit it throws PacketOverLimit before building any more of the value.
  *
- * What it reads: nil, booleans, integers (64-bit ones as BigInt, as msgpackr does), floats,
- * strings, bin, arrays, maps (as Map: with records on, msgpackr writes only Map objects as maps),
- * record definitions and records with one-byte ids, `undefined` (fixext 1, type 0), timestamps
- * (type 0xff), and the reference extensions 'i' and 'p' without cycles. Anything else (other
- * extension types, two-byte record ids, bundled strings, the reserved byte 0xc1, a reference to a
- * value that is still being read, trailing bytes) is refused with PacketRefused: no packet of the
- * world's protocol holds any of it.
+ * What it reads, as msgpackr returns it (SERVER_TYPES): nil, booleans, integers (64-bit ones as
+ * BigInt), floats, strings (a leading BOM kept), bin, arrays, maps (as Map: with records on,
+ * msgpackr writes only Map objects as maps), record definitions (one-byte ids; their keys a list of
+ * names, or a reference to one) and records, `undefined`, dates (also an invalid one), Set, Error,
+ * RegExp, typed arrays, ArrayBuffer and DataView, big integers beyond 64 bits, and the reference
+ * extensions without cycles. Refused with PacketRefused, as nothing the two servers send holds
+ * them: two-byte record ids, bundled strings, the reserved byte 0xc1, other extension types, a
+ * typed array of a kind msgpackr has no code for (its own decoder fails on it as well), a cycle,
+ * a reference to a value that is not complete, and trailing bytes.
  */
 
 export interface DecodeLimits {
@@ -62,22 +68,55 @@ export interface Decoded {
   nodes: number;
 }
 
-const utf8 = new TextDecoder('utf-8');
+// msgpackr keeps a leading BOM in a string; so does this
+const utf8 = new TextDecoder('utf-8', { ignoreBOM: true });
 const EXT_UNDEFINED = 0x00;
-const EXT_RECORD = 0x72;
+const EXT_BIGINT = 0x42;
+const EXT_ERROR = 0x65;
 const EXT_ID = 0x69;
 const EXT_POINTER = 0x70;
+const EXT_RECORD = 0x72;
+const EXT_SET = 0x73;
+const EXT_TYPED = 0x74;
+const EXT_REGEXP = 0x78;
 const EXT_TIMESTAMP = 0xff;
+/** msgpackr's typed-array codes (unpack.js typedArrays); 16 is an ArrayBuffer, 17 a DataView */
+const TYPED_ARRAYS = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array];
+const ARRAY_BUFFER = 16;
+const DATA_VIEW = 17;
+/** The errors msgpackr rebuilds by name; any other name makes an Error with that name */
+const ERRORS: Record<string, (message: unknown, options: { cause: unknown }) => Error> = {
+  Error: (message, options) => Error(message as string, options),
+  EvalError: (message, options) => EvalError(message as string, options),
+  RangeError: (message, options) => RangeError(message as string, options),
+  ReferenceError: (message, options) => ReferenceError(message as string, options),
+  SyntaxError: (message, options) => SyntaxError(message as string, options),
+  TypeError: (message, options) => TypeError(message as string, options),
+  URIError: (message, options) => URIError(message as string, options),
+  // As msgpackr calls it: the message where the list of errors goes
+  AggregateError: (message, options) => (AggregateError as unknown as (errors: Iterable<unknown>, message: unknown) => Error)(message as Iterable<unknown>, options),
+};
+
+/** What one reference id names: the value, what it counted, and how many levels it nests */
+interface Reference {
+  value: unknown;
+  nodes: number;
+  height: number;
+  /** A record definition's list of names (only another definition may refer to it) */
+  names?: true;
+}
 
 export function decodeServerFrame(frame: Uint8Array, limits: DecodeLimits = PACKET_LIMITS): Decoded {
   const length = frame.byteLength;
   const view = new DataView(frame.buffer, frame.byteOffset, length);
   let position = 0;
   let nodes = 0;
+  /** The deepest level reached so far (see deeper) */
+  let reach = 0;
   /** Record structures by id (0 to 63): the property names, in order */
   const structures: (string[] | undefined)[] = [];
-  /** Values named by the id extension that are complete, with what each counted */
-  const references = new Map<number, { value: unknown; nodes: number }>();
+  /** Values named by the id extension that are complete */
+  const references = new Map<number, Reference>();
   /** Ids whose value is still being read: a pointer to one would close a cycle */
   const open = new Set<number>();
 
@@ -91,8 +130,10 @@ export function decodeServerFrame(frame: Uint8Array, limits: DecodeLimits = PACK
     nodes += count;
     if (nodes > limits.maxNodes) throw new PacketOverLimit(`it holds more than ${limits.maxNodes} values`);
   };
+  /** The level inside a container at `depth`; also notes it as reached */
   const deeper = (depth: number): number => {
     if (depth >= limits.maxDepth) throw new PacketOverLimit(`it nests more than ${limits.maxDepth} levels deep`);
+    if (depth + 1 > reach) reach = depth + 1;
     return depth + 1;
   };
   /**
@@ -103,6 +144,12 @@ export function decodeServerFrame(frame: Uint8Array, limits: DecodeLimits = PACK
   const container = (count: number, slotsEach = 1) => {
     need(count * slotsEach);
     charge(count * slotsEach);
+  };
+  const id32 = (): number => {
+    need(4);
+    const id = view.getUint32(position);
+    position += 4;
+    return id;
   };
 
   const text = (bytes: number): string => {
@@ -125,6 +172,21 @@ export function decodeServerFrame(frame: Uint8Array, limits: DecodeLimits = PACK
     for (let i = 0; i < count; i++) out[i] = value(inside);
     return out;
   };
+  /** The element count of the array header at the current byte, or -1 when it is no array */
+  const arrayHeader = (): number => {
+    need(1);
+    const token = frame[position];
+    if (token >= 0x90 && token < 0xa0) return position++, token - 0x90;
+    if (token === 0xdc) return need(3), position++, view.getUint16((position += 2) - 2);
+    if (token === 0xdd) return need(5), position++, view.getUint32((position += 4) - 4);
+    return -1;
+  };
+  /** The array a Set, an Error or a RegExp is written as (msgpackr writes a fresh array: never a reference) */
+  const listOf = (what: string, depth: number, exactly?: number): unknown[] => {
+    const count = arrayHeader();
+    if (count < 0 || (exactly !== undefined && count !== exactly)) refuse(`${what} that is not written as msgpackr writes one`);
+    return array(count, depth);
+  };
   const map = (count: number, depth: number): Map<unknown, unknown> => {
     container(count, 2);
     const inside = deeper(depth);
@@ -143,61 +205,180 @@ export function decodeServerFrame(frame: Uint8Array, limits: DecodeLimits = PACK
     for (const key of keys) out[key === '__proto__' ? '__proto_' : key] = value(inside);
     return out;
   };
+  /**
+   * A record definition's property names: a list of strings and nothing else, read here without
+   * recursing. msgpackr may wrap it in an id (its first definition) and refer to it from a later
+   * definition of the same shape (when it runs out of record ids and reuses one).
+   */
+  const names = (): string[] => {
+    need(1);
+    const wrapped = frame[position] === 0xd6 && position + 1 < length;
+    if (wrapped && frame[position + 1] === EXT_POINTER) {
+      position += 2;
+      const known = references.get(id32());
+      if (!known?.names) refuse('a record definition whose keys refer to something that is not a list of names');
+      return known.value as string[];
+    }
+    let id: number | null = null;
+    if (wrapped && frame[position + 1] === EXT_ID) {
+      position += 2;
+      id = id32();
+    }
+    const count = arrayHeader();
+    if (count < 0) refuse('a record definition whose keys are not a list');
+    need(count);
+    const out = new Array<string>(count);
+    for (let i = 0; i < count; i++) {
+      need(1);
+      const token = frame[position++];
+      if (token >= 0xa0 && token < 0xc0) out[i] = text(token - 0xa0);
+      else if (token === 0xd9) out[i] = (need(1), text(frame[position++]));
+      else if (token === 0xda) out[i] = (need(2), text(view.getUint16((position += 2) - 2)));
+      else if (token === 0xdb) out[i] = (need(4), text(view.getUint32((position += 4) - 4)));
+      else refuse('a record definition whose keys are not strings');
+    }
+    if (id !== null) references.set(id, { value: out, nodes: 0, height: 0, names: true });
+    return out;
+  };
   const define = (id: number, depth: number): Record<string, unknown> => {
-    // The property names, as an array of strings, then the first record of that structure
-    const before = nodes;
-    const keys = value(depth);
-    if (!Array.isArray(keys) || !keys.every((key) => typeof key === 'string')) refuse('a record definition whose keys are not strings');
-    // The names are not part of the value (they were counted, against the limit, while they were read)
-    nodes = before;
-    structures[id & 0x3f] = keys as string[];
-    return record(keys as string[], depth);
+    // The property names (not part of the value), then the first record of that structure
+    const keys = names();
+    structures[id & 0x3f] = keys;
+    return record(keys, depth);
   };
   const timestamp = (bytes: number): Date => {
-    need(bytes);
     const at = position;
     position += bytes;
+    if (bytes === 1) return new Date(Number.NaN);
     if (bytes === 4) return new Date(view.getUint32(at) * 1000);
     if (bytes === 8) {
       const high = view.getUint32(at);
       const low = view.getUint32(at + 4);
       return new Date((high >>> 2) / 1e6 + ((high & 0x3) * 0x100000000 + low) * 1000);
     }
-    const nanoseconds = view.getUint32(at);
-    const seconds = Number(view.getBigInt64(at + 4));
-    return new Date(nanoseconds / 1e6 + seconds * 1000);
+    // msgpackr's arithmetic (unpack.js extension 0xff): the sign bit, then the low 48 bits of the seconds
+    const d = (i: number) => frame[at + i];
+    const seconds = (d(4) & 0x80 ? -0x1000000000000 : 0) + d(6) * 0x10000000000 + d(7) * 0x100000000 + d(8) * 0x1000000 + (d(9) << 16) + (d(10) << 8) + d(11);
+    // (its nanoseconds as a signed 32-bit sum, as msgpackr computes them)
+    return new Date(((d(0) << 24) + (d(1) << 16) + (d(2) << 8) + d(3)) / 1e6 + seconds * 1000);
+  };
+  /** A typed array, ArrayBuffer or DataView of `bytes` data bytes (its kind code first) */
+  const typed = (bytes: number): unknown => {
+    if (bytes < 1) refuse('a typed array without its kind');
+    const code = frame[position++];
+    const Kind = TYPED_ARRAYS[code];
+    if (!Kind && code !== ARRAY_BUFFER && code !== DATA_VIEW) refuse(`a typed array of kind ${code}, which msgpackr has no code for`);
+    const byteLength = bytes - 1;
+    const size = Kind ? Kind.BYTES_PER_ELEMENT : 1;
+    if (byteLength % size !== 0) refuse('a typed array whose bytes are not whole elements');
+    // Its elements are values like any other (the array itself was charged by whatever holds it)
+    charge(byteLength / size);
+    // A copy, as msgpackr makes: aligned for its kind, and not a view that keeps the frame alive
+    const buffer = Uint8Array.prototype.slice.call(frame, position, position + byteLength).buffer;
+    position += byteLength;
+    return Kind ? new Kind(buffer) : code === ARRAY_BUFFER ? buffer : new DataView(buffer);
+  };
+  /** A big integer beyond 64 bits (msgpackr unpack.js extension 0x42, the same arithmetic) */
+  const bigint = (bytes: number): bigint => {
+    if (bytes < 1) refuse('a big integer without its bytes');
+    // One value per 64-bit word beyond the first (the integer itself was charged by whatever holds it)
+    charge(Math.ceil(bytes / 8) - 1);
+    const start = position;
+    position += bytes;
+    const headLength = bytes % 8 || 8;
+    let head = BigInt(frame[start] & 0x80 ? frame[start] - 0x100 : frame[start]);
+    for (let i = 1; i < headLength; i++) head = (head << 8n) + BigInt(frame[start + i]);
+    if (bytes === headLength) return head;
+    const words = (from: number, to: number): bigint => {
+      if (to - from <= 40) {
+        let out = view.getBigUint64(start + from);
+        for (let i = from + 8; i < to; i += 8) out = (out << 64n) | view.getBigUint64(start + i);
+        return out;
+      }
+      const middle = from + (((to - from) >> 4) << 3);
+      return (words(from, middle) << BigInt((to - middle) * 8)) | words(middle, to);
+    };
+    return (head << BigInt((bytes - headLength) * 8)) | words(headLength, bytes);
+  };
+  const error = (parts: unknown[]): Error => {
+    const [name, message, cause] = parts;
+    // Only the table's own names (msgpackr's lookup would also find Object.prototype's members)
+    if (typeof name === 'string' && Object.prototype.hasOwnProperty.call(ERRORS, name)) return ERRORS[name](message, { cause });
+    const made = Error(message as string, { cause });
+    made.name = name as string;
+    return made;
+  };
+  /** A one-byte marker extension (Set, Error, RegExp) is followed by a filler byte, then its array */
+  const marker = (bytes: number, what: string) => {
+    if (bytes !== 1 || frame[position] !== 0) refuse(`${what} that is not written as msgpackr writes one`);
+    position++;
   };
   /** An extension of `bytes` data bytes, whose type byte is next */
   const extension = (bytes: number, depth: number): unknown => {
     need(1 + bytes);
     const type = frame[position++];
-    if (type === EXT_TIMESTAMP && (bytes === 4 || bytes === 8 || bytes === 12)) return timestamp(bytes);
-    if (bytes === 1 && type === EXT_UNDEFINED) {
-      position++;
-      return undefined;
-    }
-    if (bytes === 1 && type === EXT_RECORD) return define(frame[position++], depth);
-    if (bytes === 4 && type === EXT_ID) {
-      const id = view.getUint32(position);
-      position += 4;
-      if (open.has(id)) refuse('a reference id that is defined inside itself');
-      open.add(id);
-      const before = nodes;
-      const named = value(deeper(depth));
-      open.delete(id);
-      // What it counted: itself (charged by whatever holds it) and everything in it
-      references.set(id, { value: named, nodes: 1 + nodes - before });
-      return named;
-    }
-    if (bytes === 4 && type === EXT_POINTER) {
-      const id = view.getUint32(position);
-      position += 4;
-      const known = references.get(id);
-      if (!known) return refuse(open.has(id) ? 'a reference to a value that contains it (a cycle)' : 'a reference to nothing');
-      // Counted again in full: whoever walks the value meets it once more (one node of it was
-      // charged already, for the pointer)
-      charge(known.nodes - 1);
-      return known.value;
+    switch (type) {
+      case EXT_TIMESTAMP:
+        if (bytes === 1 || bytes === 4 || bytes === 8 || bytes === 12) return timestamp(bytes);
+        break;
+      case EXT_UNDEFINED:
+        if (bytes !== 1) break;
+        position++;
+        return undefined;
+      case EXT_RECORD:
+        if (bytes !== 1) return refuse('a two-byte record definition');
+        return define(frame[position++], depth);
+      case EXT_SET:
+        marker(bytes, 'a Set');
+        return new Set(listOf('a Set', depth));
+      case EXT_ERROR:
+        marker(bytes, 'an Error');
+        return error(listOf('an Error', depth, 3));
+      case EXT_REGEXP: {
+        marker(bytes, 'a RegExp');
+        const [source, flags] = listOf('a RegExp', depth, 2);
+        if (typeof source !== 'string' || typeof flags !== 'string') return refuse('a RegExp that is not written as msgpackr writes one');
+        try {
+          return new RegExp(source, flags);
+        } catch {
+          return refuse('a RegExp whose pattern does not compile');
+        }
+      }
+      case EXT_TYPED:
+        return typed(bytes);
+      case EXT_BIGINT:
+        return bigint(bytes);
+      case EXT_ID: {
+        if (bytes !== 4) break;
+        const id = id32();
+        if (open.has(id)) refuse('a reference id that is defined inside itself');
+        open.add(id);
+        const before = nodes;
+        const inside = deeper(depth);
+        const outerReach = reach;
+        reach = inside;
+        const named = value(inside);
+        // How many levels it nests below where it stands (0 for a plain value)
+        const height = reach - inside;
+        reach = Math.max(outerReach, reach);
+        open.delete(id);
+        // What it counted: itself (charged by whatever holds it) and everything in it
+        references.set(id, { value: named, nodes: 1 + nodes - before, height });
+        return named;
+      }
+      case EXT_POINTER: {
+        if (bytes !== 4) break;
+        const id = id32();
+        const known = references.get(id);
+        if (!known || known.names) return refuse(open.has(id) ? 'a reference to a value that contains it (a cycle)' : 'a reference to nothing');
+        // Its levels, from where it is put now
+        if (depth + known.height > limits.maxDepth) throw new PacketOverLimit(`it nests more than ${limits.maxDepth} levels deep`);
+        if (depth + known.height > reach) reach = depth + known.height;
+        // Counted again in full: whoever walks the value meets it once more (one node of it was
+        // charged already, for the pointer)
+        charge(known.nodes - 1);
+        return known.value;
+      }
     }
     return refuse(`extension type 0x${type.toString(16)} with ${bytes} byte(s)`);
   };
@@ -235,6 +416,12 @@ export function decodeServerFrame(frame: Uint8Array, limits: DecodeLimits = PACK
       case 0xc7:
         need(1);
         return extension(frame[position++], depth);
+      case 0xc8:
+        need(2);
+        return extension(view.getUint16((position += 2) - 2), depth);
+      case 0xc9:
+        need(4);
+        return extension(view.getUint32((position += 4) - 4), depth);
       case 0xca:
         need(4);
         return view.getFloat32((position += 4) - 4);
@@ -267,10 +454,14 @@ export function decodeServerFrame(frame: Uint8Array, limits: DecodeLimits = PACK
         return view.getBigInt64((position += 8) - 8);
       case 0xd4:
         return extension(1, depth);
+      case 0xd5:
+        return extension(2, depth);
       case 0xd6:
         return extension(4, depth);
       case 0xd7:
         return extension(8, depth);
+      case 0xd8:
+        return extension(16, depth);
       case 0xd9:
         need(1);
         return text(frame[position++]);
@@ -293,7 +484,7 @@ export function decodeServerFrame(frame: Uint8Array, limits: DecodeLimits = PACK
         need(4);
         return map(view.getUint32((position += 4) - 4), depth);
       default:
-        // 0xc1 (never used; msgpackr's bundled strings), ext 16/32 and fixext 2/16
+        // 0xc1: never used by either server (msgpackr's own placeholder)
         return refuse(`byte 0x${token.toString(16)}`);
     }
   }

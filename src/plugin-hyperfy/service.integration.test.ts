@@ -970,6 +970,64 @@ describe('HyperfyService: "stop" does not wait its turn', () => {
     expect(stopAllActions).toHaveBeenCalledTimes(1);
   });
 
+  it('applies the MUTED-room rule on arrival as its turn would: a bare "stop" from the only other player stops nothing there, "Coo, stop" does', async () => {
+    vi.useFakeTimers();
+    const { world, runtime, stopAllActions } = walking();
+    runtime.getParticipantUserState = vi.fn(async () => 'MUTED');
+    world.entities.items.set('p1', { data: { id: 'p1', type: 'player', name: 'Alice' } });
+    world.network.onChatAdded(cooWorldChat('walk', 'p1', 'Alice', 'go to the tree, Coo'));
+    world.network.onChatAdded(cooWorldChat('bare', 'p1', 'Alice', 'stop'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runtime.getParticipantUserState).toHaveBeenCalled();
+    expect(stopAllActions).not.toHaveBeenCalled();
+    world.network.onChatAdded(cooWorldChat('named', 'p1', 'Alice', 'Coo, stop'));
+    expect(stopAllActions).toHaveBeenCalledTimes(1);
+    // Not muted: the bare "stop" of the only other player stops on arrival, once its room state is read
+    runtime.getParticipantUserState = vi.fn(async () => null);
+    world.network.onChatAdded(cooWorldChat('bare2', 'p1', 'Alice', 'stop'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stopAllActions).toHaveBeenCalledTimes(2);
+  });
+
+  it('stops nothing on arrival once the message\'s own turn has begun, or the session ended, while its room state was read', async () => {
+    const { s, world, runtime, stopAllActions } = walking();
+    world.entities.items.set('p1', { data: { id: 'p1', type: 'player', name: 'Alice' } });
+    const reads: ((state: string | null) => void)[] = [];
+    runtime.getParticipantUserState = vi.fn(() => new Promise((resolve) => reads.push(resolve)));
+    const claimed = { id: 'c1', body: 'stop', fromId: 'p1' };
+    (s as any).stopOnArrival(claimed);
+    // Its turn begins first: the turn decides from here
+    expect(s.claimStop(claimed)).toBe(false);
+    reads.shift()!(null);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(stopAllActions).not.toHaveBeenCalled();
+    const ended = { id: 'c2', body: 'stop', fromId: 'p1' };
+    (s as any).stopOnArrival(ended);
+    await s.end();
+    reads.shift()!(null);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // (ending the session stops the controls itself, for its own reason)
+    expect(stopAllActions.mock.calls.filter(([why]: any[]) => why === 'asked to stop')).toEqual([]);
+  });
+
+  it("keeps a stop's mark on its own queued message, however many other stops arrive while it waits", async () => {
+    vi.useFakeTimers();
+    const { s, world, received } = walking();
+    let finishWalk!: () => void;
+    const handle = s.messages.handleMessage;
+    s.messages.handleMessage = async (msg: any, slot: any) => (msg.id === 'walk' ? new Promise<void>((resolve) => (finishWalk = resolve)) : handle(msg, slot));
+    world.network.onChatAdded(cooWorldChat('walk', 'p1', 'Alice', 'Coo, go to the tree'));
+    await vi.advanceTimersByTimeAsync(0);
+    world.network.onChatAdded(cooWorldChat('A', 'p1', 'Alice', 'Coo, stop!'));
+    // Five other senders, eight stops each: far more marks than any count-based memory would keep
+    for (let sender = 2; sender <= 6; sender++) for (let i = 0; i < 8; i++) world.network.onChatAdded(cooWorldChat(`s${sender}-${i}`, `p${sender}`, `P${sender}`, 'Coo, stop!'));
+    finishWalk();
+    await vi.advanceTimersByTimeAsync(10);
+    await s.conversation.idle();
+    const a = received().find((content: any) => content.metadata?.hyperfyMessageId === 'A');
+    expect(a?.metadata).toMatchObject({ hyperfyStopTaken: true });
+  });
+
   it('stops nothing for a stop the queue does not admit (its sender is over the rate limit), nor for one not addressed to the agent', async () => {
     vi.useFakeTimers();
     const { world, stopAllActions } = walking();

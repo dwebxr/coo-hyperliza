@@ -165,9 +165,8 @@ export class AgentActions extends System {
     }
 
     console.log('Releasing current action.');
+    const node = this.currentNode;
     const control = this.world.controls;
-    control.setKey('keyX', true);
-    control.keyX.pressed = true;
     // Handlers the engine or a script put on the key are contained like every other callback here
     const contained = (what: string, call: () => void) => {
       try {
@@ -176,23 +175,9 @@ export class AgentActions extends System {
         console.warn(`[Actions] ${what} threw: ${error?.message ?? error}`);
       }
     };
-    contained("The X key's press handler", () => control.keyX.onPress?.());
-    // World scripts hold controls of their own (AgentControls.bind): the key is pressed there too
-    control.pressAppButton('keyX', true);
-
-    // A world script's cancel handler. If it throws, the item is still let go of (keyX released,
-    // nothing held) and the caller (HYPERFY_UNUSE_ITEM) is told it failed.
-    let cancelFailed = false;
-    let cancelError: unknown;
-    if (typeof this.currentNode._onCancel === 'function') {
-      try {
-        this.currentNode._onCancel();
-      } catch (error) {
-        cancelFailed = true;
-        cancelError = error;
-      }
-    }
-
+    // Reserved before X goes down or any callback runs: a callback that unregisters or rebuilds the
+    // node (unregister keeps the node while a release is under way) or throws leaves X coming up
+    // on time, and the agent free once it has
     this.releaseTimer = setTimeout(() => {
       this.releaseTimer = null;
       control.setKey('keyX', false);
@@ -201,7 +186,16 @@ export class AgentActions extends System {
       control.pressAppButton('keyX', false);
       this.currentNode = null;
     }, RELEASE_MS);
-    if (cancelFailed) throw cancelError;
+    control.setKey('keyX', true);
+    control.keyX.pressed = true;
+    contained("The X key's press handler", () => control.keyX.onPress?.());
+    // World scripts hold controls of their own (AgentControls.bind): the key is pressed there too
+    control.pressAppButton('keyX', true);
+
+    // A world script's cancel handler, on the node as it was when the release began. If it throws,
+    // the item is still let go of (keyX released, nothing held) and the caller (HYPERFY_UNUSE_ITEM)
+    // is told it failed.
+    if (typeof node._onCancel === 'function') node._onCancel();
     return true;
   }
 

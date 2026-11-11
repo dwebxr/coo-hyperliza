@@ -9,7 +9,7 @@ import { PuppeteerManager } from "../managers/puppeteer-manager.js";
 import type { WorldScripts } from "../lib/script-api";
 import { ASSET_BYTE_CAPS, type AssetBytes, type AssetKind, describeUrl, fetchAssetBytes } from "../lib/asset-bytes";
 import { SafeFetchError } from "../lib/net-policy";
-import { gltfCharge, modelBudget } from "../lib/gltf-budget";
+import { externalUriProblem, gltfCharge, modelBudget } from "../lib/gltf-budget";
 import { type AssetLease, PARSE_COPIES, assetMemory, modelReservation, workBytes } from "../lib/asset-memory";
 import { PageWork } from "../lib/page-work";
 
@@ -30,9 +30,20 @@ const NO_TEXTURES = Object.freeze({
   loadTexture: (): Promise<null> => Promise.resolve(null),
 });
 
-/** The engine's glTF loader as the agent uses it: no texture is loaded (NO_TEXTURES). */
+/**
+ * The engine's glTF loader as the agent uses it: no texture is loaded (NO_TEXTURES), and nothing by
+ * URL. A file that names a buffer or an image by URL is refused before it is parsed here
+ * (gltf-budget.ts externalUriProblem); should a load by URL still be asked for, its URL is refused
+ * here, so the engine's FileLoader (global fetch, outside the network policy) never runs for one.
+ */
 export function createGltfLoader(): GLTFLoader {
-  const loader: any = new GLTFLoader();
+  // (in three, though not in the types the agent builds against)
+  const manager = new (THREE as any).LoadingManager();
+  manager.setURLModifier((url: string) => {
+    if (url.startsWith('data:')) return url;
+    throw new Error(`[AgentLoader] Not loading ${describeUrl(url)}: nothing the agent parses loads a file by URL`);
+  });
+  const loader: any = new GLTFLoader(manager);
   // First, before the loader's own texture extensions (WebP, AVIF, Basis), which load images too
   loader.pluginCallbacks.unshift(() => NO_TEXTURES);
   return loader;
@@ -262,6 +273,9 @@ export class AgentLoader extends System {
       // copies of its BIN chunk and buffer views
       lease?.shrink(asset.bytes.byteLength + PARSE_COPIES * stripped.byteLength);
       // The page's copy comes in memory of its own (managers/puppeteer-manager.ts fromBase64): no second copy
+      // Parsed here: nothing in it may name a file by URL (the page writes none)
+      const external = externalUriProblem(stripped);
+      if (external) throw new Error(`[AgentLoader] ${external}`);
       const arrayBuffer = stripped.byteOffset === 0 && stripped.byteLength === stripped.buffer.byteLength ? stripped.buffer : stripped.slice().buffer;
       const gltf: any = await new Promise((ok, bad) => this.gltfLoader.parse(arrayBuffer, '', ok, bad));
       this.throwIfStopped();
@@ -296,6 +310,9 @@ export class AgentLoader extends System {
    * is reserved, with the download, until the parse is over.
    */
   private async parseEmote(key: string, asset: AssetBytes, chargedBytes: number, lease?: AssetLease) {
+    // Parsed here, not in the page: nothing in it may name a file by URL
+    const external = externalUriProblem(asset.bytes);
+    if (external) throw new Error(`[AgentLoader] ${external}`);
     await lease?.toWork(asset.bytes.byteLength + chargedBytes, this.stopped.signal);
     this.throwIfStopped();
     const bytes = asset.bytes;

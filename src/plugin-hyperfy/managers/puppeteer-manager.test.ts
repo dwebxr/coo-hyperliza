@@ -316,6 +316,26 @@ describe('PuppeteerManager', () => {
     expect(steps).toEqual(['rollback', 'rollback', 'forget']);
   });
 
+  it('takes back what a page call kept when its accept step throws or rejects, also when the call has no signal', async () => {
+    const manager = PuppeteerManager.getOrCreate() as any;
+    const page = await manager.init();
+    const steps: string[] = [];
+    const ops: unknown[] = [];
+    page.evaluate.mockImplementation(async (_fn: unknown, ...args: any[]) => {
+      if (['rollback', 'forget'].includes(args.at(-1))) steps.push(`${args.at(-1)} ${args.at(-2)}`);
+      else ops.push(args.at(-1));
+      return Buffer.from('glb').toString('base64');
+    });
+    await expect(manager.loadGlbBytes(new Uint8Array([1]), { accept: () => { throw new Error('conversion failed'); } })).rejects.toThrow('conversion failed');
+    await expect(manager.loadVRMBytes(new Uint8Array([1]), 'https://world.test/a.vrm', { accept: async () => Promise.reject(new Error('conversion rejected')) })).rejects.toThrow('conversion rejected');
+    // Each was filed under an id of its own, and that id was taken back
+    expect(ops).toEqual([expect.stringMatching(/^op-\d+$/), expect.stringMatching(/^op-\d+$/)]);
+    expect(steps).toEqual([`rollback ${ops[0]}`, `rollback ${ops[1]}`]);
+    // Accepted without a signal: forgotten
+    await expect(manager.loadGlbBytes(new Uint8Array([1]), { accept: (bytes: Uint8Array) => text(bytes) })).resolves.toBe('glb');
+    expect(steps.at(-1)).toBe(`forget ${ops[2]}`);
+  });
+
   it('returns an accepted result whatever its signal does while the record is being dropped: from the acceptance on it is the caller\'s', async () => {
     const manager = PuppeteerManager.getOrCreate() as any;
     const page = await manager.init();

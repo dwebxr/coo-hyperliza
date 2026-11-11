@@ -7,6 +7,7 @@ import { actingSession } from "../service";
 import { getShopProducts } from "../../openpay-store";
 import { parseAliases } from "../lib/addressing";
 import { isJapanese, matchSimpleCommand, simpleCommandReply } from "../lib/simple-commands";
+import { ignoredAsMuted } from "../lib/room-state";
 import { NoticeThrottle, composeOfflineReply } from "../lib/offline-reply";
 import { readActionNames, readString, readStringList } from "../lib/model-output";
 
@@ -48,8 +49,12 @@ async function handleSimpleCommand(runtime: IAgentRuntime, message: Memory, call
     const mine = world.entities?.player?.base?.position;
     if (!theirs || !mine) return false;
     // Moves the avatar: in its turn among such sections (ConnectionSession.withBody)
-    const underWay = await session.withBody(async (signal) => {
-      if (theirs.distanceTo(mine) > COME_TELEPORT_BEYOND_M) {
+    const underWay = await session.withBody(async (signal): Promise<boolean | 'gone'> => {
+      // Again, now: the speaker may have left while this waited for the avatar
+      const theirsNow = world.entities?.items?.get(senderId)?.base?.position;
+      const mineNow = world.entities?.player?.base?.position;
+      if (!theirsNow || !mineNow) return 'gone';
+      if (theirsNow.distanceTo(mineNow) > COME_TELEPORT_BEYOND_M) {
         return controls.teleportToEntity(senderId) === 'arrived';
       } else {
         // Not awaited: the reply goes out while walking. The walk goes on after this turn has
@@ -61,6 +66,17 @@ async function handleSimpleCommand(runtime: IAgentRuntime, message: Memory, call
     // The teleport could not be made (their position is not one): not handled here, so nothing
     // is claimed; the turn goes on as for any other message
     if (!underWay) return false;
+    if (underWay === 'gone') {
+      logger.info('[Bootstrap] "Come here" from a speaker who is no longer in the world');
+      await callback({
+        thought: 'Simple request (come), but the speaker is gone.',
+        text: isJapanese(message.content.text) ? 'あれ、どこにいるか分からなくなっちゃいました。' : "Hmm, I can't find you right now.",
+        actions: ['REPLY'],
+        source: 'hyperfy',
+        ...(message.id ? { inReplyTo: createUniqueUuid(runtime, message.id) } : {}),
+      });
+      return true;
+    }
   } else if (!(message.content.metadata as { hyperfyStopTaken?: boolean } | undefined)?.hyperfyStopTaken) {
     // Waits for nobody: it ends whatever walk is in progress
     controls.stopAllActions('asked to stop');
@@ -215,15 +231,7 @@ export const messageReceivedHandler = async ({
           : undefined;
         await Promise.all([embedding, runtime.createMemory(message, 'messages')]);
 
-        const agentUserState = await runtime.getParticipantUserState(
-          message.roomId,
-          runtime.agentId
-        );
-
-        if (
-          agentUserState === 'MUTED' &&
-          !message.content.text?.toLowerCase().includes(runtime.character.name.toLowerCase())
-        ) {
+        if (await ignoredAsMuted(runtime, message.roomId, message.content.text)) {
           logger.debug(`[Bootstrap] Ignoring muted room ${message.roomId}`);
           return;
         }

@@ -19,10 +19,25 @@ import { isJapanese } from '../lib/simple-commands';
 import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
 import { readString } from '../lib/model-output';
 import { shownName } from '../lib/text';
+import { notArrivedText } from '../lib/move-outcome';
+import type { MoveOutcome } from '../systems/controls';
+
+/** Raised inside the look when the walk to the entity did not get it close enough to see it. */
+class NotThere extends Error {
+  constructor(readonly outcome: Exclude<MoveOutcome, 'arrived'>) {
+    super(`the walk to the entity ended ${outcome}`);
+  }
+}
 
 const SCENE_PERCEPTION = 'HYPERFY_SCENE_PERCEPTION';
 // Said when the look itself failed (the snapshot or reading it)
 const LOOK_FAILED_EN = "Sorry, I couldn't get a proper look just now.";
+/**
+ * Within this distance a picture taken toward an entity from where the agent stands still shows it,
+ * when the walk there did not arrive (it timed out, or no path was found). The code knows only the
+ * distance, not what stands in between: something may still block the view.
+ */
+export const LOOK_VIEW_DISTANCE_M = 20;
 const LOOK_FAILED_JA = 'ごめんなさい、今はうまく見られませんでした。';
 
 export enum SnapshotType {
@@ -184,8 +199,15 @@ export const hyperfyScenePerceptionAction: Action = {
             const ent = world.entities.items.get(choice.entityId);
             const pos = ent?.base?.position || ent?.root?.position;
             if (!pos) throw new Error('No position');
-            await world.controls.followEntity(choice.entityId, undefined, { signal });
+            const outcome: MoveOutcome = await world.controls.followEntity(choice.entityId, undefined, { signal });
             session.assertLive();
+            if (outcome !== 'arrived') {
+              // Stopped, replaced or cancelled: whoever ended the walk did not want this look. Timed
+              // out or no path: still worth a picture from here when the entity is near enough.
+              const here = world.entities.player?.base?.position;
+              const near = here && typeof here.distanceTo === 'function' && here.distanceTo(pos) <= LOOK_VIEW_DISTANCE_M;
+              if (!((outcome === 'timed-out' || outcome === 'unreachable') && near)) throw new NotThere(outcome);
+            }
             return renderPage.capture(world, { kind: 'target', position: [pos.x, pos.y, pos.z] }, { signal });
           }
         }
@@ -194,6 +216,17 @@ export const hyperfyScenePerceptionAction: Action = {
       look.release();
       // A cancelled turn says nothing more
       if (err instanceof TurnCancelled) throw err;
+      if (err instanceof NotThere) {
+        logger.info(`[Perception] Not looking: ${err.message}`);
+        const name = shownName(entities.find((e) => e.id === (choice as { entityId?: string }).entityId)?.name, 64) || 'it';
+        await tellFailure(
+          callback,
+          SCENE_PERCEPTION,
+          japanese ? `${name}のところまで行けなかったので、見られませんでした。` : `${notArrivedText(err.outcome)} So I couldn't take a look at ${name}.`,
+          { thought: 'The walk to the entity did not get there.', metadata: { error: 'not_there', outcome: err.outcome, snapshotType } }
+        );
+        return actionFailed(SCENE_PERCEPTION, `did not get to the entity (${err.outcome})`, { snapshotType });
+      }
       logger.error('Snapshot failed:', err);
       await tellFailure(callback, SCENE_PERCEPTION, japanese ? LOOK_FAILED_JA : LOOK_FAILED_EN, { thought: 'Snapshot failed.', metadata: { error: 'snapshot_failure', snapshotType } });
       return actionFailed(SCENE_PERCEPTION, 'snapshot failed', { snapshotType });
