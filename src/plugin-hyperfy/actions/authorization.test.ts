@@ -333,6 +333,37 @@ describe('with scene edits off (the default)', () => {
 });
 
 /*
+ * providers/actions.ts offers the model the actions whose validate() holds. An action that would
+ * only refuse is not offered, so the model does not tell a player it can change the scene.
+ */
+describe('whether the scene edit is offered to the model (validate)', () => {
+  const offered = (runtime: any, world: Record<string, unknown>, requester: string) =>
+    inChatTurn(world, () => hyperfyEditEntityAction.validate(runtime, {} as any, {} as any), requester);
+
+  it('is offered to a builder who asks in chat while scene edits are on', async () => {
+    const { world, runtime } = editSetup();
+    expect(await offered(runtime, world, 'builder-1')).toBe(true);
+  });
+
+  it.each([[undefined], ['off']])('is not offered to anyone while scene edits are off (HYPERFY_SCENE_EDITS=%s)', async (value) => {
+    vi.unstubAllEnvs();
+    if (value !== undefined) vi.stubEnv('HYPERFY_SCENE_EDITS', value);
+    const { world, runtime } = editSetup();
+    expect(await offered(runtime, world, 'builder-1')).toBe(false);
+  });
+
+  it('is not offered to a visitor, on an autonomous turn, outside a turn, or when the agent itself may not build', async () => {
+    const { world, runtime } = editSetup();
+    expect(await offered(runtime, world, 'visitor-1')).toBe(false);
+    expect(await inAutonomousTurn(world, () => hyperfyEditEntityAction.validate(runtime, {} as any, {} as any))).toBe(false);
+    expect(await hyperfyEditEntityAction.validate(runtime, {} as any, {} as any)).toBe(false);
+    const visitorAgent = worldFromSnapshot(cooWorldSnapshot({ selfRank: 0, players: [{ id: 'builder-1', name: 'Bob', rank: 1 }] }), { controls: {} });
+    const setup = editSetup(visitorAgent);
+    expect(await offered(setup.runtime, visitorAgent, 'builder-1')).toBe(false);
+  });
+});
+
+/*
  * A scene edit bound to the connection it was authorized on, with the real BuildManager: the
  * world, its network and the requester's rank change while the planner (or the walk) is awaited.
  */

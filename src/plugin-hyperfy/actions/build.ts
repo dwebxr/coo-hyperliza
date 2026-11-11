@@ -275,8 +275,13 @@ Don't list every action like a log — instead, summarize the overall outcome na
     name: EDIT_ENTITY,
     similes: ['EDIT_ENTITY_IN_WORLD', 'MODIFY_SCENE', 'BUILD_STRUCTURE'],
     description: `Performs scene edits in Hyperfy, including duplicating, moving, rotating, scaling, deleting, or importing entities. Use when the user asks to modify or add something in the 3D world.`,
+    // What the model is offered: providers/actions.ts lists the actions whose validate() holds.
+    // While a request would only be refused (edits off, the requester or the agent not a builder,
+    // no turn) the action is not listed, so the model does not say it can change the scene.
+    // Core runs a handler without calling validate(): the handler below refuses on its own.
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
-      return !!connectedSession(runtime)?.world?.controls;
+      if (!connectedSession(runtime)?.world?.controls) return false;
+      return sceneEditRefusal(currentTurn()) === null;
     },
     handler: async (runtime, message, state, _options, callback, responses) => {
       // Checked first, so a refused request costs no model call: only a builder who asked in chat or voice

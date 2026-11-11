@@ -201,11 +201,15 @@ export class ConnectionSession {
       events.onDisconnect?.(this, reason, kickCode)
     })
     // The local player only spawns after a real session is established.
+    // The engine sends 'player' again when the player is rebuilt (after its name is set, for one):
+    // the session is established once.
     this.listen(world, 'player', () => {
       if (this.ended) return
-      this.established = true
-      this.clearSnapshotTimer()
-      events.onEstablished?.(this)
+      if (!this.established) {
+        this.established = true
+        this.clearSnapshotTimer()
+        events.onEstablished?.(this)
+      }
       this.tipWallet?.begin()
     })
   }

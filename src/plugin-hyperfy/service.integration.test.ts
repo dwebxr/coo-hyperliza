@@ -1324,6 +1324,8 @@ describe('HyperfyService and the session of each connection', () => {
     expect(lines).not.toContain('HyperfyService connected successfully to wss://play.world.test/ws');
     session.world.emit('player', {});
     expect([service.isConnected(), session.connected]).toEqual([true, true]);
+    // The engine sends 'player' again when the player is rebuilt (its name was set): still one line
+    session.world.emit('player', {});
     expect(lines.filter((line) => line === 'HyperfyService connected successfully to wss://play.world.test/ws')).toHaveLength(1);
     await service.disconnect();
     expect([service.getSession(), service.getWorld(), service.currentWorldId, service.isConnected()]).toEqual([null, null, null, false]);
