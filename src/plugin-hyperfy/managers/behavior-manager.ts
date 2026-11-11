@@ -4,7 +4,9 @@ import { autoTemplate } from "../templates";
 import { agentActivityLock } from "./guards";
 import { getHyperfyActions, formatActions, countOtherPlayers } from "../utils";
 import { isOpenPayLink } from "../../openpay-store";
-import { AiBudgetExceededError, forPurpose, getUsageBudget, runWithOrigin } from "../../usage-budget";
+import { AiBudgetExceededError, forPurpose, getUsageBudget } from "../../usage-budget";
+import { AUTONOMY_ACTIONS } from "../lib/authorization";
+import { type TurnContext, neverAbortedSignal, runTurn } from "../lib/turn-context";
 import {
   type AutonomyConfig,
   type Point,
@@ -14,7 +16,7 @@ import {
   chooseIdleStep,
   readAutonomyConfig,
 } from "../lib/idle-behavior";
-import { readString, readStringList } from "../lib/model-output";
+import { readActionNames, readString, readStringList } from "../lib/model-output";
 
 const TIME_INTERVAL_IDLE_MIN = 60000; // 60 seconds when no players around
 const TIME_INTERVAL_IDLE_MAX = 120000; // 120 seconds when no players around
@@ -163,8 +165,14 @@ export class BehaviorManager {
     if (budget.autonomyAiAvailable(agentActivityLock.lastActivityAt())) {
       // Counted up front, so a failing tick cannot be retried on every loop
       budget.recordAutonomyAiTick();
+      const turn: TurnContext = {
+        origin: 'autonomy',
+        world,
+        generation: service.getConnectionGeneration(),
+        signal: neverAbortedSignal(),
+      };
       try {
-        await runWithOrigin('autonomous', () => this.runAiBehavior(service, world));
+        await runTurn(turn, () => this.runAiBehavior(service, world));
         return hasOtherPlayers;
       } catch (error) {
         if (!(error instanceof AiBudgetExceededError)) throw error;
@@ -296,20 +304,8 @@ export class BehaviorManager {
 
     const state = await this.runtime.composeState(newMessage);
 
-    const actionsData = await getHyperfyActions(
-      this.runtime,
-      newMessage,
-      state, [
-      'HYPERFY_GOTO_ENTITY',
-      'HYPERFY_WALK_RANDOMLY',
-      'HYPERFY_USE_ITEM',
-      'HYPERFY_UNUSE_ITEM',
-      'HYPERFY_AMBIENT_SPEECH',
-      'HYPERFY_TELEPORT_TO_USER',
-      'REPLY',
-      'IGNORE',
-    ]
-    );
+    // What the prompt offers; lib/authorization.ts refuses anything else the model names
+    const actionsData = await getHyperfyActions(this.runtime, newMessage, state, [...AUTONOMY_ACTIONS]);
 
     const actionsText = actionsData.length > 0 ? formatActions(actionsData) : '';
 
@@ -332,7 +328,7 @@ export class BehaviorManager {
       content: {
         thought: readString(parsedXml, 'thought'),
         text: readString(parsedXml, 'text'),
-        actions: readStringList(parsedXml, 'actions'),
+        actions: readActionNames(parsedXml),
         providers: readStringList(parsedXml, 'providers'),
         emote: readString(parsedXml, 'emote'),
       },

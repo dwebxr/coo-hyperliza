@@ -9,9 +9,10 @@ import {
     logger,
 } from '@elizaos/core';
 import { HyperfyService } from '../service';
-import { forPurpose } from '../../usage-budget';
+import { AiBudgetExceededError, forPurpose } from '../../usage-budget';
+import { AnthropicRefusalError } from '../../anthropic-models';
 import { AgentControls } from '../systems/controls'; // Import AgentControls type
-import { actionFailed, actionSucceeded } from '../lib/action-result';
+import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
 
 const GOTO_ENTITY = 'HYPERFY_GOTO_ENTITY';
 
@@ -97,7 +98,7 @@ export const hyperfyGotoEntityAction: Action = {
 
       if (!service || !world || !controls) {
         logger.error('[GOTO Action] Hyperfy service, world, or controls not found.');
-        await callback({ thought: 'Prerequisites failed.', error: "Cannot navigate. Hyperfy connection/controls unavailable." });
+        await tellFailure(callback, GOTO_ENTITY, "I can't move right now.");
         return actionFailed(GOTO_ENTITY, 'Hyperfy connection/controls unavailable');
       }
       
@@ -113,10 +114,11 @@ export const hyperfyGotoEntityAction: Action = {
         navigationResult = await runtime.useModel(ModelType.OBJECT_LARGE, forPurpose('navigation', { prompt }));
         logger.info('[GOTO Action] Navigation target extracted:', navigationResult);
       } catch (error) {
+        // The turn's caller handles these (scripted or offline fallback, a fixed decline)
+        if (error instanceof AiBudgetExceededError || error instanceof AnthropicRefusalError) throw error;
         logger.error(`[GOTO Action] Error during navigation target extraction:`, error);
-        await callback({
+        await tellFailure(callback, GOTO_ENTITY, 'Action failed: Could not determine a navigation target.', {
           thought: 'Failed to extract navigation target.',
-          text: 'Action failed: Could not determine a navigation target.',
           metadata: { error: 'extraction_failed' },
         });
         return actionFailed(GOTO_ENTITY, 'could not determine a navigation target');
@@ -127,9 +129,8 @@ export const hyperfyGotoEntityAction: Action = {
         !navigationResult.navigationType ||
         !navigationResult.parameter
       ) {
-        await callback({
+        await tellFailure(callback, GOTO_ENTITY, 'Action failed: Invalid navigation target.', {
           thought: 'Navigation target missing or malformed.',
-          text: 'Action failed: Invalid navigation target.',
           metadata: { error: 'invalid_navigation_target' },
         });
         return actionFailed(GOTO_ENTITY, 'invalid navigation target');
@@ -182,8 +183,7 @@ export const hyperfyGotoEntityAction: Action = {
         }
       } catch (error: any) {
         logger.error(`[GOTO Action] Navigation failed:`, error);
-        await callback({
-          text: `Navigation failed: ${error.message}`,
+        await tellFailure(callback, GOTO_ENTITY, `Navigation failed: ${error.message}`, {
           metadata: { error: 'navigation_error', detail: error.message },
         });
         return actionFailed(GOTO_ENTITY, `navigation failed: ${error.message}`);

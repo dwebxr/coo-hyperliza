@@ -1,80 +1,80 @@
 import { IAgentRuntime } from "@elizaos/core";
-import { HyperfyService } from "../service";
 import { uuid } from '../hyperfy/src/core/utils.js'
 import { cloneDeep } from 'lodash-es'
 import { importApp } from '../hyperfy/src/core/extras/appTools.js'
 import { hashFile } from '../hyperfy/src/core/utils-client.js'
 import { resolveUrl } from "../utils.js";
+import { SceneEditStopped } from "../lib/authorization";
 
+/**
+ * What one scene edit request may act on: the world it was authorized for, a check that throws
+ * SceneEditStopped once that authorization no longer holds (the connection changed, or the
+ * requester may no longer build), and whether the connection is still the one it started on.
+ * Every method acts only on `world` and calls `check()` right before each effect on it (walking
+ * there, changing or adding entities, each upload request), which also covers every await before
+ * that effect.
+ */
+export interface EditGuard {
+  readonly world: any;
+  check(): void;
+  connectionLive(): boolean;
+}
+
+/** What one operation did: only `applied` changed the world. */
+export type EditResult =
+  | { outcome: 'applied' }
+  | { outcome: 'skipped'; reason: string }
+  | { outcome: 'failed'; reason: string };
+
+const applied: EditResult = { outcome: 'applied' };
+const skipped = (reason: string): EditResult => ({ outcome: 'skipped', reason });
+const failed = (reason: string): EditResult => ({ outcome: 'failed', reason });
+
+const numbers = (value: unknown, length: number): value is number[] =>
+  Array.isArray(value) && value.length === length && value.every((n) => typeof n === 'number' && Number.isFinite(n));
 
 export class BuildManager {
-  private runtime: IAgentRuntime;
-  
-  constructor(runtime: IAgentRuntime) {
-    this.runtime = runtime;
-  }
-  
-  async translate(entityId, position: [number, number, number]) {
-    const service = this.getService();
-    const world = service.getWorld();
-    const entity = world.entities.items.get(entityId);
-    if (!entity) {
-      console.warn(`[BuildManager] translate: entity ${entityId} not found`);
-      return;
-    }
-    const controls = world.controls;
-    if (controls) {
-      await controls.goto(entity.root.position.x, entity.root.position.z);
-    }
-    entity.root.position.fromArray(position);
-    this.entityUpdate(entity);
+  constructor(_runtime: IAgentRuntime) {}
+
+  /** Walks next to the target first, as before; the edit itself is checked again afterwards. */
+  private async walkTo(guard: EditGuard, x: number, z: number) {
+    const controls = guard.world.controls;
+    if (!controls) return;
+    guard.check();
+    await controls.goto(x, z);
   }
 
-  async rotate(entityId, quaternion: [number, number, number, number]) {
-    const service = this.getService();
-    const world = service.getWorld();
-    const entity = world.entities.items.get(entityId);
-    if (!entity) {
-      console.warn(`[BuildManager] rotate: entity ${entityId} not found`);
-      return;
-    }
-    const controls = world.controls;
-    if (controls) {
-      await controls.goto(entity.root.position.x, entity.root.position.z);
-    }
-    entity.root.quaternion.fromArray(quaternion);
-    this.entityUpdate(entity);
-  }
-  
-  async scale(entityId, scale: [number, number, number]) {
-    const service = this.getService();
-    const world = service.getWorld();
-    const entity = world.entities.items.get(entityId);
-    if (!entity) {
-      console.warn(`[BuildManager] scale: entity ${entityId} not found`);
-      return;
-    }
-    const controls = world.controls;
-    if (controls) {
-      await controls.goto(entity.root.position.x, entity.root.position.z);
-    }
-    entity.root.scale.fromArray(scale);
-    this.entityUpdate(entity);
+  private async transform(guard: EditGuard, entityId, field: 'position' | 'quaternion' | 'scale', value: unknown, length: number): Promise<EditResult> {
+    if (!numbers(value, length)) return failed(`invalid ${field}`);
+    const entity = guard.world.entities.items.get(entityId);
+    if (!entity) return skipped('target not found');
+    await this.walkTo(guard, entity.root.position.x, entity.root.position.z);
+    guard.check();
+    entity.root[field].fromArray(value);
+    this.entityUpdate(guard, entity);
+    return applied;
   }
 
-  async duplicate(entityId) {
-    const service = this.getService();
-    const world = service.getWorld();
+  translate(guard: EditGuard, entityId, position: [number, number, number]): Promise<EditResult> {
+    return this.transform(guard, entityId, 'position', position, 3);
+  }
+
+  rotate(guard: EditGuard, entityId, quaternion: [number, number, number, number]): Promise<EditResult> {
+    return this.transform(guard, entityId, 'quaternion', quaternion, 4);
+  }
+
+  scale(guard: EditGuard, entityId, scale: [number, number, number]): Promise<EditResult> {
+    return this.transform(guard, entityId, 'scale', scale, 3);
+  }
+
+  async duplicate(guard: EditGuard, entityId): Promise<EditResult> {
+    const world = guard.world;
     const entity = world.entities.items.get(entityId);
-    if (!entity) {
-      console.warn(`[BuildManager] duplicate: entity ${entityId} not found`);
-      return;
-    }
-    const controls = world.controls;
-    if (controls) {
-      await controls.goto(entity.root.position.x, entity.root.position.z);
-    }
-    if (entity.isApp) {
+    if (!entity) return skipped('target not found');
+    if (!entity.isApp) return skipped('only apps can be duplicated');
+    await this.walkTo(guard, entity.root.position.x, entity.root.position.z);
+    {
+      guard.check();
       let blueprintId = entity.data.blueprint
       // if unique, we also duplicate the blueprint
       if (entity.blueprint.unique) {
@@ -113,51 +113,49 @@ export class BuildManager {
       }
       world.entities.add(data, true)
     }
+    return applied;
   }
 
-  async delete(entityId) {
-    const service = this.getService();
-    const world = service.getWorld();
-    const entity = world.entities.items.get(entityId);
-    if (!entity) {
-      console.warn(`[BuildManager] delete: entity ${entityId} not found`);
-      return;
-    }
-    if (entity.isApp && !entity.data.pinned) {
-      const controls = world.controls;
-      if (controls) {
-        await controls.goto(entity.root.position.x, entity.root.position.z);
-      }
-      entity.destroy(true)
-      this.entityUpdate(entity);
-    }
+  async delete(guard: EditGuard, entityId): Promise<EditResult> {
+    const entity = guard.world.entities.items.get(entityId);
+    if (!entity) return skipped('target not found');
+    if (!entity.isApp) return skipped('only apps can be deleted');
+    if (entity.data.pinned) return skipped('the app is pinned');
+    await this.walkTo(guard, entity.root.position.x, entity.root.position.z);
+    guard.check();
+    entity.destroy(true)
+    this.entityUpdate(guard, entity);
+    return applied;
   }
 
   async importEntity(
+    guard: EditGuard,
     url: string,
     position?: any,
     quaternion?: any
-  ) {
+  ): Promise<EditResult> {
     if (typeof url !== 'string' || !/^(https?|asset):\/\//.test(url)) {
       console.warn(`[BuildManager] importEntity: rejected url (only http://, https:// and asset:// are allowed): ${url}`)
-      return
+      return failed('only http(s):// and asset:// URLs can be imported')
     }
-    const service = this.getService();
-    const world = service.getWorld();
+    const ext = url.split('?')[0].split('.').pop()?.toLowerCase()
+    if (ext !== 'hyp' && ext !== 'glb' && ext !== 'vrm') return failed('only .hyp, .glb and .vrm files can be imported')
+    const world = guard.world;
     const resolvedUrl = await resolveUrl(url, world, { allowLocal: false });
     if (!resolvedUrl) {
       console.warn(`[BuildManager] importEntity: could not resolve url: ${url}`)
-      return
+      return failed('the URL could not be resolved')
     }
     let file
     
+    guard.check();
     const resp = await fetch(resolvedUrl)
     if (!resp.ok) {
       console.error(`[BuildManager] importEntity: fetch failed with ${resp.status} ${resp.statusText} for ${url}`)
-      return
+      return failed(`download failed (HTTP ${resp.status})`)
     }
     const blob = await resp.blob()
-    file = new File([blob], url.split('/').pop(), { type: resp.headers.get('content-type') })
+    file = new File([blob], url.split('?')[0].split('/').pop(), { type: resp.headers.get('content-type') })
     
     await new Promise(resolve => setTimeout(resolve, 100))
     
@@ -165,7 +163,7 @@ export class BuildManager {
 
     if (file.size > maxSize) {
       console.error(`File too large. Maximum size is ${maxSize / (1024 * 1024)}MB`)
-      return
+      return failed('the file is too large for the world')
     }
     const validVec3 = (v: any): v is [number, number, number] =>
       Array.isArray(v) && v.length === 3 && v.every(n => typeof n === 'number');
@@ -176,32 +174,25 @@ export class BuildManager {
     position = validVec3(position) ? position : [0, 0, 0];
     quaternion = validQuat(quaternion) ? quaternion : [0, 0, 0, 1];
     
-    const controls = world.controls;
-    if (controls) {
-      await controls.goto(position[0], position[2]);
-    }
+    await this.walkTo(guard, position[0], position[2]);
     
     const transform = {
       position,
       quaternion,
     };
-    const ext = file.name.split('.').pop().toLowerCase()
     try {
-      if (ext === 'hyp') {
-        await this.addApp(file, transform)
-      }
-      if (ext === 'glb' || ext === 'vrm') {
-        await this.addModel(file, transform)
-      }
+      return ext === 'hyp' ? await this.addApp(guard, file, transform) : await this.addModel(guard, file, transform)
     } catch (err) {
+      if (err instanceof SceneEditStopped) throw err
       console.error(`[BuildManager] importEntity: failed to import ${file.name}:`, err)
+      return failed(`import failed: ${err instanceof Error ? err.message : String(err)}`)
     }
   }
 
-  async addApp(file, transform) {
-    const service = this.getService();
-    const world = service.getWorld();
+  async addApp(guard: EditGuard, file, transform): Promise<EditResult> {
+    const world = guard.world;
     const info = await importApp(file)
+    guard.check();
     
     const blueprint = {
       id: uuid(),
@@ -235,34 +226,39 @@ export class BuildManager {
       state: {},
     }
     const app = world.entities.add(data, true)
-    const promises = info.assets.map(asset => {
-      return world.network.upload(asset.file)
-    })
     try {
-      await Promise.all(promises)
-      app.onUploaded()
+      await Promise.all(info.assets.map(asset => world.network.upload(asset.file, { check: () => guard.check() })))
+      guard.check();
     } catch (err) {
+      // Takes back the app this edit added (entityRemoved, which coo-world accepts from the app's
+      // uploader), also when the requester may no longer build: that restores the world. Never on
+      // another connection. Its blueprint stays: the protocol has no way to remove one.
+      if (guard.connectionLive()) app.destroy(true)
+      if (err instanceof SceneEditStopped) throw err
       console.error('failed to upload .hyp assets')
       console.error(err)
-      app.destroy()
+      return failed(`upload failed: ${err instanceof Error ? err.message : String(err)}`)
     }
+    app.onUploaded()
+    return applied
   }
 
-  async addModel(file, transform) {
-    const service = this.getService();
-    const world = service.getWorld();
+  async addModel(guard: EditGuard, file, transform): Promise<EditResult> {
+    const world = guard.world;
     const hash = await hashFile(file)
     const ext = file.name.split('.').pop().toLowerCase()
     const filename = `${hash}.${ext}`
     
     const baseUrl = world.assetsUrl.replace(/\/$/, "");
     const url = `${baseUrl}/${filename}`;
-    const uploadPromise = world.network.upload(file);
+    guard.check();
+    const uploadPromise = world.network.upload(file, { check: () => guard.check() });
     const timeoutPromise = new Promise((_resolve, reject) =>
       setTimeout(() => reject(new Error("Upload timed out")), 30000)
     );
 
     await Promise.race([uploadPromise, timeoutPromise]);
+    guard.check();
     
     const blueprint = {
       id: uuid(),
@@ -297,20 +293,16 @@ export class BuildManager {
     }
     const app = world.entities.add(data, true)
     app.onUploaded()
+    return applied
   }
   
-  entityUpdate(entity) {
-    const service = this.getService();
-    const world = service.getWorld();
-    world.network.send('entityModified', {
+  /** Called right after a checked change, with no await in between. */
+  entityUpdate(guard: EditGuard, entity) {
+    guard.world.network.send('entityModified', {
         id: entity.data.id,
         position: entity.root.position.toArray(),
         quaternion: entity.root.quaternion.toArray(),
         scale: entity.root.scale.toArray(),
     })
-  }
-
-  private getService() {
-    return this.runtime.getService<HyperfyService>(HyperfyService.serviceType);
   }
 }

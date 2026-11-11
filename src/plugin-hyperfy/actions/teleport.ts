@@ -7,7 +7,7 @@ import {
     logger,
 } from "@elizaos/core";
 import { HyperfyService } from "../service";
-import { actionFailed, actionSucceeded } from "../lib/action-result";
+import { actionFailed, actionSucceeded, tellFailure } from "../lib/action-result";
 
 const TELEPORT_TO_USER = "HYPERFY_TELEPORT_TO_USER";
 
@@ -30,12 +30,14 @@ export const teleportToUserAction: Action = {
         const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
         if (!service) {
             logger.error("[Teleport Action] HyperfyService not found.");
+            await tellFailure(callback, TELEPORT_TO_USER, "I can't teleport right now.");
             return actionFailed(TELEPORT_TO_USER, "HyperfyService not found");
         }
 
         const world = service.getWorld();
         if (!world) {
             logger.warn("[Teleport Action] World not ready.");
+            await tellFailure(callback, TELEPORT_TO_USER, "I can't teleport right now.");
             return actionFailed(TELEPORT_TO_USER, "world not ready");
         }
 
@@ -54,14 +56,17 @@ export const teleportToUserAction: Action = {
                 teleported = world.controls.teleportToEntity(targetUserId) === true;
             } else {
                 logger.error("[Teleport Action] Teleport capability not found on world.actions or world.controls.");
+                await tellFailure(callback, TELEPORT_TO_USER, "I can't teleport right now.");
                 return actionFailed(TELEPORT_TO_USER, "teleport capability not found");
             }
         } catch (error: any) {
             logger.error("[Teleport Action] Teleport failed:", error);
+            await tellFailure(callback, TELEPORT_TO_USER, "I couldn't teleport just now.");
             return actionFailed(TELEPORT_TO_USER, `teleport failed: ${error?.message ?? error}`);
         }
         if (!teleported) {
             logger.warn("[Teleport Action] No player to teleport to; nothing happened.");
+            await tellFailure(callback, TELEPORT_TO_USER, "I couldn't find anyone to teleport to.");
             return actionFailed(TELEPORT_TO_USER, "no player to teleport to");
         }
 

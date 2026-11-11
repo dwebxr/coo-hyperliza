@@ -2,8 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../service', () => ({ HyperfyService: { serviceType: 'hyperfy' } }));
 
+import { ModelType } from '@elizaos/core';
 import { BehaviorManager } from './behavior-manager';
-import { UsageBudget, type UsageLimits, resetUsageBudget } from '../../usage-budget';
+import { AiBudgetExceededError, UsageBudget, type UsageLimits, resetUsageBudget } from '../../usage-budget';
+import { currentTurn } from '../lib/turn-context';
+import { createRuntime } from '../test-support/core-runtime';
 
 const noLimits: UsageLimits = {
   aiCallsPerHour: null,
@@ -35,6 +38,7 @@ function setup({ emoteClips = true }: { emoteClips?: boolean } = {}) {
   const emotes = { playEmote: vi.fn(), hasEmote: vi.fn(() => emoteClips) };
   const service = {
     getWorld: () => world,
+    getConnectionGeneration: () => 5,
     currentWorldId: '00000000-0000-0000-0000-0000000000ee',
     getEmoteManager: () => emotes,
     getMessageManager: () => ({ sendMessage: vi.fn() }),
@@ -109,5 +113,70 @@ describe('BehaviorManager', () => {
     expect(runtime.useModel).not.toHaveBeenCalled();
     expect(controls.goto).not.toHaveBeenCalled();
     expect(emotes.playEmote).not.toHaveBeenCalled();
+  });
+});
+
+describe('BehaviorManager autonomous turns', () => {
+  afterEach(() => {
+    resetUsageBudget();
+    vi.restoreAllMocks();
+  });
+
+  it('runs a Claude-decided tick as an autonomous turn with no requester', async () => {
+    resetUsageBudget(new UsageBudget(noLimits));
+    const { runtime, tick } = setup();
+    let seen: any;
+    runtime.processActions.mockImplementation(async () => {
+      seen = currentTurn();
+    });
+    await tick();
+    expect(seen).toMatchObject({ origin: 'autonomy', generation: 5, world: runtime.getService().getWorld() });
+    expect(seen.requesterId).toBeUndefined();
+  });
+
+  /** The real BehaviorManager on a real core runtime with the plugin's real (guarded) actions. */
+  function realRuntime(plan: string, models: Record<string, unknown> = {}) {
+    const { emotes, controls, runtime: fake } = setup();
+    const service = fake.getService();
+    const world = service.getWorld();
+    world.actions = {};
+    const buildManager = { translate: vi.fn(), delete: vi.fn(), importEntity: vi.fn() };
+    const { runtime, recorded, useModel } = createRuntime({
+      service: { ...service, isConnected: () => true, getBuildManager: () => buildManager },
+      models: { [ModelType.TEXT_LARGE]: plan, ...models },
+    });
+    vi.spyOn(runtime, 'ensureConnection').mockResolvedValue(undefined);
+    const manager = new BehaviorManager(runtime, { tickMinMs: 1, tickMaxMs: 1, patrolPoints: [{ x: 3, z: 4 }], wanderRadius: 6 });
+    const tick = () => (manager as any).executeBehavior() as Promise<boolean>;
+    return { runtime, recorded, useModel, buildManager, emotes, controls, tick };
+  }
+
+  it('edits nothing when the plan names the scene edit by name, substring or simile, and drops an empty name', async () => {
+    resetUsageBudget(new UsageBudget(noLimits));
+    const { recorded, useModel, buildManager, tick } = realRuntime(
+      '<response><thought>t</thought><actions>HYPERFY_EDIT_ENTITY,EDIT,MODIFY_SCENE,</actions></response>'
+    );
+    await tick();
+    const results = recorded.memories.filter((m) => m.content.type === 'action_result').map((m) => m.content as any);
+    expect(results.map((r) => r.actionResult.error)).toEqual(Array(3).fill('HYPERFY_EDIT_ENTITY is not allowed on an autonomous turn'));
+    expect(useModel.mock.calls.map(([type]) => type)).toEqual([ModelType.TEXT_LARGE]);
+    expect(buildManager.translate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['HYPERFY_USE_ITEM', ModelType.OBJECT_SMALL],
+    ['HYPERFY_GOTO_ENTITY', ModelType.OBJECT_LARGE],
+  ])('falls back to scripted behavior when %s runs out of Claude budget mid-tick', async (action, model) => {
+    const budget = new UsageBudget(noLimits);
+    resetUsageBudget(budget);
+    const { emotes, tick } = realRuntime(`<response><thought>t</thought><actions>${action}</actions></response>`, {
+      [model]: () => {
+        throw new AiBudgetExceededError('AI_MAX_CALLS_PER_HOUR=1');
+      },
+    });
+    await expect(tick()).resolves.toBe(true);
+    expect(budget.snapshot(60_000).autonomy).toEqual({ aiTicks: 1, scriptedTicks: 1 });
+    // The scripted step: greeting the newcomer
+    expect(emotes.playEmote).toHaveBeenCalledWith('waving both hands');
   });
 });

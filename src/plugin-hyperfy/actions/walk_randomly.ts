@@ -9,7 +9,7 @@ import {
 // No longer need THREE here
 import { AgentControls } from '../systems/controls'; // Still need type for casting
 import { HyperfyService } from '../service';
-import { actionFailed, actionSucceeded } from '../lib/action-result';
+import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
 
 const WALK_RANDOMLY = 'HYPERFY_WALK_RANDOMLY';
 
@@ -41,14 +41,14 @@ export const hyperfyWalkRandomlyAction: Action = {
 
       if (!service || !world || !controls) {
         logger.error('Hyperfy service, world, or controls not found for HYPERFY_WALK_RANDOMLY action.');
-        await callback({ text: "Error: Cannot wander. Hyperfy connection/controls unavailable." });
+        await tellFailure(callback, WALK_RANDOMLY, "Error: Cannot wander. Hyperfy connection/controls unavailable.");
         return actionFailed(WALK_RANDOMLY, 'Hyperfy connection/controls unavailable');
       }
 
       // Check for specific methods from the reverted AgentControls
        if (typeof controls.startRandomWalk !== 'function' || typeof controls.stopRandomWalk !== 'function') {
            logger.error('AgentControls missing startRandomWalk or stopRandomWalk methods.');
-           await callback({ text: "Error: Wander functionality not available in controls." });
+           await tellFailure(callback, WALK_RANDOMLY, "Error: Wander functionality not available in controls.");
            return actionFailed(WALK_RANDOMLY, 'wander functionality not available in controls');
        }
 

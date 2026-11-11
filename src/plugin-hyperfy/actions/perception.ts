@@ -12,12 +12,16 @@ import {
 
 import { HyperfyService } from '../service';
 import { AiBudgetExceededError, forPurpose, getUsageBudget } from '../../usage-budget';
+import { AnthropicRefusalError } from '../../anthropic-models';
 import { chooseSnapshot, type NamedEntity } from '../lib/snapshot-choice';
 import { isJapanese } from '../lib/simple-commands';
-import { actionFailed, actionSucceeded } from '../lib/action-result';
+import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
 import { readString } from '../lib/model-output';
 
 const SCENE_PERCEPTION = 'HYPERFY_SCENE_PERCEPTION';
+// Said when the look itself failed (the snapshot or reading it)
+const LOOK_FAILED_EN = "Sorry, I couldn't get a proper look just now.";
+const LOOK_FAILED_JA = 'ごめんなさい、今はうまく見られませんでした。';
 
 export enum SnapshotType {
   LOOK_AROUND     = 'LOOK_AROUND',
@@ -121,7 +125,7 @@ export const hyperfyScenePerceptionAction: Action = {
 
     if (!service || !world || !puppeteerManager) {
       logger.error('Hyperfy service/world unavailable.');
-      await callback({ text: 'Unable to observe environment. Hyperfy world not available.' });
+      await tellFailure(callback, SCENE_PERCEPTION, 'Unable to observe environment. Hyperfy world not available.');
       return actionFailed(SCENE_PERCEPTION, 'Hyperfy world not available');
     }
 
@@ -130,13 +134,14 @@ export const hyperfyScenePerceptionAction: Action = {
     const budget = getUsageBudget();
     if (!budget.visionAvailable() || !budget.aiAvailable()) {
       budget.recordSkip('vision');
-      await callback({
-        thought: 'The vision budget is used up for now.',
-        text: japanese
+      await tellFailure(
+        callback,
+        SCENE_PERCEPTION,
+        japanese
           ? 'ごめんなさい、今はちょっと目を休めています。また少ししてから声をかけてくださいね。'
           : "Sorry, I'm resting my eyes for a bit. Ask me again a little later!",
-        metadata: { error: 'vision_budget' },
-      });
+        { thought: 'The vision budget is used up for now.', metadata: { error: 'vision_budget' } }
+      );
       return actionFailed(SCENE_PERCEPTION, 'vision budget used up');
     }
 
@@ -177,7 +182,7 @@ export const hyperfyScenePerceptionAction: Action = {
       }
     } catch (err) {
       logger.error('Snapshot failed:', err);
-      await callback({ thought: 'Snapshot failed.', metadata: { error: 'snapshot_failure', snapshotType } });
+      await tellFailure(callback, SCENE_PERCEPTION, japanese ? LOOK_FAILED_JA : LOOK_FAILED_EN, { thought: 'Snapshot failed.', metadata: { error: 'snapshot_failure', snapshotType } });
       return actionFailed(SCENE_PERCEPTION, 'snapshot failed', { snapshotType });
     }
 
@@ -205,23 +210,18 @@ export const hyperfyScenePerceptionAction: Action = {
       const res = await runtime.useModel(ModelType.IMAGE_DESCRIPTION, forPurpose('vision', { imageUrl: imgBase64, prompt: responsePrompt }));
       xmlRaw = typeof res === 'string' ? res : res.description;
     } catch (err) {
-      if (err instanceof AiBudgetExceededError) {
-        await callback({
-          thought: 'The Claude budget is used up for now.',
-          text: japanese ? 'ごめんなさい、今はよく見られないみたいです。' : "Sorry, I can't take a proper look right now.",
-          metadata: { error: 'ai_budget' },
-        });
-        return actionFailed(SCENE_PERCEPTION, 'AI budget used up', { snapshotType });
-      }
+      // The turn's caller answers without Claude (handlers/messageReceivedHandler.ts); a reply sent
+      // here would be dropped by core along with the error
+      if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError) throw err;
       logger.error('Vision response failed:', err);
-      await callback({ thought: 'Cannot understand the scene.', metadata: { error: 'vision_failure' } });
+      await tellFailure(callback, SCENE_PERCEPTION, japanese ? LOOK_FAILED_JA : LOOK_FAILED_EN, { thought: 'Cannot understand the scene.', metadata: { error: 'vision_failure' } });
       return actionFailed(SCENE_PERCEPTION, 'vision model failed', { snapshotType });
     }
 
     const parsed = parseKeyValueXml(xmlRaw);
 
     if (!parsed) {
-      await callback({ thought: 'Malformed XML.', metadata: { error: 'xml_parse_failure', xmlRaw } });
+      await tellFailure(callback, SCENE_PERCEPTION, japanese ? LOOK_FAILED_JA : LOOK_FAILED_EN, { thought: 'Malformed XML.', metadata: { error: 'xml_parse_failure', xmlRaw } });
       return actionFailed(SCENE_PERCEPTION, 'could not parse the vision reply', { snapshotType });
     }
 

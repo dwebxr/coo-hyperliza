@@ -44,6 +44,26 @@ export function readTipWalletAccount(env: Env = process.env): PrivateKeyAccount 
   }
 }
 
+let held: { account: PrivateKeyAccount | null } | null = null;
+
+/**
+ * The agent's tip wallet, read from TIP_WALLET_PRIVATE_KEY on the first call and kept in this
+ * module (so every reconnect signs with it). Every call deletes the variable from `env`: the
+ * elizaOS server re-reads .env (without overriding) after loading the project, which puts it back,
+ * so the service calls this again when it starts. Whatever reads the environment between such a
+ * re-read and the next call (or after a later re-read) can still see the key.
+ */
+export function takeTipWalletAccount(env: Env = process.env): PrivateKeyAccount | null {
+  held ??= { account: readTipWalletAccount(env) };
+  delete env[TIP_WALLET_ENV];
+  return held.account;
+}
+
+/** Tests only: forgets the account taken by takeTipWalletAccount. */
+export function forgetTipWalletAccount(): void {
+  held = null;
+}
+
 /** The domain the world signs in as: the host of its address (e.g. play.dwebxr.xyz). */
 export function signInHost(wsUrl: string): string | null {
   try {
@@ -114,6 +134,7 @@ export class TipWallet {
   private verified = false;
   /** The world's evmTips flag on the agent's player, read from entityModified. */
   private tipsOn = false;
+  private hasReceived = false;
   private readonly now: () => number;
   private readonly schedule: (fn: () => void, ms: number) => unknown;
   private readonly cancel: (timer: unknown) => void;
@@ -134,6 +155,7 @@ export class TipWallet {
     network.onEntityModified = (data: any) => {
       if (data && typeof data === 'object' && 'evmTips' in data && data.id === options.selfId()) {
         this.tipsOn = data.evmTips === true;
+        this.noteReceiving();
       }
       return onEntityModified?.call(network, data);
     };
@@ -146,6 +168,19 @@ export class TipWallet {
   /** Signed in and shown as receiving tips on this connection. */
   get receiving(): boolean {
     return this.verified && !this.stopped && this.tipsOn;
+  }
+
+  /**
+   * Whether this connection's wallet has been receiving tips at some point: the world then did the
+   * sign-in and switched tips on, so tips it confirms later (after a sign-out, or with "Receive
+   * tips" off again) were sent while it was.
+   */
+  get receivedOnThisConnection(): boolean {
+    return this.hasReceived;
+  }
+
+  private noteReceiving(): void {
+    if (this.receiving) this.hasReceived = true;
   }
 
   /**
@@ -210,6 +245,7 @@ export class TipWallet {
     if (data.verified) {
       if (typeof data.wallet !== 'string' || data.wallet.toLowerCase() !== this.account.address.toLowerCase()) return;
       this.verified = true;
+      this.noteReceiving();
       this.failures = 0;
       this.network.send('setEvmTipReceive', { enabled: true });
       this.timer = this.schedule(() => {

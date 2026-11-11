@@ -5,6 +5,7 @@ vi.mock('../events', () => ({ hyperfyEventType: { VOICE_MESSAGE_RECEIVED: 'HYPER
 
 import { VoiceManager } from './voice-manager';
 import { UsageBudget, resetUsageBudget } from '../../usage-budget';
+import { currentTurn, neverAbortedSignal, runTurn, turnDelivered } from '../lib/turn-context';
 
 function setup(publishAudioStream: (...args: any[]) => Promise<void>) {
   const player = { setSpeaking: vi.fn() };
@@ -226,4 +227,53 @@ describe('VoiceManager voice limits', () => {
     const { manager } = setup(async () => {});
     await expect(manager.speak('https://only.a/link')).resolves.toBe(false);
   });
+});
+
+describe('VoiceManager turns', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("handles a speaker's utterance as a voice turn for that player, after the pause", async () => {
+    vi.useFakeTimers();
+    const world = { livekit: {}, entities: {} };
+    const runtime: any = { getService: () => ({ getWorld: () => world, getConnectionGeneration: () => 4 }) };
+    const manager = new VoiceManager(runtime);
+    let seen: any;
+    vi.spyOn(manager as any, 'processTranscription').mockImplementation(async () => {
+      seen = currentTurn();
+    });
+    (manager as any).userStates.set('p1', { buffers: [], totalLength: 0, lastActive: 0, transcriptionText: '' });
+    manager.debouncedProcessTranscription('p1' as any);
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(seen).toMatchObject({ origin: 'voice', requesterId: 'p1', world, generation: 4 });
+    expect(seen.signal.aborted).toBe(false);
+  });
+});
+
+describe('VoiceManager delivery', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each([
+    ['played', async () => {}, true],
+    ['the room refused the stream', async () => {
+      throw new Error('room gone');
+    }, false],
+  ])('counts an utterance as delivered for the turn only when it was played (%s)', async (_what, publish, played) => {
+    const utils = await import('../utils');
+    vi.spyOn(utils, 'generateSpeech').mockResolvedValue(Buffer.from('audio'));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { manager } = setup(publish);
+    const turn = { origin: 'voice' as const, requesterId: 'p1', world: {}, generation: 0, signal: neverAbortedSignal() };
+    const result = await runTurn(turn, async () => [await manager.speak('Hello there'), turnDelivered(currentTurn())]);
+    expect(result).toEqual([played, played]);
+  });
+});
+
+it('does not count an utterance that could not be played because the world has no voice room', async () => {
+  const utils = await import('../utils');
+  vi.spyOn(utils, 'generateSpeech').mockResolvedValue(Buffer.from('audio'));
+  const manager = new VoiceManager({ getService: () => ({ getWorld: () => ({ entities: {} }) }) } as any);
+  const turn = { origin: 'voice' as const, requesterId: 'p1', world: {}, generation: 0, signal: neverAbortedSignal() };
+  const result = await runTurn(turn, async () => [await manager.speak('Hello there'), turnDelivered(currentTurn())]);
+  expect(result).toEqual([false, false]);
+  vi.restoreAllMocks();
 });

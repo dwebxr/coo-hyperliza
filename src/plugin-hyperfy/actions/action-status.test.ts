@@ -1,75 +1,16 @@
-import { AgentRuntime, ModelType, type Action, type Content, type Memory, type UUID } from '@elizaos/core';
+import { ModelType, type Action } from '@elizaos/core';
 import * as THREE from 'three';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { hyperfyPlugin } from '../index';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SHARE_ACTION, createOpenPayStorePlugin } from '../../openpay-store';
 import { AgentActions } from '../systems/actions';
 import { AgentControls } from '../systems/controls';
+import { connectedService, createRuntime, run, runPlan } from '../test-support/core-runtime';
+import { inAutonomousTurn, inChatTurn, worldWithBuilder } from '../test-support/turns';
 
 /*
  * Drives real elizaOS core processActions (1.7.2) with the plugin's real actions and records the
  * action memory core stores for each one: content.actionStatus is what later turns see.
  */
-
-const uuid = () => crypto.randomUUID() as UUID;
-
-interface Recorded {
-  memories: Memory[];
-  callbacks: Content[];
-}
-
-function createRuntime({ service = null, models = {} }: { service?: unknown; models?: Record<string, unknown> } = {}) {
-  const runtime = new AgentRuntime({ character: { name: 'Coo', bio: [], settings: {} }, plugins: [] });
-  const recorded: Recorded = { memories: [], callbacks: [] };
-  // Only the two adapter calls processActions makes; runtime.createMemory itself stays real
-  (runtime as { adapter: unknown }).adapter = {
-    createMemory: async (memory: Memory) => {
-      recorded.memories.push(memory);
-      return memory.id;
-    },
-    log: async () => {},
-  };
-  vi.spyOn(runtime, 'composeState').mockResolvedValue({ values: {}, data: {}, text: '' });
-  vi.spyOn(runtime, 'getService').mockReturnValue(service as never);
-  vi.spyOn(runtime, 'useModel').mockImplementation((async (type: string) => {
-    if (!(type in models)) throw new Error(`unexpected model call: ${type}`);
-    return models[type];
-  }) as never);
-  for (const action of hyperfyPlugin.actions ?? []) runtime.registerAction(action);
-  return { runtime, recorded };
-}
-
-type StoredAction = Content & { actionStatus: string; actionResult: Record<string, any> };
-
-/** Runs one planned response naming `actionNames` (in order) and returns each one's stored action memory. */
-async function runPlan(
-  runtime: AgentRuntime,
-  recorded: Recorded,
-  actionNames: string[],
-  { content = {}, message = {} }: { content?: Content; message?: Partial<Memory> } = {}
-): Promise<StoredAction[]> {
-  const roomId = uuid();
-  const incoming: Memory = {
-    id: uuid(),
-    entityId: uuid(),
-    roomId,
-    content: { text: 'please do it', source: 'hyperfy', metadata: { hyperfyFromId: 'player-1' } },
-    ...message,
-  };
-  const planned: Memory = { id: uuid(), entityId: runtime.agentId, roomId, content: { ...content, actions: actionNames } };
-  const before = recorded.memories.length;
-  await runtime.processActions(incoming, [planned], { values: {}, data: {}, text: '' }, async (reply) => {
-    recorded.callbacks.push(reply);
-    return [];
-  });
-  const stored = recorded.memories.slice(before).filter((m) => m.content.type === 'action_result');
-  expect(stored.map((m) => m.content.actionName)).toEqual(actionNames);
-  return stored.map((m) => m.content as StoredAction);
-}
-
-async function run(runtime: AgentRuntime, recorded: Recorded, actionName: string, options?: Parameters<typeof runPlan>[3]) {
-  return (await runPlan(runtime, recorded, [actionName], options))[0];
-}
 
 /** A world with the real AgentControls and AgentActions systems; navigation itself is stubbed per test. */
 function createWorld({ withPlayer = true }: { withPlayer?: boolean } = {}) {
@@ -98,11 +39,12 @@ const addActionNode = (world: any, entityId: string, extra: Record<string, unkno
 
 const settleTimers = () => new Promise((resolve) => setTimeout(resolve, 10));
 
-function connectedService(world: Record<string, unknown>, extra: Record<string, unknown> = {}) {
-  return { isConnected: () => true, getWorld: () => world, ...extra };
-}
-
-afterEach(() => vi.restoreAllMocks());
+// Scene edits for builders switched on (they are off by default)
+beforeEach(() => vi.stubEnv('HYPERFY_SCENE_EDITS', 'builders'));
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+});
 
 describe('core processActions contract (what the action-result helpers rely on)', () => {
   const stub = (name: string, result: unknown): Action => ({
@@ -125,6 +67,7 @@ describe('core processActions contract (what the action-result helpers rely on)'
 });
 
 describe('action status recorded by core for every Hyperfy action', () => {
+  // Scene edits run in a chat turn from player-1, a builder in a coo-world (see lib/authorization.ts)
   it('records a completed IGNORE, REPLY and ambient speech that reuse the planned text', async () => {
     const { runtime, recorded } = createRuntime();
     expect((await run(runtime, recorded, 'IGNORE', { content: { thought: 'no' } })).actionStatus).toBe('completed');
@@ -155,7 +98,8 @@ describe('action status recorded by core for every Hyperfy action', () => {
     'HYPERFY_EDIT_ENTITY',
   ])('records %s as failed, with the reason, when there is no Hyperfy service', async (actionName) => {
     const { runtime, recorded } = createRuntime();
-    const stored = await run(runtime, recorded, actionName);
+    // A builder's chat turn, so the scene edit gets as far as looking for the service
+    const stored = await inChatTurn(worldWithBuilder(), () => run(runtime, recorded, actionName));
     expect(stored.actionStatus).toBe('failed');
     expect(stored.actionResult).toMatchObject({ success: false, data: { actionName } });
     expect(typeof stored.actionResult.error).toBe('string');
@@ -187,31 +131,56 @@ describe('action status recorded by core for every Hyperfy action', () => {
     expect(recorded.callbacks.map((c) => c.text)).toEqual(expect.arrayContaining(['Teleporting to you!', 'Using item: crate', 'Item released.']));
   });
 
-  it('records teleport, use and release as failed, and announces nothing, when the real systems do nothing', async () => {
+  describe('teleport, use and release when the real systems do nothing', () => {
     // The sender left and nobody else is in the world; the crate has no action node; nothing is held
-    const world = createWorld();
-    vi.spyOn(world.controls, 'goto').mockResolvedValue(undefined);
-    const { runtime, recorded } = createRuntime({
-      service: connectedService(world),
-      models: { [ModelType.OBJECT_SMALL]: { entityId: 'crate' } },
+    function setup() {
+      const world = createWorld();
+      vi.spyOn(world.controls, 'goto').mockResolvedValue(undefined);
+      const { runtime, recorded } = createRuntime({
+        service: connectedService(world),
+        models: { [ModelType.OBJECT_SMALL]: { entityId: 'crate' } },
+      });
+      return { world, runtime, recorded };
+    }
+
+    it('records them as failed and tells the requester why', async () => {
+      const { world, runtime, recorded } = setup();
+      const teleport = await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_TELEPORT_TO_USER'));
+      expect(teleport.actionStatus).toBe('failed');
+      expect(teleport.actionResult.error).toBe('no player to teleport to');
+      expect(world.entities.player.teleport).not.toHaveBeenCalled();
+
+      const use = await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_USE_ITEM'));
+      expect(use.actionStatus).toBe('failed');
+      expect(use.actionResult.data).toMatchObject({ targetEntityId: 'crate', outcome: 'no-action-nodes' });
+
+      addActionNode(world, 'lamp');
+      const otherNode = await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_USE_ITEM'));
+      expect(otherNode.actionResult.data).toMatchObject({ outcome: 'entity-has-no-action-node' });
+
+      const release = await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_UNUSE_ITEM'));
+      expect(release.actionStatus).toBe('failed');
+      expect(release.actionResult.error).toBe('not holding or using anything');
+      expect(recorded.callbacks.map((c) => c.text)).toEqual([
+        "I couldn't find anyone to teleport to.",
+        "There's nothing near me I can use.",
+        "I can't use that one.",
+        "I'm not holding or using anything.",
+      ]);
     });
-    const teleport = await run(runtime, recorded, 'HYPERFY_TELEPORT_TO_USER');
-    expect(teleport.actionStatus).toBe('failed');
-    expect(teleport.actionResult.error).toBe('no player to teleport to');
-    expect(world.entities.player.teleport).not.toHaveBeenCalled();
 
-    const use = await run(runtime, recorded, 'HYPERFY_USE_ITEM');
-    expect(use.actionStatus).toBe('failed');
-    expect(use.actionResult.data).toMatchObject({ targetEntityId: 'crate', outcome: 'no-action-nodes' });
-
-    addActionNode(world, 'lamp');
-    const otherNode = await run(runtime, recorded, 'HYPERFY_USE_ITEM');
-    expect(otherNode.actionResult.data).toMatchObject({ outcome: 'entity-has-no-action-node' });
-
-    const release = await run(runtime, recorded, 'HYPERFY_UNUSE_ITEM');
-    expect(release.actionStatus).toBe('failed');
-    expect(release.actionResult.error).toBe('not holding or using anything');
-    expect(recorded.callbacks).toEqual([]);
+    it('records them as failed and posts nothing on an autonomous turn (nobody asked)', async () => {
+      const { world, runtime, recorded } = setup();
+      const errors = [];
+      for (const name of ['HYPERFY_TELEPORT_TO_USER', 'HYPERFY_USE_ITEM', 'HYPERFY_UNUSE_ITEM']) {
+        const stored = await inAutonomousTurn(world, () => run(runtime, recorded, name));
+        expect(stored.actionStatus, name).toBe('failed');
+        errors.push(stored.actionResult.error);
+      }
+      // The handlers ran (these actions are allowed on autonomous turns) and failed for their own reasons
+      expect(errors).toEqual(['no player to teleport to', 'nothing was used (no-action-nodes)', 'not holding or using anything']);
+      expect(recorded.callbacks).toEqual([]);
+    });
   });
 
   it('turns a rejected navigation into a failed result and still runs the next planned action', async () => {
@@ -225,6 +194,7 @@ describe('action status recorded by core for every Hyperfy action', () => {
     expect(use.actionStatus).toBe('failed');
     expect(use.actionResult.error).toMatch(/^could not reach or use the item: /);
     expect(ignore.actionStatus).toBe('completed');
+    expect(recorded.callbacks[0]).toMatchObject({ text: "I couldn't get to that item.", actions: ['HYPERFY_USE_ITEM'] });
   });
 
   it('turns a throwing teleport or release into a failed result', async () => {
@@ -251,6 +221,7 @@ describe('action status recorded by core for every Hyperfy action', () => {
     const release = await run(runtime, recorded, 'HYPERFY_UNUSE_ITEM');
     expect(release.actionStatus).toBe('failed');
     expect(release.actionResult.error).toBe('releasing failed: app script error');
+    expect(recorded.callbacks.map((c) => c.text)).toEqual(["I couldn't teleport just now.", 'Using item: crate', "I couldn't let go of it."]);
   });
 
   it('records a failed navigation and an item it could not find as failed', async () => {
@@ -270,9 +241,9 @@ describe('action status recorded by core for every Hyperfy action', () => {
   });
 
   it('records a scene edit as completed after running the planned operations', async () => {
-    const buildManager = { translate: vi.fn().mockResolvedValue(undefined) };
+    const buildManager = { translate: vi.fn().mockResolvedValue({ outcome: 'applied' }) };
     const messageManager = { sendMessage: vi.fn() };
-    const world = { controls: {} };
+    const world = worldWithBuilder({ controls: {} });
     const { runtime, recorded } = createRuntime({
       service: connectedService(world, { getBuildManager: () => buildManager, getMessageManager: () => messageManager }),
       models: {
@@ -282,7 +253,7 @@ describe('action status recorded by core for every Hyperfy action', () => {
         [ModelType.TEXT_SMALL]: '<response><thought>done</thought><text>Box is up!</text></response>',
       },
     });
-    const stored = await run(runtime, recorded, 'HYPERFY_EDIT_ENTITY');
+    const stored = await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_EDIT_ENTITY'));
     expect(stored.actionStatus).toBe('completed');
     expect(stored.actionResult.data).toEqual({
       actionName: 'HYPERFY_EDIT_ENTITY',
@@ -291,15 +262,16 @@ describe('action status recorded by core for every Hyperfy action', () => {
       failed: 0,
       outcomes: [{ operation: 'translate', target: 'box', outcome: 'executed' }],
     });
-    expect(buildManager.translate).toHaveBeenCalledWith('box', [0, 2, 0]);
+    expect(buildManager.translate).toHaveBeenCalledWith(expect.objectContaining({ world }), 'box', [0, 2, 0]);
     expect(recorded.callbacks).toEqual([expect.objectContaining({ thought: 'done', text: 'Box is up!', emote: '' })]);
     expect(messageManager.sendMessage).toHaveBeenCalledWith('Moved the box up');
   });
 
   describe('scene edits whose plan did not fully run', () => {
     const summary = '<response><thought>t</thought><text>Summary</text></response>';
+    const world = worldWithBuilder({ controls: {} });
     const editService = (buildManager: Record<string, unknown>) =>
-      connectedService({ controls: {} }, { getBuildManager: () => buildManager, getMessageManager: () => ({ sendMessage: vi.fn() }) });
+      connectedService(world, { getBuildManager: () => buildManager, getMessageManager: () => ({ sendMessage: vi.fn() }) });
     const refused = { success: false, operation: 'delete', requestedEntityName: 'stone throne', reason: 'not found' };
     const move = { success: true, operation: 'translate', target: 'box', parameters: { position: [0, 2, 0] }, description: 'Moved' };
 
@@ -309,7 +281,7 @@ describe('action status recorded by core for every Hyperfy action', () => {
         service: editService({ delete: vi.fn() }),
         models: { [ModelType.OBJECT_LARGE]: { operations: [refused] } },
       });
-      const stored = await run(runtime, recorded, 'HYPERFY_EDIT_ENTITY');
+      const stored = await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_EDIT_ENTITY'));
       expect(stored.actionStatus).toBe('failed');
       expect(stored.actionResult.error).toBe('no operation was executed');
       expect(stored.actionResult.data).toMatchObject({ executed: 0, skipped: 1, failed: 0 });
@@ -321,7 +293,7 @@ describe('action status recorded by core for every Hyperfy action', () => {
         service: editService({ translate: vi.fn().mockRejectedValue(new Error('locked')) }),
         models: { [ModelType.OBJECT_LARGE]: { operations: [move] }, [ModelType.TEXT_SMALL]: summary },
       });
-      const stored = await run(runtime, recorded, 'HYPERFY_EDIT_ENTITY');
+      const stored = await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_EDIT_ENTITY'));
       expect(stored.actionStatus).toBe('failed');
       expect(stored.actionResult.error).toBe('1 of 1 operations failed');
       expect(stored.actionResult.data.outcomes).toEqual([{ operation: 'translate', target: 'box', outcome: 'failed', reason: 'locked' }]);
@@ -332,19 +304,19 @@ describe('action status recorded by core for every Hyperfy action', () => {
         service: editService({}),
         models: { [ModelType.OBJECT_LARGE]: { operations: [null] }, [ModelType.TEXT_SMALL]: summary },
       });
-      const stored = await run(runtime, recorded, 'HYPERFY_EDIT_ENTITY');
+      const stored = await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_EDIT_ENTITY'));
       expect(stored.actionStatus).toBe('failed');
       expect(stored.actionResult.data).toMatchObject({ executed: 0, skipped: 0, failed: 1 });
       expect(recorded.callbacks).toEqual([expect.objectContaining({ text: 'Summary' })]);
     });
 
     it('records a partly refused plan as completed, with the counts', async () => {
-      const translate = vi.fn().mockResolvedValue(undefined);
+      const translate = vi.fn().mockResolvedValue({ outcome: 'applied' });
       const { runtime, recorded } = createRuntime({
         service: editService({ translate }),
         models: { [ModelType.OBJECT_LARGE]: { operations: [move, refused] }, [ModelType.TEXT_SMALL]: summary },
       });
-      const stored = await run(runtime, recorded, 'HYPERFY_EDIT_ENTITY');
+      const stored = await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_EDIT_ENTITY'));
       expect(stored.actionStatus).toBe('completed');
       expect(stored.actionResult.data).toMatchObject({ executed: 1, skipped: 1, failed: 0 });
       expect(stored.actionResult.data.outcomes[1]).toEqual({ operation: 'delete', outcome: 'skipped', reason: 'not found' });
@@ -352,23 +324,36 @@ describe('action status recorded by core for every Hyperfy action', () => {
   });
 
   it('records a scene edit with no usable plan from the model as failed', async () => {
-    const world = { controls: {} };
+    const world = worldWithBuilder({ controls: {} });
     const { runtime, recorded } = createRuntime({
       service: connectedService(world, { getBuildManager: () => ({}), getMessageManager: () => ({}) }),
       models: { [ModelType.OBJECT_LARGE]: { nothing: true } },
     });
-    const stored = await run(runtime, recorded, 'HYPERFY_EDIT_ENTITY');
+    const stored = await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_EDIT_ENTITY'));
     expect(stored.actionStatus).toBe('failed');
     expect(stored.actionResult.error).toBe('no edit plan from the model');
   });
 
-  it('records the OpenPay share action as failed on an autonomous turn', async () => {
+  it('refuses the OpenPay share action on an autonomous turn, even for a message its own check would let through', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise(() => {}));
+    const shop = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'someone' })!;
+    const { runtime, recorded } = createRuntime();
+    runtime.registerAction(shop.actions![0]);
+    // A player's message with text: the action's own isAutonomous() check would not refuse it
+    const stored = await inAutonomousTurn(worldWithBuilder(), () =>
+      run(runtime, recorded, SHARE_ACTION, { message: { content: { text: 'a link to the hoverboard please', source: 'hyperfy' } } })
+    );
+    expect(stored.actionStatus).toBe('failed');
+    expect(stored.actionResult).toMatchObject({ success: false, error: `${SHARE_ACTION} is not allowed on an autonomous turn` });
+    expect(recorded.callbacks).toEqual([]);
+  });
+
+  it('still refuses the OpenPay share action for a self-sent, empty message outside any turn (its own check)', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise(() => {}));
     const shop = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'someone' })!;
     const { runtime, recorded } = createRuntime();
     runtime.registerAction(shop.actions![0]);
     const stored = await run(runtime, recorded, SHARE_ACTION, { message: { entityId: runtime.agentId, content: { text: '' } } });
-    expect(stored.actionStatus).toBe('failed');
-    expect(stored.actionResult).toMatchObject({ success: false, data: { actionName: SHARE_ACTION } });
+    expect(stored.actionResult).toMatchObject({ success: false, error: 'links are only shared in a conversation' });
   });
 });

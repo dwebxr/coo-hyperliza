@@ -2,6 +2,8 @@ import { System } from '../hyperfy/src/core/systems/System.js'
 import { logger } from '@elizaos/core';
 import * as THREE from 'three';
 import { Vector3Enhanced } from '../hyperfy/src/core/extras/Vector3Enhanced.js'
+import { ControlPriorities } from '../hyperfy/src/core/extras/ControlPriorities.js'
+import { buttons } from '../hyperfy/src/core/extras/buttons.js'
 
 const FORWARD = new THREE.Vector3(0, 0, -1)
 const v1 = new THREE.Vector3()
@@ -24,6 +26,21 @@ function createButtonState() {
     pressed: false,
     released: false,
   }
+}
+
+/** What app.control() gives a world script: see AgentControls.bind */
+export interface AppControl {
+  readonly [key: string]: any;
+  release(): void;
+}
+
+function bindRotations(quaternion: THREE.Quaternion, euler: THREE.Euler) {
+  ; (euler as any)._onChange(() => {
+    quaternion.setFromEuler(euler, false)
+  })
+  ; (quaternion as any)._onChange(() => {
+    euler.setFromQuaternion(quaternion, undefined, false)
+  })
 }
 
 class ControlsToken {
@@ -70,6 +87,9 @@ export class AgentControls extends System {
   };
   private _navigationResolve: (() => void) | null = null;
   // <------------------------
+
+  /** Controls bound by world scripts (bind); nothing in them refers back to this system */
+  private appControls = new Set<AppControl>();
 
   private _currentWalkToken: ControlsToken | null = null;
   private _isRandomWalking: boolean = false;
@@ -128,6 +148,12 @@ export class AgentControls extends System {
       if (this.hasOwnProperty(key) && this[key] && (this[key] as any).$button) {
         (this[key] as any).pressed = false;
         (this[key] as any).released = false;
+      }
+    }
+    for (const control of this.appControls) {
+      for (const name of buttons) {
+        control[name].pressed = false;
+        control[name].released = false;
       }
     }
     // We don't run navigationTick here, it runs on its own interval
@@ -558,19 +584,11 @@ export class AgentControls extends System {
   }
 
   createCamera(self) {
-    function bindRotations(quaternion, euler) {
-      euler._onChange(() => {
-        quaternion.setFromEuler(euler, false)
-      })
-      quaternion._onChange(() => {
-        euler.setFromQuaternion(quaternion, undefined, false)
-      })
-    }
     const world = self.world;
     const position = new THREE.Vector3().copy(world.rig?.position || new THREE.Vector3());
     const quaternion = new THREE.Quaternion().copy(world.rig?.quaternion || new THREE.Quaternion());
     const rotation = new THREE.Euler(0, 0, 0, 'YXZ').copy(world.rig?.rotation || new THREE.Euler());
-    bindRotations(quaternion, rotation); // You already import this
+    bindRotations(quaternion, rotation);
     const zoom = world.camera?.position?.z ?? 10;
 
     return {
@@ -583,8 +601,69 @@ export class AgentControls extends System {
     };
   }
 
-  // Dummy methods
-  bind(options: any) { return this; }
+  /**
+   * The engine's controls.bind(). The local player (PlayerLocal) binds with PLAYER priority and
+   * reads the agent's keys and camera from what it gets back, so it gets this system itself.
+   *
+   * Every other caller is a world app script calling app.control() (systems/Apps.js forces APP
+   * priority). It gets an object of its own that leads nowhere: button states, a camera and a
+   * pointer that only it reads and writes. The agent's own simulated keys do not show in it; the
+   * one thing the agent does with it is press keyX when it releases an item
+   * (AgentActions.releaseAction), which is how a seat or vehicle script learns the agent wants out.
+   */
+  bind(options: any = {}): AgentControls | AppControl {
+    if (options?.priority === ControlPriorities.PLAYER) return this;
+    const controls = this;
+    const entries: Record<string, any> = {};
+    for (const name of buttons) entries[name] = { ...createButtonState(), onPress: null, onRelease: null };
+    const quaternion = new THREE.Quaternion();
+    const rotation = new THREE.Euler(0, 0, 0, 'YXZ');
+    bindRotations(quaternion, rotation);
+    let released = false;
+    const control: AppControl = Object.freeze({
+      ...entries,
+      camera: { $camera: true, position: new THREE.Vector3(), quaternion, rotation, zoom: 0, write: false },
+      pointer: { locked: false, delta: { x: 0, y: 0 }, lock() { }, unlock() { } },
+      screen: Object.freeze({ width: 1920, height: 1080 }),
+      scrollDelta: { value: 0 },
+      xrLeftStick: { value: { x: 0, y: 0, z: 0 } },
+      xrRightStick: { value: { x: 0, y: 0, z: 0 } },
+      setActions() { },
+      release() {
+        if (released) return;
+        released = true;
+        controls.appControls.delete(control);
+        // The script's own callback, if it passed one to app.control(). The engine calls release()
+        // while it tears an app down, which a throwing callback must not interrupt.
+        try {
+          if (typeof options?.onRelease === 'function') options.onRelease();
+        } catch (error: any) {
+          logger.warn(`[Controls] A world script's onRelease handler threw: ${error?.message ?? error}`);
+        }
+      },
+    });
+    this.appControls.add(control);
+    return control;
+  }
+
+  /** Presses or releases a button on every control a world script holds, calling its handler */
+  pressAppButton(name: string, down: boolean) {
+    for (const control of this.appControls) {
+      const button = control[name];
+      if (!button?.$button || button.down === down) continue;
+      button.down = down;
+      button.pressed = down;
+      button.released = !down;
+      const handler = down ? button.onPress : button.onRelease;
+      if (typeof handler !== 'function') continue;
+      try {
+        handler();
+      } catch (error: any) {
+        logger.warn(`[Controls] A world script's ${name} handler threw: ${error?.message ?? error}`);
+      }
+    }
+  }
+
   release() { }
   setActions() { }
 }

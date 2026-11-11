@@ -1,4 +1,5 @@
-import type { ActionResult } from '@elizaos/core';
+import type { ActionResult, Content, HandlerCallback } from '@elizaos/core';
+import { currentTurn } from './turn-context';
 
 /*
  * What an action handler returns to core's processActions (elizaOS core 1.7.2), which stores it in
@@ -18,4 +19,18 @@ export function actionSucceeded(actionName: string, data: Record<string, unknown
 /** The action could not do what it was asked to; `error` says why. */
 export function actionFailed(actionName: string, error: string, data: Record<string, unknown> = {}): ActionResult {
   return { success: false, error, data: { ...data, actionName } };
+}
+
+/**
+ * Tells whoever asked for the action that it could not be done. An autonomous turn says nothing:
+ * nobody asked, and its callback would post the text to world chat.
+ */
+export async function tellFailure(
+  callback: HandlerCallback | undefined,
+  actionName: string,
+  text: string,
+  extra: Partial<Content> = {}
+): Promise<void> {
+  if (currentTurn()?.origin === 'autonomy') return;
+  await callback?.({ ...extra, text, actions: [actionName], source: 'hyperfy' });
 }

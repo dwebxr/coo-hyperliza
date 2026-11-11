@@ -1,11 +1,13 @@
 import { Content, EventType, HandlerCallback, IAgentRuntime, Memory, ModelType, asUUID, composePromptFromState, createUniqueUuid, logger, parseKeyValueXml, truncateToCompleteSentence } from "@elizaos/core";
 import { hyperfyShouldRespondTemplate, hyperfyMessageHandlerTemplate } from "../templates";
 import { AiBudgetExceededError, forPurpose, getUsageBudget } from "../../usage-budget";
+import { AnthropicRefusalError } from "../../anthropic-models";
+import { currentTurn, turnDelivered } from "../lib/turn-context";
 import { getShopProducts } from "../../openpay-store";
 import { parseAliases } from "../lib/addressing";
 import { isJapanese, matchSimpleCommand, simpleCommandReply } from "../lib/simple-commands";
 import { NoticeThrottle, composeOfflineReply } from "../lib/offline-reply";
-import { readString, readStringList } from "../lib/model-output";
+import { readActionNames, readString, readStringList } from "../lib/model-output";
 
 /** What the Hyperfy chat and voice events hand the handler (see ../events.ts). */
 export interface MessageReceivedHandlerParams {
@@ -63,15 +65,37 @@ async function handleSimpleCommand(runtime: IAgentRuntime, message: Memory, call
   return true;
 }
 
-/** Answers a player who talks to the agent while the Claude budget is used up. */
-async function replyWithoutAi(runtime: IAgentRuntime, message: Memory, callback: HandlerCallback): Promise<void> {
+/**
+ * Answers a player who talks to the agent while the Claude budget is used up. The "on a break"
+ * notice is throttled per player when it is sent up front (`throttle`), but not when it is the
+ * only answer to a request that ran out of budget partway (see the catch in the handler).
+ */
+async function replyWithoutAi(
+  runtime: IAgentRuntime,
+  message: Memory,
+  callback: HandlerCallback,
+  { throttle = true }: { throttle?: boolean } = {}
+): Promise<void> {
   const text = message.content.text ?? '';
   const reply = composeOfflineReply({ text, products: getShopProducts(runtime), japanese: isJapanese(text) });
-  if (reply.kind === 'notice' && !offlineNotices.allow(`${message.roomId}:${message.entityId}`)) return;
+  const key = `${message.roomId}:${message.entityId}`;
+  if (reply.kind === 'notice' && throttle && !offlineNotices.allow(key)) return;
   getUsageBudget().recordSkip('offline-reply');
   logger.info(`[Bootstrap] Claude budget reached; answering with a ${reply.kind} instead`);
   await callback({
     ...reply.content,
+    ...(message.id ? { inReplyTo: createUniqueUuid(runtime, message.id) } : {}),
+  });
+}
+
+/** Said without a model call when Claude declined the request. */
+async function replyDeclined(runtime: IAgentRuntime, message: Memory, callback: HandlerCallback): Promise<void> {
+  logger.info('[Bootstrap] The model declined the request; answering with a fixed reply');
+  await callback({
+    thought: 'The model declined this request.',
+    text: isJapanese(message.content.text) ? 'ごめんなさい、それはお手伝いできません。' : "Sorry, I can't help with that.",
+    actions: ['REPLY'],
+    source: 'hyperfy',
     ...(message.id ? { inReplyTo: createUniqueUuid(runtime, message.id) } : {}),
   });
 }
@@ -85,9 +109,17 @@ async function replyWithoutAi(runtime: IAgentRuntime, message: Memory, callback:
 export const messageReceivedHandler = async ({
   runtime,
   message,
-  callback,
+  callback: platformCallback,
   onComplete,
 }: MessageReceivedHandlerParams): Promise<void> => {
+  // Whether the player got anything during this turn: recorded where output actually happens (each
+  // chat chunk posted, an utterance played; see noteDelivered), not when a callback is entered,
+  // because a callback can drop or fail to deliver what it gets. An emote alone does not count: it
+  // answers nothing in words, so a fixed reply after it is not a duplicate. Core hands action
+  // replies to the callback only after the action returns, so an action that throws delivers nothing.
+  const turn = currentTurn();
+  const callback = platformCallback;
+  const delivered = () => turnDelivered(turn);
   // Set up timeout monitoring
   const timeoutDuration = 60 * 60 * 1000; // 1 hour
   let timeoutId: NodeJS.Timeout | undefined = undefined;
@@ -147,7 +179,6 @@ export const messageReceivedHandler = async ({
       // Set by the Hyperfy message/voice managers
       const metadata = (message.content?.metadata ?? {}) as { directlyAddressed?: boolean; soloPlayer?: boolean };
       const addressed = !!(metadata.directlyAddressed || metadata.soloPlayer);
-      let replied = false;
       try {
         if (message.entityId === runtime.agentId) {
           logger.debug(`[Bootstrap] Skipping message from self (${runtime.agentId})`);
@@ -183,15 +214,11 @@ export const messageReceivedHandler = async ({
 
         // Simple requests from the player talking to the agent need no model call
         if (addressed && (await handleSimpleCommand(runtime, message, callback))) {
-          replied = true;
           return;
         }
 
         if (!getUsageBudget().aiAvailable()) {
-          if (addressed) {
-            replied = true;
-            await replyWithoutAi(runtime, message, callback);
-          }
+          if (addressed) await replyWithoutAi(runtime, message, callback);
           return;
         }
 
@@ -257,7 +284,7 @@ export const messageReceivedHandler = async ({
 
             // Map parsed XML to Content type, handling potential missing fields
             if (parsedXml) {
-              let actions = readStringList(parsedXml, 'actions') || ['IGNORE'];
+              let actions = readActionNames(parsedXml) || ['IGNORE'];
 
               // Reorder actions so 'REPLY' always comes first if present
               const replyIndex = actions.findIndex(a => a.toUpperCase() === 'REPLY');
@@ -320,9 +347,8 @@ export const messageReceivedHandler = async ({
             state = await runtime.composeState(message, responseContent?.providers || []);
           }
 
-          // From here the player gets the generated reply; a budget error in a later action
-          // (e.g. navigation) must not add the offline notice on top
-          replied = responseMessages.length > 0;
+          // An action that runs out of budget or is declined stops the rest of the plan (the error
+          // propagates); the catch below answers only if nothing reached the player before that
           await runtime.processActions(message, responseMessages, state, callback);
           
           await runtime.evaluate(message, state, shouldRespond, callback, responseMessages);
@@ -367,9 +393,17 @@ export const messageReceivedHandler = async ({
 
       } catch (error: any) {
         runError = error?.message || String(error);
-        // The budget ran out partway through this turn: still answer the player
-        if (error instanceof AiBudgetExceededError && addressed && !replied) {
-          await replyWithoutAi(runtime, message, callback).catch((e) => logger.warn('[Bootstrap] Offline reply failed:', e));
+        // The budget ran out, or the model declined, before the player got anything: answer anyway,
+        // without a model call. Nothing is added when a reply (e.g. REPLY before the failing
+        // action) already reached them.
+        if (addressed && !delivered()) {
+          const fallback =
+            error instanceof AiBudgetExceededError
+              ? () => replyWithoutAi(runtime, message, callback, { throttle: false })
+              : error instanceof AnthropicRefusalError
+                ? () => replyDeclined(runtime, message, callback)
+                : null;
+          await fallback?.().catch((e) => logger.warn('[Bootstrap] Fallback reply failed:', e));
         }
       } finally {
         // Emitted on every path, including early returns (muted room, superseded response)

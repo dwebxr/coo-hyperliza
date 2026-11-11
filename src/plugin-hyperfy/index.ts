@@ -22,6 +22,7 @@ import { hyperfyActionsProvider } from './providers/actions';
 import { characterProvider } from './providers/character';
 import { hyperfyTipsProvider } from './providers/tips';
 import { hyperfyEvents } from './events';
+import { guardActions } from './lib/authorization';
 
 // The world's URL (WS_URL) is read and validated once, when HyperfyService starts (lib/world-url.ts)
 export const hyperfyPlugin: Plugin = {
@@ -34,7 +35,8 @@ export const hyperfyPlugin: Plugin = {
     HyperfyService
   ],
   events: hyperfyEvents,
-  actions: [
+  // Each handler checks the action's real name against what the current turn may run (lib/authorization.ts)
+  actions: guardActions([
     hyperfyScenePerceptionAction,
     hyperfyGotoEntityAction,
     hyperfyUseItemAction,
@@ -46,7 +48,7 @@ export const hyperfyPlugin: Plugin = {
     teleportToUserAction,
     replyAction,
     ignoreAction
-  ],
+  ]),
   providers: [
     hyperfyProvider,
     hyperfyEmoteProvider,

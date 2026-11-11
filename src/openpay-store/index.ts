@@ -8,7 +8,8 @@ import {
   logger,
 } from '@elizaos/core';
 import { isDirectlyAddressed } from '../plugin-hyperfy/lib/addressing';
-import { actionFailed, actionSucceeded } from '../plugin-hyperfy/lib/action-result';
+import { actionFailed, actionSucceeded, tellFailure } from '../plugin-hyperfy/lib/action-result';
+import { guardActions } from '../plugin-hyperfy/lib/authorization';
 import {
   DEFAULT_OPENPAY_STORE_API_URL,
   StoreCatalog,
@@ -181,6 +182,7 @@ export function createOpenPayStorePlugin(env: Record<string, string | undefined>
       });
       if (!product) {
         logger.info(`[OpenPayStore] Could not tell which product to share (productId: ${String(reply?.productId ?? '')})`);
+        await tellFailure(callback, SHARE_ACTION, "Sorry, I couldn't tell which product you mean, so I didn't post a link.");
         return actionFailed(SHARE_ACTION, 'could not tell which product to share');
       }
 
@@ -208,6 +210,8 @@ export function createOpenPayStorePlugin(env: Record<string, string | undefined>
       void catalog.refresh();
     },
     providers: [provider],
-    actions: [shareAction],
+    // Refused on autonomous Hyperfy turns (lib/authorization.ts); the handler's isAutonomous check
+    // also covers runs without a turn context
+    actions: guardActions([shareAction]),
   };
 }

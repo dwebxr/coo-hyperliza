@@ -66,7 +66,12 @@ export class AgentActions extends System {
 
     setTimeout(() => {
       if (typeof target._onTrigger === 'function') {
-        target._onTrigger({ playerId: this.world.entities.player.data.id });
+        // A world script's callback, run from a timer: nothing else would catch what it throws
+        try {
+          target._onTrigger({ playerId: this.world.entities.player.data.id });
+        } catch (error: any) {
+          console.warn(`[Actions] The item's trigger handler threw: ${error?.message ?? error}`);
+        }
       }
       control.setKey('keyE', false);
       this.currentNode = target;
@@ -87,17 +92,33 @@ export class AgentActions extends System {
     control.setKey('keyX', true);
     control.keyX.pressed = true;
     control.keyX.onPress?.();
+    // World scripts hold controls of their own (AgentControls.bind): the key is pressed there too
+    control.pressAppButton('keyX', true);
 
+    // A world script's cancel handler. If it throws, the item is still let go of (keyX released,
+    // nothing held) and the caller (HYPERFY_UNUSE_ITEM) is told it failed.
+    let cancelFailed = false;
+    let cancelError: unknown;
     if (typeof this.currentNode._onCancel === 'function') {
-      this.currentNode._onCancel();
+      try {
+        this.currentNode._onCancel();
+      } catch (error) {
+        cancelFailed = true;
+        cancelError = error;
+      }
     }
 
     setTimeout(() => {
       control.setKey('keyX', false);
       control.keyX.released = false;
-      control.keyX.onRelease?.();
-      this.currentNode = null;
+      try {
+        control.keyX.onRelease?.();
+      } finally {
+        control.pressAppButton('keyX', false);
+        this.currentNode = null;
+      }
     }, 500);
+    if (cancelFailed) throw cancelError;
     return true;
   }
 

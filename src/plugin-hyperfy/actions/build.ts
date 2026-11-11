@@ -10,16 +10,36 @@ import {
     parseKeyValueXml
   } from '@elizaos/core';
   import { HyperfyService } from '../service';
-  import { forPurpose } from '../../usage-budget';
-  import { actionFailed, actionSucceeded } from '../lib/action-result';
+  import { AiBudgetExceededError, forPurpose } from '../../usage-budget';
+  import { AnthropicRefusalError } from '../../anthropic-models';
+  import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
+  import { EDIT_ENTITY_ACTION, SceneEditStopped, readSceneEditsMode, sceneEditRefusal, sceneEditStillAllowed } from '../lib/authorization';
+  import type { EditGuard, EditResult } from '../managers/build-manager';
   import { readString } from '../lib/model-output';
+  import { isJapanese } from '../lib/simple-commands';
+  import { currentTurn } from '../lib/turn-context';
   const MAX_RETRIES = 3;
-  const EDIT_ENTITY = 'HYPERFY_EDIT_ENTITY';
+  const EDIT_ENTITY = EDIT_ENTITY_ACTION;
+  // Said without a model call to someone who may not have the world edited
+  const REFUSAL_EN = 'Sorry, I can only change things in this world when a builder asks me to.';
+  const REFUSAL_JA = 'ごめんなさい、ワールドの編集はビルダー権限のある方に頼まれたときだけできます。';
+  // ...and when scene edits are off (HYPERFY_SCENE_EDITS)
+  const OFF_EN = "Sorry, I can't change things in this world.";
+  const OFF_JA = 'ごめんなさい、このワールドでは編集のお手伝いはできません。';
+  const STOPPED_EN = 'I had to stop before finishing those edits.';
+  const STOPPED_JA = '編集の途中で止めました。';
+
+  /** What was done, said without a model call (when the summary cannot be written). */
+  function outcomeText(executed: number, total: number, japanese: boolean): string {
+    if (executed === 0) return japanese ? 'その変更はできませんでした。' : "I couldn't make any of those changes.";
+    return japanese ? `${total}件中${executed}件の変更をしました。` : `I made ${executed} of the ${total} changes.`;
+  }
 
   /**
-   * What happened to one entry of the model's edit plan: run without throwing, skipped because the
-   * plan itself marked it as not possible, or failed (threw, unsupported type, or not an object).
-   * "executed" only means the manager call returned; the managers do not report whether it took effect.
+   * What happened to one entry of the model's edit plan, from what the build manager reported:
+   * executed (the change was made), skipped (the plan itself marked it as not possible, or there was
+   * nothing to do: the target was gone, pinned, not an app), or failed (refused or failed import,
+   * invalid parameters, unsupported type, not an object, threw, or not run because the edit stopped).
    */
   interface OperationOutcome {
     operation?: string;
@@ -29,6 +49,13 @@ import {
   }
 
   const stringOrUndefined = (value: unknown) => (typeof value === 'string' ? value : undefined);
+
+  /** The operation and target of a plan entry, for its outcome. */
+  function describe(entry: unknown): Pick<OperationOutcome, 'operation' | 'target'> {
+    if (!entry || typeof entry !== 'object') return {};
+    const op = entry as Record<string, unknown>;
+    return { operation: stringOrUndefined(op.operation), target: stringOrUndefined(op.target) };
+  }
 
   export enum EditOperationType {
     DUPLICATE = 'duplicate',
@@ -196,14 +223,53 @@ ${summary}
       callback: HandlerCallback,
       responses,
     ) => {
+      // Checked first, so a refused request costs no model call: only a builder who asked in chat or voice
+      const turn = currentTurn();
+      const refusal = sceneEditRefusal(turn);
+      const japanese = isJapanese(message.content?.text ?? '');
+      if (refusal || !turn) {
+        logger.warn(`[EDIT_ENTITY Action] Refused: ${refusal}`);
+        if (turn?.requesterId) {
+          const off = readSceneEditsMode().mode === 'off';
+          await callback?.({
+            thought: `I may not edit the world for this request (${refusal}).`,
+            text: off ? (japanese ? OFF_JA : OFF_EN) : japanese ? REFUSAL_JA : REFUSAL_EN,
+            actions: [EDIT_ENTITY],
+            source: 'hyperfy',
+          });
+        }
+        return actionFailed(EDIT_ENTITY, refusal ?? 'no turn');
+      }
+
       const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-      const world = service?.getWorld();
       const buildManager = service?.getBuildManager();
-    
-      if (!service || !world || !buildManager) {
+
+      if (!service || service.getWorld() !== turn.world || !buildManager) {
         logger.error('[EDIT_ENTITY Action] Hyperfy service, world, or buildManager not found.');
+        await tellFailure(callback, EDIT_ENTITY, japanese ? '今はワールドを編集できません。' : "I can't edit the world right now.");
         return actionFailed(EDIT_ENTITY, 'Hyperfy service, world, or buildManager not found');
       }
+
+      // The edit acts only on the world it was authorized for, and stops as soon as that no longer
+      // holds: the connection changed, or the requester may no longer build there
+      const stillAllowed = () =>
+        sceneEditStillAllowed(turn, { world: service.getWorld(), generation: service.getConnectionGeneration() });
+      const connectionLive = () => service.getWorld() === turn.world && service.getConnectionGeneration() === turn.generation;
+      const guard: EditGuard = {
+        world: turn.world,
+        check() {
+          const reason = stillAllowed();
+          if (reason) throw new SceneEditStopped(reason);
+        },
+        connectionLive,
+      };
+      // Posted while the turn runs (core holds callback content until the handler returns), and only
+      // while the edit is still allowed: never to another connection, or for a requester who may no
+      // longer build. (The final "had to stop" explanation goes through the callback, which only
+      // checks the connection.)
+      const postNow = (text: string) => {
+        if (!stillAllowed()) service.getMessageManager()?.sendMessage(text);
+      };
     
       let operationResults: any = null;
       let attempts = 0;
@@ -222,6 +288,9 @@ ${summary}
     
           logger.warn(`[EDIT_ENTITY Action] Unexpected structure on attempt ${attempts + 1}:`, operationResults);
         } catch (error) {
+          // Retrying cannot help: the budget is used up (the turn's caller falls back to scripted or
+          // offline behavior) or the model declined this request
+          if (error instanceof AiBudgetExceededError || error instanceof AnthropicRefusalError) throw error;
           logger.error(`[EDIT_ENTITY Action] Model error on attempt ${attempts + 1}:`, error);
         }
     
@@ -231,57 +300,68 @@ ${summary}
       
       if (!Array.isArray(operationResults?.operations)) {
         logger.error(`[EDIT_ENTITY Action] Scene editing failed — could not understand instructions properly.`);
+        await tellFailure(callback, EDIT_ENTITY, japanese ? 'ごめんなさい、どう編集すればいいか分かりませんでした。' : "Sorry, I couldn't work out how to make that change.");
         return actionFailed(EDIT_ENTITY, 'no edit plan from the model');
       }
     
       const operations: unknown[] = operationResults.operations;
       const outcomes: OperationOutcome[] = [];
+      // For the summary prompt: what each executed operation was meant to do
+      const descriptions: (string | undefined)[] = [];
+      // Why the remaining operations were not run, once the edit had to stop
+      let stopped: string | null = null;
+      const record = (outcome: OperationOutcome, description?: string) => {
+        outcomes.push(outcome);
+        descriptions.push(description);
+        return outcome;
+      };
       for (const entry of operations) {
+        // Set by the first operation that had to stop (every effect checks the guard first)
+        if (stopped) {
+          record({ ...describe(entry), outcome: 'failed', reason: `not run: ${stopped}` });
+          continue;
+        }
         if (!entry || typeof entry !== 'object') {
           logger.warn(`[EDIT_ENTITY Action] Ignoring an edit plan entry that is not an object (${entry === null ? 'null' : typeof entry})`);
-          outcomes.push({ outcome: 'failed', reason: 'not an operation object' });
+          record({ outcome: 'failed', reason: 'not an operation object' });
           continue;
         }
         const op = entry as Record<string, any>;
-        const outcome: OperationOutcome = {
-          operation: stringOrUndefined(op.operation),
-          target: stringOrUndefined(op.target),
-          outcome: 'executed',
-        };
-        outcomes.push(outcome);
+        const { operation, target, parameters, description } = op;
+        const outcome = record({ ...describe(op), outcome: 'executed' }, stringOrUndefined(description));
         if (!op.success) {
           logger.warn(`[EDIT_ENTITY Action] Skipping failed operation:`, op.reason || op);
           outcome.outcome = 'skipped';
           outcome.reason = stringOrUndefined(op.reason);
           continue;
         }
-    
-        const { operation, target, parameters, description } = op;
 
+        let done: EditResult;
         try {
           switch (operation) {
             case EditOperationType.TRANSLATE:
-              await buildManager.translate(target, parameters?.position);
+              done = await buildManager.translate(guard, target, parameters?.position);
               break;
 
             case EditOperationType.ROTATE:
-              await buildManager.rotate(target, parameters?.rotation);
+              done = await buildManager.rotate(guard, target, parameters?.rotation);
               break;
 
             case EditOperationType.SCALE:
-              await buildManager.scale(target, parameters?.scale);
+              done = await buildManager.scale(guard, target, parameters?.scale);
               break;
 
             case EditOperationType.DUPLICATE:
-              await buildManager.duplicate(target);
+              done = await buildManager.duplicate(guard, target);
               break;
 
             case EditOperationType.DELETE:
-              await buildManager.delete(target);
+              done = await buildManager.delete(guard, target);
               break;
 
             case EditOperationType.IMPORT:
-              await buildManager.importEntity(
+              done = await buildManager.importEntity(
+                guard,
                 target,
                 parameters?.position,
                 parameters?.rotation
@@ -290,18 +370,26 @@ ${summary}
 
             default:
               logger.warn(`[EDIT_ENTITY Action] Unsupported operation type: ${operation}`);
-              outcome.outcome = 'failed';
-              outcome.reason = 'unsupported operation type';
+              done = { outcome: 'failed', reason: 'unsupported operation type' };
               break;
           }
-          if (description) {
-            const messageManager = service.getMessageManager();
-            messageManager.sendMessage(description);
-          }
         } catch (error: any) {
+          if (error instanceof SceneEditStopped) {
+            logger.warn(`[EDIT_ENTITY Action] Stopped before ${operation} on "${target}": ${error.message}`);
+            stopped = error.message;
+            outcome.outcome = 'failed';
+            outcome.reason = `not run: ${error.message}`;
+            continue;
+          }
           logger.error(`[EDIT_ENTITY Action] Operation ${operation} on "${target}" failed:`, error);
-          outcome.outcome = 'failed';
-          outcome.reason = String(error?.message ?? error);
+          done = { outcome: 'failed', reason: String(error?.message ?? error) };
+        }
+        if (done.outcome === 'applied') {
+          if (typeof description === 'string' && description) postNow(description);
+        } else {
+          logger.warn(`[EDIT_ENTITY Action] ${operation} on "${target}" ${done.outcome}: ${done.reason}`);
+          outcome.outcome = done.outcome;
+          outcome.reason = done.reason;
         }
       }
 
@@ -314,18 +402,27 @@ ${summary}
         ? actionSucceeded(EDIT_ENTITY, resultData)
         : actionFailed(
             EDIT_ENTITY,
-            failed > 0 ? `${failed} of ${outcomes.length} operations failed` : 'no operation was executed',
+            stopped ? `stopped: ${stopped}` : failed > 0 ? `${failed} of ${outcomes.length} operations failed` : 'no operation was executed',
             resultData
           );
 
-      const summaryText = operations.map((entry) => {
-        if (!entry || typeof entry !== 'object') return 'FAILURE: unreadable operation entry';
-        const op = entry as Record<string, any>;
-        if (op.success) {
-          return `SUCCESS: ${op.description}`;
-        } else {
-          return `FAILURE: Tried to ${op.operation} "${op.requestedEntityName}" → ${op.reason}`;
-        }
+      if (stopped) {
+        // No summary call: say what happened as it is (the callback only checks the connection)
+        await callback({
+          thought: `Stopped editing: ${stopped}.`,
+          text: `${japanese ? STOPPED_JA : STOPPED_EN} ${outcomeText(executed, outcomes.length, japanese)}`,
+          actions: [EDIT_ENTITY],
+          source: 'hyperfy',
+        });
+        return result;
+      }
+
+      // From what was actually done, not from the model's plan
+      const summaryText = outcomes.map((o, i) => {
+        const what = `${o.operation ?? 'an operation'}${o.target ? ` on "${o.target}"` : ''}`;
+        return o.outcome === 'executed'
+          ? `DONE: ${descriptions[i] ?? what}`
+          : `NOT DONE (${o.outcome}): ${what} → ${o.reason ?? 'no reason given'}`;
       }).join('\n');
       
       const stateForResponse = await runtime.composeState(message);
@@ -338,10 +435,16 @@ ${summary}
       try {
         finalXml = await runtime.useModel(ModelType.TEXT_SMALL, forPurpose('build', { prompt: agentResponsePrompt }));
       } catch (err) {
+        if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError) {
+          // The edits stand: say what was done now (callback content would be lost with the
+          // error), then let the turn's caller handle the used-up budget or the refusal
+          postNow(outcomeText(executed, outcomes.length, japanese));
+          throw err;
+        }
         logger.error('[EDIT_ENTITY Action] Final summarization failed:', err);
         await callback({
-          thought: 'Scene edits completed, but final summary generation failed.',
-          text: 'Edits are done, but I had trouble summarizing the results clearly.',
+          thought: 'Scene edits finished, but the summary could not be written.',
+          text: outcomeText(executed, outcomes.length, japanese),
         });
         return result;
       }
@@ -351,7 +454,7 @@ ${summary}
         logger.error('[EDIT_ENTITY Action] Failed to parse summary XML.');
         await callback({
           thought: 'Could not interpret response XML.',
-          text: 'Edits completed, but I couldn’t finish the summary properly.',
+          text: outcomeText(executed, outcomes.length, japanese),
         });
         return result;
       }

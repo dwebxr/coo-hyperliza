@@ -8,6 +8,8 @@
   // Every file listed here, and every file it imports, must be strict-clean. src/index.ts is
   // left out: it imports the whole Hyperfy plugin. Add each new module that can be strict.
   "include": [
+    // Not its test: @elizaos/plugin-sql's types cannot be resolved through its package exports
+    "src/agent-secrets.ts",
     "src/anthropic-models.ts",
     "src/anthropic-models.test.ts",
     "src/elevenlabs-speech.ts",

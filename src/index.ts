@@ -3,10 +3,11 @@ import { Buffer } from 'buffer';
 
 import dotenv from 'dotenv';
 
-// Values from the .env file, applied as character secrets below. The tip wallet's key stays out:
-// elizaOS stores character secrets in its database and returns them from its API.
-const { TIP_WALLET_PRIVATE_KEY: _tipWalletKey, ...envFile } = dotenv.config().parsed ?? {};
+// The keys of the .env file: earlier versions copied them into the character secrets, which
+// elizaOS stores in its database (see characterSecrets below)
+const envFileKeys = Object.keys(dotenv.config().parsed ?? {});
 import {
+  getAllowedEnvVars,
   logger,
   type Character,
   type IAgentRuntime,
@@ -19,6 +20,14 @@ import { elevenLabsSpeechPlugin } from './elevenlabs-speech';
 import { createOpenPayStorePlugin } from './openpay-store';
 import { planModelPlugins } from './llm-provider';
 import { startUsageReports } from './usage-budget';
+import { characterSecrets, removeStaleStoredSecrets, secureServerDefaults } from './agent-secrets';
+import { takeTipWalletAccount } from './plugin-hyperfy/lib/tip-wallet';
+
+// The tip wallet's key moves into memory and out of process.env before elizaOS copies anything
+takeTipWalletAccount();
+// Before the server starts listening: loopback unless SERVER_HOST says otherwise, and a locked API
+// unless ELIZA_SERVER_AUTH_TOKEN is set
+for (const line of secureServerDefaults(process.env)) logger.warn(line);
 
 let modelPlan: ReturnType<typeof planModelPlugins>;
 try {
@@ -39,10 +48,10 @@ export const character: Character = {
   name: 'Coo',
   plugins: modelPlan.packages,
   settings: {
-    // .env is authoritative. elizaOS keeps a copy of the environment from earlier runs in the agent's
-    // database record and prefers it over the current environment; secrets set here override that copy
-    // (an old, revoked API key stored there made every model call fail with 401).
-    secrets: { ...envFile },
+    // Not the .env file: elizaOS stores these in the agent's database record and its API returns
+    // them. Nulls delete what earlier versions stored there (an old, revoked API key stored there
+    // made every model call fail with 401; src/anthropic-models.ts reads process.env first anyway).
+    secrets: characterSecrets(envFileKeys, { env: process.env, coreCopies: getAllowedEnvVars() }),
     avatar: 'https://dwebxr.xyz/images/coo.jpg',
     voice: {
       model: 'tts-1',
@@ -224,6 +233,10 @@ export const character: Character = {
 const initCharacter = async ({ runtime }: { runtime: IAgentRuntime }) => {
   logger.info('Initializing character');
   logger.info('Name: ', character.name);
+  // What earlier versions stored for keys that are no longer in .env (characterSecrets covers the rest)
+  await removeStaleStoredSecrets(runtime, { env: process.env, coreCopies: getAllowedEnvVars() }).catch((error) =>
+    logger.warn(`[Secrets] Could not clean up stored secrets: ${error instanceof Error ? error.message : String(error)}`)
+  );
   // Claude / vision / voice usage per purpose, to tune the limits in .env
   startUsageReports();
 };

@@ -30,7 +30,7 @@ See "Cost Controls and Usage Limits" for the settings.
 - **Walking Around**: Patrol a fixed route (`PATROL_POINTS`) or wander around its post
 - **Greeting Players**: Walk over to and wave at players who arrive
 - **Approaching Players**: Walk towards nearby players
-- **Item Usage**: Interact with objects in the world
+- **Item Usage**: Interact with objects in the world. Items are made by the world's app scripts, which the agent runs only with `HYPERFY_WORLD_SCRIPTS=sandboxed` (see "World App Scripts")
 - **Conversation**: Text chat and voice conversations. The world cuts chat messages at 500 characters, so longer replies are posted as up to four messages; text beyond that ends with an ellipsis
 
 ## Setup
@@ -69,10 +69,23 @@ ELEVENLABS_OUTPUT_FORMAT=mp3_44100_128
 # Server Settings (127.0.0.1 = reachable from this machine only)
 SERVER_PORT=3001
 SERVER_HOST=127.0.0.1
+# Token for the web UI / API (clients send it as X-API-KEY); leave it unset to keep them locked
+ELIZA_SERVER_AUTH_TOKEN=a-long-random-string
+# The key elizaOS encrypts its stored secrets with
+SECRET_SALT=another-long-random-string
 ```
 
 > **Security**: `localstorage.json` holds the agent's Hyperfy auth token. Never commit it, and never paste logs that contain it.
-> The web UI / API has no authentication unless `ELIZA_SERVER_AUTH_TOKEN` is set (clients send it as `X-API-KEY`). Keep `SERVER_HOST=127.0.0.1` unless remote access is needed; before binding to `0.0.0.0`, set the token and restrict network access.
+> **The elizaOS web UI / API.** Whoever may use it can read the `.env` file the server finds (`GET /api/system/env/local`: every key, `TIP_WALLET_PRIVATE_KEY` included) and rewrite it (`POST`), read the agent's stored database record including its stored secrets (`GET /api/agents/<id>`), control the agent, and over its Socket.IO connections send the agent messages and stream its logs. elizaOS authenticates the REST API only when `ELIZA_SERVER_AUTH_TOKEN` is set (clients send it as `X-API-KEY`) and Socket.IO only when `SERVER_API_KEY` is set (the web UI sends the one key it stores for both), and listens on every interface (`0.0.0.0`) when `SERVER_HOST` is unset. So when the CLI loads this project (`elizaos start` / `elizaos dev`, which `bun run start` / `bun run dev` run), Coo, at startup:
+> - with `SERVER_HOST` unset, makes the server listen on `127.0.0.1` only;
+> - with `ELIZA_SERVER_AUTH_TOKEN` unset, locks the REST API and Socket.IO for that run with a random token that is never shown or stored: every request under `/api` gets 401 and every Socket.IO connection is refused (the `/healthz` and `/health` status routes and the web UI's own files still answer). To use the web UI or API, set your own `ELIZA_SERVER_AUTH_TOKEN` in `.env` and restart;
+> - with `SERVER_API_KEY` unset, uses the REST token for Socket.IO too, so your own token unlocks both.
+>
+> **These defaults only apply when the CLI loads this project.** `elizaos start --character <file>` and `elizaos dev --character <file>` start the server without it, and then none of the above applies: unless `.env` (or the environment) says otherwise, the server listens on `0.0.0.0` with no authentication. The values in `.env` are the only protection that holds on every start path, so keep `SERVER_HOST=127.0.0.1` there (the example file has it) and fill in your own `ELIZA_SERVER_AUTH_TOKEN`.
+>
+> What remains: with your own token, the API is as strong as that token, and anyone who has it can read and rewrite `.env`; with a token and a non-loopback `SERVER_HOST`, anyone on the network who has the token can (Coo logs a warning then). On the locked default, other programs on this machine and web pages in your browser cannot use the REST API or Socket.IO. The token does not cover `/media/uploads/...` and `/media/generated/...`, which serve files from elizaOS's data directory to whoever knows the agent or channel id and the file name (Coo itself puts none there). The random token lives in the agent's process environment, so processes the agent starts (Chromium, ffmpeg) inherit it.
+>
+> Stored secrets: Coo does not copy `.env` into the agent record. On each start it deletes what earlier versions stored there: the keys that are in `.env` now, in the start's own merge, and, once the agent has started, stored keys that have since been removed from `.env`. If the database refuses that second step, the log says so as an error and those keys stay stored. elizaOS itself still stores the variables its CLI copies from the environment, notably `POSTGRES_URL`, and the settings it reads from the record (such as per-model tuning like `OBJECT_SMALL_TEMPERATURE`). Stored secrets are encrypted with `SECRET_SALT`; its default, `secretsalt`, is public, so set your own.
 
 ### 3. Set Up PostgreSQL (Required)
 
@@ -108,6 +121,15 @@ brew install ffmpeg
 bun run build
 bun run dev
 ```
+
+To check that a build boots without touching the live world, the real database or any key, use the scratch smoke instead of starting the agent in this directory (where the CLI loads `.env`):
+
+```bash
+bun run build
+node scripts/smoke-boot.mjs --dir /tmp/coo-smoke    # any empty directory outside the repository
+```
+
+It copies `dist/` next to a throwaway PostgreSQL cluster, starts `elizaos start` there with a dummy key and an unreachable world in both `HYPERFY_WORLD_SCRIPTS` modes, and checks that the agent is listed, tries to connect and schedules a retry, passes the sandbox self-test, returns no key from its API, contacts nothing but 127.0.0.1, and exits on SIGTERM. It needs `initdb`/`pg_ctl` from PostgreSQL 17 with pgvector (`SMOKE_PG_BIN` overrides the Homebrew path).
 
 ## Configuration
 
@@ -175,14 +197,63 @@ How it works and what it can do:
 - The world only offers the Tip button for a player whose wallet signed in on the current connection, so Coo signs in on every connection with its key (Sign-In with Ethereum), then turns "Receive tips" on. The world shares only that yes/no flag; the address goes only to a signed-in player who is sending a tip.
 - The key only ever signs the world's own sign-in message. Before signing, Coo checks that it is exactly that: the world's domain (the host of `WS_URL`), its statement, Coo's address, the nonce it was given, no extra content and a short expiry. Anything else is refused and tips stay off for that connection. Nothing in the agent builds or sends a transaction.
 - Tips arrive as ERC-20 tokens at Coo's address; Coo never moves them. Move them to your main wallet now and then (for example by importing the key into a wallet app; that needs a little POL for gas) and keep only small amounts at this address. If the key may have leaked, create a new wallet and move what is left.
-- The key is kept out of the character secrets elizaOS stores in its database and returns from its API. Its name must not start with `COO_`, which elizaOS would copy into those secrets.
+- The key is kept out of the character secrets elizaOS stores in its database and returns from its API (a copy an earlier version stored there is deleted on the next start). Its name must not start with `COO_`, which elizaOS would copy into those secrets.
+- At startup the key is read into memory and removed from the agent's process environment; it stays in `.env`. The elizaOS server re-reads `.env` once while starting, which puts it back for a moment, so the Hyperfy service removes it again when it starts. Code running in that window, or after any later re-read of `.env`, can still see it.
 - Coo explains how to tip it when asked, while it is receiving tips, and never asks for tips on its own.
-- Tips work only while Coo is connected, and the world announces a tip only once it is confirmed on chain (the world needs its RPC for that).
+- Tips work only while Coo is connected, and the world announces a tip only once it is confirmed on chain (the world needs its RPC for that). Coo thanks for a tip announcement only once its wallet has been signed in and shown as receiving tips on that connection: a tip confirmed after "Receive tips" was switched off again on that connection is still thanked, one announced after a reconnect but before the new sign-in is not.
+- Coo verifies nothing on chain: a world on which its wallet signed in can announce a tip that did not happen, and Coo thanks for it.
 - Check the rules that apply to you (taxes, and whether perks in return for tips make you a seller) before relying on tips.
 
 ### Agent Aliases
 
 `HYPERFY_AGENT_ALIASES` is a comma-separated list of extra names the agent answers to (e.g. `クー`). A message containing the agent's name or one of these aliases skips the "should I respond?" LLM check. The check is also skipped when the agent is 1-on-1 with a single player.
+
+### Who Can Ask for What
+
+The agent never does for someone what the world would not let them do themselves:
+
+- **Scene edits** (`HYPERFY_EDIT_ENTITY`: move, rotate, scale, duplicate, delete, import objects) are **off by default**. `HYPERFY_SCENE_EDITS=builders` turns them on for players who may build in the world: present in it, with builder rank or higher as the world's server reports it (on coo-world the higher of the player's rank and the world's rank setting), or with their player id or userId in `HYPERFY_OPERATOR_IDS` (comma-separated). They must ask in chat or by voice; anyone else gets a short refusal, and no Claude call is made for it. Autonomous behavior never edits the world. Any other value of `HYPERFY_SCENE_EDITS` is a configuration error (logged) and keeps them off; the log says which applies on every connection.
+  **Turn them on only for a world whose server sets each chat message's sender itself.** The owner's coo-world does. Stock Hyperfy does not: it passes on whatever sender id a client puts in its chat message, so there any visitor can pose as a builder or as a listed operator.
+- **An edit stops** as soon as its authorization no longer holds: when the connection to the world changed (a reconnect), or when the requester's rank dropped or they left. It is checked again right before each thing it does in the world: walking there, each change, the download of an import, each request of an upload, and each announcement in chat. Nothing is sent to a new connection. The operations not yet made are reported as not done; an imported app that was already added when its upload failed or the edit stopped is taken back again (on the same connection only; its blueprint stays, as the world has no way to remove one).
+- **What Coo says it did is what it did**: a target that is gone, a pinned app, something that is not an app, invalid numbers, or a refused or failed import is reported as not done, in its own summary and in the fixed "I made N of the M changes" it falls back to.
+- **Autonomous steps** may only run walking, using/releasing items, teleporting to a player, ambient speech, replying and ignoring. Any other action the model names on such a step (including by a partial name or a synonym) is refused when it would run.
+- **Conversation** is only what the world's server sent: chat that app scripts in the world post (whatever sender they give it) is shown locally but is never answered, never counts as a tip announcement, and is never sent on to the world.
+- Everything else (walking to someone, using items, looking around, replying) stays open to everyone.
+
+Caveats:
+- On a coo-world without `ADMIN_CODE`, everyone is an admin, so everyone can ask for scene edits.
+- Stock Hyperfy worlds pass on whatever sender id a client puts in its chat message (and newer ones also send ranks, so ranks do not tell such a world apart). On them, keep `HYPERFY_SCENE_EDITS=off`: with it on, anyone who sends chat under a builder's or a listed operator's id can ask for edits. coo-world sets the sender id on its server.
+- A tip announcement is also a sender-less chat message; it counts only once Coo's tip wallet has been signed in and receiving tips on that connection, and Coo checks nothing on chain (see Tips).
+- These checks rely on the world's app scripts not reaching the engine's internals (for example the network handlers that record ranks and chat). By default scripts are not run at all; with `HYPERFY_WORLD_SCRIPTS=sandboxed` they run behind a membrane that keeps those internals out of reach (next section).
+
+### World App Scripts
+
+A Hyperfy world sends *app scripts*: JavaScript written by whoever builds in the world (or runs it), which every client executes. The engine bundled here evaluates them in an SES `Compartment`, but in this agent that was never a boundary: without `lockdown()` one line reaches `process`, and even with it the engine's script API hands out the raw world object (and with it the session token, the socket, and the handlers that chat, ranks and the tip wallet are fed from).
+
+`HYPERFY_WORLD_SCRIPTS` decides what happens to them. There is no mode that runs scripts without the sandbox; any other value is logged as an error and means `off`.
+
+| Value | What the agent does |
+|-------|---------------------|
+| `off` (default) | Scripts are downloaded with their app and never evaluated. Apps still show their models. What stops working in the agent: interactive items (`HYPERFY_USE_ITEM` finds nothing to use), script-driven sky/environment changes, and anything a script would animate or move. |
+| `sandboxed` | At startup the whole process is locked down with SES (`lockdown()`), and a self-test runs the known escapes against the real script runtime; if lockdown fails or one probe gets through, the agent logs why and exits. Each script then runs in its own compartment behind a membrane (`src/plugin-hyperfy/lib/script-membrane.ts`): what the engine returns reaches a script only through a proxy or a wrapper, as an opaque token, or as a copy, and what a script passes reaches the engine only as a copy (its functions as wrappers, its promises followed by promises of the agent's own, its bytes copied into buffers of the agent's own). The self-test also tries the escapes found in review: a promise's or a buffer's species constructor, a forged node reference, a function as `this`, and a host error's stack. |
+
+What a sandboxed script gets: the engine's `world` and `app` API, `props`, `setTimeout`, `console`, `Vector3`/`Quaternion`/`Euler`/`Matrix4`/`LerpVector3`/`LerpQuaternion`/`Curve` and the helper functions. Differences from a Hyperfy client that script authors will notice:
+
+- `fetch()` is refused: scripts have no network access in the agent. (Models, avatars and images a script asks the engine to load are still downloaded by the agent's loader.)
+- `Object3D` and `URL.createObjectURL` are not available; `world.get`/`world.set`/`world.open` do nothing.
+- Objects a script hands to the engine are copied (later changes to the script's own object are not seen by the engine), and the engine's objects are seen through proxies. On a vector, quaternion, euler, matrix, lerp or curve, adding properties, replacing methods and reading fields that start with `_` do not work; `class X extends Vector3` does not behave like a subclass.
+- A property named `_isRef` or `_ref` cannot be handed to the engine or set on its objects (the engine reads those names as node references), and the members that take a node (`add`, `remove`, `insert`, a joint's `body0`/`body1`, `world.add`/`remove`/`attach`) or a geometry (`geometry`) take only one the engine made.
+- A world API function cannot be called with a function as its `this` (`api.call(someFunction, ...)` throws).
+- An error from the engine reaches a script with its name and message only, without a stack; file paths in the message read `<path>`.
+- `app.control()` returns a control of the script's own. The agent does not feed it input, except that it presses `keyX` there when it releases an item (`HYPERFY_UNUSE_ITEM`).
+- `world.chat()` only shows in the agent's local chat view; it is never sent to the world and never answered.
+- SES refuses sources that contain `import(`, `eval(` or `<!--`, even in comments and strings.
+
+What the sandbox does not do:
+
+> A sandboxed world script still runs inside the agent's process, on its only thread. There is no CPU or memory isolation: `while (true) {}` hangs the agent for good, and a script can allocate until the process dies. A script can use everything the engine's script API offers it: create and move nodes, read every player's position, name and id, teleport, push, freeze and re-skin the agent's own avatar, send app events to the world's server, post to the agent's local chat view, and make the agent download models, avatars and images from any URL it names (of a download it learns only whether it worked and, for a model, the names and positions of its parts). A script can break the engine code it calls into by passing it nonsense, which can stop that app, the world's update loop, or the whole process. A script's own error stack traces name the agent's files and where they are on disk. The sandbox is defence for worlds whose builders you mostly trust. It is not a guarantee against a hostile world: use `off` there.
+
+Side effects of `sandboxed` on the rest of the process: the JavaScript built-ins are frozen for everything, including elizaOS and its plugins (SES logs the few Bun-only built-ins it removes at startup), and unhandled promise rejections are logged and survived instead of ending the process, because one line of script can cause one. After upgrading Bun, elizaOS or a plugin, run the tests and the boot smoke below with `sandboxed` before relying on it: lockdown is sensitive to new built-ins, and the self-test only proves that the escapes it knows are closed.
 
 ### World Compatibility
 
@@ -231,6 +302,14 @@ Each limit may go over by one call or utterance. Counts are kept in memory and s
 src/
 ├── plugin-hyperfy/
 │   ├── lib/
+│   │   ├── turn-context.ts      # What a chat / voice / autonomous turn acts for
+│   │   ├── authorization.ts     # Who may ask for what; the autonomous action list
+│   │   ├── world-identity.ts    # Ranks as the world's server reports them
+│   │   ├── world-chat.ts        # Chat provenance; the agent's own posts
+│   │   ├── script-sandbox.ts    # HYPERFY_WORLD_SCRIPTS: lockdown, self-test, compartments
+│   │   ├── script-membrane.ts   # What crosses between app scripts and the engine
+│   │   ├── script-api.ts        # The world/app API and globals a sandboxed script gets
+│   │   ├── script-facades.ts    # console, fetch and setTimeout for scripts
 │   │   ├── tip-wallet.ts        # Coo's wallet sign-in for tips
 │   │   ├── tip-notice.ts        # Reads the world's tip announcements
 │   │   ├── idle-behavior.ts     # Scripted patrol / wander / greeting steps
@@ -261,6 +340,7 @@ src/
 ├── openpay-store/              # OpenPay Store shop clerk
 ├── anthropic-models.ts         # Claude through the official SDK
 ├── usage-budget.ts             # Usage meter, limits and reports
+├── agent-secrets.ts            # What goes into elizaOS's stored secrets; API exposure warning
 ├── elevenlabs-speech.ts        # ElevenLabs speech-to-text / text-to-speech models
 ├── llm-provider.ts             # Model plugin selection (Claude only)
 └── index.ts                    # Main entry point & character config
@@ -282,6 +362,7 @@ stubs/unused-elizaos-plugin/    # Stands in for plugins @elizaos/cli lists but n
 9. **coo-world Compatibility**: Current network protocol, authenticated uploads, the world's walking clips, chat split to the world's length limit
 10. **Lean, Pinned Dependencies**: Unused integrations removed and `bun.lock` committed (`bun audit` to check)
 11. **Tips**: Coo can receive coo-world tips (JPYC) with its own wallet and thanks the tippers
+12. **Authorization**: Scene edits only for players the world lets build, an enforced list of what autonomous steps may do, and only the world server's chat counts as conversation (see "Who Can Ask for What")
 
 ## Troubleshooting
 

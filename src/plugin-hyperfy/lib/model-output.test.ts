@@ -1,6 +1,6 @@
 import { parseKeyValueXml, type Memory } from '@elizaos/core';
 import { describe, expect, it } from 'vitest';
-import { plannedContent, readString, readStringList } from './model-output';
+import { plannedContent, readActionNames, readString, readStringList } from './model-output';
 
 describe('readString / readStringList on real parseKeyValueXml output', () => {
   const parsed = parseKeyValueXml(
@@ -41,5 +41,19 @@ describe('plannedContent', () => {
     expect(plannedContent(response({ text: 'hi' }), 'REPLY')).toBeNull();
     expect(plannedContent(response({ text: '   ', actions: ['REPLY'] }), 'REPLY')).toBeNull();
     expect(plannedContent(response({ message: 5, actions: ['REPLY'] }), 'REPLY')).toBeNull();
+  });
+});
+
+describe('readActionNames', () => {
+  it('drops the blank names core produces for a trailing or doubled comma', () => {
+    expect(readStringList(parseKeyValueXml('<response><actions>REPLY,</actions></response>')!, 'actions')).toEqual(['REPLY', '']);
+    expect(readActionNames(parseKeyValueXml('<response><actions>REPLY,</actions></response>')!)).toEqual(['REPLY']);
+    expect(readActionNames(parseKeyValueXml('<response><actions> , REPLY ,, IGNORE </actions></response>')!)).toEqual(['REPLY', 'IGNORE']);
+    expect(readActionNames(parseKeyValueXml('<response><actions></actions><text>x</text></response>')!)).toEqual([]);
+  });
+
+  it('is undefined when there is no action list', () => {
+    expect(readActionNames(parseKeyValueXml('<response><text>x</text></response>')!)).toBeUndefined();
+    expect(readActionNames({ actions: 'REPLY' })).toBeUndefined();
   });
 });

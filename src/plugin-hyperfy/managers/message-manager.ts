@@ -6,7 +6,8 @@ import { countOtherPlayers } from "../utils";
 import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
 import { splitChatText } from "../lib/chat-chunks";
 import { isOpenPayLink } from "../../openpay-store";
-import { runWithOrigin } from "../../usage-budget";
+import { type TurnContext, neverAbortedSignal, noteDelivered, runTurn } from "../lib/turn-context";
+import { postAgentChat } from "../lib/world-chat";
 import { isJapanese } from "../lib/simple-commands";
 import { type TipNotice, parseTipNotice, tipThanks } from "../lib/tip-notice";
 import moment from 'moment'
@@ -39,21 +40,36 @@ export class MessageManager {
   }
 
   async handleMessage(msg, turn?: ChatTurn): Promise<void> {
+    const service = this.getService();
+    const world = service.getWorld();
+    const context: TurnContext = {
+      origin: 'chat',
+      // Set by the world's server on coo-world; chosen by the sending client on upstream Hyperfy
+      requesterId: typeof msg.fromId === 'string' && msg.fromId ? msg.fromId : undefined,
+      world,
+      generation: service.getConnectionGeneration(),
+      signal: neverAbortedSignal(),
+    };
     // maybe a thinking emote here?
-    await runWithOrigin('chat', () => agentActivityLock.run(async () => {
-      const service = this.getService();
-      const world = service.getWorld();
+    await runTurn(context, () => agentActivityLock.run(async () => {
       const agentPlayerId = world.entities.player.data.id // Get agent's ID
       const senderName = msg.from || 'System'
       const messageBody = msg.body || ''
       const _currentWorldId = service.currentWorldId;
       console.info(`[Chat Received] From: ${senderName}, ID: ${msg.id}, Body: "${messageBody}"`)
 
-      // World notices have no sender (players cannot send one: the world sets fromId)
+      // World notices have no sender. coo-world sets fromId itself, so players cannot send one;
+      // a server that relays chat as clients wrote it can, so a tip announcement counts only once
+      // this connection's tip wallet has been signed in and shown as receiving tips. Nothing is
+      // checked on chain: such a world can still announce a tip that did not happen.
       if (!msg.fromId) {
         const agentName = world.entities.player.data?.name || this.runtime.character.name
         const tip = parseTipNotice(messageBody, agentName)
-        if (tip) await this.thankForTip(tip, service, world)
+        if (tip && !service.getTipWallet?.()?.receivedOnThisConnection) {
+          logger.info(`[Tips] Ignoring a tip announcement: the agent has not been receiving tips on this connection`)
+        } else if (tip) {
+          await this.thankForTip(tip, service, world)
+        }
         return
       }
 
@@ -246,21 +262,17 @@ export class MessageManager {
 
       console.info(`HyperfyService sending message: "${text}" as ${agentPlayerName} (${agentPlayerId})`)
 
-      if (typeof world.chat.add !== 'function') {
-        throw new Error('world.chat.add is not a function')
-      }
-
+      // Not world.chat.add, which never broadcasts (lib/world-chat.ts)
       for (const body of chunks) {
-        world.chat.add(
-          {
-            id: uuid(),
-            body,
-            fromId: agentPlayerId,
-            from: agentPlayerName,
-            createdAt: moment().toISOString()
-          },
-          true
-        )
+        postAgentChat(world, {
+          id: uuid(),
+          body,
+          fromId: agentPlayerId,
+          from: agentPlayerName,
+          createdAt: moment().toISOString()
+        })
+        // Per chunk: a later chunk that fails does not undo what was posted
+        noteDelivered()
       }
       return true
     } catch (error: any) {

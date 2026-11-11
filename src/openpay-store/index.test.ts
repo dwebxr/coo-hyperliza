@@ -146,12 +146,14 @@ describe('createOpenPayStorePlugin', () => {
     expect(isOpenPayLink(content)).toBe(false);
   });
 
-  it('never shares on autonomous turns or for an unresolvable product', async () => {
+  it('never shares on autonomous turns or for an unresolvable product (the player is told it posted no link)', async () => {
     const { action } = await loadedPlugin();
     const callback = vi.fn();
     const autonomous = await action.handler(runtime(), { entityId: 'agent', content: { text: '' } } as any, undefined, {}, callback, reply('h_board'));
-    const unknown = await action.handler(runtime(), userMessage('hyperfy', { text: 'それのリンクちょうだい' }), undefined, {}, callback, reply('h_unknown'));
     expect(callback).not.toHaveBeenCalled();
+    const unknown = await action.handler(runtime(), userMessage('hyperfy', { text: 'それのリンクちょうだい' }), undefined, {}, callback, reply('h_unknown'));
+    expect(callback.mock.calls.map(([content]) => content.text)).toEqual(["Sorry, I couldn't tell which product you mean, so I didn't post a link."]);
+    expect(JSON.stringify(callback.mock.calls)).not.toContain('https://');
     expect(autonomous).toMatchObject({ success: false, data: { actionName: SHARE_ACTION } });
     expect(unknown).toMatchObject({ success: false, data: { actionName: SHARE_ACTION } });
   });

@@ -5,7 +5,8 @@ import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
 import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
 import { isOpenPayLink } from "../../openpay-store";
-import { getUsageBudget, runWithOrigin } from "../../usage-budget";
+import { getUsageBudget } from "../../usage-budget";
+import { type TurnContext, neverAbortedSignal, noteDelivered, runTurn } from "../lib/turn-context";
 
 type LiveKitAudioData = {
   participant: string;
@@ -152,8 +153,19 @@ export class VoiceManager {
 
     this.transcriptionTimeout = setTimeout(() => {
       this.transcriptionTimeout = null;
+      const service = this.getService();
+      const world = service?.getWorld();
+      if (!world) return;
+      const turn: TurnContext = {
+        origin: 'voice',
+        // The LiveKit participant identity, which the world's server sets to the player id
+        requesterId: playerId,
+        world,
+        generation: service.getConnectionGeneration(),
+        signal: neverAbortedSignal(),
+      };
       agentActivityLock
-        .run(() => runWithOrigin('voice', () => this.processTranscription(playerId)))
+        .run(() => runTurn(turn, () => this.processTranscription(playerId)))
         .catch((error) => console.error(`Error handling voice from ${playerId}:`, error));
     }, DEBOUNCE_TRANSCRIPTION_THRESHOLD) as unknown as NodeJS.Timeout;
   }
@@ -331,8 +343,9 @@ export class VoiceManager {
   }
 
   /**
-   * Synthesizes text and plays it in the world. Never throws. Resolves to whether speech was
-   * produced: false when there is nothing to say, the voice limit is reached, or TTS failed.
+   * Synthesizes text and plays it in the world. Never throws. Resolves to whether it was played:
+   * false when there is nothing to say, the voice limit is reached, TTS failed, or the playback
+   * was dropped, failed or timed out. A played utterance counts as delivered for the turn.
    */
   async speak(text: string): Promise<boolean> {
     // Never read URLs aloud
@@ -356,8 +369,9 @@ export class VoiceManager {
         return false;
       }
       budget.recordTts(text.length);
-      await this.playAudio(audioBuffer, generation);
-      return true;
+      const played = await this.playAudio(audioBuffer, generation);
+      if (played) noteDelivered();
+      return played;
     } catch (error) {
       logger.warn('[VoiceManager] TTS failed, text-only response sent:', error);
       return false;
@@ -376,33 +390,35 @@ export class VoiceManager {
 
   /**
    * Queues audio so overlapping replies play one after another instead of being dropped.
-   * A failed or hung playback never blocks the ones after it.
+   * A failed or hung playback never blocks the ones after it. Resolves to whether it was played
+   * (the room accepted the whole stream).
    */
-  async playAudio(audioBuffer: Buffer, generation: number = this.playbackGeneration): Promise<void> {
-    if (this.stopped || generation !== this.playbackGeneration) return;
+  async playAudio(audioBuffer: Buffer, generation: number = this.playbackGeneration): Promise<boolean> {
+    if (this.stopped || generation !== this.playbackGeneration) return false;
     if (this.pendingPlaybacks >= MAX_PENDING_PLAYBACKS) {
       logger.warn(`[VoiceManager] ${this.pendingPlaybacks} utterances already queued, dropping audio`);
-      return;
+      return false;
     }
 
     this.pendingPlaybacks++;
     const current = this.playbackChain.then(() =>
-      generation === this.playbackGeneration ? this.playNow(audioBuffer) : undefined
+      generation === this.playbackGeneration ? this.playNow(audioBuffer) : false
     );
-    this.playbackChain = current.catch(() => { });
+    this.playbackChain = current.then(() => { }, () => { });
 
     try {
-      await current;
+      return await current;
     } catch (error) {
       logger.error('[VoiceManager] Audio playback failed:', error);
+      return false;
     } finally {
       if (generation === this.playbackGeneration) this.pendingPlaybacks--;
     }
   }
 
-  private async playNow(audioBuffer: Buffer): Promise<void> {
+  private async playNow(audioBuffer: Buffer): Promise<boolean> {
     const world = this.getService()?.getWorld();
-    if (!world?.livekit) return;
+    if (!world?.livekit) return false;
 
     // Speaking state makes the engine play the TALK emote
     const player = world.entities?.player;
@@ -424,6 +440,7 @@ export class VoiceManager {
         world.livekit.publishAudioStream(audioBuffer, { signal: abort.signal }),
         timeout,
       ]);
+      return true;
     } finally {
       clearTimeout(timer);
       if (this.activePlayback === abort) this.activePlayback = null;

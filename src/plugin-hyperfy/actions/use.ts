@@ -9,12 +9,20 @@ import {
   ModelType
 } from '@elizaos/core';
 import { HyperfyService } from '../service';
-import { forPurpose } from '../../usage-budget';
+import { AiBudgetExceededError, forPurpose } from '../../usage-budget';
+import { AnthropicRefusalError } from '../../anthropic-models';
 import { AgentActions, type PerformActionOutcome } from '../systems/actions';
 import { AgentControls } from '../systems/controls';
-import { actionFailed, actionSucceeded } from '../lib/action-result';
+import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
 
 const USE_ITEM = 'HYPERFY_USE_ITEM';
+
+// What the player is told when the agent reached the item but nothing was used
+const USE_FAILURE_TEXT: Record<Exclude<PerformActionOutcome, 'started'>, string> = {
+  busy: "I'm already using something else.",
+  'no-action-nodes': "There's nothing near me I can use.",
+  'entity-has-no-action-node': "I can't use that one.",
+};
 
 // Template to extract entity to interact with
 const useItemTemplate = `
@@ -58,7 +66,7 @@ export const hyperfyUseItemAction: Action = {
 
     if (!service || !world || !actions || !controls) {
       logger.error('Hyperfy service, world, or actions not found for HYPERFY_USE_ITEM action.');
-      await callback({ text: "Error: Cannot use item. Agent action system unavailable." });
+      await tellFailure(callback, USE_ITEM, "Error: Cannot use item. Agent action system unavailable.");
       return actionFailed(USE_ITEM, 'agent action system unavailable');
     }
 
@@ -78,12 +86,15 @@ export const hyperfyUseItemAction: Action = {
           logger.warn('[USE ITEM] No valid entityId extracted.');
         }
       } catch (err) {
+        // The turn's caller handles these (scripted or offline fallback, a fixed decline)
+        if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError) throw err;
         logger.error('[USE ITEM] Extraction failed:', err);
       }
     }
 
     if (!targetEntityId) {
       logger.warn('[USE ITEM] No suitable item found to use based on the context.');
+      await tellFailure(callback, USE_ITEM, "I couldn't tell which item you mean.");
       return actionFailed(USE_ITEM, 'no suitable item found');
     }
 
@@ -91,10 +102,7 @@ export const hyperfyUseItemAction: Action = {
     const entity = world.entities?.items?.get(targetEntityId);
     const targetPosition = entity?.root?.position
     if (!targetPosition) {
-      await callback({
-        text: `Could not locate entity ${targetEntityId}.`,
-        metadata: { error: 'entity_not_found' }
-      });
+      await tellFailure(callback, USE_ITEM, `Could not locate entity ${targetEntityId}.`, { metadata: { error: 'entity_not_found' } });
       return actionFailed(USE_ITEM, 'entity not found', { targetEntityId });
     }
 
@@ -105,10 +113,12 @@ export const hyperfyUseItemAction: Action = {
       outcome = actions.performAction(targetEntityId);
     } catch (error: any) {
       logger.error('[USE ITEM] Walking to or using the item failed:', error);
+      await tellFailure(callback, USE_ITEM, "I couldn't get to that item.");
       return actionFailed(USE_ITEM, `could not reach or use the item: ${error?.message ?? error}`, { targetEntityId });
     }
     if (outcome !== 'started') {
       logger.warn(`[USE ITEM] Nothing to use on ${targetEntityId} (${outcome}).`);
+      await tellFailure(callback, USE_ITEM, USE_FAILURE_TEXT[outcome]);
       return actionFailed(USE_ITEM, `nothing was used (${outcome})`, { targetEntityId, outcome });
     }
 

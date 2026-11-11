@@ -18,6 +18,17 @@ export function readStringList(source: Record<string, unknown>, key: string): st
   return Array.isArray(value) && value.every((item) => typeof item === 'string') ? value : undefined;
 }
 
+/**
+ * The action names at `key` (default "actions") with blank entries dropped, or undefined when it
+ * is not a list of strings. parseKeyValueXml turns "REPLY," into ["REPLY", ""], and elizaOS core
+ * (1.7.2) resolves "" to the first registered action, because every name contains it.
+ */
+export function readActionNames(source: Record<string, unknown>, key = 'actions'): string[] | undefined {
+  return readStringList(source, key)
+    ?.map((name) => name.trim())
+    .filter((name) => name.length > 0);
+}
+
 // Where a planned response carries the words to say
 const PLANNED_TEXT_KEYS = ['message', 'text'];
 

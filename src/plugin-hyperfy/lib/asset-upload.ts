@@ -46,10 +46,20 @@ export interface UploadNetwork {
   maxUploadSize?: unknown;
 }
 
+/** What a caller of world.network.upload may pass (service.ts installs uploadAsset there). */
+export interface UploadOptions {
+  /**
+   * Called right before each HTTP request (and so after every await before it); it throws to stop
+   * the upload. Scene edits pass their authorization check here; the agent's own avatar and emote
+   * uploads pass none.
+   */
+  check?: () => void;
+}
+
 /**
  * Uploads a file the way the world's own client does: upload-check, then the multipart upload,
  * both with the session's token. Throws AssetUploadError (with the HTTP status when the world
- * answered) instead of failing silently.
+ * answered) instead of failing silently, or whatever `check` throws.
  */
 export async function uploadAsset(
   network: UploadNetwork,
@@ -58,7 +68,8 @@ export async function uploadAsset(
     authToken,
     fetchImpl = fetch,
     timeoutMs = UPLOAD_TIMEOUT_MS,
-  }: { authToken?: string | null; fetchImpl?: typeof fetch; timeoutMs?: number } = {}
+    check,
+  }: { authToken?: string | null; fetchImpl?: typeof fetch; timeoutMs?: number } & UploadOptions = {}
 ): Promise<void> {
   if (!network.apiUrl) throw new AssetUploadError('Upload failed: the world has not sent its API URL yet');
   // The world enforces the same cap; refusing here spares a doomed transfer
@@ -71,6 +82,7 @@ export async function uploadAsset(
   // One deadline for the whole upload
   const signal = AbortSignal.timeout(timeoutMs);
   const send = async (url: string, init: RequestInit = {}): Promise<Response> => {
+    check?.();
     let resp: Response;
     try {
       resp = await fetchImpl(url, { ...init, headers, signal });
@@ -84,8 +96,8 @@ export async function uploadAsset(
   const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
   const filename = `${await hashFileBuffer(Buffer.from(await file.arrayBuffer()))}.${ext}`;
   // First check whether the world already has it
-  const check = await send(`${network.apiUrl}/upload-check?filename=${encodeURIComponent(filename)}`);
-  const data: any = await check.json().catch(() => null);
+  const existing = await send(`${network.apiUrl}/upload-check?filename=${encodeURIComponent(filename)}`);
+  const data: any = await existing.json().catch(() => null);
   if (data?.exists === true) return;
 
   const form = new FormData();

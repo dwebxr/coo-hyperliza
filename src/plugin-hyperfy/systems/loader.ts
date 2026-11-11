@@ -7,6 +7,7 @@ import { createEmoteFactory } from "../hyperfy/src/core/extras/createEmoteFactor
 import { AgentAvatar } from "./avatar.js";
 import { PuppeteerManager } from "../managers/puppeteer-manager.js";
 import { resolveUrl } from "../utils.js";
+import type { WorldScripts } from "../lib/script-api";
 
 // --- Mock Browser Environment for Loaders ---
 // These might need adjustment based on GLTFLoader/VRMLoaderPlugin requirements
@@ -57,8 +58,11 @@ export class AgentLoader extends System {
   results: Map<any, any>;
   gltfLoader: GLTFLoader;
   dummyScene: any;
-  constructor(world) {
+  /** The sandboxed script runtime, or null when world scripts are off (lib/script-sandbox.ts) */
+  private scripts: WorldScripts | null;
+  constructor(world, { scripts = null }: { scripts?: WorldScripts | null } = {}) {
     super(world);
+    this.scripts = scripts;
     this.promises = new Map();
     this.results = new Map();
     this.gltfLoader = new GLTFLoader();
@@ -112,34 +116,14 @@ export class AgentLoader extends System {
           return result;
         }
 
-        // TEMP WORKAROUND: Only load scripts that do not create video, UI, or image elements.
-        // TODO: Replace this with a proper script validation system.
         if (type === 'script') {
           const code = await response.text();
-
-          // TEMP WORKAROUND: Patch world.getPlayer to prevent crash during script init
-          // Many scripts call world.getPlayer().id immediately, which crashes if player isn't loaded.
-          const originalGetPlayer = this.world.getPlayer?.bind(this.world);
-          if (!this.world.getPlayer || !this.world.getPlayer()) {
-            this.world.getPlayer = () => {
-              return originalGetPlayer?.() || {
-                id: 'temp-loading-id',
-                base: { position: new THREE.Vector3() },
-                root: { position: new THREE.Vector3() }
-              };
-            };
-          }
-
-          try {
-            const script = this.world.scripts.evaluate(code);
-            this.results.set(key, script);
-            return script;
-          } catch (e) {
-            console.error(`[ScriptLoader] Failed to evaluate script: ${e.message}`);
-            return null;
-          }
+          // HYPERFY_WORLD_SCRIPTS=off (the default): the code is kept for the engine's bookkeeping
+          // and never evaluated, so the app shows its model and does nothing.
+          const script = this.scripts ? this.scripts.evaluate(code) : { exec() { }, code };
+          this.results.set(key, script);
+          return script;
         }
-
 
         console.warn(`[AgentLoader] Unsupported type in load(): ${type}`);
         return null;

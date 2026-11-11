@@ -4,6 +4,8 @@ vi.mock('../service', () => ({ HyperfyService: { serviceType: 'hyperfy' } }));
 vi.mock('../events', () => ({ hyperfyEventType: { MESSAGE_RECEIVED: 'HYPERFY_MESSAGE_RECEIVED' } }));
 
 import { MessageManager } from './message-manager';
+import { installWorldChat } from '../lib/world-chat';
+import { currentTurn } from '../lib/turn-context';
 
 describe('MessageManager.formatMessages', () => {
   const manager = new MessageManager({ character: { templates: {} } } as any);
@@ -32,27 +34,27 @@ describe('MessageManager.formatMessages', () => {
 });
 
 describe('MessageManager.sendMessage', () => {
+  // The real world chat (lib/world-chat.ts) over the engine's chat state and a recording network
   function createChat() {
     const send = vi.fn();
-    const add = vi.fn((msg, broadcast) => {
-      if (broadcast) send('chatAdded', msg);
-    });
-    const world = {
-      chat: { add },
+    const world: any = {
+      chat: { msgs: [] as any[], listeners: new Set(), add: vi.fn() },
+      events: { emit: vi.fn() },
+      network: { send },
       entities: { player: { data: { id: 'me', name: 'Coo' } } },
     };
+    installWorldChat(world);
     const runtime: any = {
       character: { templates: {} },
       getService: () => ({ isConnected: () => true, getWorld: () => world, getEntityName: () => 'Coo' }),
     };
-    return { manager: new MessageManager(runtime), add, send };
+    return { manager: new MessageManager(runtime), world, send };
   }
 
-  it('broadcasts a long reply as separate chatAdded messages in order', async () => {
-    const { manager, add, send } = createChat();
+  it('broadcasts a long reply as separate chatAdded messages in order, and shows each locally', async () => {
+    const { manager, world, send } = createChat();
     const parts = ['a'.repeat(500), 'b'.repeat(500), 'c'.repeat(250)];
     await expect(manager.sendMessage(parts.join(''))).resolves.toBe(true);
-    expect(add).toHaveBeenCalledTimes(3);
     expect(send).toHaveBeenCalledTimes(3);
     const messages = send.mock.calls.map(([event, msg], index) => {
       expect(event).toBe('chatAdded');
@@ -61,16 +63,16 @@ describe('MessageManager.sendMessage', () => {
       expect(msg.fromId).toBe('me');
       expect(msg.from).toBe('Coo');
       expect(Number.isNaN(Date.parse(msg.createdAt))).toBe(false);
-      expect(add).toHaveBeenNthCalledWith(index + 1, msg, true);
       return msg;
     });
+    expect(world.chat.msgs).toEqual(messages);
     expect(new Set(messages.map((msg) => msg.id)).size).toBe(3);
   });
 
   it.each(['', ' \t\r\n　'])('does not post an empty or whitespace reply (%j)', async (text) => {
-    const { manager, add, send } = createChat();
+    const { manager, world, send } = createChat();
     await expect(manager.sendMessage(text)).resolves.toBe(false);
-    expect(add).not.toHaveBeenCalled();
+    expect(world.chat.msgs).toEqual([]);
     expect(send).not.toHaveBeenCalled();
   });
 
@@ -82,9 +84,9 @@ describe('MessageManager.sendMessage', () => {
     await expect(new MessageManager(runtime).sendMessage('hi')).resolves.toBe(false);
   });
 
-  it('returns false instead of throwing when chat.add fails', async () => {
+  it('returns false instead of throwing when the world chat is not installed', async () => {
     const world = {
-      chat: { add: () => { throw new Error('boom'); } },
+      chat: { add: vi.fn() },
       entities: { player: { data: { id: 'me', name: 'Coo' } } },
     };
     const runtime: any = {
@@ -92,21 +94,20 @@ describe('MessageManager.sendMessage', () => {
       getService: () => ({ isConnected: () => true, getWorld: () => world, getEntityName: () => 'Coo' }),
     };
     await expect(new MessageManager(runtime).sendMessage('hi')).resolves.toBe(false);
+    // Never the broadcasting path app scripts can reach
+    expect(world.chat.add).not.toHaveBeenCalled();
   });
 
-  it('leaves the first chunk posted and returns false when chat.add throws on the second', async () => {
-    const { manager, add, send } = createChat();
-    add.mockImplementationOnce((msg, broadcast) => {
-      if (broadcast) send('chatAdded', msg);
-    }).mockImplementationOnce(() => { throw new Error('second chunk failed'); });
+  it('leaves the first chunk posted and returns false when sending the second fails', async () => {
+    const { manager, send } = createChat();
+    send.mockImplementationOnce(() => {}).mockImplementationOnce(() => { throw new Error('second chunk failed'); });
     const parts = ['a'.repeat(500), 'b'.repeat(500), 'c'.repeat(250)];
 
     await expect(manager.sendMessage(parts.join(''))).resolves.toBe(false);
 
-    expect(add).toHaveBeenCalledTimes(2);
-    expect(add).toHaveBeenNthCalledWith(2, expect.objectContaining({ body: parts[1] }), true);
-    expect(send).toHaveBeenCalledTimes(1);
-    expect(send).toHaveBeenCalledWith('chatAdded', expect.objectContaining({ body: parts[0] }));
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenNthCalledWith(1, 'chatAdded', expect.objectContaining({ body: parts[0] }));
+    expect(send).toHaveBeenNthCalledWith(2, 'chatAdded', expect.objectContaining({ body: parts[1] }));
   });
 });
 
@@ -121,6 +122,7 @@ describe('MessageManager stale turns', () => {
       character: { name: 'Coo', templates: {} },
       getService: () => ({
         getWorld: () => world,
+        getConnectionGeneration: () => 3,
         currentWorldId: 'w1',
         getEmoteManager: () => ({ playEmote: vi.fn() }),
         getVoiceManager: () => ({ speak }),
@@ -138,6 +140,25 @@ describe('MessageManager stale turns', () => {
     await manager.handleMessage({ id: 'm1', fromId: 'p1', from: 'Alice', body: 'hi' }, turn);
     return { manager, turn, callback, sendMessage, speak, runtime, replaceWorld: () => (world = { entities: world.entities }) };
   }
+
+  it('handles the message as a chat turn for its sender, on the world and connection it arrived on', async () => {
+    let seen: any;
+    const world = { entities: { player: { data: { id: 'coo' } } } };
+    const runtime: any = {
+      agentId: 'agent',
+      character: { name: 'Coo', templates: {} },
+      getService: () => ({ getWorld: () => world, getConnectionGeneration: () => 7, currentWorldId: 'w1' }),
+      ensureConnection: vi.fn(),
+      getEntityById: vi.fn().mockResolvedValue({ id: 'e' }),
+      emitEvent: vi.fn(async () => {
+        seen = currentTurn();
+      }),
+    };
+    await new MessageManager(runtime).handleMessage({ id: 'm1', fromId: 'p1', from: 'Alice', body: 'hi' });
+    expect(seen).toMatchObject({ origin: 'chat', requesterId: 'p1', world, generation: 7 });
+    expect(seen.signal.aborted).toBe(false);
+    expect(currentTurn()).toBeUndefined();
+  });
 
   it('delivers replies for a live turn', async () => {
     const { callback, sendMessage, speak } = await receiveAndCaptureCallback();
@@ -178,7 +199,7 @@ describe('MessageManager shop links', () => {
     const runtime: any = {
       agentId: 'agent',
       character: { name: 'Coo', templates: {} },
-      getService: () => ({ getWorld: () => world, currentWorldId: 'w1', getEmoteManager: () => ({ playEmote: vi.fn() }), getVoiceManager: () => ({ speak }) }),
+      getService: () => ({ getWorld: () => world, getConnectionGeneration: () => 0, currentWorldId: 'w1', getEmoteManager: () => ({ playEmote: vi.fn() }), getVoiceManager: () => ({ speak }) }),
       ensureConnection: vi.fn(),
       getEntityById: vi.fn().mockResolvedValue({ id: 'e' }),
       createMemory: vi.fn(),
@@ -195,22 +216,29 @@ describe('MessageManager shop links', () => {
 });
 
 describe('MessageManager tip notices', () => {
-  function setup() {
+  function setup({ receiving = true }: { receiving?: boolean } = {}) {
+    // What the agent posts reaches the network through the world chat
     const add = vi.fn();
     const faceEntity = vi.fn().mockResolvedValue(undefined);
     const self = { data: { id: 'me', type: 'player', name: 'Coo' } };
-    const world = {
-      chat: { add },
+    const world: any = {
+      chat: { msgs: [], listeners: new Set(), add: vi.fn() },
+      events: { emit: vi.fn() },
+      network: { send: (name: string, msg: unknown) => add(msg, name) },
       controls: { faceEntity },
       entities: { player: self, items: new Map<string, any>([['me', self], ['p1', { data: { id: 'p1', type: 'player', name: 'Alice' } }]]) },
     };
+    installWorldChat(world);
     const speak = vi.fn().mockResolvedValue(true);
     const service = {
       isConnected: () => true,
       getWorld: () => world,
+      getConnectionGeneration: () => 0,
       getEntityName: () => 'Coo',
       getEmoteManager: () => ({ hasEmote: () => false, playEmote: vi.fn() }),
       getVoiceManager: () => ({ speak }),
+      // The tip wallet's state on this connection (lib/tip-wallet.ts TipWallet.receivedOnThisConnection)
+      getTipWallet: () => ({ receivedOnThisConnection: receiving }),
       currentWorldId: '00000000-0000-0000-0000-0000000000ee',
     };
     const runtime: any = {
@@ -229,7 +257,7 @@ describe('MessageManager tip notices', () => {
   it('thanks the tipper without a model call: faces them, speaks, and remembers it', async () => {
     const { manager, add, speak, faceEntity, runtime, notice } = setup();
     await manager.handleMessage(notice('Alice tipped Coo 100 JPYC'));
-    expect(add).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining('Aliceさん、100 JPYCの投げゼニ') }), true);
+    expect(add).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining('Aliceさん、100 JPYCの投げゼニ') }), 'chatAdded');
     expect(speak).toHaveBeenCalledWith(expect.stringContaining('ありがとうございます'));
     expect(faceEntity).toHaveBeenCalledWith('p1');
     expect(runtime.createMemory.mock.calls[0][0].content.thought).toBe('Alice tipped me 100 JPYC.');
@@ -240,7 +268,14 @@ describe('MessageManager tip notices', () => {
     const { manager, add, notice } = setup();
     await manager.handleMessage({ id: 'm1', from: 'Alice', fromId: 'p1', body: 'hello Coo', createdAt: new Date().toISOString() });
     await manager.handleMessage(notice('(only you) Alice tipped you 5 JPYC'));
-    expect(add).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining('Thank you so much for the 5 JPYC tip, Alice') }), true);
+    expect(add).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining('Thank you so much for the 5 JPYC tip, Alice') }), 'chatAdded');
+  });
+
+  it('ignores a tip announcement while the agent is not receiving tips on this connection', async () => {
+    const { manager, add, speak, notice } = setup({ receiving: false });
+    await manager.handleMessage(notice('Alice tipped Coo 100 JPYC'));
+    expect(add).not.toHaveBeenCalled();
+    expect(speak).not.toHaveBeenCalled();
   });
 
   it('ignores other world notices and tips to someone else', async () => {

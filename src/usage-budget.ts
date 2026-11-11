@@ -1,5 +1,5 @@
-import { AsyncLocalStorage } from 'node:async_hooks';
 import { logger } from '@elizaos/core';
+import { currentUsageOrigin, runWithUsageOrigin } from './plugin-hyperfy/lib/turn-context';
 
 /**
  * Usage meter and budgets for everything that costs money: Claude calls, vision, text-to-speech
@@ -67,15 +67,17 @@ export class AiBudgetExceededError extends Error {
   }
 }
 
-const originStore = new AsyncLocalStorage<UsageOrigin>();
-
-/** Runs fn with every model call and speech inside it attributed to origin. */
+/**
+ * Runs fn with every model call and speech inside it attributed to origin. Chat, voice and
+ * autonomous turns get their origin from their TurnContext (plugin-hyperfy/lib/turn-context.ts),
+ * which shares this scope.
+ */
 export function runWithOrigin<T>(origin: UsageOrigin, fn: () => Promise<T>): Promise<T> {
-  return originStore.run(origin, fn);
+  return runWithUsageOrigin(origin, fn);
 }
 
 export function currentOrigin(): UsageOrigin {
-  return originStore.getStore() ?? 'other';
+  return currentUsageOrigin() ?? 'other';
 }
 
 /** null = no limit. */

@@ -23,11 +23,16 @@ import { PuppeteerManager } from './managers/puppeteer-manager.js'
 import { BuildManager } from './managers/build-manager.js'
 import { getModuleDirectory } from './utils'
 import { ReconnectController } from './lib/reconnect'
-import { type AssetUploadError, ensureAsset, uploadAsset } from './lib/asset-upload'
+import { type AssetUploadError, type UploadOptions, ensureAsset, uploadAsset } from './lib/asset-upload'
 import { PROTOCOL_VERSION, adaptToWorldProtocol } from './lib/world-protocol'
 import { storage } from './hyperfy/src/core/storage.js'
-import { TipWallet, readTipWalletAccount, signInHost } from './lib/tip-wallet'
+import { TipWallet, signInHost, takeTipWalletAccount } from './lib/tip-wallet'
 import { resolveWorldWsUrl } from './lib/world-url'
+import { installWorldChat, worldChat } from './lib/world-chat'
+import { trackWorldIdentity } from './lib/world-identity'
+import { describeSceneEditsMode, readSceneEditsMode } from './lib/authorization'
+import { resolveWorldScriptsMode, surviveUnhandledRejections } from './lib/script-sandbox'
+import { activateWorldScripts, createWorldScripts } from './lib/script-api'
 import { type HyperfyDisconnectedPayload, hyperfyEventType } from './events'
 
 const moduleDirPath = getModuleDirectory();
@@ -78,6 +83,8 @@ export class HyperfyService extends Service {
   private puppeteerManager: PuppeteerManager;
   private buildManager: BuildManager;
   private tipWallet: TipWallet | null = null;
+  /** HYPERFY_WORLD_SCRIPTS=sandboxed and the sandbox passed its self-test; false means scripts are off */
+  private worldScriptsSandboxed: boolean = false;
 
   public get currentWorldId(): UUID | null {
     return this._currentWorldId
@@ -85,6 +92,11 @@ export class HyperfyService extends Service {
 
   public getWorld(): any | null {
     return this.world;
+  }
+
+  /** Bumped by every teardown; a turn records the one it started on. */
+  public getConnectionGeneration(): number {
+    return this.connectionGeneration;
   }
 
   constructor(protected runtime: IAgentRuntime) {
@@ -102,7 +114,11 @@ export class HyperfyService extends Service {
 
   static async start(runtime: IAgentRuntime): Promise<HyperfyService> {
     console.info('*** Starting Hyperfy service ***')
+    // The key leaves the environment again here: the elizaOS server re-reads .env after the
+    // project is loaded (see takeTipWalletAccount)
+    takeTipWalletAccount()
     const service = new HyperfyService(runtime)
+    service.worldScriptsSandboxed = await HyperfyService.prepareWorldScripts()
     let wsUrl: string
     try {
       wsUrl = resolveWorldWsUrl(process.env.WS_URL)
@@ -123,6 +139,28 @@ export class HyperfyService extends Service {
       })
 
     return service
+  }
+
+  /**
+   * Applies HYPERFY_WORLD_SCRIPTS before any world exists. `sandboxed` locks the whole process
+   * down (SES) and self-tests the sandbox; if that fails the process exits, because a realm that
+   * is locked down halfway, or locked down and still leaking, must neither run scripts nor carry on.
+   */
+  private static async prepareWorldScripts(): Promise<boolean> {
+    const { mode, problem } = resolveWorldScriptsMode(process.env.HYPERFY_WORLD_SCRIPTS)
+    if (problem) console.error(`[Hyperfy] ${problem}`)
+    if (mode === 'off') {
+      console.info('[Hyperfy] World scripts are off: app scripts sent by the world are not run (HYPERFY_WORLD_SCRIPTS=sandboxed runs them in a sandbox; see README).')
+      return false
+    }
+    if (!(await activateWorldScripts())) {
+      console.error('[Hyperfy] HYPERFY_WORLD_SCRIPTS=sandboxed could not be made safe in this runtime. Exiting; set HYPERFY_WORLD_SCRIPTS=off to run without world scripts.')
+      process.exit(1)
+    }
+    // One unhandled rejection in a script would otherwise end the process
+    surviveUnhandledRejections()
+    console.info('[Hyperfy] World scripts run sandboxed (HYPERFY_WORLD_SCRIPTS=sandboxed). The sandbox does not stop a script from hanging the agent; see README.')
+    return true
   }
 
   static async stop(runtime: IAgentRuntime): Promise<void> {
@@ -178,12 +216,19 @@ export class HyperfyService extends Service {
 
       // The engine's packet table, encoding and socket URL predate the world's protocol version
       adaptToWorldProtocol(world.network, () => storage.get('authToken'))
+      // Ranks and account ids as the world's server reports them (lib/authorization.ts reads them)
+      trackWorldIdentity(world)
+      // Only chat the server sent becomes a turn; chat.add never broadcasts (lib/world-chat.ts)
+      installWorldChat(world)
+      const sceneEdits = readSceneEditsMode(process.env)
+      if (sceneEdits.problem) console.error(`[Hyperfy] ${sceneEdits.problem}`)
+      console.info(describeSceneEditsMode(process.env))
 
       // The engine's upload sends no session token and ignores the response, but the world only
       // accepts uploads from an authenticated session. The token is read per call: the snapshot
       // may issue a new one.
-      world.network.upload = (file: File) =>
-        uploadAsset(world.network, file, { authToken: storage.get('authToken') })
+      world.network.upload = (file: File, { check }: UploadOptions = {}) =>
+        uploadAsset(world.network, file, { authToken: storage.get('authToken'), check })
 
       // Registered before init so a socket that closes during init is not missed.
       let kickCode: string | null = null
@@ -229,37 +274,13 @@ export class HyperfyService extends Service {
         ; (world as any).controls = this.controls
       world.systems.push(this.controls)
       // Temporarily comment out AgentLoader to test for updateTransform error
-      const loader = new AgentLoader(world)
+      const loader = new AgentLoader(world, { scripts: this.worldScriptsSandboxed ? createWorldScripts() : null })
         ; (world as any).loader = loader
       world.systems.push(loader);
 
       const environment = new AgentEnvironment(world);
       ; (world as any).environment = environment
       world.systems.push(environment);
-
-      // HACK: Overwriting `chat.add` to prevent crashes caused by the original implementation.
-      // This ensures safe handling of chat messages and avoids unexpected errors from undefined fields.
-      (world as any).chat.add = (msg, broadcast) => {
-        const chat = (world as any).chat;
-        const MAX_MSGS = 50;
-
-        chat.msgs = [...chat.msgs, msg]
-
-        if (chat.msgs.length > MAX_MSGS) {
-          chat.msgs.shift()
-        }
-        for (const callback of chat.listeners) {
-          callback(chat.msgs)
-        }
-
-        // emit chat event
-        const readOnly = Object.freeze({ ...msg })
-        world.events.emit('chat', readOnly)
-        // maybe broadcast
-        if (broadcast) {
-          world.network.send('chatAdded', msg)
-        }
-      };
 
       const mockElement = {
         appendChild: () => { },
@@ -710,6 +731,8 @@ export class HyperfyService extends Service {
     console.info('[HyperfyService] Initializing chat subscription...')
     const generation = this.connectionGeneration
     this.chatQueue = Promise.resolve()
+    // Undefined (not installed) means nothing becomes a turn
+    const chat = worldChat(this.world)
 
     this.world.chat.subscribe((msgs: any[]) => {
       // Wait for player entity (ensures world/chat exist too)
@@ -719,6 +742,10 @@ export class HyperfyService extends Service {
 
       // Step 1: Identify new messages and update processed set
       msgs.forEach((msg: any) => {
+        // Only what the world's server sent on this connection: not app scripts' chat (any
+        // fromId), not the agent's own posts, not the snapshot's history
+        if (!chat?.isLiveFromNetwork(msg)) return
+
         // Check timestamp FIRST - only consider messages newer than connection time
         const messageTimestamp = msg.createdAt ? new Date(msg.createdAt).getTime() : 0;
         // Also check for NaN (invalid date)
@@ -743,7 +770,7 @@ export class HyperfyService extends Service {
         console.info(`[Chat] Found ${newMessagesFound.length} new messages to process.`)
 
         // In arrival order, one at a time. IDs are reserved above, so the listener re-running
-        // (e.g. when Coo posts its reply) cannot queue the same message twice.
+        // (e.g. when another message arrives) cannot queue the same message twice.
         for (const msg of newMessagesFound) {
           this.chatQueue = this.chatQueue.then(async () => {
             if (generation !== this.connectionGeneration) return
@@ -792,7 +819,8 @@ export class HyperfyService extends Service {
   }
 
   private createTipWallet(world: any, wsUrl: string): TipWallet | null {
-    const account = readTipWalletAccount()
+    // Read once per process; the environment no longer has the key after the first read
+    const account = takeTipWalletAccount()
     if (!account) return null
     const host = signInHost(wsUrl)
     if (!host) {
