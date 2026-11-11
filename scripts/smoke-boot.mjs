@@ -8,14 +8,16 @@
  * or `bun run start` in the repository for that: the CLI loads the repository's .env (live world,
  * real database, real keys).
  *
- *   bun run build && node scripts/smoke-boot.mjs --dir <empty scratch directory> [--modes off,sandboxed] [--no-locked] [--keep]
+ *   bun run build && node scripts/smoke-boot.mjs --dir <empty scratch directory> [--modes off,sandboxed] [--no-locked] [--no-bad-limit] [--keep]
  *
  * The scratch directory must have no .env in it or in any directory above it.
  *
  * Each mode runs with SERVER_HOST=127.0.0.1 and an ELIZA_SERVER_AUTH_TOKEN the smoke chooses, and
  * the API is called with it. One more run (`off-locked`, skipped with --no-locked) sets neither: the
  * agent must then listen on loopback only and keep its API locked (401 without a token) while it
- * still boots, which is checked from its log.
+ * still boots, which is checked from its log. A last run (`off-bad-limit`, skipped with
+ * --no-bad-limit) sets AI_MAX_CALLS_PER_HOUR to something that is not a number: the agent must
+ * say which variable it cannot read and exit by itself, without connecting to a world.
  *
  * Per run, in <dir>/run-<mode>/ (created, and removed afterwards unless --keep):
  *   package.json   the repository's, with `scripts` replaced (see below)
@@ -70,6 +72,8 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PG_BIN = process.env.SMOKE_PG_BIN || '/opt/homebrew/opt/postgresql@17/bin';
 const PUPPETEER_CACHE = process.env.SMOKE_PUPPETEER_CACHE_DIR || path.join(os.homedir(), '.cache/puppeteer');
 const BOOT_TIMEOUT_MS = 180_000;
+// What the bad-limit run sets AI_MAX_CALLS_PER_HOUR to
+const BAD_LIMIT = 'not-a-number';
 const EXIT_TIMEOUT_MS = 30_000;
 
 const args = process.argv.slice(2);
@@ -201,15 +205,15 @@ function sampleSockets(pid, remotes, listeners, chromium = new Set()) {
   }
 }
 
-async function smoke(mode, { locked = false } = {}) {
+async function smoke(mode, { locked = false, badLimit = false } = {}) {
   const checks = [];
   const check = (name, ok, detail = '') => {
     checks.push({ name, ok: !!ok, detail });
     console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`);
   };
-  const runDir = path.join(baseDir, `run-${mode}${locked ? '-locked' : ''}`);
+  const runDir = path.join(baseDir, `run-${mode}${locked ? '-locked' : ''}${badLimit ? '-bad-limit' : ''}`);
   if (existsSync(runDir)) throw new Error(`${runDir} already exists; remove it or use another --dir`);
-  console.log(`\n== HYPERFY_WORLD_SCRIPTS=${mode}${locked ? ', no SERVER_HOST and no ELIZA_SERVER_AUTH_TOKEN' : ', SERVER_HOST=127.0.0.1 and a token'} in ${runDir}`);
+  console.log(`\n== HYPERFY_WORLD_SCRIPTS=${mode}${locked ? ', no SERVER_HOST and no ELIZA_SERVER_AUTH_TOKEN' : ', SERVER_HOST=127.0.0.1 and a token'}${badLimit ? `, AI_MAX_CALLS_PER_HOUR=${BAD_LIMIT}` : ''} in ${runDir}`);
 
   const repoStorage = path.join(repo, 'localstorage.json');
   const submoduleStorage = path.join(repo, 'src/plugin-hyperfy/hyperfy/src/localstorage.json');
@@ -271,6 +275,7 @@ async function smoke(mode, { locked = false } = {}) {
       ANTHROPIC_API_KEY: dummyAnthropicKey,
       TIP_WALLET_PRIVATE_KEY: dummyTipKey,
       HYPERFY_WORLD_SCRIPTS: mode,
+      ...(badLimit ? { AI_MAX_CALLS_PER_HOUR: BAD_LIMIT } : {}),
       // Nothing may be installed: node_modules is a link to the repository's
       ELIZA_NO_AUTO_INSTALL: 'true',
       ELIZA_NO_PLUGIN_AUTO_INSTALL: 'true',
@@ -337,6 +342,35 @@ async function smoke(mode, { locked = false } = {}) {
       });
       return { status: response.status, text: await response.text() };
     };
+
+    const storageChecks = () => {
+      const storageAfter = [fingerprint(repoStorage), fingerprint(submoduleStorage)];
+      check("the repository's localstorage.json is untouched (stat only)", storageBefore[0] === storageAfter[0]);
+      check('no storage file appeared in the engine submodule', storageAfter[1] === 'absent' && storageBefore[1] === 'absent', `before: ${storageBefore[1]}, after: ${storageAfter[1]}`);
+    };
+
+    if (badLimit) {
+      // A usage limit that cannot be read must stop the start: it must never mean "no limit"
+      await waitFor('the agent to exit', () => false);
+      check('the agent exits by itself, with a failure status, when a usage limit is not a number', !!exited && exited.code !== 0 && exited.signal === null, exited ? JSON.stringify(exited) : `still running after ${BOOT_TIMEOUT_MS / 1000}s`);
+      check('it says which variable it cannot read', logText().includes(`[Usage] AI_MAX_CALLS_PER_HOUR="${BAD_LIMIT}" is not a number of 0 or more`), (logText().match(/\[Usage\] AI_MAX_CALLS_PER_HOUR[^\n]*/) ?? [''])[0].slice(0, 200));
+      check('it says that it is not starting', logText().includes('[Usage] Not starting'));
+      check('it never tried to connect to a world', !logText().includes('Attempting automatic connection') && !logText().includes('Starting Hyperfy service'));
+      let answered = false;
+      try {
+        await fetch(`http://127.0.0.1:${serverPort}/api/agents`, { signal: AbortSignal.timeout(2000) });
+        answered = true;
+      } catch {
+        // nothing listens
+      }
+      check('nothing serves the API afterwards', !answered);
+      sample();
+      const external = [...remotes].filter((remote) => !isLoopback(remote.replace(/:\d+$/, '')));
+      check('no proxy-aware client tried to reach another host', recorder.seen.length === 0, recorder.seen.join(' | '));
+      check('every sampled connection went to 127.0.0.1', external.length === 0, external.join(', '));
+      storageChecks();
+      return checks;
+    }
 
     // An empty list means dist/index.js failed to import: the CLI only warns and starts with no agent
     let agents = [];
@@ -502,9 +536,7 @@ async function smoke(mode, { locked = false } = {}) {
       );
     }
 
-    const storageAfter = [fingerprint(repoStorage), fingerprint(submoduleStorage)];
-    check("the repository's localstorage.json is untouched (stat only)", storageBefore[0] === storageAfter[0]);
-    check('no storage file appeared in the engine submodule', storageAfter[1] === 'absent' && storageBefore[1] === 'absent', `before: ${storageBefore[1]}, after: ${storageAfter[1]}`);
+    storageChecks();
     console.log(`  info  storage file in the run directory: ${fingerprint(path.join(runDir, 'localstorage.json'))}`);
     console.log(`  info  files in the run directory: ${readdirSync(runDir).join(' ')}`);
   } catch (error) {
@@ -527,7 +559,7 @@ async function smoke(mode, { locked = false } = {}) {
 }
 
 if (!baseDir) {
-  console.error('Usage: node scripts/smoke-boot.mjs --dir <empty scratch directory> [--modes off,sandboxed] [--keep]');
+  console.error('Usage: node scripts/smoke-boot.mjs --dir <empty scratch directory> [--modes off,sandboxed] [--no-locked] [--no-bad-limit] [--keep]');
   process.exit(2);
 }
 if (baseDir === repo || baseDir.startsWith(repo + path.sep)) {
@@ -544,6 +576,7 @@ console.log(`Smoke of ${path.join(repo, 'dist/index.js')} (built ${statSync(path
 const results = [];
 for (const mode of modes) results.push(...(await smoke(mode)).map((entry) => ({ mode, ...entry })));
 if (!args.includes('--no-locked')) results.push(...(await smoke('off', { locked: true })).map((entry) => ({ mode: 'off-locked', ...entry })));
+if (!args.includes('--no-bad-limit')) results.push(...(await smoke('off', { badLimit: true })).map((entry) => ({ mode: 'off-bad-limit', ...entry })));
 const failed = results.filter((entry) => !entry.ok);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed${failed.length ? `; FAILED: ${failed.map((entry) => `[${entry.mode}] ${entry.name}`).join('; ')}` : ''}`);
 process.exit(failed.length ? 1 : 0);

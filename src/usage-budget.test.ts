@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   AI_PURPOSE_MAX_TOKENS,
+  type AiReservation,
   UsageBudget,
+  UsageLimitError,
   type UsageLimits,
   currentOrigin,
   forPurpose,
@@ -9,6 +11,7 @@ import {
   maxTokensFor,
   readUsageLimits,
   runWithOrigin,
+  usageLimitProblems,
 } from './usage-budget';
 
 const HOUR = 60 * 60_000;
@@ -31,6 +34,17 @@ function clock(start = 1_000_000_000) {
 
 const call = (purpose = 'chat', input = 100, output = 10) => ({ purpose, origin: 'chat' as const, inputTokens: input, outputTokens: output });
 
+/** A Claude call that was admitted and returned with this usage, as src/anthropic-models.ts does it. */
+function made(budget: UsageBudget, usage = call(), reserve = usage.inputTokens + usage.outputTokens): void {
+  const reservation = budget.reserveAi(usage, reserve);
+  if (typeof reservation === 'string') throw new Error(`not admitted: ${reservation}`);
+  reservation.settle(usage);
+}
+const admitted = (reservation: AiReservation | string): AiReservation => {
+  if (typeof reservation === 'string') throw new Error(`not admitted: ${reservation}`);
+  return reservation;
+};
+
 describe('readUsageLimits', () => {
   it('has no Claude, vision or voice limits by default, and a modest autonomous budget', () => {
     expect(readUsageLimits({})).toEqual({
@@ -44,25 +58,66 @@ describe('readUsageLimits', () => {
     });
   });
 
-  it('reads every limit, where 0 turns that use off and invalid values are ignored', () => {
+  it('reads every limit: empty or unset is no limit (the default for the autonomous ones), 0 turns that use off', () => {
     const limits = readUsageLimits({
       AI_MAX_CALLS_PER_HOUR: '120',
-      AI_MAX_TOKENS_PER_DAY: '2000000',
+      AI_MAX_TOKENS_PER_DAY: ' 2000000 ',
       VISION_MAX_PER_HOUR: '0',
-      VOICE_TTS_MAX_CHARS_PER_DAY: '20000',
-      VOICE_STT_MAX_SECONDS_PER_DAY: 'lots',
+      VOICE_TTS_MAX_CHARS_PER_DAY: '',
+      VOICE_STT_MAX_SECONDS_PER_DAY: '   ',
       AUTONOMY_AI_MAX_PER_HOUR: '0',
-      AUTONOMY_AI_MIN_INTERVAL_SEC: '300',
+      AUTONOMY_AI_MIN_INTERVAL_SEC: '300.9',
     });
-    expect(limits).toMatchObject({
+    expect(limits).toEqual({
       aiCallsPerHour: 120,
       aiTokensPerDay: 2_000_000,
       visionPerHour: 0,
-      ttsCharsPerDay: 20_000,
+      ttsCharsPerDay: null,
       sttSecondsPerDay: null,
       autonomyAiPerHour: 0,
       autonomyAiMinIntervalMs: 300_000,
     });
+  });
+
+  it.each(['lots', '-1', '1e3', '0x10', '1,000', '100 calls', 'Infinity', 'NaN', '+5', '.5', '5.', '１２', '9'.repeat(30)])('refuses the value %j instead of taking it for "no limit"', (value) => {
+    for (const key of ['AI_MAX_CALLS_PER_HOUR', 'AI_MAX_TOKENS_PER_DAY', 'VISION_MAX_PER_HOUR', 'VOICE_TTS_MAX_CHARS_PER_DAY', 'VOICE_STT_MAX_SECONDS_PER_DAY', 'AUTONOMY_AI_MAX_PER_HOUR', 'AUTONOMY_AI_MIN_INTERVAL_SEC']) {
+      expect(() => readUsageLimits({ [key]: value }), key).toThrow(UsageLimitError);
+      expect(usageLimitProblems({ [key]: value }), key).toHaveLength(1);
+    }
+    // A budget that reads its limits from the environment fails closed on first use
+    const env = process.env.AI_MAX_CALLS_PER_HOUR;
+    process.env.AI_MAX_CALLS_PER_HOUR = value;
+    try {
+      const budget = new UsageBudget();
+      expect(() => budget.aiAvailable()).toThrow(UsageLimitError);
+      expect(() => budget.reserveAi({ purpose: 'chat', origin: 'chat' }, 10)).toThrow(UsageLimitError);
+    } finally {
+      if (env === undefined) delete process.env.AI_MAX_CALLS_PER_HOUR;
+      else process.env.AI_MAX_CALLS_PER_HOUR = env;
+    }
+  });
+});
+
+describe('usageLimitProblems', () => {
+  it('finds nothing wrong with empty, zero and plain numbers', () => {
+    expect(usageLimitProblems({})).toEqual([]);
+    expect(usageLimitProblems({ AI_MAX_CALLS_PER_HOUR: '', AI_MAX_TOKENS_PER_DAY: '0', VISION_MAX_PER_HOUR: '12', AI_MAX_TOKENS_CHAT: '3000', USAGE_REPORT_INTERVAL_MIN: '0' })).toEqual([]);
+  });
+
+  it('names every variable it cannot read, also the per-purpose caps and the report interval, and says what to write instead', () => {
+    const problems = usageLimitProblems({ AI_MAX_CALLS_PER_HOUR: 'abc', AI_MAX_TOKENS_SHOULD_RESPOND: '-5', USAGE_REPORT_INTERVAL_MIN: 'hourly', VISION_MAX_PER_HOUR: '3' });
+    expect(problems).toEqual([
+      '[Usage] AI_MAX_CALLS_PER_HOUR="abc" is not a number of 0 or more. Leave it empty for the default (for a limit: no limit), or set a number (0 turns that use off).',
+      '[Usage] AI_MAX_TOKENS_SHOULD_RESPOND="-5" is not a number of 0 or more. Leave it empty for the default (for a limit: no limit), or set a number (0 turns that use off).',
+      '[Usage] USAGE_REPORT_INTERVAL_MIN="hourly" is not a number of 0 or more. Leave it empty for the default (for a limit: no limit), or set a number (0 turns that use off).',
+    ]);
+  });
+
+  it('shows only the start of a value, on one line (it could be a secret pasted into the wrong line)', () => {
+    const [problem] = usageLimitProblems({ AI_MAX_TOKENS_PER_DAY: `sk-ant-${'x'.repeat(80)}\nINFO forged` });
+    expect(problem).toContain('AI_MAX_TOKENS_PER_DAY="sk-ant-xxxxxxxxxxxxxxxxx…"');
+    expect(problem).not.toContain('forged');
+    expect(problem).not.toContain('\n');
   });
 });
 
@@ -94,10 +149,11 @@ describe('UsageBudget', () => {
   it('stops Claude after the hourly call limit, and allows it again as the hour rolls on', () => {
     const c = clock();
     const budget = new UsageBudget({ ...noLimits, aiCallsPerHour: 2 }, c.now);
-    budget.recordAi(call());
+    made(budget);
     c.advance(10 * 60_000);
-    budget.recordAi(call());
+    made(budget);
     expect(budget.aiBlockedReason()).toBe('AI_MAX_CALLS_PER_HOUR=2');
+    expect(budget.reserveAi(call(), 1)).toBe('AI_MAX_CALLS_PER_HOUR=2');
     c.advance(50 * 60_000 + 1);
     expect(budget.aiAvailable()).toBe(true);
   });
@@ -105,12 +161,68 @@ describe('UsageBudget', () => {
   it('counts every kind of token toward the daily token limit', () => {
     const c = clock();
     const budget = new UsageBudget({ ...noLimits, aiTokensPerDay: 1000 }, c.now);
-    budget.recordAi({ ...call('chat', 500, 100), cacheReadTokens: 300 });
+    made(budget, { ...call('chat', 500, 100), cacheReadTokens: 300 } as ReturnType<typeof call>, 900);
     expect(budget.aiAvailable()).toBe(true);
-    budget.recordAi(call('chat', 50, 50));
+    made(budget, call('chat', 50, 50));
     expect(budget.aiBlockedReason()).toBe('AI_MAX_TOKENS_PER_DAY=1000');
     c.advance(DAY);
     expect(budget.aiAvailable()).toBe(true);
+  });
+
+  it('admits a Claude call only when its whole reservation fits the daily token limit', () => {
+    const budget = new UsageBudget({ ...noLimits, aiTokensPerDay: 1000 }, clock().now);
+    made(budget, call('chat', 600, 100));
+    // 300 are left: something is available, but not for a call that may use 301
+    expect(budget.aiAvailable()).toBe(true);
+    expect(budget.reserveAi(call(), 301)).toBe('AI_MAX_TOKENS_PER_DAY=1000');
+    const fits = admitted(budget.reserveAi(call(), 300));
+    // Reserved to the last token: nothing else is admitted while that call runs
+    expect(budget.aiAvailable()).toBe(false);
+    expect(budget.reserveAi(call(), 1)).toBe('AI_MAX_TOKENS_PER_DAY=1000');
+    // It used less than it reserved: the rest is free again
+    fits.settle(call('chat', 100, 50));
+    expect(budget.snapshot(DAY).ai).toMatchObject({ calls: 2, inputTokens: 700, outputTokens: 150, reservedTokens: 0 });
+    expect(admitted(budget.reserveAi(call(), 150))).toBeDefined();
+  });
+
+  it('never admits more calls than the hourly limit, however many ask before any has returned', () => {
+    const budget = new UsageBudget({ ...noLimits, aiCallsPerHour: 3 }, clock().now);
+    const results = Array.from({ length: 10 }, () => budget.reserveAi(call(), 100));
+    expect(results.filter((r) => typeof r !== 'string')).toHaveLength(3);
+    expect(results.slice(3).every((r) => r === 'AI_MAX_CALLS_PER_HOUR=3')).toBe(true);
+    expect(budget.snapshot(HOUR).ai.calls).toBe(3);
+  });
+
+  it('never admits reservations beyond the daily token limit, however many ask before any has returned', () => {
+    const budget = new UsageBudget({ ...noLimits, aiTokensPerDay: 1000 }, clock().now);
+    const results = Array.from({ length: 10 }, () => budget.reserveAi(call(), 300));
+    expect(results.filter((r) => typeof r !== 'string')).toHaveLength(3);
+    expect(budget.snapshot(DAY).ai.reservedTokens).toBe(900);
+  });
+
+  it('keeps a failed call counted: as a call always, and with its whole reservation unless the API refused the request outright', () => {
+    const c = clock();
+    const budget = new UsageBudget({ ...noLimits, aiCallsPerHour: 3, aiTokensPerDay: 1000 }, c.now);
+    admitted(budget.reserveAi(call(), 400)).fail('unknown');
+    admitted(budget.reserveAi(call(), 400)).fail('rejected');
+    expect(budget.snapshot(DAY).ai).toMatchObject({ calls: 2, inputTokens: 0, outputTokens: 0, reservedTokens: 400 });
+    // 600 tokens and one call are left
+    expect(budget.reserveAi(call(), 601)).toBe('AI_MAX_TOKENS_PER_DAY=1000');
+    admitted(budget.reserveAi(call(), 600)).fail('rejected');
+    expect(budget.aiBlockedReason()).toBe('AI_MAX_CALLS_PER_HOUR=3');
+    expect(formatUsageReport(budget.snapshot(DAY))).toContain('Claude 3 calls (0 in / 0 out / 400 held for calls in progress or failed)');
+    // The held tokens leave with the day, like any other use
+    c.advance(DAY);
+    expect(budget.snapshot(DAY).ai.reservedTokens).toBe(0);
+  });
+
+  it('ends a reservation once: a second settle or fail changes nothing', () => {
+    const budget = new UsageBudget({ ...noLimits, aiTokensPerDay: 1000 }, clock().now);
+    const reservation = admitted(budget.reserveAi(call(), 500));
+    reservation.settle(call('chat', 10, 5));
+    reservation.fail('unknown');
+    reservation.settle(call('chat', 999, 999));
+    expect(budget.snapshot(DAY).ai).toMatchObject({ calls: 1, inputTokens: 10, outputTokens: 5, reservedTokens: 0 });
   });
 
   it('spaces autonomous Claude ticks, counting from the last tick or the end of the last conversation', () => {
@@ -134,38 +246,66 @@ describe('UsageBudget', () => {
     expect(budget.autonomyAiAvailable()).toBe(false);
     c.advance(30 * 60_000);
     expect(budget.autonomyAiAvailable()).toBe(true);
-    for (let i = 0; i < 5; i++) budget.recordAi(call());
+    for (let i = 0; i < 5; i++) made(budget);
     expect(budget.autonomyAiAvailable()).toBe(false);
 
     const off = new UsageBudget({ ...noLimits, autonomyAiPerHour: 0 }, c.now);
     expect(off.autonomyAiAvailable()).toBe(false);
   });
 
-  it('limits vision per hour and voice per day, each on its own', () => {
+  it('limits vision per hour and voice per day, each on its own, and never admits what does not fit whole', () => {
     const c = clock();
     const budget = new UsageBudget({ ...noLimits, visionPerHour: 1, ttsCharsPerDay: 100, sttSecondsPerDay: 60 }, c.now);
-    budget.recordVision();
-    budget.recordTts(99);
-    budget.recordStt(59.5);
+    expect(budget.reserveVision()).not.toBeNull();
+    expect(budget.reserveVision()).toBeNull();
+    expect(budget.reserveTts(99)).toBe(true);
+    expect(budget.reserveStt(59.5)).toBe(true);
     expect([budget.visionAvailable(), budget.ttsAvailable(), budget.sttAvailable()]).toEqual([false, true, true]);
-    budget.recordTts(5);
-    budget.recordStt(1);
+    // One character and half a second are left
+    expect(budget.reserveTts(2)).toBe(false);
+    expect(budget.reserveStt(0.6)).toBe(false);
+    expect(budget.snapshot(DAY)).toMatchObject({ ttsChars: 99, sttSeconds: 59.5 });
+    expect(budget.reserveTts(1)).toBe(true);
+    expect(budget.reserveStt(0.5)).toBe(true);
     expect([budget.ttsAvailable(), budget.sttAvailable(), budget.aiAvailable()]).toEqual([false, false, true]);
     c.advance(HOUR);
     expect(budget.visionAvailable()).toBe(true);
     expect(budget.ttsAvailable()).toBe(false);
     c.advance(DAY);
-    expect(budget.ttsAvailable()).toBe(true);
+    expect(budget.reserveTts(100)).toBe(true);
+  });
+
+  it('admits no voice or vision at a limit of 0, and nothing that is not an amount', () => {
+    const off = new UsageBudget({ ...noLimits, visionPerHour: 0, ttsCharsPerDay: 0, sttSecondsPerDay: 0, aiCallsPerHour: 0 }, clock().now);
+    expect([off.reserveVision(), off.reserveTts(1), off.reserveTts(0), off.reserveStt(0.01), off.reserveStt(0)]).toEqual([null, false, false, false, false]);
+    expect(off.reserveAi(call(), 0)).toBe('AI_MAX_CALLS_PER_HOUR=0');
+    const open = new UsageBudget(noLimits, clock().now);
+    expect([open.reserveTts(Number.NaN), open.reserveStt(-1), open.reserveTts(Number.POSITIVE_INFINITY)]).toEqual([false, false, false]);
+    expect(open.snapshot(DAY)).toMatchObject({ ttsChars: 0, sttSeconds: 0 });
+  });
+
+  it('gives a look at the world back when it is released, once', () => {
+    const budget = new UsageBudget({ ...noLimits, visionPerHour: 1 }, clock().now);
+    const look = budget.reserveVision()!;
+    expect(budget.reserveVision()).toBeNull();
+    look.release();
+    look.release();
+    const again = budget.reserveVision();
+    expect(again).not.toBeNull();
+    // Releasing the first one again does not free the second
+    look.release();
+    expect(budget.reserveVision()).toBeNull();
+    expect(budget.snapshot(HOUR).vision).toBe(1);
   });
 
   it('reports usage by purpose, origin and kind for a window', async () => {
     const c = clock();
     const budget = new UsageBudget(noLimits, c.now);
-    budget.recordAi(call('chat', 1000, 100));
-    budget.recordAi({ ...call('autonomous', 2000, 50), origin: 'autonomous' });
-    await runWithOrigin('autonomous', async () => budget.recordTts(40));
-    budget.recordTts(10);
-    budget.recordStt(12.4);
+    made(budget, call('chat', 1000, 100));
+    made(budget, { ...call('autonomous', 2000, 50), origin: 'autonomous' } as unknown as ReturnType<typeof call>);
+    await runWithOrigin('autonomous', async () => budget.reserveTts(40));
+    budget.reserveTts(10);
+    budget.reserveStt(12.4);
     budget.recordAutonomyAiTick();
     budget.recordScriptedTick();
     budget.recordScriptedTick();

@@ -18,18 +18,21 @@ const texturesMap = (window.texturesMap = new Map()); // `${materialId}:${slot}`
 const avatarMap = (window.avatarMap = new Map()); // avatar URL -> VRM factory
 window.activeVRMInstances = [];
 
-// How to take back what a recent load kept, by the operation id the agent passed with it: the agent
-// calls undo(op) when the world the load was for went away while it ran. Only the latest are kept.
+// How to take back what a load kept, by the operation id the agent passed with it. The agent
+// settles every such load as soon as it returns: settle(op, true) commits it (the record goes at
+// once), settle(op, false) takes it back (the world it was for went away, or the call failed).
+// A record lives only between a load's return and its settlement; there is no expiry.
 const undoable = new Map();
-const UNDO_KEPT = 64;
 function keepUndo(op, undoIt) {
-  if (op !== undefined) remember(undoable, op, undoIt, UNDO_KEPT, () => {});
+  if (op !== undefined) undoable.set(op, undoIt);
 }
-function undo(op) {
+function settle(op, keep) {
   const undoIt = undoable.get(op);
   undoable.delete(op);
-  if (undoIt) undoIt();
+  if (undoIt && !keep) undoIt();
 }
+/** Loads waiting for the agent to settle them (for scripts/smoke-chromium.mjs) */
+const pendingSettlements = () => undoable.size;
 /** Drops the texture under `key` and frees it, if it is still the one this load put there */
 function forgetTexture(key, texture) {
   if (texturesMap.get(key) === texture) texturesMap.delete(key);
@@ -371,4 +374,4 @@ function rehydrate(sceneJson, stripSlots, players) {
   window.renderer.render(window.scene, window.camera);
 }
 
-window.agentPage = { LIMITS, loadGlb, loadVrm, registerTexture, loadEnvironmentHDR, hdrTexture, rehydrate, undo };
+window.agentPage = { LIMITS, loadGlb, loadVrm, registerTexture, loadEnvironmentHDR, hdrTexture, rehydrate, settle, pendingSettlements };

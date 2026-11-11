@@ -26,6 +26,20 @@ describe('composeOfflineReply', () => {
   });
 });
 
+describe('composeOfflineReply and short titles', () => {
+  it('posts no link for a message that merely contains a short title, and does not offer that title as an example', () => {
+    const shelf = [product('h_cap', 'Cap'), product('h_ai', 'AI'), product('h_hon', '本'), product('h_board', 'Hyper Board')];
+    for (const text of ['Nice cap!', 'I work on AI', 'この本は何？']) {
+      const reply = composeOfflineReply({ text, products: shelf, japanese: false });
+      expect(reply.kind, text).toBe('notice');
+      expect(reply.content.text).toBe("Sorry, I'm on a short break and can't chat properly right now. Tell me a product name and I'll post its purchase link (e.g. Hyper Board).");
+    }
+    // With nothing recognisable on the shelf there is nothing to offer
+    expect(composeOfflineReply({ text: 'hello', products: shelf.slice(0, 3), japanese: false }).content.text).toBe("Sorry, I'm on a short break and can't chat properly right now.");
+    expect(composeOfflineReply({ text: 'the Hyper Board please', products: shelf, japanese: false }).kind).toBe('link');
+  });
+});
+
 describe('NoticeThrottle', () => {
   it('allows one notice per key per interval', () => {
     let t = 0;

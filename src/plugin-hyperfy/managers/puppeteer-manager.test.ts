@@ -218,7 +218,7 @@ describe('PuppeteerManager', () => {
     vi.restoreAllMocks();
   });
 
-  it('takes back what a page call kept when the signal fired while it ran, under the id it passed', async () => {
+  it('settles a page call whose signal fired while it ran as taken back, under the id it passed (the page side is checked by smoke-chromium)', async () => {
     const manager = PuppeteerManager.getOrCreate({} as any) as any;
     const page = await manager.init();
     const stop = new AbortController();
@@ -229,15 +229,48 @@ describe('PuppeteerManager', () => {
 
     await expect(manager.registerTexture({ bytes: new Uint8Array([1]), contentType: 'image/png', url: 'https://world.test/a.png' }, 'map', { signal: stop.signal })).rejects.toBeInstanceOf(PageOperationCancelled);
 
-    const [loadCall, undoCall] = page.evaluate.mock.calls.slice(-2);
+    const [loadCall, settleCall] = page.evaluate.mock.calls.slice(-2);
     const op = loadCall.at(-1);
     expect(op).toMatch(/^op-\d+$/);
-    expect(undoCall.slice(1)).toEqual([op]);
-    // The undo call runs agentPage.undo with that id
-    const undone: string[] = [];
-    (globalThis as any).window = { agentPage: { undo: (id: string) => undone.push(id) } };
-    undoCall[0](op);
-    expect(undone).toEqual([op]);
+    expect(settleCall.slice(1)).toEqual([op, false]);
+    // The settle call runs agentPage.settle with that id
+    const settled: unknown[][] = [];
+    (globalThis as any).window = { agentPage: { settle: (...args: unknown[]) => settled.push(args) } };
+    settleCall[0](op, false);
+    expect(settled).toEqual([[op, false]]);
+  });
+
+  it('commits every page call that succeeded with its signal unfired, and takes back one that failed', async () => {
+    const manager = PuppeteerManager.getOrCreate({} as any) as any;
+    const page = await manager.init();
+    const signal = new AbortController().signal;
+
+    await manager.registerTexture({ bytes: new Uint8Array([1]), contentType: 'image/png', url: 'https://world.test/a.png' }, 'map', { signal });
+    const [committedLoad, commit] = page.evaluate.mock.calls.slice(-2);
+    expect(commit.slice(1)).toEqual([committedLoad.at(-1), true]);
+
+    page.evaluate.mockImplementationOnce(async () => {
+      throw new Error('decode failed');
+    });
+    await expect(manager.loadEnvironmentHDR(new Uint8Array([1]), { signal })).rejects.toThrow('decode failed');
+    const [failedLoad, takeBack] = page.evaluate.mock.calls.slice(-2);
+    expect(takeBack.slice(1)).toEqual([failedLoad.at(-1), false]);
+  });
+
+  it('runs page calls under its watchdog: a call past the deadline fails with RenderPageKilled, and the next use starts a new browser', async () => {
+    const manager = new PuppeteerManager({} as any, { watchdog: { deadlineMs: 100, table: async () => [] } }) as any;
+    const page = await manager.init();
+    page.evaluate.mockImplementationOnce(() => new Promise(() => {}));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const error = await manager.loadEnvironmentHDR(new Uint8Array([1])).catch((e: unknown) => e);
+
+    expect(error).toMatchObject({ name: 'RenderPageKilled', reason: 'deadline' });
+    expect(launched).toHaveLength(1);
+    const next = await manager.init();
+    expect(next).not.toBe(page);
+    expect(launched).toHaveLength(2);
+    vi.restoreAllMocks();
   });
 
   it('writes diagnostic snapshots to disk only when HYPERFY_DEBUG_SNAPSHOTS=true', async () => {

@@ -22,11 +22,22 @@ describe('describeUrl', () => {
     expect(describeUrl(url)).toBe(expected);
   });
 
-  it('caps a long URL and says how long it was', () => {
+  it('caps a long URL at MAX_LOGGED_URL characters in all, and says how long it was', () => {
     const url = `https://cdn.example.com/${'a'.repeat(500)}.glb`;
     const line = describeUrl(url);
-    expect(line.startsWith(url.slice(0, MAX_LOGGED_URL))).toBe(true);
+    expect(line.startsWith(url.slice(0, 150))).toBe(true);
     expect(line).toContain(`(${url.length} characters)`);
-    expect(line.length).toBeLessThan(MAX_LOGGED_URL + 40);
+    expect(line.length).toBeLessThanOrEqual(MAX_LOGGED_URL);
+    for (const long of [`/${'p'.repeat(5000)}`, `data:${'t'.repeat(5000)},x`, `blob:https://cdn.example.com/${'b'.repeat(5000)}`, `https://h.example.com/?${'k'.repeat(5000)}=v`]) {
+      expect(describeUrl(long).length, long.slice(0, 30)).toBeLessThanOrEqual(MAX_LOGGED_URL);
+    }
+  });
+
+  it('unwraps one blob: and writes a blob: inside it as another kind, however deeply nested', () => {
+    expect(describeUrl('blob:blob:https://user:pw@cdn.example.com/a')).toBe('blob:<URL of another kind, 38 characters>');
+    const deep = `${'blob:'.repeat(100_000)}https://cdn.example.com/a`;
+    const line = describeUrl(deep);
+    expect(line.startsWith('blob:<URL of another kind')).toBe(true);
+    expect(line.length).toBeLessThanOrEqual(MAX_LOGGED_URL);
   });
 });

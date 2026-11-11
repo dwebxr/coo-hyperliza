@@ -8,6 +8,13 @@ import { currentUsageOrigin, runWithUsageOrigin } from './plugin-hyperfy/lib/tur
  *
  * Counts are in memory, over rolling windows (the last hour / the last 24 hours), and start
  * from zero when the agent restarts.
+ *
+ * A use is reserved before the request is made (reserveAi, reserveVision, reserveTts, reserveStt):
+ * the check and the count are one synchronous step, so requests that start at the same time cannot
+ * all pass a check that only one of them fits. A reservation is admitted only when it fits the
+ * limit whole, so a limit is not exceeded by what was reserved; a use that turns out larger than
+ * its reservation (see reserveAi) is the one way over. The *Available() checks reserve nothing:
+ * they say whether anything is left, for deciding early not to start.
  */
 
 type Env = Record<string, string | undefined>;
@@ -44,10 +51,18 @@ export function purposeEnvKey(purpose: AiPurpose): string {
   return `AI_MAX_TOKENS_${purpose.toUpperCase().replace(/-/g, '_')}`;
 }
 
-/** The output cap for a tagged call; undefined for untagged calls (other plugins). */
+/**
+ * The output cap for a tagged call; undefined for untagged calls (other plugins). An override
+ * that is not a number is refused at startup (usageLimitProblems); here it gives the default cap.
+ */
 export function maxTokensFor(purpose: unknown, env: Env = process.env): number | undefined {
   if (!isAiPurpose(purpose)) return undefined;
-  const override = parseCount(env[purposeEnvKey(purpose)], purposeEnvKey(purpose));
+  let override: number | null = null;
+  try {
+    override = parseCount(env[purposeEnvKey(purpose)], purposeEnvKey(purpose));
+  } catch {
+    // The default cap below
+  }
   return override && override > 0 ? override : AI_PURPOSE_MAX_TOKENS[purpose];
 }
 
@@ -96,24 +111,61 @@ export interface UsageLimits {
 export const DEFAULT_AUTONOMY_AI_PER_HOUR = 20;
 export const DEFAULT_AUTONOMY_AI_MIN_INTERVAL_SEC = 120;
 
-const warnedInvalid = new Set<string>();
+/** A usage variable is set to something that is not a number of 0 or more. */
+export class UsageLimitError extends Error {
+  constructor(key: string, raw: string) {
+    // The value could be anything pasted into the wrong line: only its start, on one line
+    const shown = raw.trim().replace(/[^\x20-\x7e]/g, '?').slice(0, 24);
+    super(`${key}="${shown}${raw.trim().length > 24 ? '…' : ''}" is not a number of 0 or more`);
+    this.name = 'UsageLimitError';
+  }
+}
 
-/** An empty value means "use the default"; a number is the limit (0 turns that use off). */
+// Digits with an optional fraction: no sign, exponent, hex, separators or units
+const PLAIN_NUMBER = /^\d+(\.\d+)?$/;
+
+/**
+ * An empty or unset value means "not set" (no limit, or the default); a number of 0 or more is
+ * the value, rounded down (0 turns that use off). Anything else throws UsageLimitError: a limit
+ * that cannot be read never means "no limit".
+ */
 function parseCount(raw: string | undefined, key: string): number | null {
   const value = raw?.trim();
   if (!value) return null;
-  const n = Number(value);
-  if (!Number.isFinite(n) || n < 0) {
-    // Read on every call for the per-purpose caps; say it once
-    if (!warnedInvalid.has(`${key}=${raw}`)) {
-      warnedInvalid.add(`${key}=${raw}`);
-      logger.warn(`[Usage] Ignoring invalid ${key}="${raw}" (expected a number of 0 or more)`);
-    }
-    return null;
-  }
-  return Math.floor(n);
+  const n = PLAIN_NUMBER.test(value) ? Math.floor(Number(value)) : NaN;
+  if (!Number.isSafeInteger(n)) throw new UsageLimitError(key, raw ?? '');
+  return n;
 }
 
+const LIMIT_KEYS = [
+  'AI_MAX_CALLS_PER_HOUR',
+  'AI_MAX_TOKENS_PER_DAY',
+  'VISION_MAX_PER_HOUR',
+  'VOICE_TTS_MAX_CHARS_PER_DAY',
+  'VOICE_STT_MAX_SECONDS_PER_DAY',
+  'AUTONOMY_AI_MAX_PER_HOUR',
+  'AUTONOMY_AI_MIN_INTERVAL_SEC',
+] as const;
+
+/**
+ * What is wrong with the usage variables in `env`, one line each; empty when all can be read.
+ * Covers the limits, the per-purpose output caps (AI_MAX_TOKENS_<PURPOSE>) and
+ * USAGE_REPORT_INTERVAL_MIN. The agent refuses to start on any of these (src/index.ts).
+ */
+export function usageLimitProblems(env: Env = process.env): string[] {
+  const keys = [...LIMIT_KEYS, ...(Object.keys(AI_PURPOSE_MAX_TOKENS) as AiPurpose[]).map(purposeEnvKey), 'USAGE_REPORT_INTERVAL_MIN'];
+  const problems: string[] = [];
+  for (const key of keys) {
+    try {
+      parseCount(env[key], key);
+    } catch (error) {
+      problems.push(`[Usage] ${(error as Error).message}. Leave it empty for the default (for a limit: no limit), or set a number (0 turns that use off).`);
+    }
+  }
+  return problems;
+}
+
+/** Throws UsageLimitError for a limit that is set but is not a number of 0 or more. */
 export function readUsageLimits(env: Env = process.env): UsageLimits {
   const read = (key: string) => parseCount(env[key], key);
   return {
@@ -136,7 +188,25 @@ export interface AiCall {
   cacheWriteTokens?: number;
 }
 
-type AiEvent = Required<AiCall> & { at: number };
+/** `reserved`: tokens counted toward the limit for a call that has not returned, or that failed after it may have been billed. */
+type AiEvent = Required<AiCall> & { at: number; reserved: number };
+
+/** A Claude call that was admitted. Exactly one of settle/fail ends it; until then its reservation counts. */
+export interface AiReservation {
+  /** The call returned: its real usage replaces the reservation. */
+  settle(usage: Pick<AiCall, 'inputTokens' | 'outputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'>): void;
+  /**
+   * The call failed. It still counts as a call. `rejected` means the API refused the request
+   * before generating anything, so no tokens are counted; otherwise (timeout, abort, connection
+   * or server error) it may have been billed and the whole reservation stays counted.
+   */
+  fail(outcome: 'rejected' | 'unknown'): void;
+}
+
+/** A look at the world that was admitted; release() gives it back when no request was made for it. */
+export interface VisionReservation {
+  release(): void;
+}
 type AmountEvent = { at: number; amount: number; origin: UsageOrigin };
 export type SkipKind = 'ai-call' | 'offline-reply' | 'vision' | 'tts' | 'stt';
 
@@ -150,7 +220,8 @@ export interface TokenTotals {
 
 export interface UsageSnapshot {
   windowMs: number;
-  ai: TokenTotals & { byPurpose: Record<string, TokenTotals>; byOrigin: Record<string, number> };
+  /** `reservedTokens`: counted toward the token limit for calls in progress and calls that failed after they may have been billed. */
+  ai: TokenTotals & { reservedTokens: number; byPurpose: Record<string, TokenTotals>; byOrigin: Record<string, number> };
   autonomy: { aiTicks: number; scriptedTicks: number };
   vision: number;
   ttsChars: number;
@@ -171,7 +242,7 @@ function addTo(totals: TokenTotals, e: AiEvent): void {
   totals.cacheWriteTokens += e.cacheWriteTokens;
 }
 
-const totalTokens = (e: AiEvent) => e.inputTokens + e.outputTokens + e.cacheReadTokens + e.cacheWriteTokens;
+const totalTokens = (e: AiEvent) => e.inputTokens + e.outputTokens + e.cacheReadTokens + e.cacheWriteTokens + e.reserved;
 
 export class UsageBudget {
   private ai: AiEvent[] = [];
@@ -197,8 +268,11 @@ export class UsageBudget {
 
   // --- Claude ---
 
-  /** Why Claude may not be called right now, or null when it may. */
-  aiBlockedReason(): string | null {
+  /**
+   * Why a Claude call that needs `tokens` (0: any call at all) may not be made right now, or null
+   * when it may. Calls in progress count as a call each and with their reserved tokens.
+   */
+  aiBlockedReason(tokens = 0): string | null {
     const t = this.now();
     const { aiCallsPerHour, aiTokensPerDay } = this.limits;
     if (aiCallsPerHour !== null && this.countSince(this.ai, t - HOUR_MS) >= aiCallsPerHour) {
@@ -206,18 +280,50 @@ export class UsageBudget {
     }
     if (aiTokensPerDay !== null) {
       const used = this.ai.reduce((sum, e) => (e.at > t - DAY_MS ? sum + totalTokens(e) : sum), 0);
-      if (used >= aiTokensPerDay) return `AI_MAX_TOKENS_PER_DAY=${aiTokensPerDay}`;
+      if (used >= aiTokensPerDay || used + tokens > aiTokensPerDay) return `AI_MAX_TOKENS_PER_DAY=${aiTokensPerDay}`;
     }
     return null;
   }
 
+  /** Whether any Claude call may be made right now. Reserves nothing: the call itself is admitted by reserveAi. */
   aiAvailable(): boolean {
     return this.aiBlockedReason() === null;
   }
 
-  recordAi(call: AiCall): void {
-    this.ai.push({ cacheReadTokens: 0, cacheWriteTokens: 0, ...call, at: this.now() });
+  /**
+   * Admits one Claude call, counted from now: one call toward the hourly limit and `tokens` (the
+   * most the caller expects it to use: prompt and output cap) toward the daily one. Returns why
+   * not (as aiBlockedReason) when it does not fit. Check and count are one step, so calls that
+   * start together cannot exceed the call limit, nor the token limit by what they reserved. The
+   * token limit can still be passed by a call that uses more than it reserved.
+   */
+  reserveAi(call: Pick<AiCall, 'purpose' | 'origin'>, tokens: number): AiReservation | string {
+    const reserved = Math.max(0, Math.ceil(tokens));
+    const blocked = this.aiBlockedReason(reserved);
+    if (blocked) return blocked;
+    const event: AiEvent = { ...call, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reserved, at: this.now() };
+    this.ai.push(event);
     this.prune();
+    let ended = false;
+    const end = (apply: () => void) => {
+      if (ended) return;
+      ended = true;
+      apply();
+    };
+    return {
+      settle: (usage) =>
+        end(() => {
+          event.reserved = 0;
+          event.inputTokens = usage.inputTokens;
+          event.outputTokens = usage.outputTokens;
+          event.cacheReadTokens = usage.cacheReadTokens ?? 0;
+          event.cacheWriteTokens = usage.cacheWriteTokens ?? 0;
+        }),
+      fail: (outcome) =>
+        end(() => {
+          if (outcome === 'rejected') event.reserved = 0;
+        }),
+    };
   }
 
   // --- Autonomous behavior ---
@@ -253,31 +359,61 @@ export class UsageBudget {
     return limit === null || this.countSince(this.vision, this.now() - HOUR_MS) < limit;
   }
 
-  recordVision(): void {
-    this.vision.push({ at: this.now(), amount: 1, origin: currentOrigin() });
+  /**
+   * Admits one look at the world (counted from now), or returns null when the hourly limit is
+   * used up. release() takes it back; it is for a look that ended before any request was made.
+   */
+  reserveVision(): VisionReservation | null {
+    if (!this.visionAvailable()) return null;
+    const event: AmountEvent = { at: this.now(), amount: 1, origin: currentOrigin() };
+    this.vision.push(event);
     this.prune();
+    return {
+      release: () => {
+        const index = this.vision.indexOf(event);
+        if (index !== -1) this.vision.splice(index, 1);
+      },
+    };
   }
 
-  // --- Voice (may go over by at most one utterance) ---
+  // --- Voice ---
 
+  /** Whether any text-to-speech is left today. Reserves nothing. */
   ttsAvailable(): boolean {
     const limit = this.limits.ttsCharsPerDay;
     return limit === null || this.sumSince(this.tts, this.now() - DAY_MS) < limit;
   }
 
-  recordTts(chars: number): void {
-    this.tts.push({ at: this.now(), amount: chars, origin: currentOrigin() });
-    this.prune();
+  /**
+   * Admits `chars` characters of text-to-speech and counts them, or returns false when they do not
+   * fit in what is left of the daily limit. They stay counted whatever becomes of the request.
+   */
+  reserveTts(chars: number): boolean {
+    return this.reserveAmount(this.tts, this.limits.ttsCharsPerDay, chars);
   }
 
+  /** Whether any speech-to-text is left today. Reserves nothing. */
   sttAvailable(): boolean {
     const limit = this.limits.sttSecondsPerDay;
     return limit === null || this.sumSince(this.stt, this.now() - DAY_MS) < limit;
   }
 
-  recordStt(seconds: number): void {
-    this.stt.push({ at: this.now(), amount: seconds, origin: currentOrigin() });
+  /**
+   * Admits `seconds` of audio for speech-to-text and counts them, or returns false when they do not
+   * fit in what is left of the daily limit. They stay counted whatever becomes of the request
+   * (speech-to-text is billed by audio length).
+   */
+  reserveStt(seconds: number): boolean {
+    return this.reserveAmount(this.stt, this.limits.sttSecondsPerDay, seconds);
+  }
+
+  private reserveAmount(events: AmountEvent[], limit: number | null, amount: number): boolean {
+    if (!Number.isFinite(amount) || amount < 0) return false;
+    // 0 turns that use off, also for an amount of 0
+    if (limit !== null && (limit === 0 || this.sumSince(events, this.now() - DAY_MS) + amount > limit)) return false;
+    events.push({ at: this.now(), amount, origin: currentOrigin() });
     this.prune();
+    return true;
   }
 
   recordSkip(kind: SkipKind): void {
@@ -289,9 +425,10 @@ export class UsageBudget {
 
   snapshot(windowMs: number): UsageSnapshot {
     const since = this.now() - windowMs;
-    const ai = { ...emptyTotals(), byPurpose: {} as Record<string, TokenTotals>, byOrigin: {} as Record<string, number> };
+    const ai = { ...emptyTotals(), reservedTokens: 0, byPurpose: {} as Record<string, TokenTotals>, byOrigin: {} as Record<string, number> };
     for (const e of this.ai) {
       if (e.at <= since) continue;
+      ai.reservedTokens += e.reserved;
       addTo(ai, e);
       addTo((ai.byPurpose[e.purpose] ??= emptyTotals()), e);
       ai.byOrigin[e.origin] = (ai.byOrigin[e.origin] ?? 0) + 1;
@@ -358,7 +495,7 @@ export function formatUsageReport(s: UsageSnapshot, limits?: UsageLimits): strin
     : '';
   const skipped = entries(Object.fromEntries(Object.entries(s.skipped).filter(([, n]) => n > 0)));
   return [
-    `[Usage ${window}] Claude ${s.ai.calls} calls (${tokens(s.ai)})`,
+    `[Usage ${window}] Claude ${s.ai.calls} calls (${tokens(s.ai)}${s.ai.reservedTokens ? ` / ${k(s.ai.reservedTokens)} held for calls in progress or failed` : ''})`,
     s.ai.calls ? `by origin: ${entries(s.ai.byOrigin)}` : null,
     purposes ? `by purpose: ${purposes}` : null,
     `autonomous ticks: ${s.autonomy.aiTicks} AI / ${s.autonomy.scriptedTicks} scripted`,
@@ -388,6 +525,7 @@ let reportTimer: NodeJS.Timeout | null = null;
 /** Logs the last interval and the last 24 hours every USAGE_REPORT_INTERVAL_MIN minutes (default 60, 0 = off). */
 export function startUsageReports(env: Env = process.env): void {
   if (reportTimer) return;
+  // Throws for a value that is not a number, like the limits (the agent does not start then)
   const minutes = parseCount(env.USAGE_REPORT_INTERVAL_MIN, 'USAGE_REPORT_INTERVAL_MIN') ?? 60;
   if (minutes === 0) return;
   const intervalMs = minutes * 60_000;

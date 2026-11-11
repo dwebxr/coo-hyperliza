@@ -172,12 +172,77 @@ export function getWavHeader(
   return wavHeader;
 }
 
+// One deadline for a speech request and for reading its answer
+const TTS_REQUEST_TIMEOUT_MS = 30_000;
+// The audio of one utterance. A minute of speech is about 1 MB as 128 kbit/s MP3 and 6 MB as
+// 48 kHz PCM; what is spoken of one reply is capped before it is sent (voice-manager.ts)
+export const MAX_SPEECH_AUDIO_BYTES = 16 * 1024 * 1024;
+// A transcript with word timings for at most 30 s of audio is a few kilobytes
+export const MAX_TRANSCRIPT_RESPONSE_BYTES = 1024 * 1024;
+// How much of an API's error answer is read, to be logged
+const MAX_ERROR_BODY_BYTES = 2048;
+
+/**
+ * The body of a fetch response, read as it arrives and given up as soon as it is larger than
+ * `maxBytes` (throws) or `signal` fires (throws). With `truncate` a larger body is cut at
+ * `maxBytes` instead. Either way the rest of the body is cancelled, not downloaded.
+ */
+export async function readBodyWithin(response: Response, maxBytes: number, signal: AbortSignal, { truncate = false }: { truncate?: boolean } = {}): Promise<Buffer> {
+  const declared = Number(response.headers.get('content-length'));
+  if (!truncate && Number.isFinite(declared) && declared > maxBytes) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`the response is ${declared} bytes, more than the ${maxBytes} allowed`);
+  }
+  const reader = response.body?.getReader();
+  if (!reader) return Buffer.alloc(0);
+  const onAbort = () => void reader.cancel().catch(() => {});
+  signal.addEventListener('abort', onAbort, { once: true });
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      if (signal.aborted) throw new Error('the response took too long');
+      const { done, value } = await reader.read();
+      if (signal.aborted) throw new Error('the response took too long');
+      if (done) break;
+      if (size + value.byteLength > maxBytes) {
+        if (!truncate) throw new Error(`the response is larger than the ${maxBytes} bytes allowed`);
+        chunks.push(value.subarray(0, maxBytes - size));
+        break;
+      }
+      chunks.push(value);
+      size += value.byteLength;
+    }
+    return Buffer.concat(chunks);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+    // A no-op when the body was read to its end
+    await reader.cancel().catch(() => {});
+  }
+}
+
+/** Runs one request under a deadline that also covers reading its answer. */
+async function withDeadline<T>(ms: number, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(new Error(`no complete answer within ${ms} ms`)), ms);
+  try {
+    return await run(deadline.signal);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The start of an API's error answer, on one line, for the log. */
+async function errorText(response: Response, signal: AbortSignal): Promise<string> {
+  const head = await readBodyWithin(response, MAX_ERROR_BODY_BYTES, signal, { truncate: true }).catch(() => Buffer.alloc(0));
+  return head.toString('utf8').replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ').trim();
+}
+
 /**
  * Direct ElevenLabs TTS API call
  * @param text - Text to convert to speech
  * @returns Buffer containing the audio data (PCM format)
  */
-const TTS_REQUEST_TIMEOUT_MS = 30_000;
 
 export async function generateElevenLabsTTS(text: string): Promise<Buffer | null> {
   const apiKey = process.env.ELEVENLABS_XI_API_KEY;
@@ -199,35 +264,36 @@ export async function generateElevenLabsTTS(text: string): Promise<Buffer | null
   console.log(`[ElevenLabs TTS] Generating speech with voiceId=${voiceId}, model=${modelId}, format=${outputFormat}`);
 
   try {
-    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=${outputFormat}`, {
-      method: 'POST',
-      signal: AbortSignal.timeout(TTS_REQUEST_TIMEOUT_MS),
-      headers: {
-        'xi-api-key': apiKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        text: text,
-        model_id: modelId,
-        voice_settings: {
-          stability: stability,
-          similarity_boost: similarityBoost,
-          style: style,
-          use_speaker_boost: process.env.ELEVENLABS_VOICE_USE_SPEAKER_BOOST === 'true',
+    return await withDeadline(TTS_REQUEST_TIMEOUT_MS, async (signal) => {
+      const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=${outputFormat}`, {
+        method: 'POST',
+        signal,
+        headers: {
+          'xi-api-key': apiKey,
+          'Content-Type': 'application/json',
         },
-      }),
+        body: JSON.stringify({
+          text: text,
+          model_id: modelId,
+          voice_settings: {
+            stability: stability,
+            similarity_boost: similarityBoost,
+            style: style,
+            use_speaker_boost: process.env.ELEVENLABS_VOICE_USE_SPEAKER_BOOST === 'true',
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        console.error(`[ElevenLabs TTS] API error ${response.status}: ${await errorText(response, signal)}`);
+        return null;
+      }
+
+      // Read as it arrives, at most MAX_SPEECH_AUDIO_BYTES and within the request's deadline
+      const buffer = await readBodyWithin(response, MAX_SPEECH_AUDIO_BYTES, signal);
+      console.log(`[ElevenLabs TTS] Successfully generated ${buffer.length} bytes of audio`);
+      return buffer;
     });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`[ElevenLabs TTS] API error ${response.status}: ${errorText}`);
-      return null;
-    }
-
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    console.log(`[ElevenLabs TTS] Successfully generated ${buffer.length} bytes of audio`);
-    return buffer;
   } catch (error) {
     console.error('[ElevenLabs TTS] Error:', error);
     return null;
@@ -252,31 +318,31 @@ export async function generateOpenAITTS(text: string): Promise<Buffer | null> {
   console.log(`[OpenAI TTS Direct] Generating speech with model=${model}, voice=${voice}`);
 
   try {
-    const response = await fetch('https://api.openai.com/v1/audio/speech', {
-      method: 'POST',
-      signal: AbortSignal.timeout(TTS_REQUEST_TIMEOUT_MS),
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: model,
-        input: text,
-        voice: voice,
-        response_format: 'mp3',
-      }),
+    return await withDeadline(TTS_REQUEST_TIMEOUT_MS, async (signal) => {
+      const response = await fetch('https://api.openai.com/v1/audio/speech', {
+        method: 'POST',
+        signal,
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: model,
+          input: text,
+          voice: voice,
+          response_format: 'mp3',
+        }),
+      });
+
+      if (!response.ok) {
+        console.error(`[OpenAI TTS Direct] API error ${response.status}: ${await errorText(response, signal)}`);
+        return null;
+      }
+
+      const buffer = await readBodyWithin(response, MAX_SPEECH_AUDIO_BYTES, signal);
+      console.log(`[OpenAI TTS Direct] Successfully generated ${buffer.length} bytes of audio`);
+      return buffer;
     });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`[OpenAI TTS Direct] API error ${response.status}: ${errorText}`);
-      return null;
-    }
-
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    console.log(`[OpenAI TTS Direct] Successfully generated ${buffer.length} bytes of audio`);
-    return buffer;
   } catch (error) {
     console.error('[OpenAI TTS Direct] Error:', error);
     return null;
@@ -300,19 +366,21 @@ export async function transcribeWithElevenLabs(audio: Buffer, fileName = 'speech
   form.append('file', new Blob([new Uint8Array(audio)]), fileName);
 
   try {
-    const response = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
-      method: 'POST',
-      signal: AbortSignal.timeout(TTS_REQUEST_TIMEOUT_MS),
-      headers: { 'xi-api-key': apiKey },
-      body: form,
+    return await withDeadline(TTS_REQUEST_TIMEOUT_MS, async (signal) => {
+      const response = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
+        method: 'POST',
+        signal,
+        headers: { 'xi-api-key': apiKey },
+        body: form,
+      });
+      if (!response.ok) {
+        console.error(`[ElevenLabs STT] API error ${response.status}: ${await errorText(response, signal)}`);
+        return null;
+      }
+      const body = await readBodyWithin(response, MAX_TRANSCRIPT_RESPONSE_BYTES, signal);
+      const data = JSON.parse(body.toString('utf8')) as { text?: unknown };
+      return typeof data?.text === 'string' ? data.text : null;
     });
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`[ElevenLabs STT] API error ${response.status}: ${errorText}`);
-      return null;
-    }
-    const data = (await response.json()) as { text?: unknown };
-    return typeof data?.text === 'string' ? data.text : null;
   } catch (error) {
     console.error('[ElevenLabs STT] Error:', error);
     return null;

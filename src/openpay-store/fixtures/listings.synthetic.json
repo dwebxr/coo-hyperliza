@@ -1,0 +1,109 @@
+{
+  "_synthetic": "NOT a recorded response. Written by hand from the response shape that src/openpay-store/catalog.ts and its tests document for GET https://open-pay.jp/api/store/listings (ok, items[]: id, title, desc?, emoji?, category?, priceJpyc, feeJpyc, totalJpyc, usdcEnabled, tags, handle, updatedAt, url). No request was made to the Store to produce it. Replace it with a recorded response to prove what catalog.test.ts lists as unproven.",
+  "ok": true,
+  "items": [
+    {
+      "id": "h_hoverboard01",
+      "title": "HoverBoard",
+      "priceJpyc": "500",
+      "feeJpyc": "5",
+      "totalJpyc": "505",
+      "usdcEnabled": false,
+      "tags": [
+        "vehicle",
+        "vrm"
+      ],
+      "handle": "coo",
+      "updatedAt": 1762650000000,
+      "url": "https://open-pay.jp/ja/@coo?product=h_hoverboard01&from=agent",
+      "desc": "Ride it around the world.",
+      "emoji": "🛹",
+      "category": "3d-game"
+    },
+    {
+      "id": "h_biodome02",
+      "title": "Bio Dome",
+      "priceJpyc": "4950",
+      "feeJpyc": "49.5",
+      "totalJpyc": "4999.5",
+      "usdcEnabled": false,
+      "tags": [],
+      "handle": "coo",
+      "updatedAt": 1762560000000,
+      "url": "https://open-pay.jp/ja/@coo?product=h_biodome02&from=agent",
+      "desc": "A glass dome with plants inside.",
+      "emoji": "🌿",
+      "category": "3d-model"
+    },
+    {
+      "id": "h_matcha03",
+      "title": "抹茶ラテのレシピ",
+      "priceJpyc": "100",
+      "feeJpyc": "10",
+      "totalJpyc": "110",
+      "usdcEnabled": true,
+      "tags": [],
+      "handle": "coo",
+      "updatedAt": 1762470000000,
+      "url": "https://open-pay.jp/ja/@coo?product=h_matcha03&from=agent",
+      "desc": "おうちで作れる抹茶ラテ。",
+      "emoji": "🍵",
+      "category": "recipe"
+    },
+    {
+      "id": "h_avatar04",
+      "title": "Coo アバター (VRM)",
+      "priceJpyc": "1000",
+      "feeJpyc": "10",
+      "totalJpyc": "1010",
+      "usdcEnabled": false,
+      "tags": [],
+      "handle": "coo",
+      "updatedAt": 1762380000000,
+      "url": "https://open-pay.jp/ja/@coo?product=h_avatar04&from=agent",
+      "emoji": "🧑‍🎤",
+      "category": "avatar"
+    },
+    {
+      "id": "h_note05",
+      "title": "Web3 入門ノート",
+      "priceJpyc": "300",
+      "feeJpyc": "30",
+      "totalJpyc": "330",
+      "usdcEnabled": false,
+      "tags": [
+        "web3"
+      ],
+      "handle": "cipherweb",
+      "updatedAt": 1762290000000,
+      "url": "https://open-pay.jp/ja/@cipherweb?product=h_note05&from=agent",
+      "desc": "ウォレットの作り方から。",
+      "category": "ebook"
+    },
+    {
+      "id": "h_sticker06",
+      "title": "Sticker Pack Vol.1",
+      "priceJpyc": "50",
+      "feeJpyc": "5",
+      "totalJpyc": "55",
+      "usdcEnabled": false,
+      "tags": [],
+      "handle": "cipherweb",
+      "updatedAt": 1762200000000,
+      "url": "https://open-pay.jp/ja/@cipherweb?product=h_sticker06&from=agent",
+      "emoji": "✨"
+    },
+    {
+      "id": "h_plain07",
+      "title": "Plain item without optional fields",
+      "priceJpyc": "1",
+      "feeJpyc": "0",
+      "totalJpyc": "1",
+      "usdcEnabled": false,
+      "tags": [],
+      "handle": "cipherweb",
+      "updatedAt": 1762110000000,
+      "url": "https://open-pay.jp/ja/@cipherweb?product=h_plain07&from=agent"
+    }
+  ]
+}

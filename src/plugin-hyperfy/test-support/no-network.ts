@@ -48,10 +48,19 @@ const systemLookupPromise = dns.promises.lookup as AnyFunction;
 };
 
 // ---- DNS queries: none at all (they go to the configured DNS server, never only to this machine) ----
-const QUERIES = ['resolve', 'resolve4', 'resolve6', 'resolveAny', 'resolveCaa', 'resolveCname', 'resolveMx', 'resolveNaptr', 'resolveNs', 'resolvePtr', 'resolveSoa', 'resolveSrv', 'resolveTxt', 'reverse', 'lookupService'];
+
+/** Every query method of `target` as this runtime has them: resolve*, reverse, lookupService (also ones added later) */
+function queryMethods(target: object): string[] {
+  const names = new Set<string>();
+  for (let object: object | null = target; object && object !== Object.prototype; object = Object.getPrototypeOf(object)) {
+    for (const name of Object.getOwnPropertyNames(object)) {
+      if ((/^resolve/.test(name) || name === 'reverse' || name === 'lookupService') && typeof (target as Record<string, unknown>)[name] === 'function') names.add(name);
+    }
+  }
+  return [...names];
+}
 for (const target of [dns, dns.Resolver.prototype] as Record<string, unknown>[]) {
-  for (const name of QUERIES) {
-    if (typeof target[name] !== 'function') continue;
+  for (const name of queryMethods(target)) {
     target[name] = function (query: unknown, ...rest: any[]) {
       const callback = rest.at(-1) as AnyFunction;
       queueMicrotask(() => callback(refused(`DNS ${name} of ${String(query)}`)));
@@ -60,8 +69,7 @@ for (const target of [dns, dns.Resolver.prototype] as Record<string, unknown>[])
   }
 }
 for (const target of [dns.promises, dns.promises.Resolver.prototype] as Record<string, unknown>[]) {
-  for (const name of QUERIES) {
-    if (typeof target[name] !== 'function') continue;
+  for (const name of queryMethods(target)) {
     target[name] = (query: unknown) => Promise.reject(refused(`DNS ${name} of ${String(query)}`));
   }
 }
@@ -138,7 +146,8 @@ const connect = net.Socket.prototype.connect as AnyFunction;
 (net.Socket.prototype as { connect: AnyFunction }).connect = function (this: net.Socket, ...args: any[]) {
   const options = connectOptions(args);
   // A local (Unix domain) socket never leaves the machine
-  if (typeof options.path === 'string') return connect.apply(this, args);
+  // Node picks a local socket by `!!path`: an empty path is TCP to host and port
+  if (options.path) return connect.apply(this, args);
   const host: string = options.host ?? 'localhost';
   const fail = (what: string) => {
     const error = refused(what);

@@ -8,6 +8,7 @@ const page = vi.hoisted(() => ({
   environment: null as string | null,
   undo: new Map<string, () => void>(),
   undone: [] as string[],
+  committed: [] as string[],
   ready: null as Promise<void> | null,
   gate: null as Promise<void> | null,
 }));
@@ -28,9 +29,14 @@ vi.mock('../managers/puppeteer-manager.js', async (importOriginal) => {
       page.environment = base64;
       if (op) page.undo.set(op, () => (page.environment = null));
     },
-    undo(op: string) {
-      page.undone.push(op);
-      page.undo.get(op)?.();
+    settle(op: string, keep: boolean) {
+      const undo = page.undo.get(op);
+      page.undo.delete(op);
+      if (keep) page.committed.push(op);
+      else {
+        page.undone.push(op);
+        undo?.();
+      }
     },
   };
   const fakePage = {
@@ -39,8 +45,11 @@ vi.mock('../managers/puppeteer-manager.js', async (importOriginal) => {
       return fn(...args);
     },
   };
+  const { RenderWatchdog } = await import('../lib/render-watchdog');
   const manager = Object.create(actual.PuppeteerManager.prototype);
   manager.operations = 0;
+  // No browser here: nothing to sample or kill
+  manager.watchdog = new RenderWatchdog({ rootPid: () => null, kill: () => {}, table: async () => [] });
   manager.init = async () => {
     await page.ready;
     return fakePage;
@@ -109,6 +118,7 @@ describe('AgentEnvironment sky updates', () => {
     page.environment = null;
     page.undo.clear();
     page.undone.length = 0;
+    page.committed.length = 0;
     page.ready = null;
     page.gate = null;
     await closeServers();
@@ -139,6 +149,8 @@ describe('AgentEnvironment sky updates', () => {
     await expect.poll(() => env.csm.lightDirection).toBe('direction of asset://second.jpg');
     expect([...page.textures.values()]).toEqual([`${origin}/assets/second.jpg`]);
     expect(page.environment).toBe(Buffer.from('image-bytes').toString('base64'));
+    // Both page calls were committed: the page keeps no record of either
+    expect([page.committed.length, page.undo.size]).toEqual([2, 0]);
     await expect.poll(() => assets.cutShort).toBe(1);
     expect(console.warn).not.toHaveBeenCalled();
   });

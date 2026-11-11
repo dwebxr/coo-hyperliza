@@ -25,3 +25,45 @@ export function truncateCodePoints(value: string, max: number, ellipsis = ''): s
   const kept = chars.slice(0, room).join('');
   return ellipsis ? `${kept.trimEnd()}${ellipsis}` : kept;
 }
+
+// Cc controls, Cf format characters (zero-width, bidi overrides and isolates, tags) and the
+// line/paragraph separators (Zl, Zp)
+const INVISIBLE_CHARS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+// Everything that can end a line: Cc controls and the line/paragraph separators
+const LINE_BREAKING_CHARS = /[\p{Cc}\p{Zl}\p{Zp}]/gu;
+
+/** Replaces control, format (zero-width, bidi) and line/paragraph separator characters with `replacement`. */
+export function stripInvisibleChars(value: string, replacement = ''): string {
+  return value.replace(INVISIBLE_CHARS, replacement);
+}
+
+/**
+ * Untrusted text as one line of at most `max` code points: control characters and line/paragraph
+ * separators become spaces, so it cannot start a new line in a log or a new section in a prompt.
+ * Runs of ordinary spaces and format characters (emoji joiners) are kept.
+ */
+export function oneLine(value: string, max: number): string {
+  // A code point is at most two UTF-16 units: nothing beyond 2 x max units can survive the cut
+  return truncateCodePoints(head(value, max * 2).replace(LINE_BREAKING_CHARS, ' ').trim(), max).trimEnd();
+}
+
+/** The first `units` UTF-16 units of `value`, never ending in half a surrogate pair. */
+function head(value: string, units: number): string {
+  if (value.length <= units) return value;
+  const code = value.charCodeAt(units - 1);
+  return value.slice(0, code >= 0xd800 && code <= 0xdbff ? units - 1 : units);
+}
+
+export const SHOWN_NAME_MAX = 32;
+
+/**
+ * A name from the world (a player, an entity, an action label) as it is logged, prompted and
+ * spoken: control, format and line/paragraph separator characters become spaces, whitespace is
+ * collapsed, and it is cut to `max` code points (coo-world's shown() does the same to the names in
+ * its tip announcements). Empty when nothing visible is left or the value is not a string.
+ */
+export function shownName(value: unknown, max = SHOWN_NAME_MAX): string {
+  if (typeof value !== 'string') return '';
+  // Only the start can survive the cut: an over-long value is not scanned whole
+  return truncateCodePoints(stripInvisibleChars(head(value, max * 8), ' ').replace(/\s+/g, ' ').trim(), max).trimEnd();
+}

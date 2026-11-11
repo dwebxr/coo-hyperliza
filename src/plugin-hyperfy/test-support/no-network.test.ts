@@ -75,12 +75,14 @@ describe('the no-network guard of the test process', () => {
     expect(await refusal(net.createConnection({ port: 80, host: '192.0.2.1' }))).toContain('connection to 192.0.2.1:80');
     expect(await refusal(tls.connect({ port: 443, host: '192.0.2.1' }))).toContain('connection to 192.0.2.1:443');
     expect(await refusal(tls.connect(443, 'guard-test.invalid'))).toContain('connection to guard-test.invalid:443');
+    // An empty path is no local socket to Node (it picks one by `!!path`): this is TCP
+    expect(await refusal(new net.Socket().connect({ path: '', host: '192.0.2.1', port: 80 }))).toContain('connection to 192.0.2.1:80');
     // Strings Number() makes a port of 0 or more are ports to Node, not socket paths
     for (const port of ['0x50', '8e1', '+80', ' 80 ']) {
       const socket = new net.Socket();
       expect(await refusal((socket.connect as (...args: unknown[]) => net.Socket).call(socket, port, '192.0.2.1')), port).toContain('connection to 192.0.2.1:');
     }
-    expect(takeNetworkAttempts()).toHaveLength(12);
+    expect(takeNetworkAttempts()).toHaveLength(13);
   });
 
   it('lets the other forms reach this machine: a port alone (localhost), loopback by address, a local socket', async () => {
@@ -105,11 +107,15 @@ describe('the no-network guard of the test process', () => {
     expect(await message((cb) => new dns.Resolver().resolve6('guard-test.invalid', cb))).toContain('DNS resolve6 of guard-test.invalid');
     expect(await outcome(dns.promises.resolveTxt('guard-test.invalid'))).toContain('DNS resolveTxt of guard-test.invalid');
     expect(await outcome(new dns.promises.Resolver().resolveMx('guard-test.invalid'))).toContain('DNS resolveMx of guard-test.invalid');
+    // Methods the module has today, found at run time (resolveTlsa is newer than most lists)
+    expect(await message((cb) => (dns as any).resolveTlsa('guard-test.invalid', cb))).toContain('DNS resolveTlsa of guard-test.invalid');
+    expect(await outcome((dns.promises as any).resolveTlsa('guard-test.invalid'))).toContain('DNS resolveTlsa of guard-test.invalid');
+    expect(await message((cb) => (new dns.Resolver() as any).resolveTlsa('guard-test.invalid', cb))).toContain('DNS resolveTlsa of guard-test.invalid');
     // Imported by name, not through the module object
     expect(await message((cb) => namedResolve4('guard-test.invalid', cb))).toContain('DNS resolve4 of guard-test.invalid');
     expect(await message((cb) => namedLookup('guard-test.invalid', cb))).toContain('DNS lookup of guard-test.invalid');
     expect(await outcome(namedResolveTxt('guard-test.invalid'))).toContain('DNS resolveTxt of guard-test.invalid');
-    expect(takeNetworkAttempts()).toHaveLength(10);
+    expect(takeNetworkAttempts()).toHaveLength(13);
   });
 
   it('refuses UDP to a name whose socket lookup answers with an address that is not loopback', async () => {

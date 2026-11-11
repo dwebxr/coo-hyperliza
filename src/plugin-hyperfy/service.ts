@@ -17,7 +17,7 @@ import { AgentActions } from './systems/actions.js'
 import { loadPhysX } from './physx/loadPhysX.js'
 import { BehaviorManager } from "./managers/behavior-manager.js"
 import { EmoteManager } from './managers/emote-manager.js'
-import { MessageManager, type ChatTurn } from './managers/message-manager.js'
+import { MessageManager } from './managers/message-manager.js'
 import { VoiceManager } from './managers/voice-manager.js'
 import { PuppeteerManager } from './managers/puppeteer-manager.js'
 import { BuildManager } from './managers/build-manager.js'
@@ -31,6 +31,7 @@ import { storage } from './hyperfy/src/core/storage.js'
 import { TipWallet, signInHost, takeTipWalletAccount } from './lib/tip-wallet'
 import { resolveWorldWsUrl, worldHttpOrigin } from './lib/world-url'
 import { installWorldChat, worldChat } from './lib/world-chat'
+import { ChatIntake } from './lib/chat-intake'
 import { trackWorldIdentity } from './lib/world-identity'
 import { describeSceneEditsMode, readSceneEditsMode } from './lib/authorization'
 import { resolveWorldScriptsMode, surviveUnhandledRejections } from './lib/script-sandbox'
@@ -47,10 +48,6 @@ const HYPERFY_APPEARANCE_POLL_INTERVAL = 30000
 type AvatarResult = { outcome: 'applied' | 'gave-up'; error?: string } | { outcome: 'retry'; error?: string }
 // Teardown must not hang a reconnect on a stuck native/CDP call
 const TEARDOWN_STEP_TIMEOUT_MS = 10000
-// Chat is handled one message at a time; a handler stuck longer than this (e.g. an action that
-// keeps navigating) stops holding up the next message, though it keeps running in the background.
-const CHAT_MESSAGE_SLOT_MS = 180000
-
 
 export class HyperfyService extends Service {
   static serviceType = 'hyperfy'
@@ -61,7 +58,6 @@ export class HyperfyService extends Service {
   private isConnectedState: boolean = false
   private wsUrl: string | null = null
   private _currentWorldId: UUID | null = null
-  private processedMsgIds: Set<string> = new Set()
 
   private playerNamesMap: Map<string, string> = new Map()
   private appearanceIntervalId: NodeJS.Timeout | null = null
@@ -70,7 +66,6 @@ export class HyperfyService extends Service {
   private avatarOutcome: { outcome: 'applied' | 'gave-up'; error?: string } | null = null
   private nameSet: boolean = false
 
-  private connectionTime: number | null = null
   private appearancePollInFlight: boolean = false
   private lastConnectConfig: { wsUrl: string; authToken?: string; worldId: UUID } | null = null
   private connectPromise: Promise<void> | null = null
@@ -78,7 +73,8 @@ export class HyperfyService extends Service {
   private isStopping: boolean = false
   // Bumped by every teardown so an in-flight connect can tell its world was torn down
   private connectionGeneration: number = 0
-  private chatQueue: Promise<void> = Promise.resolve()
+  /** Turns the world's live chat into turns for this connection (lib/chat-intake.ts) */
+  private chatIntake: ChatIntake | null = null
   private reconnectController: ReconnectController
   private behaviorManager: BehaviorManager;
   private emoteManager: EmoteManager;
@@ -219,7 +215,7 @@ export class HyperfyService extends Service {
       const generation = this.connectionGeneration
 
       // The engine's packet table, encoding and socket URL predate the world's protocol version
-      adaptToWorldProtocol(world.network, () => storage.get('authToken'))
+      const protocol = adaptToWorldProtocol(world.network, () => storage.get('authToken'))
       // Ranks and account ids as the world's server reports them (lib/authorization.ts reads them)
       trackWorldIdentity(world)
       // Only chat the server sent becomes a turn; chat.add never broadcasts (lib/world-chat.ts)
@@ -242,9 +238,10 @@ export class HyperfyService extends Service {
 
       // The engine's upload sends no session token and ignores the response, but the world only
       // accepts uploads from an authenticated session. The token is read per call: the snapshot
-      // may issue a new one. It is sent to the world's own origin only.
+      // may issue a new one. It is sent to the world's own origin only, and not at all when it was
+      // withheld from the socket (lib/world-protocol.ts): that world's API is not encrypted either.
       world.network.upload = (file: File, { check }: UploadOptions = {}) =>
-        uploadAsset(world.network, file, { net, authToken: storage.get('authToken'), check })
+        uploadAsset(world.network, file, { net, authToken: protocol.sessionToken() ?? undefined, check })
 
       // Registered before init so a socket that closes during init is not missed.
       let kickCode: string | null = null
@@ -329,17 +326,6 @@ export class HyperfyService extends Service {
       }
       console.info('Hyperfy world initialized.')
 
-      this.processedMsgIds.clear()
-      if (this.world.chat?.msgs) {
-        console.info(`Processing ${this.world.chat.msgs.length} existing chat messages.`)
-        this.world.chat.msgs.forEach((msg: any) => {
-          if (msg && msg.id) {
-            this.processedMsgIds.add(msg.id)
-          }
-        })
-        console.info(`Populated ${this.processedMsgIds.size} processed message IDs from history.`)
-      }
-
       this.voiceManager.start();
 
       this.behaviorManager.start();
@@ -349,8 +335,6 @@ export class HyperfyService extends Service {
       this.isConnectedState = true
 
       this.startAppearancePolling()
-
-      this.connectionTime = Date.now(); // Record connection time
 
       console.info(`HyperfyService connected successfully to ${describeUrl(this.wsUrl)}`)
     } catch (error: any) {
@@ -408,11 +392,7 @@ export class HyperfyService extends Service {
       return
     }
 
-    if (this.world.chat?.subscribe) {
-      this.startChatSubscription()
-    } else {
-      console.warn('[Hyperfy Events] world.chat.subscribe not available.')
-    }
+    this.startChatSubscription()
   }
 
   /**
@@ -638,6 +618,8 @@ export class HyperfyService extends Service {
     this.stopAppearancePolling()
     this.tipWallet?.stop();
     this.tipWallet = null;
+    this.chatIntake?.stop();
+    this.chatIntake = null;
     this.behaviorManager?.stop();
     this.voiceManager?.stop();
     this.emoteManager?.stop();
@@ -671,10 +653,6 @@ export class HyperfyService extends Service {
     this.wsUrl = null
     this.appearanceSet = false
     this.avatarOutcome = null
-
-    this.processedMsgIds.clear()
-
-    this.connectionTime = null; // Clear connection time
 
     if (this.appearanceIntervalId) { clearInterval(this.appearanceIntervalId); this.appearanceIntervalId = null; }
 
@@ -741,70 +719,31 @@ export class HyperfyService extends Service {
   }
 
   private startChatSubscription(): void {
-    if (!this.world || !this.world.chat) {
-      console.error('Cannot subscribe to chat: World or Chat system not available.')
+    const world = this.world
+    // Undefined (not installed) means nothing becomes a turn
+    const chat = world ? worldChat(world) : undefined
+    if (!world || !chat) {
+      console.error('Cannot subscribe to chat: World or its chat is not available.')
       return
     }
 
     console.info('[HyperfyService] Initializing chat subscription...')
     const generation = this.connectionGeneration
-    this.chatQueue = Promise.resolve()
-    // Undefined (not installed) means nothing becomes a turn
-    const chat = worldChat(this.world)
-
-    this.world.chat.subscribe((msgs: any[]) => {
-      // Wait for player entity (ensures world/chat exist too)
-      if (!this.world || !this.world.chat || !this.world.entities?.player || !this.connectionTime) return
-
-      const newMessagesFound: any[] = [] // Temporary list for new messages
-
-      // Step 1: Identify new messages and update processed set
-      msgs.forEach((msg: any) => {
-        // Only what the world's server sent on this connection: not app scripts' chat (any
-        // fromId), not the agent's own posts, not the snapshot's history
-        if (!chat?.isLiveFromNetwork(msg)) return
-
-        // Check timestamp FIRST - only consider messages newer than connection time
-        const messageTimestamp = msg.createdAt ? new Date(msg.createdAt).getTime() : 0;
-        // Also check for NaN (invalid date)
-        if (!messageTimestamp || isNaN(messageTimestamp) || messageTimestamp <= this.connectionTime) {
-          // Ensure historical messages are marked processed if encountered *before* connectionTime was set (edge case)
-          if (msg?.id && !this.processedMsgIds.has(msg.id.toString())) {
-            this.processedMsgIds.add(msg.id.toString());
-          }
-          return; // Skip this message
-        }
-
-        // Check if we've already processed this message ID (secondary check for duplicates)
-        const msgIdStr = msg.id?.toString();
-        if (msgIdStr && !this.processedMsgIds.has(msgIdStr)) {
-          newMessagesFound.push(msg) // Add the full message object
-          this.processedMsgIds.add(msgIdStr) // Mark ID as processed immediately
-        }
-      })
-
-      // Step 2: Process only the newly found messages
-      if (newMessagesFound.length > 0) {
-        console.info(`[Chat] Found ${newMessagesFound.length} new messages to process.`)
-
-        // In arrival order, one at a time. IDs are reserved above, so the listener re-running
-        // (e.g. when another message arrives) cannot queue the same message twice.
-        for (const msg of newMessagesFound) {
-          this.chatQueue = this.chatQueue.then(async () => {
-            if (generation !== this.connectionGeneration) return
-            if (!this.messageManager) return
-            const turn: ChatTurn = { cancelled: false }
-            // Logs and swallows failures, so one bad message never breaks the chain
-            const settled = await settleWithin(this.messageManager.handleMessage(msg, turn), CHAT_MESSAGE_SLOT_MS, `handling chat message ${msg?.id}`)
-            // Whatever the timed-out turn produces later is dropped instead of overlapping the next one
-            if (!settled) turn.cancelled = true
-          }).catch(error => {
-            // Never let one failure stop every later message on this connection
-            console.error('[Chat] Unexpected error in the chat queue:', error)
-          })
-        }
-      }
+    this.chatIntake?.stop()
+    // One turn at a time, in the order the world's server sent the messages; bounded and
+    // rate-limited (lib/chat-intake.ts)
+    const intake = new ChatIntake({
+      isLive: () => generation === this.connectionGeneration && this.chatIntake === intake,
+      handle: async (msg, turn) => {
+        // Before the agent's own player exists there is nobody to answer as
+        if (!this.messageManager || !world.entities?.player) return
+        await this.messageManager.handleMessage(msg, turn)
+      },
     })
+    this.chatIntake = intake
+    // Only what the world's server sent on this connection: not app scripts' chat (any fromId),
+    // not the agent's own posts, not the snapshot's history (lib/world-chat.ts)
+    chat.onLive((msg) => void intake.accept(msg))
   }
 
   getEmoteManager() {

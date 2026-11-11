@@ -13,6 +13,7 @@ import { AiBudgetExceededError, forPurpose } from '../../usage-budget';
 import { AnthropicRefusalError } from '../../anthropic-models';
 import { AgentControls } from '../systems/controls'; // Import AgentControls type
 import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
+import { oneLine } from '../lib/text';
 
 const GOTO_ENTITY = 'HYPERFY_GOTO_ENTITY';
 
@@ -21,8 +22,11 @@ export enum NavigationType {
   POSITION = 'position',
 }
 
-const navigationTargetExtractionTemplate = (thoughts?: string) => {
-  return `
+// The agent's thought enters through a state value ({{navigationThought}}), never as template
+// text: it is model output, which can quote a player and contain anything, braces included
+const MAX_THOUGHT_CODE_POINTS = 500;
+
+const navigationTargetExtractionTemplate = `
 # Task:
 Decide whether the agent should navigate to a specific **Entity** or a direct **Position** in the Hyperfy world.
 
@@ -37,7 +41,7 @@ Decide whether the agent should navigate to a specific **Entity** or a direct **
 - Use "position" only if a direct coordinate is clearly specified or derivable.
 
 # Agent Thought:
-${thoughts || 'None'}
+{{navigationThought}}
 
 # World State:
 {{hyperfyStatus}}
@@ -64,8 +68,7 @@ or
 \`\`\`
 
 Only return the JSON object. Do not include any extra text or comments.
-  `.trim();
-};
+`.trim();
 
 
 
@@ -86,11 +89,13 @@ export const hyperfyGotoEntityAction: Action = {
       callback: HandlerCallback,
       responses,
     ) => {
-      const thoughtSnippets =
+      const thoughtSnippets = oneLine(
         responses
           ?.map((res) => res.content?.thought)
-          .filter(Boolean)
-          .join('\n') ?? '';
+          .filter((thought): thought is string => typeof thought === 'string' && !!thought)
+          .join(' ') ?? '',
+        MAX_THOUGHT_CODE_POINTS
+      );
 
       const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
       const world = service?.getWorld(); // Use the getter
@@ -107,8 +112,8 @@ export const hyperfyGotoEntityAction: Action = {
       try {
         const extractionState = await runtime.composeState(message);
         const prompt = composePromptFromState({
-          state: extractionState,
-          template: navigationTargetExtractionTemplate(thoughtSnippets),
+          state: { ...extractionState, values: { ...extractionState.values, navigationThought: thoughtSnippets || 'None' } },
+          template: navigationTargetExtractionTemplate,
         });
 
         navigationResult = await runtime.useModel(ModelType.OBJECT_LARGE, forPurpose('navigation', { prompt }));

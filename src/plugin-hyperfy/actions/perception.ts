@@ -17,6 +17,7 @@ import { chooseSnapshot, type NamedEntity } from '../lib/snapshot-choice';
 import { isJapanese } from '../lib/simple-commands';
 import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
 import { readString } from '../lib/model-output';
+import { shownName } from '../lib/text';
 
 const SCENE_PERCEPTION = 'HYPERFY_SCENE_PERCEPTION';
 // Said when the look itself failed (the snapshot or reading it)
@@ -29,7 +30,7 @@ export enum SnapshotType {
   LOOK_AT_ENTITY  = 'LOOK_AT_ENTITY'
 }
 
-const responseGenerationTemplate = (viewHeader: string) => `
+const responseGenerationTemplate = `
 <task>
 You are {{agentName}}, a visible in-world AI character in Hyperfy — a real-time, multiplayer 3D simulation.
 
@@ -59,7 +60,7 @@ Your task is to observe, interpret, and respond to the current moment as a fully
 
 ## What you see right now
 The attached image is a snapshot you just took in the world. Treat it as your own eyes — you are looking at the scene right now.
-${viewHeader}
+{{hyperfyView}}
 
 
 </providers>
@@ -132,7 +133,10 @@ export const hyperfyScenePerceptionAction: Action = {
     const text = message.content?.text ?? '';
     const japanese = isJapanese(text);
     const budget = getUsageBudget();
-    if (!budget.visionAvailable() || !budget.aiAvailable()) {
+    // The look is counted now, before the snapshot is taken: two looks that start together cannot
+    // both take the last one. It is given back below when it ends before any model call.
+    const look = budget.aiAvailable() ? budget.reserveVision() : null;
+    if (!look) {
       budget.recordSkip('vision');
       await tellFailure(
         callback,
@@ -181,6 +185,7 @@ export const hyperfyScenePerceptionAction: Action = {
         }
       }
     } catch (err) {
+      look.release();
       logger.error('Snapshot failed:', err);
       await tellFailure(callback, SCENE_PERCEPTION, japanese ? LOOK_FAILED_JA : LOOK_FAILED_EN, { thought: 'Snapshot failed.', metadata: { error: 'snapshot_failure', snapshotType } });
       return actionFailed(SCENE_PERCEPTION, 'snapshot failed', { snapshotType });
@@ -189,22 +194,28 @@ export const hyperfyScenePerceptionAction: Action = {
     let viewHeader: string;
     switch (choice.type) {
       case 'LOOK_AROUND':
-        viewHeader = `It is a 360° (equirectangular) view all around {{agentName}}'s current position.`;
+        viewHeader = `It is a 360° (equirectangular) view all around your current position.`;
         break;
       case 'LOOK_DIRECTION':
-        viewHeader = `It shows the view toward {{agentName}}'s **${choice.direction}** side.`;
+        viewHeader = `It shows the view toward your **${choice.direction}** side.`;
         break;
       case 'LOOK_AT_ENTITY': {
-        const name = entities.find((e) => e.id === choice.entityId)?.name ?? choice.entityId;
-        viewHeader = `It is focused on “${name}” (entity ${choice.entityId}).`;
+        const name = shownName(entities.find((e) => e.id === choice.entityId)?.name, 64) || 'an entity';
+        viewHeader = `It is focused on “${name}” (entity ${shownName(choice.entityId, 64)}).`;
         break;
       }
     }
 
     /* One multimodal call: look at the snapshot and answer in character */
-    state = await runtime.composeState(message);
-    const responsePrompt = composePromptFromState({ state, template: responseGenerationTemplate(viewHeader) });
-    budget.recordVision();
+    let responsePrompt: string;
+    try {
+      state = await runtime.composeState(message);
+      // The view's description is a value, not template text: an entity's name is world content
+      responsePrompt = composePromptFromState({ state: { ...state, values: { ...state.values, hyperfyView: viewHeader } }, template: responseGenerationTemplate });
+    } catch (err) {
+      look.release();
+      throw err;
+    }
     let xmlRaw: string;
     try {
       const res = await runtime.useModel(ModelType.IMAGE_DESCRIPTION, forPurpose('vision', { imageUrl: imgBase64, prompt: responsePrompt }));
@@ -212,6 +223,8 @@ export const hyperfyScenePerceptionAction: Action = {
     } catch (err) {
       // The turn's caller answers without Claude (handlers/messageReceivedHandler.ts); a reply sent
       // here would be dropped by core along with the error
+      // Refused by the Claude budget: no request was made for this look
+      if (err instanceof AiBudgetExceededError) look.release();
       if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError) throw err;
       logger.error('Vision response failed:', err);
       await tellFailure(callback, SCENE_PERCEPTION, japanese ? LOOK_FAILED_JA : LOOK_FAILED_EN, { thought: 'Cannot understand the scene.', metadata: { error: 'vision_failure' } });

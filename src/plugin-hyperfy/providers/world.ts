@@ -11,10 +11,17 @@ import {
 import { HyperfyService } from '../service';
 import * as THREE from 'three'
 import { Vector3Enhanced } from '../hyperfy/src/core/extras/Vector3Enhanced.js'
+import { SHOWN_NAME_MAX, oneLine, shownName } from '../lib/text'
+import { CHAT_BODY_MAX_CODE_POINTS } from '../lib/chat-intake'
 
 // Per entity type, how many of the nearest entities get a full line. The rest are listed
 // compactly (name + id) so actions can still target them without flooding the prompt.
 const MAX_DETAILED_ENTITIES_PER_TYPE = 40;
+// Names and labels come from the world (players, builders, app scripts): each enters the prompt as
+// one short line without control or format characters. Players' names are cut like chat senders'.
+const ENTITY_NAME_MAX = 64;
+const promptName = (value: unknown, max = ENTITY_NAME_MAX) => shownName(value, max);
+const promptId = (value: unknown) => shownName(String(value ?? ''), ENTITY_NAME_MAX) || 'unknown';
 
 export const hyperfyProvider: Provider = {
     name: 'HYPERFY_WORLD_STATE',
@@ -54,8 +61,8 @@ export const hyperfyProvider: Provider = {
         const agentPos = world?.entities?.player?.base?.position;
 
         for (const [id, entity] of entities.entries()) {
-          const name = entity?.data?.name || entity?.blueprint?.name || 'Unnamed';
-          const type = entity?.data?.type || 'unknown';
+          const type = promptName(entity?.data?.type, 24) || 'unknown';
+          const name = promptName(entity?.data?.name || entity?.blueprint?.name, type === 'player' ? SHOWN_NAME_MAX : ENTITY_NAME_MAX) || 'Unnamed';
           const pos = entity?.base?.position || entity?.root?.position;
           const quat = entity?.base?.quaternion || entity?.root?.quaternion;
           const scale = entity?.base?.scale || entity?.root?.scale;
@@ -71,13 +78,14 @@ export const hyperfyProvider: Provider = {
             ? `[${[scale.x, scale.y, scale.z].map(s => s.toFixed(2)).join(', ')}]`
             : 'N/A';
 
+          const shownId = promptId(id);
           if (id === agentId) {
-            agentText = `## Agent Info (You)\nEntity ID: ${id}, Name: ${name}, Position: ${posStr}, Quaternion: ${quatStr}`;
+            agentText = `## Agent Info (You)\nEntity ID: ${shownId}, Name: ${name}, Position: ${posStr}, Quaternion: ${quatStr}`;
             continue;
           }
 
           allEntityIds.push(id);
-          let line = `- Name: ${name}, Entity ID: ${id}, Position: ${posStr}, Quaternion: ${quatStr}`;
+          let line = `- Name: ${name}, Entity ID: ${shownId}, Position: ${posStr}, Quaternion: ${quatStr}`;
 
           if (type === 'app') {
             line += `, Scale: ${scaleStr}`;
@@ -95,7 +103,7 @@ export const hyperfyProvider: Provider = {
           const distance = pos && agentPos && typeof pos.distanceTo === 'function'
             ? pos.distanceTo(agentPos)
             : Number.POSITIVE_INFINITY;
-          categorizedEntities[type].push({ line, compact: `${name} (${id})`, distance });
+          categorizedEntities[type].push({ line, compact: `${name} (${shownId})`, distance });
         }
 
         let categorizedSummary = '';
@@ -122,9 +130,9 @@ export const hyperfyProvider: Provider = {
             ? `[${[pos.x, pos.y, pos.z].map(p => p.toFixed(2)).join(', ')}]`
             : 'N/A';
 
-          const label = action._label ?? 'Unnamed Action';
-          const entityId = entity?.data?.id ?? 'unknown';
-          const entityName = entity?.blueprint?.name ?? 'Unnamed';
+          const label = promptName(action._label) || 'Unnamed Action';
+          const entityId = promptId(entity?.data?.id);
+          const entityName = promptName(entity?.blueprint?.name) || 'Unnamed';
 
           return `- Entity ID: ${entityId}, Entity Name: ${entityName}, Action: ${label}, Position: ${posStr}`;
         });
@@ -137,9 +145,9 @@ export const hyperfyProvider: Provider = {
         
         const equipText = currentAction ? (() => {
           const entity = currentAction.ctx?.entity;
-          const label = currentAction._label ?? 'Unnamed Action';
-          const entityId = entity?.data?.id ?? 'unknown';
-          const entityName = entity?.blueprint?.name ?? 'Unnamed';
+          const label = promptName(currentAction._label) || 'Unnamed Action';
+          const entityId = promptId(entity?.data?.id);
+          const entityName = promptName(entity?.blueprint?.name) || 'Unnamed';
           return `## Your Equipped Item or Action\nYou are currently using:\n- Action: ${label}, Entity Name: ${entityName}, Entity ID: ${entityId}`;
         })() : '## Your Equipped Item or Action\nYou are not currently performing or holding anything.';
 
@@ -152,17 +160,19 @@ export const hyperfyProvider: Provider = {
 
         let chatText = `## In-World Messages\n### Chat History\n${formattedHistory}`;
 
-        const messageText = _message.content?.text?.trim();
+        // Bounded where it was received (chat intake, voice); bounded again here for any other source
+        const messageText = oneLine(_message.content?.text ?? '', CHAT_BODY_MAX_CODE_POINTS);
         if (messageText) {
           const senderId = _message.entityId;
           const senderEntity = await runtime.getEntityById(senderId);
           const hyperfyMeta = senderEntity?.metadata?.hyperfy as { userName?: string; username?: string; name?: string } | undefined;
-          const senderName =
+          const senderName = promptName(
             hyperfyMeta?.userName ||
             hyperfyMeta?.username ||
             hyperfyMeta?.name ||
-            (senderEntity?.names || []).find(n => n.toLowerCase() !== 'anonymous') ||
-            'Unknown User';
+            (senderEntity?.names || []).find(n => n.toLowerCase() !== 'anonymous'),
+            SHOWN_NAME_MAX
+          ) || 'Unknown User';
 
           const receivedMessageSection = [
             `### Received Message`,
@@ -206,7 +216,7 @@ export const hyperfyProvider: Provider = {
       } catch (error: any) { // Add type annotation for error
          logger.error('Error getting Hyperfy state from service:', error);
          // The incoming message only reaches the prompt through this provider, so keep it on errors.
-         const received = _message.content?.text?.trim();
+         const received = oneLine(_message.content?.text ?? '', CHAT_BODY_MAX_CODE_POINTS);
          const text = '# Hyperfy World State\nStatus: Error retrieving state.' +
            (received ? `\n\n### Received Message\n${received}` : '');
          return {

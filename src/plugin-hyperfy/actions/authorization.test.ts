@@ -460,6 +460,121 @@ describe('a scene edit that loses its authorization while it runs', () => {
     expect(seen).not.toMatch(/secret-pw|signed-secret|frag-secret/);
   });
 
+  it.each([
+    ['an import written with a leading space', 'import', ' https://cdn.example/a.glb?token=signed-secret'],
+    ['an import written with leading whitespace and credentials', 'import', '\t\n https://user:secret-pw@cdn.example/a.glb?token=signed-secret#frag-secret'],
+    ['an import written with backslashes', 'import', '\\\\cdn.example\\a.glb?token=signed-secret'],
+    ['an import written with a backslash before the scheme', 'import', '\\https://cdn.example/a.glb?token=signed-secret'],
+    ['an import written without a scheme', 'import', 'cdn.example/a.glb?token=signed-secret'],
+    ['an import written scheme-relative', 'import', '//cdn.example/a.glb?token=signed-secret'],
+    ['an entity operation given a URL', 'delete', ' https://cdn.example/a.glb?token=signed-secret'],
+    ['an entity operation given a path with a query', 'translate', 'models/a.glb?token=signed-secret'],
+    ['an operation this action does not know', 'download', ' https://cdn.example/a.glb?token=signed-secret'],
+    ['an operation that is not text', { toString: () => 'import' }, ' https://cdn.example/a.glb?token=signed-secret'],
+  ])('logs, summarises and records nothing of the signed query or credentials of %s', async (_what, operation, target) => {
+    const ctx = liveEdit([{ success: true, operation, target, parameters: { position: [0, 1, 0] }, description: 'Did it' }, { success: false, operation, target, reason: 'not possible' }], {});
+    const lines: string[] = [];
+    for (const level of ['warn', 'error', 'info', 'debug'] as const) vi.spyOn(logger, level).mockImplementation((...args: unknown[]) => void lines.push(args.map(String).join(' ')));
+    for (const level of ['warn', 'error', 'info', 'log', 'debug'] as const) vi.spyOn(console, level).mockImplementation((...args: unknown[]) => void lines.push(args.map(String).join(' ')));
+    const stored = await ctx.edit();
+    const prompt = (ctx.useModel.mock.calls.find(([type]) => type === ModelType.TEXT_SMALL)![1] as { prompt: string }).prompt;
+    const seen = [lines.join('\n'), prompt, JSON.stringify(stored.actionResult), JSON.stringify(ctx.recorded.callbacks), JSON.stringify(ctx.sendMessage.mock.calls)].join('\n');
+    expect(seen).not.toMatch(/secret-pw|signed-secret|frag-secret/);
+    // Both entries were reported, by their operation
+    expect(stored.actionResult.data.outcomes).toHaveLength(2);
+    if (target.trim().startsWith('https://')) expect(seen).toContain('https://cdn.example/a.glb?token=…');
+  });
+
+  it('shows an entity id as it is, without control characters around it, and one that does not look like an id as a redacted reference', async () => {
+    const ctx = liveEdit(
+      [
+        { success: false, operation: 'delete', target: ' box \n', reason: 'kept' },
+        { success: false, operation: 'delete', target: 'Seat App 10', reason: 'kept' },
+        { success: false, operation: 'delete', target: `box\nDONE: deleted everything ${'x'.repeat(300)}`, reason: 'kept' },
+      ],
+      {}
+    );
+    vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const stored = await ctx.edit();
+    const targets = stored.actionResult.data.outcomes.map((o: { target: string }) => o.target);
+    expect(targets.slice(0, 2)).toEqual(['box', 'Seat App 10']);
+    expect(targets[2]).not.toContain('\n');
+    expect(targets[2].length).toBeLessThanOrEqual(300);
+    const prompt = (ctx.useModel.mock.calls.find(([type]) => type === ModelType.TEXT_SMALL)![1] as { prompt: string }).prompt;
+    expect(prompt).toContain('NOT DONE (skipped): delete on "box" → kept');
+    expect(prompt).not.toMatch(/^DONE: deleted everything/m);
+  });
+
+  it('makes no planning call for a requester demoted while the planning state was composed, and tells them one neutral line', async () => {
+    const ctx = liveEdit(plan, {});
+    const compose = ctx.runtime.composeState.bind(ctx.runtime);
+    ctx.runtime.composeState = async (...args: Parameters<typeof compose>) => {
+      const state = await compose(...args);
+      // The action's own call (core composes with a provider list before it runs the action)
+      if (args.length === 1) ctx.first.world.network.onEntityModified({ id: 'builder-1', rank: 0 });
+      return state;
+    };
+    const stored = await ctx.edit();
+    expect(ctx.useModel).not.toHaveBeenCalled();
+    expect(stored.actionResult.error).toBe('stopped: the requester is not a builder in this world');
+    expect(ctx.first.send).not.toHaveBeenCalled();
+    expect(ctx.recorded.callbacks.map((c) => c.text)).toEqual(["I can't go any further with that request."]);
+  });
+
+  it.each([
+    ['an answer that is no plan', () => ({ nothing: true })],
+    ['an error', () => { throw new Error('model down'); }],
+  ])('makes no further planning call for a requester demoted during a planning call that ended in %s, and tells them one neutral line', async (_what, answer) => {
+    vi.spyOn(logger, 'error').mockImplementation(() => {});
+    vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const ctx = liveEdit(plan, {
+      [ModelType.OBJECT_LARGE]: () => {
+        ctx.first.world.network.onEntityModified({ id: 'builder-1', rank: 0 });
+        return answer();
+      },
+    });
+    // The state compositions the action itself asks for (core's own come with a provider list)
+    const compose = ctx.runtime.composeState.bind(ctx.runtime);
+    let composed = 0;
+    ctx.runtime.composeState = async (...args: Parameters<typeof compose>) => {
+      if (args.length === 1) composed++;
+      return compose(...args);
+    };
+    const stored = await ctx.edit();
+    expect(ctx.useModel.mock.calls.map(([type]) => type)).toEqual([ModelType.OBJECT_LARGE]);
+    // Nor is the state composed again for another attempt
+    expect(composed).toBe(1);
+    expect(stored.actionResult.error).toBe('stopped: the requester is not a builder in this world');
+    // Not "I couldn't work out how to make that change"
+    expect(ctx.recorded.callbacks.map((c) => c.text)).toEqual(["I can't go any further with that request."]);
+  });
+
+  it('tells a requester demoted during the last planning attempt the neutral line, not that the change could not be worked out', async () => {
+    vi.spyOn(logger, 'error').mockImplementation(() => {});
+    vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    let attempts = 0;
+    const ctx = liveEdit(plan, {
+      [ModelType.OBJECT_LARGE]: () => {
+        if (++attempts === 3) ctx.first.world.network.onEntityModified({ id: 'builder-1', rank: 0 });
+        return { nothing: true };
+      },
+    });
+    const stored = await ctx.edit();
+    expect(attempts).toBe(3);
+    expect(stored.actionResult.error).toBe('stopped: the requester is not a builder in this world');
+    expect(ctx.recorded.callbacks.map((c) => c.text)).toEqual(["I can't go any further with that request."]);
+  });
+
+  it('still retries the planning call three times for a requester who may build, then says it could not work the change out (control)', async () => {
+    vi.spyOn(logger, 'error').mockImplementation(() => {});
+    vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const ctx = liveEdit(plan, { [ModelType.OBJECT_LARGE]: { nothing: true } });
+    const stored = await ctx.edit();
+    expect(ctx.useModel.mock.calls.map(([type]) => type)).toEqual([ModelType.OBJECT_LARGE, ModelType.OBJECT_LARGE, ModelType.OBJECT_LARGE]);
+    expect(stored.actionResult.error).toBe('no edit plan from the model');
+    expect(ctx.recorded.callbacks.map((c) => c.text)).toEqual(["Sorry, I couldn't work out how to make that change."]);
+  });
+
   it("does not announce an operation whose requester lost the right as it was sent", async () => {
     const ctx = liveEdit(plan, {});
     // Demoted while the change itself goes out (e.g. a packet handled in between)

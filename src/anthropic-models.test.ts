@@ -12,8 +12,8 @@ vi.mock('@anthropic-ai/sdk', () => ({
   },
 }));
 
-import { AnthropicRefusalError, anthropicModelsPlugin, parseJsonResponse, toImageSource } from './anthropic-models';
-import { AiBudgetExceededError, UsageBudget, resetUsageBudget, runWithOrigin } from './usage-budget';
+import { AnthropicRefusalError, anthropicModelsPlugin, parseJsonResponse, toImageSource, tokenReserve } from './anthropic-models';
+import { AiBudgetExceededError, UsageBudget, type UsageLimits, resetUsageBudget, runWithOrigin } from './usage-budget';
 
 function runtime(settings: Record<string, string> = {}): any {
   return {
@@ -201,6 +201,108 @@ describe('anthropicModelsPlugin', () => {
     } finally {
       resetUsageBudget();
     }
+  });
+
+  describe('with limits (the budget is reserved before the request)', () => {
+    const limits = (over: Partial<UsageLimits>) =>
+      new UsageBudget({ aiCallsPerHour: null, aiTokensPerDay: null, visionPerHour: null, ttsCharsPerDay: null, sttSecondsPerDay: null, autonomyAiPerHour: null, autonomyAiMinIntervalMs: 0, ...over });
+    const text = (rt = runtime()) => models[ModelType.TEXT_LARGE](rt, { prompt: 'x', purpose: 'chat' });
+
+    it('makes exactly AI_MAX_CALLS_PER_HOUR requests when many calls start at the same time', async () => {
+      const budget = limits({ aiCallsPerHour: 3 });
+      resetUsageBudget(budget);
+      try {
+        // No request has returned while the others ask
+        let answer!: () => void;
+        const answered = new Promise<void>((resolve) => (answer = resolve));
+        create.mockImplementation(async () => {
+          await answered;
+          return reply([{ type: 'text', text: 'ok' }]);
+        });
+        const calls = Array.from({ length: 12 }, () => text().then(() => 'made', (error) => error));
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(create).toHaveBeenCalledTimes(3);
+        answer();
+        const results = await Promise.all(calls);
+        expect(results.filter((r) => r === 'made')).toHaveLength(3);
+        expect(results.filter((r) => r instanceof AiBudgetExceededError)).toHaveLength(9);
+        expect(create).toHaveBeenCalledTimes(3);
+        expect(budget.snapshot(60_000)).toMatchObject({ ai: { calls: 3 }, skipped: { 'ai-call': 9 } });
+      } finally {
+        resetUsageBudget();
+      }
+    });
+
+    it('never has more tokens in flight than AI_MAX_TOKENS_PER_DAY has room for, and frees what a call did not use', async () => {
+      // Each call reserves its prompt bytes ("You are Coo." + "x" + framing) plus the chat output cap
+      const each = tokenReserve('You are Coo.', 'x', 2048);
+      const budget = limits({ aiTokensPerDay: each * 2 + 10 });
+      resetUsageBudget(budget);
+      try {
+        let answer!: () => void;
+        const answered = new Promise<void>((resolve) => (answer = resolve));
+        create.mockImplementation(async () => {
+          await answered;
+          return reply([{ type: 'text', text: 'ok' }]);
+        });
+        const calls = Array.from({ length: 8 }, () => text().then(() => 'made', (error) => error));
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(create).toHaveBeenCalledTimes(2);
+        expect(budget.snapshot(60_000).ai.reservedTokens).toBe(each * 2);
+        answer();
+        expect((await Promise.all(calls)).filter((r) => r === 'made')).toHaveLength(2);
+        // Each used 15 tokens of what it reserved: the rest is available again
+        expect(budget.snapshot(60_000).ai).toMatchObject({ calls: 2, inputTokens: 24, outputTokens: 6, reservedTokens: 0 });
+        await expect(text()).resolves.toBe('ok');
+      } finally {
+        resetUsageBudget();
+      }
+    });
+
+    it('reserves at least what the request can cost: the bytes of system and prompt, the output cap, and a fixed amount per image', () => {
+      expect(tokenReserve(undefined, '', 100)).toBe(164);
+      expect(tokenReserve('sys', 'prompt', 100)).toBe(164 + 3 + 6);
+      // Bytes, not characters: Japanese text is three bytes a character and about a token each
+      expect(tokenReserve(undefined, 'こんにちは', 0)).toBe(64 + 15);
+      expect(tokenReserve(undefined, [{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: 'A'.repeat(100_000) } }, { type: 'text', text: 'look' }], 0)).toBe(64 + 5000 + 4);
+    });
+
+    it.each([
+      ['a timeout', Object.assign(new Error('Request timed out.'), { name: 'APIConnectionTimeoutError' }), 1],
+      ['an abort', Object.assign(new Error('Request was aborted.'), { name: 'APIUserAbortError' }), 1],
+      ['a server error', Object.assign(new Error('overloaded'), { status: 529 }), 1],
+      ['a conflict', Object.assign(new Error('conflict'), { status: 409 }), 1],
+      ['a request the API refused (400)', Object.assign(new Error('bad request'), { status: 400 }), 0],
+      ['an invalid key (401)', Object.assign(new Error('invalid x-api-key'), { status: 401 }), 0],
+      ['rate limiting by the API (429)', Object.assign(new Error('rate limited'), { status: 429 }), 0],
+    ])('counts a call that failed with %s as a call, and its reservation as used unless the API refused it', async (_what, error, held) => {
+      const each = tokenReserve('You are Coo.', 'x', 2048);
+      const budget = limits({ aiCallsPerHour: 2, aiTokensPerDay: each * 2 });
+      resetUsageBudget(budget);
+      try {
+        create.mockRejectedValue(error);
+        await expect(text()).rejects.toBe(error);
+        expect(budget.snapshot(60_000).ai).toMatchObject({ calls: 1, inputTokens: 0, outputTokens: 0, reservedTokens: held * each });
+        await expect(text()).rejects.toBe(error);
+        // Two failed calls are two calls
+        await expect(text()).rejects.toBeInstanceOf(AiBudgetExceededError);
+        expect(create).toHaveBeenCalledTimes(2);
+      } finally {
+        resetUsageBudget();
+      }
+    });
+
+    it('makes no request with the budget set to 0', async () => {
+      for (const off of [{ aiCallsPerHour: 0 }, { aiTokensPerDay: 0 }]) {
+        resetUsageBudget(limits(off));
+        try {
+          await expect(text()).rejects.toBeInstanceOf(AiBudgetExceededError);
+        } finally {
+          resetUsageBudget();
+        }
+      }
+      expect(create).not.toHaveBeenCalled();
+    });
   });
 
   it('IMAGE_DESCRIPTION also accepts a bare image string', async () => {

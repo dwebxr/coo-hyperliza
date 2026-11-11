@@ -10,6 +10,10 @@ import type { WorldScripts } from "../lib/script-api";
 import { type AssetBytes, type AssetKind, describeUrl, fetchAssetBytes } from "../lib/asset-bytes";
 import { SafeFetchError } from "../lib/net-policy";
 import { gltfStorageProblem, modelBudget } from "../lib/gltf-budget";
+import { RenderPageKilled } from "../lib/render-watchdog";
+
+/** How many assets that got the render page killed are remembered (per world), the oldest dropped first */
+const KILLERS_KEPT = 256;
 
 // --- Mock Browser Environment for Loaders ---
 // These might need adjustment based on GLTFLoader/VRMLoaderPlugin requirements
@@ -96,6 +100,11 @@ export class AgentLoader extends System {
   private waiting: Array<{ start: () => void; cancel: (error: Error) => void }> = [];
   /** Fires when the world is destroyed: downloads stop and waiting loads fail */
   private stopped = new AbortController();
+  /**
+   * Assets whose load ended with the render page killed (lib/render-watchdog.ts), with why: they
+   * fail at once from then on, for this world, instead of being tried (and killing it) again.
+   */
+  private killers = new Map<string, string>();
 
   private limits: LoaderLimits;
 
@@ -151,6 +160,8 @@ export class AgentLoader extends System {
       return Promise.resolve(null);
     }
     const key = `${type}/${url}`;
+    const killed = this.killers.get(key);
+    if (killed) return Promise.reject(new Error(`[AgentLoader] Not loading ${type} from ${describeUrl(url)} again: ${killed}`));
     const existing = this.promises.get(key);
     if (existing) {
       // A load served from the cache counts as a use, as get() does
@@ -193,6 +204,12 @@ export class AgentLoader extends System {
         return await this.parseGLB(type, key, asset);
       });
     } catch (error) {
+      if (error instanceof RenderPageKilled && !this.killers.has(key)) {
+        this.killers.set(key, error.message);
+        while (this.killers.size > KILLERS_KEPT) this.killers.delete(this.killers.keys().next().value as string);
+        console.error(`[AgentLoader] ${type} from ${describeUrl(url)} got the render page killed; it is not loaded again for this world: ${error.message}`);
+        throw error;
+      }
       // A refusal or a network failure needs no stack; anything else might
       const detail = error instanceof SafeFetchError ? `${error.message} (${error.kind})` : error;
       console.error(`[AgentLoader] Failed to load ${type} from ${describeUrl(url)}:`, detail);

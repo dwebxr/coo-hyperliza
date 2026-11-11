@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  MIN_TITLE_MATCH_CODE_POINTS,
   OPENPAY_LINK_FLAG,
   SHARE_ACTION,
   createOpenPayStorePlugin,
@@ -66,6 +67,30 @@ describe('resolveProduct', () => {
     const jp = product('h_jp', 'バイオドーム');
     expect(resolveProduct([board, jp], { messageText: 'バイオドームください' })).toBe(jp);
   });
+  it('does not look for a title shorter than 4 code points in a reply or a message, however it is written there', () => {
+    const tea = product('h_tea', 'Tea');
+    const ai = product('h_ai', 'AI');
+    const hon = product('h_hon', '本');
+    const cake = product('h_cake', 'ケーキ');
+    const padded = product('h_pad', '  Tea ');
+    const shelf = [tea, ai, hon, cake, padded, board];
+    for (const text of ['Tea, please!', 'I love AI', 'この本ください', 'ケーキおいしそう', 'Tea']) {
+      expect(resolveProduct(shelf, { messageText: text }), text).toBeNull();
+      expect(resolveProduct(shelf, { replyText: text }), text).toBeNull();
+    }
+    // Still shared by id, or by the exact title where the id belongs
+    expect(resolveProduct(shelf, { productId: 'h_hon' })).toBe(hon);
+    expect(resolveProduct(shelf, { productId: 'ケーキ' })).toBe(cake);
+    expect(resolveProduct(shelf, { productId: 'ai' })).toBe(ai);
+    // Four code points are enough, counted as code points
+    const four = product('h_four', '🛹🛹🛹🛹');
+    const cafe = product('h_cafe', 'カフェラテ');
+    expect(resolveProduct([four, cafe, tea], { messageText: 'カフェラテください' })).toBe(cafe);
+    expect(resolveProduct([four, tea], { messageText: 'その🛹🛹🛹🛹がほしい' })).toBe(four);
+    expect(resolveProduct([product('h_three', '🛹🛹🛹')], { messageText: 'その🛹🛹🛹がほしい' })).toBeNull();
+    expect(MIN_TITLE_MATCH_CODE_POINTS).toBe(4);
+  });
+
   it('never matches a title inside another word, and never guesses', () => {
     const ai = product('h_ai', 'AI');
     expect(resolveProduct([ai, board], { messageText: 'Can I get details?' })).toBeNull();

@@ -3,6 +3,8 @@ import { type IAgentRuntime, type Plugin, ModelType } from '@elizaos/core';
 import { generateElevenLabsTTS, transcribeWithElevenLabs } from './plugin-hyperfy/utils';
 import { describeUrl } from './plugin-hyperfy/lib/log-url';
 import { MAX_AUDIO_BYTES, type NetPolicy, publicNet } from './plugin-hyperfy/lib/net-policy';
+import { truncateCodePoints } from './plugin-hyperfy/lib/text';
+import { getUsageBudget } from './usage-budget';
 
 /**
  * ElevenLabs speech for other plugins (e.g. Discord voice), which go through runtime models.
@@ -11,6 +13,9 @@ import { MAX_AUDIO_BYTES, type NetPolicy, publicNet } from './plugin-hyperfy/lib
  */
 
 const AUDIO_DOWNLOAD_TIMEOUT_MS = 30_000;
+// What one TEXT_TO_SPEECH call synthesizes at most; longer text is cut (Hyperfy voice has its own
+// cap, managers/voice-manager.ts)
+export const MAX_TTS_CODE_POINTS = 1000;
 
 /** The audio a TRANSCRIPTION call was given, as bytes. `net` is what a URL is downloaded through. */
 export async function toAudioBuffer(input: unknown, net: NetPolicy = publicNet): Promise<Buffer> {
@@ -39,8 +44,15 @@ async function transcribe(_runtime: IAgentRuntime, input: unknown): Promise<stri
 /** Returns a stream, like the plugin this replaces (Discord hands it to createAudioResource). */
 async function textToSpeech(_runtime: IAgentRuntime, input: string | { text: string }): Promise<Readable> {
   const text = typeof input === 'string' ? input : input?.text;
-  if (!text?.trim()) throw new Error('[ElevenLabs] TEXT_TO_SPEECH needs text');
-  const audio = await generateElevenLabsTTS(text);
+  if (typeof text !== 'string' || !text.trim()) throw new Error('[ElevenLabs] TEXT_TO_SPEECH needs text');
+  const spoken = truncateCodePoints(text.trim(), MAX_TTS_CODE_POINTS);
+  // Counted against VOICE_TTS_MAX_CHARS_PER_DAY before the request, like Hyperfy voice
+  const budget = getUsageBudget();
+  if (!budget.reserveTts(spoken.length)) {
+    budget.recordSkip('tts');
+    throw new Error('[ElevenLabs] Text-to-speech limit reached (VOICE_TTS_MAX_CHARS_PER_DAY)');
+  }
+  const audio = await generateElevenLabsTTS(spoken);
   if (!audio) throw new Error('[ElevenLabs] Speech synthesis failed');
   return Readable.from(audio);
 }

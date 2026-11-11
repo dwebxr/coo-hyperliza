@@ -19,7 +19,11 @@ import {
   import { isJapanese } from '../lib/simple-commands';
   import { currentTurn } from '../lib/turn-context';
   import { describeUrl } from '../lib/log-url';
+  import { oneLine } from '../lib/text';
   const MAX_RETRIES = 3;
+  // What the summary prompt is told about the edit: this many results, each cut to this length
+  const MAX_SUMMARY_LINES = 30;
+  const MAX_SUMMARY_LINE_CODE_POINTS = 200;
   const EDIT_ENTITY = EDIT_ENTITY_ACTION;
   // Said without a model call to someone who may not have the world edited
   const REFUSAL_EN = 'Sorry, I can only change things in this world when a builder asks me to.';
@@ -69,20 +73,37 @@ import {
 
   const stringOrUndefined = (value: unknown) => (typeof value === 'string' ? value : undefined);
 
+  // What an entity id or name looks like: letters, digits and a little punctuation, nothing a
+  // URL needs (no colon, slash, backslash, query, fragment, user part or whitespace at the ends)
+  const ENTITY_REFERENCE = /^[\p{L}\p{N}_.$-][\p{L}\p{N} _.$-]{0,99}$/u;
+  // The operations whose target names an entity that is already in the world
+  const ENTITY_OPERATIONS: readonly unknown[] = ['duplicate', 'translate', 'rotate', 'scale', 'delete'];
+
   /**
-   * A target as logs, the summary prompt and the action result show it: a URL (what an import
-   * names) the way every logged URL is written (lib/log-url.ts), an entity id as it is.
+   * A target as logs, the summary prompt and the action result show it, decided by what the
+   * operation takes, not by what the text looks like. An import names a URL: it is always written
+   * the way every logged URL is (lib/log-url.ts), trimmed first, so no spelling of one (leading
+   * whitespace, backslashes, no scheme) keeps its query or credentials. So is the target of an
+   * operation this action does not know. The other operations name an entity: its id is shown as
+   * it is when it looks like one (ENTITY_REFERENCE), and like a URL otherwise.
    */
-  function shownTarget(target: unknown): string {
-    if (typeof target !== 'string') return String(target);
-    return /^[a-z][a-z0-9+.-]*:|^\/\/|@/i.test(target) ? describeUrl(target) : target.slice(0, 100);
+  function shownTarget(operation: unknown, target: unknown): string {
+    if (typeof target !== 'string') return oneLine(String(target), 100);
+    const text = target.trim();
+    if (ENTITY_OPERATIONS.includes(operation) && ENTITY_REFERENCE.test(text)) return text;
+    return oneLine(describeUrl(text), 300);
   }
 
   /** The operation and target of a plan entry, for its outcome. */
   function describe(entry: unknown): Pick<OperationOutcome, 'operation' | 'target'> {
     if (!entry || typeof entry !== 'object') return {};
     const op = entry as Record<string, unknown>;
-    return { operation: stringOrUndefined(op.operation), target: typeof op.target === 'string' ? shownTarget(op.target) : undefined };
+    const operation = stringOrUndefined(op.operation);
+    return {
+      // One short line: it goes into logs and the stored result as the model wrote it
+      operation: operation === undefined ? undefined : oneLine(operation, 40),
+      target: typeof op.target === 'string' ? shownTarget(op.operation, op.target) : undefined,
+    };
   }
 
   export enum EditOperationType {
@@ -184,7 +205,9 @@ const sceneEditOperationExtractionTemplate = `
   - Return only the final JSON object as shown above — no additional text, comments, or wrappers.
 `;
 
-const sceneEditSummaryResponseTemplate = (summary: string) => `
+// The results enter through a state value ({{sceneEditResults}}), never as template text: they
+// hold the model's own descriptions and reasons, which may contain anything, braces included
+const sceneEditSummaryResponseTemplate = `
 <task>
 You are {{agentName}}, a visible in-world AI character in Hyperfy — a real-time, multiplayer 3D simulation.
 
@@ -214,7 +237,7 @@ Don't list every action like a log — instead, summarize the overall outcome na
 ---
 
 ## Scene Edit Results Summary:
-${summary}
+{{sceneEditResults}}
 
 </providers>
 
@@ -311,10 +334,15 @@ ${summary}
     
       let operationResults: any = null;
       let attempts = 0;
+      // Why the requester may no longer have the world edited, once that is so: checked before
+      // every planning step and after every await in it, so no further model call is made for them
+      let noLongerPlanning: string | null = null;
     
       while (attempts < MAX_RETRIES) {
+        if ((noLongerPlanning = stillAllowed())) break;
         try {
           const extractionState = await runtime.composeState(message);
+          if ((noLongerPlanning = stillAllowed())) break;
           const prompt = composePromptFromState({
             state: extractionState,
             template: sceneEditOperationExtractionTemplate,
@@ -337,8 +365,17 @@ ${summary}
       }
 
       
+      // Also after the last planning call: its answer is not used for a requester who lost the right
+      noLongerPlanning ??= stillAllowed();
+      if (noLongerPlanning) {
+        logger.warn(`[EDIT_ENTITY Action] Stopped planning: ${noLongerPlanning}`);
+        await sayNoLonger(noLongerPlanning);
+        return actionFailed(EDIT_ENTITY, `stopped: ${noLongerPlanning}`);
+      }
+
       if (!Array.isArray(operationResults?.operations)) {
         logger.error(`[EDIT_ENTITY Action] Scene editing failed — could not understand instructions properly.`);
+        // Checked like every closing message (nothing is awaited between the check above and here)
         await tellFailure(callback, EDIT_ENTITY, japanese ? 'ごめんなさい、どう編集すればいいか分かりませんでした。' : "Sorry, I couldn't work out how to make that change.");
         return actionFailed(EDIT_ENTITY, 'no edit plan from the model');
       }
@@ -369,7 +406,7 @@ ${summary}
         const { operation, target, parameters, description } = op;
         const outcome = record({ ...describe(op), outcome: 'executed' }, stringOrUndefined(description));
         if (!op.success) {
-          logger.warn(`[EDIT_ENTITY Action] Skipping ${stringOrUndefined(operation) ?? 'an operation'} on "${shownTarget(target)}" the plan marked as failed`);
+          logger.warn(`[EDIT_ENTITY Action] Skipping ${stringOrUndefined(operation) ?? 'an operation'} on "${shownTarget(operation, target)}" the plan marked as failed`);
           outcome.outcome = 'skipped';
           outcome.reason = stringOrUndefined(op.reason);
           continue;
@@ -414,19 +451,19 @@ ${summary}
           }
         } catch (error: any) {
           if (error instanceof SceneEditStopped) {
-            logger.warn(`[EDIT_ENTITY Action] Stopped before ${operation} on "${shownTarget(target)}": ${error.message}`);
+            logger.warn(`[EDIT_ENTITY Action] Stopped before ${operation} on "${shownTarget(operation, target)}": ${error.message}`);
             stopped = error.message;
             outcome.outcome = 'failed';
             outcome.reason = `not run: ${error.message}`;
             continue;
           }
-          logger.error(`[EDIT_ENTITY Action] Operation ${operation} on "${shownTarget(target)}" failed:`, error);
+          logger.error(`[EDIT_ENTITY Action] Operation ${operation} on "${shownTarget(operation, target)}" failed:`, error);
           done = { outcome: 'failed', reason: String(error?.message ?? error) };
         }
         if (done.outcome === 'applied') {
           if (typeof description === 'string' && description) postNow(description);
         } else {
-          logger.warn(`[EDIT_ENTITY Action] ${operation} on "${shownTarget(target)}" ${done.outcome}: ${done.reason}`);
+          logger.warn(`[EDIT_ENTITY Action] ${operation} on "${shownTarget(operation, target)}" ${done.outcome}: ${done.reason}`);
           outcome.outcome = done.outcome;
           outcome.reason = done.reason;
         }
@@ -463,13 +500,14 @@ ${summary}
         return result;
       }
 
-      // From what was actually done, not from the model's plan
-      const summaryText = outcomes.map((o, i) => {
-        const what = `${o.operation ?? 'an operation'}${o.target ? ` on "${o.target}"` : ''}`;
+      // From what was actually done, not from the model's plan. Each entry is one bounded line:
+      // operations, descriptions and reasons are the planning model's words about world content
+      const summaryText = outcomes.slice(0, MAX_SUMMARY_LINES).map((o, i) => {
+        const what = `${oneLine(o.operation ?? 'an operation', 40)}${o.target ? ` on "${o.target}"` : ''}`;
         return o.outcome === 'executed'
-          ? `DONE: ${descriptions[i] ?? what}`
-          : `NOT DONE (${o.outcome}): ${what} → ${o.reason ?? 'no reason given'}`;
-      }).join('\n');
+          ? `DONE: ${oneLine(descriptions[i] ?? what, MAX_SUMMARY_LINE_CODE_POINTS)}`
+          : `NOT DONE (${o.outcome}): ${what} → ${oneLine(o.reason ?? 'no reason given', MAX_SUMMARY_LINE_CODE_POINTS)}`;
+      }).concat(outcomes.length > MAX_SUMMARY_LINES ? [`(and ${outcomes.length - MAX_SUMMARY_LINES} more)`] : []).join('\n');
       
       const stateForResponse = await runtime.composeState(message);
       // Checked again after that await: no summary call for a requester who lost the right meanwhile
@@ -479,8 +517,8 @@ ${summary}
         return result;
       }
       const agentResponsePrompt = composePromptFromState({
-        state: stateForResponse,
-        template: sceneEditSummaryResponseTemplate(summaryText),
+        state: { ...stateForResponse, values: { ...stateForResponse.values, sceneEditResults: summaryText } },
+        template: sceneEditSummaryResponseTemplate,
       });
       
       let finalXml: string;

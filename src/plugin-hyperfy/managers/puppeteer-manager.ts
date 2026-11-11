@@ -9,6 +9,7 @@ import { resolveUrl } from '../utils.js';
 import { getModuleDirectory } from '../utils.js';
 import { childEnv } from '../lib/child-env';
 import { modelBudget } from '../lib/gltf-budget';
+import { RenderWatchdog, type RenderWatchdogOptions } from '../lib/render-watchdog';
 
 // HyperfyService.serviceType. Not imported as a value: this module must load without the service
 // (and the whole engine behind it), which is how scripts/smoke-chromium.mjs runs it.
@@ -60,6 +61,11 @@ export class PageOperationCancelled extends Error {
 export class PuppeteerManager {
   private static instance: PuppeteerManager | null = null
   private operations = 0
+  /**
+   * The run-time bound on the page (lib/render-watchdog.ts): every page call below runs under it,
+   * and Chromium's tree is killed when it uses too much memory or one call takes too long.
+   */
+  readonly watchdog: RenderWatchdog
   
   private runtime: IAgentRuntime
   private browser: puppeteer.Browser
@@ -76,11 +82,32 @@ export class PuppeteerManager {
   ] as const;
 
 
-  /** `pageBundlePath`: the built render page, when it is not next to this module (the smoke script). */
-  constructor(runtime: IAgentRuntime, { pageBundlePath }: { pageBundlePath?: string } = {}) {
+  /**
+   * `pageBundlePath`: the built render page, when it is not next to this module (the smoke script).
+   * `watchdog`: FOR TESTS, a shorter deadline or another process table.
+   */
+  constructor(runtime: IAgentRuntime, { pageBundlePath, watchdog }: { pageBundlePath?: string; watchdog?: Pick<RenderWatchdogOptions, 'deadlineMs' | 'limitBytes' | 'table'> } = {}) {
     if (PuppeteerManager.instance) {
       throw new Error('PuppeteerManager has already been instantiated.')
     }
+    this.watchdog = new RenderWatchdog({
+      ...watchdog,
+      rootPid: () => this.browser?.process?.()?.pid ?? null,
+      kill: (pids) => {
+        for (const pid of pids) {
+          try {
+            process.kill(pid, 'SIGKILL')
+          } catch {
+            // gone already
+          }
+        }
+        // The next use starts a new browser at once, without waiting for puppeteer to notice
+        this.browserPromise = null
+        this.browser = null
+        this.initPromise = null
+        this.page = null
+      },
+    })
     this.runtime = runtime
     this.pageBundlePath = pageBundlePath ?? path.join(getModuleDirectory(), 'puppeteer', 'page.js')
     PuppeteerManager.instance = this
@@ -260,9 +287,9 @@ export class PuppeteerManager {
       ] as const
     };
 
-    const base64 = await page.evaluate(async (playerData) => {
+    const base64 = await this.watchdog.watch(() => page.evaluate(async (playerData) => {
       return await window.snapshotFacingDirection(playerData);
-    }, playerData);
+    }, playerData));
   
     this.saveDebugSnapshot(`scene_facing_${direction}.jpeg`, base64);
   
@@ -286,9 +313,9 @@ export class PuppeteerManager {
       position: player.base.position.toArray() as [number, number, number]
     };
 
-    const base64 = await page.evaluate(async (playerData, targetPosition) => {
+    const base64 = await this.watchdog.watch(() => page.evaluate(async (playerData, targetPosition) => {
       return await window.snapshotViewToTarget(playerData, targetPosition);
-    }, playerData, targetPosition);
+    }, playerData, targetPosition));
   
     this.saveDebugSnapshot('scene_view_to_target.jpeg', base64);
   
@@ -314,9 +341,9 @@ export class PuppeteerManager {
       quaternion: [player.base.quaternion.x, player.base.quaternion.y, player.base.quaternion.z, player.base.quaternion.w] as const
     };
     
-    const base64 = await page.evaluate(async (playerData) => {
+    const base64 = await this.watchdog.watch(() => page.evaluate(async (playerData) => {
       return await window.snapshotEquirectangular(playerData);
-    }, playerData);
+    }, playerData));
   
     this.saveDebugSnapshot('scene_equirectangular.jpeg', base64);
   
@@ -330,20 +357,43 @@ export class PuppeteerManager {
    *
    * Each takes a `signal` (the world the asset is for going away): checked once the page is ready
    * and right before the page is asked, so nothing is handed to the page after it fired. A page
-   * call cannot be interrupted; when the signal fired while one ran, what it kept in the page is
-   * taken back right after (assets.js undo) and the call fails with PageOperationCancelled.
+   * call cannot be interrupted. With a signal, the page files how to take back what the call kept
+   * under the call's id, and every call is then settled: committed when it succeeded and the
+   * signal did not fire (the page drops that record at once), taken back otherwise (the call then
+   * fails with PageOperationCancelled, or with its own error). No record outlives its call.
    */
   private async pageCall<T>(signal: AbortSignal | undefined, run: (page: puppeteer.Page, op: string[]) => Promise<T>): Promise<T> {
     const page = await this.init()
     if (signal?.aborted) throw new PageOperationCancelled()
     // The id the page files its undo under; only when there is something to cancel
     const op = signal ? [`op-${++this.operations}`] : []
-    const result = await run(page, op)
+    let result: T
+    try {
+      result = await this.watchdog.watch(() => run(page, op))
+    } catch (error) {
+      if (op.length) await this.settle(page, op[0], false)
+      throw error
+    }
     if (signal?.aborted) {
-      await page.evaluate((id) => window.agentPage.undo(id), op[0]).catch(() => {})
+      await this.settle(page, op[0], false)
       throw new PageOperationCancelled()
     }
+    if (op.length) await this.settle(page, op[0], true)
     return result
+  }
+
+  /** Commits (`keep`) or takes back what call `op` kept in the page. A page that is gone keeps nothing. */
+  private async settle(page: puppeteer.Page, op: string, keep: boolean): Promise<void> {
+    await this.watchdog.watch(() => page.evaluate((id, keep) => window.agentPage.settle(id, keep), op, keep)).catch(() => {})
+  }
+
+  /**
+   * Runs `fn` in the page as a watched page call (the memory limit and the deadline apply). For
+   * scripts/smoke-chromium.mjs, which checks the watchdog with it.
+   */
+  async evaluateWatched<T>(fn: (...args: any[]) => T | Promise<T>, ...args: unknown[]): Promise<T> {
+    const page = await this.init()
+    return this.watchdog.watch(() => page.evaluate(fn, ...args))
   }
 
   /**
@@ -423,10 +473,10 @@ export class PuppeteerManager {
     );
     
     const STRIP_SLOTS = this.STRIP_SLOTS;
-    await page.evaluate(
+    await this.watchdog.watch(() => page.evaluate(
       (sceneJson, STRIP_SLOTS, players) => window.agentPage.rehydrate(sceneJson, STRIP_SLOTS, players),
       sceneJson, STRIP_SLOTS, players
-    );
+    ));
   }
 
   private getService() {

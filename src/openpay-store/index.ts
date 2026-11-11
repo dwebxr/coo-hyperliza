@@ -83,9 +83,20 @@ export function formatShelf(products: StoreProduct[], { autonomous }: { autonomo
   ].join('\n');
 }
 
+// A title shorter than this is not looked for in running text: "AI", "Tea" or a two-character
+// Japanese title occurs in sentences that are not about the product
+export const MIN_TITLE_MATCH_CODE_POINTS = 4;
+
+/** Whether a product can be recognised by its title in a reply or a player's message. */
+export function isSpecificTitle(title: string): boolean {
+  return Array.from(title.trim()).length >= MIN_TITLE_MATCH_CODE_POINTS;
+}
+
 /**
  * Which product the reply meant: the id the model put in <productId> (an unknown id shares nothing),
  * else the one product whose title the reply or the player's message names as a whole word.
+ * Only titles of at least MIN_TITLE_MATCH_CODE_POINTS code points are looked for in text; a
+ * product with a shorter title is shared by its id (or its exact title in <productId>) only.
  * Never a URL from the model, and never a guess.
  */
 export function resolveProduct(
@@ -103,7 +114,7 @@ export function resolveProduct(
   for (const text of [replyText, messageText]) {
     if (typeof text !== 'string' || !text) continue;
     // Whole-word match for latin titles ("AI" must not match "details"), substring for Japanese
-    const matches = products.filter((p) => isDirectlyAddressed(text, [p.title]));
+    const matches = products.filter((p) => isSpecificTitle(p.title) && isDirectlyAddressed(text, [p.title]));
     if (matches.length === 1) return matches[0];
   }
   return null;

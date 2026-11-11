@@ -31,6 +31,35 @@ const IMAGE_DESCRIPTION_MAX_TOKENS = 4096;
 // covers SDK retries, Retry-After waits and reading the response body.
 const GENERATION_DEADLINE_MS = 60_000;
 
+// Reserved against AI_MAX_TOKENS_PER_DAY on top of the prompt's bytes: the request's own framing
+const FRAMING_TOKEN_RESERVE = 64;
+// Reserved per attached image. An estimate, not a bound: the API counts an image by its pixels
+const IMAGE_TOKEN_RESERVE = 5000;
+
+/**
+ * The most tokens a request can be billed for, as far as that can be known before it is sent:
+ * a token is at least one byte of text, so the prompt costs at most its UTF-8 bytes; the output
+ * (thinking included) at most `maxOutput`. Images are counted at IMAGE_TOKEN_RESERVE each.
+ */
+export function tokenReserve(system: string | undefined, content: string | Anthropic.ContentBlockParam[], maxOutput: number): number {
+  let reserve = FRAMING_TOKEN_RESERVE + maxOutput + Buffer.byteLength(system ?? '');
+  if (typeof content === 'string') return reserve + Buffer.byteLength(content);
+  for (const block of content) {
+    if (block.type === 'text') reserve += Buffer.byteLength(block.text);
+    else if (block.type === 'image') reserve += IMAGE_TOKEN_RESERVE;
+    // Nothing else is sent by this module; anything else is counted by its serialized size
+    else reserve += Buffer.byteLength(JSON.stringify(block));
+  }
+  return reserve;
+}
+
+/** Whether the API refused the request itself (a 4xx answer), so nothing was generated or billed. */
+function wasRejected(error: unknown): boolean {
+  const status = (error as { status?: unknown } | null)?.status;
+  // 408 and 409 can follow work the API already did
+  return typeof status === 'number' && status >= 400 && status < 500 && status !== 408 && status !== 409;
+}
+
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 type Effort = (typeof EFFORTS)[number];
 type Size = 'SMALL' | 'LARGE';
@@ -96,12 +125,6 @@ async function generate(
   }
 ): Promise<string> {
   const budget = getUsageBudget();
-  const blocked = budget.aiBlockedReason();
-  if (blocked) {
-    budget.recordSkip('ai-call');
-    throw new AiBudgetExceededError(blocked);
-  }
-
   const model = getSetting(runtime, `ANTHROPIC_${size}_MODEL`, DEFAULT_MODEL);
   const effort = getEffort(runtime);
   // The API rejects empty or whitespace-only stop sequences
@@ -109,23 +132,38 @@ async function generate(
   // A tagged call's own cap wins over the caller's value, which may be a global model setting
   const maxOutput = maxTokensFor(purpose) ?? maxTokens ?? DEFAULT_MAX_TOKENS;
   const label = isAiPurpose(purpose) ? purpose : modelType;
+  const client = getClient(runtime);
 
-  const response = await getClient(runtime).messages.create(
-    {
-      model,
-      max_tokens: maxOutput,
-      ...(system ? { system } : {}),
-      ...(stops.length ? { stop_sequences: stops } : {}),
-      output_config: { effort },
-      messages: [{ role: 'user', content: content ?? prompt }],
-    },
-    { signal: AbortSignal.timeout(GENERATION_DEADLINE_MS), maxRetries: 1 }
-  );
+  // Admitted and counted before the request, in one step: calls that start together cannot all
+  // pass a limit only one of them fits (usage-budget.ts reserveAi)
+  const reservation = budget.reserveAi({ purpose: label, origin: currentOrigin() }, tokenReserve(system, content ?? prompt, maxOutput));
+  if (typeof reservation === 'string') {
+    budget.recordSkip('ai-call');
+    throw new AiBudgetExceededError(reservation);
+  }
+
+  let response: Anthropic.Message;
+  try {
+    response = await client.messages.create(
+      {
+        model,
+        max_tokens: maxOutput,
+        ...(system ? { system } : {}),
+        ...(stops.length ? { stop_sequences: stops } : {}),
+        output_config: { effort },
+        messages: [{ role: 'user', content: content ?? prompt }],
+      },
+      { signal: AbortSignal.timeout(GENERATION_DEADLINE_MS), maxRetries: 1 }
+    );
+  } catch (error) {
+    // A request the API refused cost nothing; one that timed out, was aborted or lost its
+    // connection may have been billed, so its whole reservation stays counted
+    reservation.fail(wasRejected(error) ? 'rejected' : 'unknown');
+    throw error;
+  }
 
   // Billed even when the output turns out unusable
-  budget.recordAi({
-    purpose: label,
-    origin: currentOrigin(),
+  reservation.settle({
     inputTokens: response.usage.input_tokens,
     outputTokens: response.usage.output_tokens,
     cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,

@@ -122,6 +122,24 @@ function processTree(root) {
   return [...tree];
 }
 
+/** Resident memory of a process tree right now, in bytes (what lib/render-watchdog.ts measures) */
+function treeMemory(root) {
+  const rows = spawnSync('ps', ['-A', '-o', 'pid=,ppid=,rss='], { encoding: 'utf8' }).stdout.split('\n').map((line) => line.trim().split(/\s+/).map(Number)).filter((row) => row.length === 3 && row.every(Number.isFinite));
+  const tree = new Set([root]);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const [pid, parent] of rows) {
+      if (tree.has(parent) && !tree.has(pid)) {
+        tree.add(pid);
+        grew = true;
+      }
+    }
+  }
+  return rows.filter(([pid]) => tree.has(pid)).reduce((sum, [, , rss]) => sum + rss * 1024, 0);
+}
+const GiB = 1024 * 1024 * 1024;
+const inGiB = (bytes) => `${(bytes / GiB).toFixed(2)} GiB`;
+
 /** Remote ends of the TCP/UDP sockets a process tree holds right now */
 export function remoteEnds(rootPid) {
   const out = spawnSync('lsof', ['-nP', '-a', '-p', processTree(rootPid).join(','), '-iTCP', '-iUDP', '-Fn'], { encoding: 'utf8' }).stdout;
@@ -202,6 +220,9 @@ async function main() {
     manager = new PuppeteerManager({ getService: () => ({ getWorld: () => world }) }, { pageBundlePath: path.join(dir, 'page.js') });
     const page = await manager.init();
     const chromium = manager.browser.process();
+    await sleep(1000);
+    const idleMemory = treeMemory(chromium.pid);
+    console.log(`  info  Chromium's process tree, idle with the render page: ${inGiB(idleMemory)}`);
     const sockets = new Set();
     const sampler = setInterval(() => remoteEnds(chromium.pid).forEach((end) => sockets.add(end)), 150);
     const pageErrors = [];
@@ -263,6 +284,15 @@ async function main() {
       cancelled.every((outcome) => outcome === 'AbortError') && keptAfter.textures === keptBefore.textures && !keptAfter.avatar,
       `${cancelled.join(', ')}; textures ${keptBefore.textures} -> ${keptAfter.textures}, avatar kept: ${keptAfter.avatar}`
     );
+    // Successful loads are committed at once: the page keeps no record (and so no scene) for any of them
+    const texturesBeforeLoads = await page.evaluate(() => [...window.texturesMap.keys()]);
+    for (let i = 0; i < 5; i++) await manager.loadGlbBytes(environmentSource, { signal: new AbortController().signal });
+    const pendingAfterLoads = await page.evaluate(() => window.agentPage.pendingSettlements());
+    check('after five successful model loads with a signal, the page holds no load waiting to be settled', pendingAfterLoads === 0, `${pendingAfterLoads} pending`);
+    // Their textures would change which one the texture-limit check below finds least recently used
+    await page.evaluate((before) => {
+      for (const key of [...window.texturesMap.keys()]) if (!before.includes(key)) window.texturesMap.delete(key);
+    }, texturesBeforeLoads);
     const materialIds = new Set();
     environment.scene.traverse((node) => node.material?.userData?.materialId && materialIds.add(node.material.userData.materialId));
     const kept = await page.evaluate(() => window.texturesMap.size);
@@ -346,6 +376,9 @@ async function main() {
       })(),
     }));
     check("the visitor's avatar is in the scene, and the sky and the environment have their textures back", drawn.avatars === 1 && drawn.skyHasTexture && drawn.textured >= 2, JSON.stringify(drawn));
+    const loadedMemory = treeMemory(chromium.pid);
+    console.log(`  info  Chromium's process tree with the bundled avatar, environment, HDR and snapshots taken: ${inGiB(loadedMemory)}; the largest the watchdog sampled during page calls so far: ${inGiB(manager.watchdog.peakSampleBytes)} (watchdog limit ${inGiB(manager.watchdog.limitBytes)})`);
+    check('the bundled workload stays below three quarters of the watchdog limit', manager.watchdog.peakSampleBytes < 0.75 * manager.watchdog.limitBytes, `peak ${inGiB(manager.watchdog.peakSampleBytes)} of ${inGiB(manager.watchdog.limitBytes)}`);
     check('no diagnostic JPEG is written without HYPERFY_DEBUG_SNAPSHOTS=true', readdirSync(dir).filter((name) => name.endsWith('.jpeg')).length === 0);
     process.env.HYPERFY_DEBUG_SNAPSHOTS = 'true';
     await manager.snapshotFacingDirection('front');
@@ -446,6 +479,40 @@ async function main() {
     await page.close();
     const rebuilt = await manager.init();
     check('after the page closed, the next use gets a new one with the render page in it', rebuilt !== page && (await rebuilt.evaluate(() => typeof window.agentPage)) === 'object');
+
+    console.log(`  info  the largest the watchdog sampled during the whole workload: ${inGiB(manager.watchdog.peakSampleBytes)}; the longest page call: ${manager.watchdog.longestCallMs} ms (deadline ${manager.watchdog.deadlineMs} ms)`);
+    check('the slowest page call of the workload meets the deadline ten times over', manager.watchdog.longestCallMs * 10 <= manager.watchdog.deadlineMs, `${manager.watchdog.longestCallMs} ms`);
+    console.log('\n== the watchdog');
+    // A page call that allocates and touches memory without end. Its own hard stop (3.5 GiB or 20 s)
+    // ends it if the watchdog does not, so that a missing watchdog fails this check instead of
+    // exhausting the machine
+    const HARD_STOP_BYTES = 3.5 * GiB;
+    const HARD_STOP_MS = 20_000;
+    const killedPid = manager.browser.process().pid;
+    const started = Date.now();
+    const runaway = await manager.evaluateWatched(async (hardStopBytes, hardStopMs) => {
+      const kept = [];
+      let total = 0;
+      const start = Date.now();
+      while (total < hardStopBytes && Date.now() - start < hardStopMs) {
+        const chunk = new Uint8Array(32 * 1024 * 1024);
+        for (let i = 0; i < chunk.length; i += 4096) chunk[i] = 1;
+        kept.push(chunk);
+        total += chunk.length;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      return { total, ms: Date.now() - start };
+    }, HARD_STOP_BYTES, HARD_STOP_MS).then((value) => ({ value }), (error) => ({ error }));
+    const killedAfter = Date.now() - started;
+    const measured = runaway.error?.measuredBytes ?? 0;
+    check(
+      'a page call that allocates without end gets Chromium killed by the watchdog (RenderPageKilled, memory) at most 1 GiB above the limit',
+      runaway.error?.name === 'RenderPageKilled' && runaway.error.reason === 'memory' && measured > manager.watchdog.limitBytes && measured <= manager.watchdog.limitBytes + GiB,
+      runaway.error ? `${runaway.error.message}; measured ${inGiB(measured)} after ${killedAfter} ms` : `not killed: the page call returned ${JSON.stringify(runaway.value)}`
+    );
+    const afterKill = await manager.snapshotEquirectangular().then((shot) => shot, (error) => `failed: ${error?.message ?? error}`);
+    const freshPid = manager.browser?.process()?.pid;
+    check('the next snapshot works, on a new browser and page', afterKill.startsWith('data:image/jpeg;base64,') && freshPid && freshPid !== killedPid, `${afterKill.slice(0, 40)}; browser pid ${killedPid} -> ${freshPid}`);
   } catch (error) {
     check('the smoke ran to the end', false, error instanceof Error ? (error.stack ?? error.message) : String(error));
   } finally {

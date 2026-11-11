@@ -1,5 +1,5 @@
 import { logger } from '@elizaos/core';
-import { stripControlChars, truncateCodePoints } from '../plugin-hyperfy/lib/text';
+import { stripControlChars, stripInvisibleChars, truncateCodePoints } from '../plugin-hyperfy/lib/text';
 import { safeFetch, toResponse } from '../plugin-hyperfy/lib/net-policy';
 
 /**
@@ -34,7 +34,10 @@ export interface StoreProduct {
   handle: string;
   /** What the buyer pays (price + fee), in JPYC. */
   totalJpyc: string;
-  /** Purchase page, passed through unchanged (only accepted on the API's own origin). */
+  /**
+   * Purchase page, exactly as the API sent it. Only accepted when it is a plain https URL on the
+   * API's own origin whose path names this product's seller (see purchaseUrlProblem).
+   */
   url: string;
   /** Milliseconds; used to keep the merged list newest-first across sellers. */
   updatedAt: number;
@@ -49,11 +52,13 @@ export interface StoreCatalogConfig {
 
 /**
  * Collapses seller-provided text to one short line that cannot break the XML-ish prompt or
- * reply format (no <, >, backticks, control characters or newlines).
+ * reply format (no <, >, backticks, control characters or newlines) and shows as it reads:
+ * format characters (bidi overrides and isolates, zero-width characters, tags) are removed.
  */
 export function sanitizeText(value: unknown, max: number): string {
   if (typeof value !== 'string') return '';
-  const clean = stripControlChars(value, ' ')
+  // Controls and line separators become a space; format characters, which have no width, go
+  const clean = stripInvisibleChars(stripControlChars(value, ' ').replace(/[\u2028\u2029]/g, ' '))
     .replace(/[<>`]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -62,7 +67,38 @@ export function sanitizeText(value: unknown, max: number): string {
 
 const HANDLE = /^[\w.-]{1,64}$/;
 const ID = /^[\w.-]{1,128}$/;
-const AMOUNT = /^\d+(\.\d+)?$/;
+// What the buyer pays: at most 15 digits and 18 decimals (JPYC's own precision). Anything longer
+// is not an amount a person reads; the item is dropped
+const AMOUNT = /^\d{1,15}(\.\d{1,18})?$/;
+// A purchase URL as the Store writes it is well under this
+const MAX_URL_LENGTH = 512;
+const URL_UNSAFE = /[\s\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+
+/**
+ * Why `url` is not accepted as the purchase page of a product of seller `handle`, or null when it
+ * is. It is posted to chat as it is, so it must be exactly what it parses to: a plain https URL on
+ * `allowedOrigin` without credentials, whitespace, control or format characters, already in its
+ * normal form (so nothing is hidden in an encoding the chat client might undo), and its path must
+ * name the seller as a segment `@handle`.
+ */
+export function purchaseUrlProblem(url: unknown, { allowedOrigin, handle }: { allowedOrigin: string; handle: string }): string | null {
+  if (typeof url !== 'string') return 'not text';
+  if (url.length > MAX_URL_LENGTH) return 'too long';
+  if (URL_UNSAFE.test(url)) return 'contains whitespace or an invisible character';
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return 'not a URL';
+  }
+  if (parsed.protocol !== 'https:') return 'not https';
+  if (parsed.username || parsed.password) return 'has credentials';
+  if (parsed.origin !== allowedOrigin) return "not on the API's origin";
+  if (parsed.href !== url) return 'not in normal form';
+  const seller = `@${handle.toLowerCase()}`;
+  if (!parsed.pathname.split('/').some((segment) => segment.toLowerCase() === seller)) return 'its path does not name the seller';
+  return null;
+}
 
 /** Parses OPENPAY_STORE_HANDLES. null when nothing usable is configured (feature off). */
 export function parseHandles(raw: string | undefined): string[] | '*' | null {
@@ -89,23 +125,24 @@ export function parseLocale(raw: string | undefined): StoreLocale {
   return 'ja';
 }
 
-/** Whitelists one API item; null when it is malformed or its url is off the API's origin. */
-export function toStoreProduct(item: any, allowedOrigin: string): StoreProduct | null {
+/**
+ * Whitelists one API item; null when it is malformed, its seller is not one of `sellers` (the
+ * configured handles, compared without case; '*' is every seller), or its url is not that
+ * seller's purchase page (purchaseUrlProblem). The API is asked per seller, but what it answers is
+ * checked here: an item of another seller is never sold.
+ */
+export function toStoreProduct(item: any, allowedOrigin: string, sellers: readonly string[] | '*' = '*'): StoreProduct | null {
   if (!item || typeof item !== 'object') return null;
   const { id, handle, url } = item;
   // Strings per the API contract; a finite number is tolerated in case that ever changes
   const totalJpyc = typeof item.totalJpyc === 'number' && Number.isFinite(item.totalJpyc) ? String(item.totalJpyc) : item.totalJpyc;
   if (typeof id !== 'string' || !ID.test(id)) return null;
   if (typeof handle !== 'string' || !HANDLE.test(handle)) return null;
+  if (sellers !== '*' && !sellers.some((seller) => seller.toLowerCase() === handle.toLowerCase())) return null;
   if (typeof totalJpyc !== 'string' || !AMOUNT.test(totalJpyc)) return null;
   const title = sanitizeText(item.title, 120);
   if (!title) return null;
-  if (typeof url !== 'string') return null;
-  try {
-    if (new URL(url).origin !== allowedOrigin) return null;
-  } catch {
-    return null;
-  }
+  if (purchaseUrlProblem(url, { allowedOrigin, handle }) !== null) return null;
   const updatedAt = typeof item.updatedAt === 'number' && Number.isFinite(item.updatedAt) ? item.updatedAt : 0;
 
   // The url string itself is kept as the API sent it
@@ -226,9 +263,13 @@ export class StoreCatalog {
     if (body?.ok !== true || !Array.isArray(body.items)) {
       throw new TransientError(`${source}: unexpected response shape`);
     }
-    const products = body.items.map((item: any) => toStoreProduct(item, this.origin)).filter(Boolean) as StoreProduct[];
-    if (body.items.length > 0 && products.length === 0) {
-      logger.warn(`[OpenPayStore] ${source}: all ${body.items.length} item(s) were rejected as malformed`);
+    // A page asked for one seller holds that seller's products only; '*' takes every seller
+    const sellers = handle ? [handle] : '*';
+    // The API returns at most LIMIT items; more than that is not looked at
+    const items: unknown[] = body.items.slice(0, LIMIT);
+    const products = items.map((item) => toStoreProduct(item, this.origin, sellers)).filter(Boolean) as StoreProduct[];
+    if (products.length < items.length) {
+      logger.warn(`[OpenPayStore] ${source}: ${items.length - products.length} of ${items.length} item(s) were rejected (malformed, another seller's, or a purchase URL that is not a plain https link to that seller on the API's origin)`);
     }
     return products;
   }

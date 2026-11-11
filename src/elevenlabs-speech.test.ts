@@ -8,7 +8,8 @@ const { transcribeWithElevenLabs, generateElevenLabsTTS } = vi.hoisted(() => ({
 }));
 vi.mock('./plugin-hyperfy/utils', () => ({ transcribeWithElevenLabs, generateElevenLabsTTS }));
 
-import { elevenLabsSpeechPlugin, toAudioBuffer } from './elevenlabs-speech';
+import { MAX_TTS_CODE_POINTS, elevenLabsSpeechPlugin, toAudioBuffer } from './elevenlabs-speech';
+import { UsageBudget, resetUsageBudget } from './usage-budget';
 import { MAX_AUDIO_BYTES, SafeFetchError } from './plugin-hyperfy/lib/net-policy';
 import { PUBLIC_ADDRESS, closeServers, startServer, testNet } from './plugin-hyperfy/test-support/net';
 
@@ -108,6 +109,37 @@ describe('elevenLabsSpeechPlugin', () => {
     generateElevenLabsTTS.mockResolvedValue(null);
     await expect(models[ModelType.TEXT_TO_SPEECH](runtime, 'hi')).rejects.toThrow('synthesis failed');
     await expect(models[ModelType.TEXT_TO_SPEECH](runtime, '  ')).rejects.toThrow('needs text');
+  });
+});
+
+describe('elevenLabsSpeechPlugin text-to-speech limits', () => {
+  const budgetWith = (ttsCharsPerDay: number | null) =>
+    new UsageBudget({ aiCallsPerHour: null, aiTokensPerDay: null, visionPerHour: null, ttsCharsPerDay, sttSecondsPerDay: null, autonomyAiPerHour: null, autonomyAiMinIntervalMs: 0 });
+  afterEach(() => {
+    resetUsageBudget();
+    generateElevenLabsTTS.mockReset();
+  });
+
+  it('synthesizes at most 1000 code points of one request, never half a surrogate pair', async () => {
+    resetUsageBudget(budgetWith(null));
+    generateElevenLabsTTS.mockResolvedValue(Buffer.from('mp3'));
+    await models[ModelType.TEXT_TO_SPEECH](runtime, `a${'🛹'.repeat(2000)}`);
+    const [spoken] = generateElevenLabsTTS.mock.calls[0];
+    expect(spoken).toBe(`a${'🛹'.repeat(MAX_TTS_CODE_POINTS - 1)}`);
+  });
+
+  it('counts the characters before the request and refuses text that does not fit in what is left of the daily limit', async () => {
+    const budget = budgetWith(10);
+    resetUsageBudget(budget);
+    // Requests that start together: only what fits is sent
+    const pending: ((audio: Buffer) => void)[] = [];
+    generateElevenLabsTTS.mockImplementation(() => new Promise((resolve) => pending.push(resolve)));
+    const calls = ['123456', '123456', '1234'].map((text) => models[ModelType.TEXT_TO_SPEECH](runtime, text).then(() => 'spoken', (error: Error) => error.message));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(generateElevenLabsTTS.mock.calls.map(([text]) => text)).toEqual(['123456', '1234']);
+    expect(budget.snapshot(60_000)).toMatchObject({ ttsChars: 10, skipped: { tts: 1 } });
+    for (const finish of pending) finish(Buffer.from('mp3'));
+    expect(await Promise.all(calls)).toEqual(['spoken', '[ElevenLabs] Text-to-speech limit reached (VOICE_TTS_MAX_CHARS_PER_DAY)', 'spoken']);
   });
 });
 

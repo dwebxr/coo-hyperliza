@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { countOtherPlayers, resolveUrl, transcribeWithElevenLabs } from './utils';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { MAX_SPEECH_AUDIO_BYTES, MAX_TRANSCRIPT_RESPONSE_BYTES, countOtherPlayers, generateElevenLabsTTS, generateOpenAITTS, resolveUrl, transcribeWithElevenLabs } from './utils';
 
 const world = { assetsUrl: 'https://assets.example.com/' };
 
@@ -86,5 +86,151 @@ describe('transcribeWithElevenLabs', () => {
     process.env.ELEVENLABS_XI_API_KEY = 'test-key';
     globalThis.fetch = vi.fn().mockResolvedValue(new Response('{"detail":"missing_permissions"}', { status: 401 })) as any;
     await expect(transcribeWithElevenLabs(Buffer.from('x'))).resolves.toBeNull();
+  });
+});
+
+describe('speech API answers are read within a byte cap and a deadline', () => {
+  const realFetch = globalThis.fetch;
+  const env = { ...process.env };
+  beforeEach(() => {
+    process.env.ELEVENLABS_XI_API_KEY = 'test-key';
+    process.env.OPENAI_API_KEY = 'test-openai-key';
+    for (const method of ['log', 'error'] as const) vi.spyOn(console, method).mockImplementation(() => {});
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    for (const key of ['ELEVENLABS_XI_API_KEY', 'OPENAI_API_KEY']) {
+      if (env[key] === undefined) delete process.env[key];
+      else process.env[key] = env[key];
+    }
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * A response whose body is `total` bytes, `chunk` at a time, counting what was pulled and whether
+   * it was cancelled. (It ends, and yields between chunks, so that code which reads all of it
+   * fails its test instead of never returning.)
+   */
+  function oversized(total: number, chunk: number, init: ResponseInit = { status: 200 }) {
+    const state = { pulled: 0, cancelled: false };
+    const body = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          await new Promise((resolve) => setImmediate(resolve));
+          if (state.pulled >= total) return controller.close();
+          state.pulled += chunk;
+          controller.enqueue(new Uint8Array(chunk));
+        },
+        cancel() {
+          state.cancelled = true;
+        },
+      },
+      { highWaterMark: 0 }
+    );
+    return { state, response: new Response(body, init) };
+  }
+
+  /** A response whose body sends `first` and then nothing more */
+  function stalled(first = new Uint8Array(0)) {
+    const state = { cancelled: false };
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        if (first.length) controller.enqueue(first);
+      },
+      cancel() {
+        state.cancelled = true;
+      },
+    });
+    return { state, response: new Response(body, { status: 200 }) };
+  }
+
+  const speech = [
+    ['ElevenLabs text-to-speech', generateElevenLabsTTS],
+    ['OpenAI text-to-speech', generateOpenAITTS],
+  ] as const;
+
+  it.each(speech)('%s: gives up on audio larger than 16 MB while it arrives, and downloads no more of it', async (_what, generate) => {
+    const { state, response } = oversized(3 * MAX_SPEECH_AUDIO_BYTES, 1024 * 1024);
+    globalThis.fetch = vi.fn().mockResolvedValue(response) as never;
+    // Compared as a boolean: a failure must not print 48 MB of audio
+    expect((await generate('hello')) === null).toBe(true);
+    expect(state.cancelled).toBe(true);
+    // Stopped at the first chunk past the cap
+    expect(state.pulled).toBeLessThanOrEqual(MAX_SPEECH_AUDIO_BYTES + 2 * 1024 * 1024);
+  });
+
+  it.each(speech)('%s: reads nothing of an answer that declares more than 16 MB', async (_what, generate) => {
+    const { state, response } = oversized(64 * 1024, 1024, { status: 200, headers: { 'content-length': String(MAX_SPEECH_AUDIO_BYTES + 1) } });
+    globalThis.fetch = vi.fn().mockResolvedValue(response) as never;
+    await expect(generate('hello')).resolves.toBeNull();
+    expect(state.pulled).toBeLessThanOrEqual(1024);
+    expect(state.cancelled).toBe(true);
+  });
+
+  it.each(speech)('%s: gives up on an answer whose body stalls, 30 s after the request started', async (_what, generate) => {
+    vi.useFakeTimers();
+    const { state, response } = stalled(new Uint8Array(100));
+    globalThis.fetch = vi.fn().mockResolvedValue(response) as never;
+    let result: unknown = 'pending';
+    void generate('hello').then((value) => (result = value));
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(result).toBe('pending');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(result).toBeNull();
+    expect(state.cancelled).toBe(true);
+  });
+
+  it.each(speech)('%s: returns audio within the cap whole', async (_what, generate) => {
+    const audio = Buffer.alloc(3 * 1024 * 1024, 7);
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(audio, { status: 200 })) as never;
+    const result = await generate('hello');
+    expect(result?.equals(audio)).toBe(true);
+  });
+
+  it('speech-to-text: gives up on a transcript larger than 1 MB, one that stalls, and one that is not JSON', async () => {
+    const big = oversized(3 * MAX_TRANSCRIPT_RESPONSE_BYTES, 64 * 1024);
+    globalThis.fetch = vi.fn().mockResolvedValue(big.response) as never;
+    await expect(transcribeWithElevenLabs(Buffer.from('RIFF'))).resolves.toBeNull();
+    expect(big.state.cancelled).toBe(true);
+    expect(big.state.pulled).toBeLessThanOrEqual(MAX_TRANSCRIPT_RESPONSE_BYTES + 128 * 1024);
+
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('<html>busy</html>', { status: 200 })) as never;
+    await expect(transcribeWithElevenLabs(Buffer.from('RIFF'))).resolves.toBeNull();
+
+    vi.useFakeTimers();
+    const stuck = stalled(Buffer.from('{"text":"hel'));
+    globalThis.fetch = vi.fn().mockResolvedValue(stuck.response) as never;
+    let result: unknown = 'pending';
+    void transcribeWithElevenLabs(Buffer.from('RIFF')).then((value) => (result = value));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(result).toBeNull();
+    expect(stuck.state.cancelled).toBe(true);
+  });
+
+  it('logs at most 2 KB of an error answer, on one line, and downloads no more of it', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const state = { pulled: 0, cancelled: false };
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          if (state.pulled >= 512 * 1024) return controller.close();
+          state.pulled += 1024;
+          controller.enqueue(new TextEncoder().encode(`${'e'.repeat(1000)}\nINFO forged line\n`.padEnd(1024, 'e')));
+        },
+        cancel() {
+          state.cancelled = true;
+        },
+      },
+      { highWaterMark: 0 }
+    );
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(body, { status: 500 })) as never;
+    await expect(generateElevenLabsTTS('hello')).resolves.toBeNull();
+    const line = String(error.mock.calls[0][0]);
+    expect(line.startsWith('[ElevenLabs TTS] API error 500: eee')).toBe(true);
+    expect(line.length).toBeLessThanOrEqual(2048 + 40);
+    expect(line).not.toContain('\n');
+    expect(state.cancelled).toBe(true);
+    expect(state.pulled).toBeLessThanOrEqual(4096);
   });
 });

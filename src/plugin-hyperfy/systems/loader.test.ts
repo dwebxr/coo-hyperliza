@@ -11,6 +11,7 @@ const page = vi.hoisted(() => ({
   returns: null as Uint8Array | null,
   gate: null as Promise<void> | null,
   afterFetch: null as (() => void) | null,
+  fail: null as Error | null,
 }));
 vi.mock('../managers/puppeteer-manager.js', () => ({
   PuppeteerManager: {
@@ -20,6 +21,7 @@ vi.mock('../managers/puppeteer-manager.js', () => ({
         page.budgets.push(maxExportBytes);
         page.signals.push(signal);
         await page.gate;
+        if (page.fail) throw page.fail;
         return page.returns ?? bytes;
       },
       loadVRMBytes: async (bytes: Uint8Array, url: string, { maxExportBytes, signal }: { maxExportBytes: number; signal?: AbortSignal }) => {
@@ -46,6 +48,7 @@ vi.mock('../lib/asset-bytes', async (importOriginal) => {
 });
 
 import { AgentLoader, LOADER_LIMITS, type LoaderLimits } from './loader';
+import { RenderPageKilled } from '../lib/render-watchdog';
 import { NetPolicy, installWorldNet } from '../lib/net-policy';
 import { type Handler, type TestServer, closeServers, startServer } from '../test-support/net';
 
@@ -64,6 +67,7 @@ afterEach(async () => {
   page.returns = null;
   page.gate = null;
   page.afterFetch = null;
+  page.fail = null;
   await closeServers();
 });
 
@@ -409,6 +413,24 @@ describe('AgentLoader', () => {
     expect(page.signals[0]?.aborted).toBe(true);
     expect(parse).not.toHaveBeenCalled();
     expect(loader.results.size).toBe(0);
+  });
+
+  it('does not load again, for this world, a model that got the render page killed, and says so once', async () => {
+    const glb = minimalGlb();
+    const { loader, assets } = await setup({ handler: (_request, response) => response.end(Buffer.from(glb)) });
+    page.fail = new RenderPageKilled('memory', '[RenderWatchdog] the render page used 2000000000 bytes, more than 1610612736', 2e9);
+
+    await expect(loader.load('model', 'asset://heavy.glb')).rejects.toBeInstanceOf(RenderPageKilled);
+    page.fail = null;
+    for (let i = 0; i < 3; i++) await expect(loader.load('model', 'asset://heavy.glb')).rejects.toThrow('Not loading model from');
+
+    expect(page.glb).toHaveLength(1);
+    expect(assets.hits).toHaveLength(1);
+    expect(vi.mocked(console.error).mock.calls.filter(([line]) => String(line).includes('got the render page killed'))).toHaveLength(1);
+    // Another asset, and the same one in another world, load as usual
+    await expect(loader.load('model', 'asset://light.glb')).resolves.toMatchObject({ gltf: expect.anything() });
+    const other = await setup({ handler: (_request, response) => response.end(Buffer.from(glb)) });
+    await expect(other.loader.load('model', 'asset://heavy.glb')).resolves.toMatchObject({ gltf: expect.anything() });
   });
 
   it('evaluates and keeps nothing whose download finished just as the world was destroyed', async () => {

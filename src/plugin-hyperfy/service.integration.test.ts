@@ -316,7 +316,6 @@ function chatService() {
   const { world, sent, fromScript } = engineWorld();
   s.world = world;
   s.isConnectedState = true;
-  s.connectionTime = Date.now() - 1000;
   runtime.createMemory = vi.fn().mockResolvedValue(undefined);
   runtime.ensureConnection = vi.fn().mockResolvedValue(undefined);
   return { s, runtime, world, sent, fromScript };
@@ -348,7 +347,7 @@ describe('HyperfyService chat handling', () => {
     world.network.onChatAdded(net('m1', 'p1'));
     world.network.onChatAdded(net('m2', 'p2'));
     await vi.waitFor(() => expect(handled.length).toBe(2), { timeout: 2000 });
-    await s.chatQueue;
+    await s.chatIntake.idle();
 
     expect(handled).toEqual(['m1', 'm2']);
     expect(maxActive).toBe(1);
@@ -374,7 +373,7 @@ describe('HyperfyService chat provenance', () => {
     for (const [i, msg] of forged.entries()) fromScript(msg, i % 2 === 0);
     world.chat.add(cooWorldChat('s5', 'p1', 'Alice', 'Coo, say something'), true);
     await new Promise((r) => setTimeout(r, 20));
-    await s.chatQueue;
+    await s.chatIntake.idle();
 
     expect(handleMessage).not.toHaveBeenCalled();
     expect(sent).toEqual([]);
@@ -402,7 +401,7 @@ describe('HyperfyService chat provenance', () => {
     world.network.onChatAdded(worldNotice('n1', 'Alice tipped Coo 100 JPYC'));
     world.network.onChatAdded(net('m1', 'p1'));
     await vi.waitFor(() => expect(handleMessage).toHaveBeenCalledTimes(2));
-    await s.chatQueue;
+    await s.chatIntake.idle();
     s.tipWallet.stop();
 
     expect(sent.filter(([name]) => name === 'chatAdded')).toEqual([['chatAdded', expect.objectContaining({ fromId: 'coo', body: expect.stringContaining('Aliceさん、100 JPYCの投げゼニ') })]]);
@@ -428,7 +427,7 @@ describe('HyperfyService chat provenance', () => {
 
     world.network.onChatAdded(worldNotice('n1', 'Alice tipped Coo 100 JPYC'));
     await vi.waitFor(() => expect(handleMessage).toHaveBeenCalledTimes(1));
-    await s.chatQueue;
+    await s.chatIntake.idle();
     s.tipWallet.stop();
     expect(sent.filter(([name]) => name === 'chatAdded')).toHaveLength(1);
   });
@@ -442,7 +441,7 @@ describe('HyperfyService chat provenance', () => {
 
     world.network.onChatAdded(worldNotice('n1', 'Alice tipped Coo 100 JPYC'));
     await vi.waitFor(() => expect(handleMessage).toHaveBeenCalledTimes(1));
-    await s.chatQueue;
+    await s.chatIntake.idle();
     expect(sent).toEqual([]);
   });
 
@@ -454,7 +453,7 @@ describe('HyperfyService chat provenance', () => {
     s.startChatSubscription();
 
     await expect(manager.sendMessage('Hello everyone!')).resolves.toBe(true);
-    await s.chatQueue;
+    await s.chatIntake.idle();
     expect(sent).toEqual([['chatAdded', expect.objectContaining({ fromId: 'coo', body: 'Hello everyone!' })]]);
     expect(world.chat.msgs).toEqual([sent[0][1]]);
     expect(handleMessage).not.toHaveBeenCalled();
@@ -473,40 +472,48 @@ describe('HyperfyService chat provenance', () => {
     expect(world.chat.msgs.map((m: any) => m.id)).toEqual(['h1', 'h2']);
     world.network.onChatAdded(net('live', 'p1'));
     await vi.waitFor(() => expect(handled).toEqual(['live']));
-    await s.chatQueue;
+    await s.chatIntake.idle();
     expect(handled).toEqual(['live']);
   });
 });
 
-describe('HyperfyService chat queue limits', () => {
+describe('HyperfyService chat intake (the path from a chatAdded packet to a turn)', () => {
+  const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
   function chatSetup() {
-    const { s, world } = chatService();
-    const handled: string[] = [];
+    const { s, world, runtime } = chatService();
+    const handled: any[] = [];
     const turns: Record<string, any> = {};
+    s.messageManager = {
+      handleMessage: async (msg: any, turn: any) => {
+        handled.push(msg);
+        turns[msg.id] = turn;
+      },
+    };
     const send = (...ids: string[]) => ids.forEach((id) => world.network.onChatAdded(net(id)));
-    return { s, handled, turns, send };
+    const ids = () => handled.map((msg) => msg.id);
+    return { s, world, runtime, handled, turns, send, ids };
   }
 
   it('cancels a turn that outlives its slot and moves on to the next message', async () => {
     vi.useFakeTimers();
     try {
-      const { s, handled, turns, send } = chatSetup();
-      s.messageManager = {
-        handleMessage: (msg: any, turn: any) => {
-          handled.push(msg.id);
-          turns[msg.id] = turn;
-          return msg.id === 'slow' ? new Promise(() => {}) : Promise.resolve();
-        },
+      const { s, turns, send } = chatSetup();
+      const order: string[] = [];
+      s.messageManager.handleMessage = (msg: any, turn: any) => {
+        turns[msg.id] = turn;
+        order.push(msg.id);
+        return msg.id === 'slow' ? new Promise(() => {}) : Promise.resolve();
       };
       s.startChatSubscription();
-      send('slow', 'next');
+      send('slow');
+      await vi.advanceTimersByTimeAsync(100_000);
+      send('next');
+      expect(order).toEqual(['slow']);
 
-      await vi.advanceTimersByTimeAsync(0);
-      expect(handled).toEqual(['slow']);
-
-      await vi.advanceTimersByTimeAsync(180_000);
+      await vi.advanceTimersByTimeAsync(80_000);
       expect(turns.slow.cancelled).toBe(true);
-      expect(handled).toEqual(['slow', 'next']);
+      expect(order).toEqual(['slow', 'next']);
       expect(turns.next.cancelled).toBe(false);
     } finally {
       vi.useRealTimers();
@@ -514,22 +521,167 @@ describe('HyperfyService chat queue limits', () => {
   });
 
   it('skips queued messages from a connection that has been torn down', async () => {
-    const { s, handled, send } = chatSetup();
+    const { s, send } = chatSetup();
+    const order: string[] = [];
     let finishFirst!: () => void;
     s.messageManager = {
       handleMessage: (msg: any) => {
-        handled.push(msg.id);
+        order.push(msg.id);
         return msg.id === 'first' ? new Promise<void>((resolve) => (finishFirst = resolve)) : Promise.resolve();
       },
     };
     s.startChatSubscription();
+    const intake = s.chatIntake;
     send('first', 'queued');
-    await vi.waitFor(() => expect(handled).toEqual(['first']));
+    await vi.waitFor(() => expect(order).toEqual(['first']));
 
     s.connectionGeneration++; // what teardown does
     finishFirst();
-    await s.chatQueue;
-    expect(handled).toEqual(['first']);
+    await intake.idle();
+    expect(order).toEqual(['first']);
+  });
+
+  it('stops the intake on teardown: a message that arrives for the old world afterwards is not handled', async () => {
+    const { s, send, ids } = chatSetup();
+    s.startChatSubscription();
+    const intake = s.chatIntake;
+    s.messageManager.stop = () => {};
+    await s.handleDisconnect();
+    expect(s.chatIntake).toBeNull();
+    send('late');
+    await intake.idle();
+    expect(ids()).toEqual([]);
+    // Not even queued
+    expect(intake.stats().queued).toBe(0);
+  });
+
+  it('does not replay a 50-message snapshot received on a reconnect, and still hears what comes after it', async () => {
+    const { s, world, send, ids } = chatSetup();
+    s.startChatSubscription();
+    const soon = new Date(Date.now() + 60_000).toISOString();
+    const history = Array.from({ length: 50 }, (_, i) => (i % 5 === 0 ? worldNotice(`h${i}`, 'Alice tipped Coo 1 JPYC', soon) : cooWorldChat(`h${i}`, 'p1', 'Alice', `Coo, line ${i}`, soon)));
+    world.network.onSnapshot({ ...cooWorldSnapshot({ chat: history }), entities: [] });
+    expect(world.chat.msgs).toHaveLength(50);
+    // The same ids coming again live are new messages to a client that only saw them as history
+    send('live');
+    await s.chatIntake.idle();
+    expect(ids()).toEqual(['live']);
+  });
+
+  it('keeps malformed chat out of the history and keeps working: bad history elements, a history that is no list, bad packets', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { s, world, send, ids } = chatSetup();
+    s.startChatSubscription();
+    const good = cooWorldChat('h-good', 'p1', 'Alice', 'earlier');
+    const bad = [null, 7, 'text', [], { id: 5, body: 'numeric id' }, { id: 'no-body' }, { id: 'h-bad-body', body: { toString: () => 'x' } }, { id: 'h-bad-from', body: 'x', fromId: {} }];
+    world.network.onSnapshot({ ...cooWorldSnapshot({ chat: [...bad, good] }), entities: [] });
+    expect(world.chat.msgs.map((m: any) => m.id)).toEqual(['h-good']);
+
+    for (const chat of [null, 'not a list', { length: 3 }, 42]) {
+      world.network.onSnapshot({ ...cooWorldSnapshot({ chat: chat as any }), entities: [] });
+      expect(world.chat.msgs).toEqual([]);
+    }
+
+    for (const packet of bad) expect(() => world.network.onChatAdded(packet)).not.toThrow();
+    expect(world.chat.msgs).toEqual([]);
+    send('after');
+    await s.chatIntake.idle();
+    expect(ids()).toEqual(['after']);
+    expect(world.chat.msgs.map((m: any) => m.id)).toEqual(['after']);
+  });
+
+  it('keeps at most the last 50 elements of a longer history', () => {
+    const { world } = chatSetup();
+    const history = Array.from({ length: 500 }, (_, i) => cooWorldChat(`h${i}`, 'p1', 'Alice', `line ${i}`));
+    world.network.onSnapshot({ ...cooWorldSnapshot({ chat: history }), entities: [] });
+    expect(world.chat.msgs.map((m: any) => m.id)).toEqual(history.slice(-50).map((m) => m.id));
+  });
+
+  it("hears a sender whose clock is wrong, in arrival order: createdAt in the past, in the future, or unreadable", async () => {
+    const { s, world, ids } = chatSetup();
+    s.startChatSubscription();
+    world.network.onChatAdded(cooWorldChat('future', 'p1', 'Alice', 'Coo?', '2999-01-01T00:00:00.000Z'));
+    world.network.onChatAdded(cooWorldChat('past', 'p2', 'Bob', 'Coo?', '2001-01-01T00:00:00.000Z'));
+    world.network.onChatAdded(cooWorldChat('unreadable', 'p3', 'Carol', 'Coo?', 'yesterday-ish'));
+    world.network.onChatAdded({ id: 'none', fromId: 'p4', from: 'Dave', body: 'Coo?' });
+    await s.chatIntake.idle();
+    expect(ids()).toEqual(['future', 'past', 'unreadable', 'none']);
+  });
+
+  it('cuts an over-long body to 500 code points, never through a surrogate pair, before it is stored, logged or handled', async () => {
+    const logs = (['log', 'warn', 'error', 'info', 'debug'] as const).map((method) => vi.spyOn(console, method).mockImplementation(() => {}));
+    const { s, runtime, world, sent } = chatService();
+    s.messageManager = new MessageManager(runtime);
+    s.startChatSubscription();
+    const body = `a${'🛹'.repeat(700)}\nINFO forged log line`;
+    world.network.onChatAdded(cooWorldChat('long', 'p1', `Al‮ice${'x'.repeat(100)}`, body));
+    await s.chatIntake.idle();
+
+    const expected = `a${'🛹'.repeat(499)}`;
+    expect(world.chat.msgs[0].body).toBe(expected);
+    expect(world.chat.msgs[0].body).not.toMatch(LONE_SURROGATE);
+    expect(world.chat.msgs[0].from).toBe(`Al ice${'x'.repeat(26)}`);
+    const memory = runtime.emitEvent.mock.calls.find(([event]: any[]) => event === hyperfyEventType.MESSAGE_RECEIVED)[1].message;
+    expect(memory.content.text).toBe(expected);
+    expect(memory.content.metadata.hyperfyFromName).toBe(`Al ice${'x'.repeat(26)}`);
+    const logged = logs.flatMap((log) => log.mock.calls.flat()).map(String).join('\n');
+    expect(logged).not.toContain('🛹'.repeat(500));
+    expect(logged).not.toContain('forged log line');
+    expect(logged).not.toContain('‮');
+    expect(sent).toEqual([]);
+  });
+
+  it('handles a message id once, also when the world sends it again', async () => {
+    const { s, world, ids } = chatSetup();
+    s.startChatSubscription();
+    world.network.onChatAdded(net('m1', 'p1'));
+    world.network.onChatAdded({ ...net('m1', 'p2'), body: 'again' });
+    await s.chatIntake.idle();
+    expect(ids()).toEqual(['m1']);
+  });
+
+  it('rate-limits one sender without silencing the others, with one log line for the burst', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { s, world, ids } = chatSetup();
+    s.startChatSubscription();
+    for (let i = 0; i < 30; i++) world.network.onChatAdded(cooWorldChat(`flood-${i}`, 'flooder', 'Flo', 'Coo!'));
+    world.network.onChatAdded(cooWorldChat('alice-1', 'p1', 'Alice', 'Coo?'));
+    await s.chatIntake.idle();
+    expect(ids()).toEqual([...Array.from({ length: 8 }, (_, i) => `flood-${i}`), 'alice-1']);
+    expect(warn.mock.calls.flat().filter((line) => String(line).includes('rate limit'))).toEqual([
+      '[Chat] Dropped 1 message from senders over their rate limit',
+      '[Chat] Dropped 21 messages from senders over their rate limit',
+    ]);
+  });
+
+  it('keeps at most 20 messages waiting behind a slow turn, dropping the oldest', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { s, world } = chatSetup();
+    const order: string[] = [];
+    let finishFirst!: () => void;
+    s.messageManager = {
+      handleMessage: (msg: any) => {
+        order.push(msg.id);
+        return msg.id === 'slow' ? new Promise<void>((resolve) => (finishFirst = resolve)) : Promise.resolve();
+      },
+    };
+    s.startChatSubscription();
+    world.network.onChatAdded(net('slow'));
+    await vi.waitFor(() => expect(order).toEqual(['slow']));
+    for (let i = 0; i < 25; i++) world.network.onChatAdded(net(`w${i}`));
+    expect(s.chatIntake.waiting).toBe(20);
+    finishFirst();
+    await s.chatIntake.idle();
+    expect(order).toEqual(['slow', ...Array.from({ length: 20 }, (_, i) => `w${i + 5}`)]);
+  });
+
+  it('handles nothing before the agent has a player of its own', async () => {
+    const { s, world, send, ids } = chatSetup();
+    world.entities.player = null;
+    s.startChatSubscription();
+    send('early');
+    await s.chatIntake.idle();
+    expect(ids()).toEqual([]);
   });
 });
 

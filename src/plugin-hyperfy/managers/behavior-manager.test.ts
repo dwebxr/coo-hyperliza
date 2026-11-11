@@ -81,6 +81,22 @@ describe('BehaviorManager', () => {
     expect(budget.snapshot(60_000).autonomy).toEqual({ aiTicks: 1, scriptedTicks: 1 });
   });
 
+  it('lists the actions an autonomous turn may use in the prompt, as text: braces in a description are not template syntax', async () => {
+    resetUsageBudget(new UsageBudget(noLimits));
+    const { runtime, tick } = setup();
+    runtime.composeState.mockResolvedValue({ values: { secret: 'S3CRET', agentName: 'Coo' }, data: {}, text: '' });
+    runtime.actions = [
+      { name: 'HYPERFY_WALK_RANDOMLY', description: 'Wander {{secret}} {{#each x}}', validate: async () => true },
+      { name: 'HYPERFY_EDIT_ENTITY', description: 'Edit the scene', validate: async () => true },
+    ];
+    await tick();
+    const { prompt } = runtime.useModel.mock.calls[0][1];
+    expect(prompt).toContain('# Available Actions:\n- **HYPERFY_WALK_RANDOMLY**: Wander {{secret}} {{#each x}}\n');
+    expect(prompt).not.toContain('S3CRET');
+    // Only what an autonomous turn is allowed
+    expect(prompt).not.toContain('HYPERFY_EDIT_ENTITY');
+  });
+
   it('keeps patrolling when the Claude budget is used up', async () => {
     resetUsageBudget(new UsageBudget({ ...noLimits, aiCallsPerHour: 0 }));
     vi.spyOn(Math, 'random').mockReturnValue(0.1);

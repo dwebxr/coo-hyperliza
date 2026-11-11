@@ -10,7 +10,7 @@ import { cooWorldSnapshot } from '../test-support/world-packets';
 import { worldFromSnapshot } from '../test-support/turns';
 
 /*
- * A voice utterance all the way through: the real VoiceManager (debounce, transcription), the
+ * A voice utterance all the way through: the real VoiceManager (audio frame, pause, transcription), the
  * plugin's real voice event handler, real elizaOS core processActions, and the real scene edit
  * with the real BuildManager. The speaker's identity travels only in the voice TurnContext.
  */
@@ -64,21 +64,25 @@ function voiceTurn(speakerRank: number) {
   for (const handler of hyperfyEvents[hyperfyEventType.VOICE_MESSAGE_RECEIVED]) runtime.registerEvent(hyperfyEventType.VOICE_MESSAGE_RECEIVED, handler as never);
   const manager = new VoiceManager(runtime);
   vi.spyOn(manager, 'speak').mockResolvedValue('all');
-  // What the LiveKit audio listener collects for a loud enough utterance
-  (manager as any).userStates.set('player-1', { buffers: [Buffer.alloc(9600)], totalLength: 9600, lastActive: Date.now(), transcriptionText: '' });
-  return { manager, send, useModel, box };
+  manager.start();
+  // A loud 100 ms frame from the speaker, as AgentLiveKit emits it to the listener the manager registered
+  const frame = Buffer.alloc(9600);
+  for (let i = 0; i < frame.length; i += 2) frame.writeInt16LE(i % 4 === 0 ? 5000 : -5000, i);
+  const hear = world.livekit.on.mock.calls.find(([event]: [string]) => event === 'audio')[1] as (data: unknown) => void;
+  const speak = () => hear({ participant: 'player-1', buffer: frame });
+  return { manager, send, useModel, box, speak };
 }
 
 it("carries the speaker's identity from a voice utterance to the scene edit's authorization", async () => {
-  const { manager, send, useModel } = voiceTurn(1);
-  manager.debouncedProcessTranscription('player-1' as never);
+  const { send, useModel, speak } = voiceTurn(1);
+  speak();
   await vi.waitFor(() => expect(send).toHaveBeenCalledWith('entityModified', expect.objectContaining({ id: 'box', position: [0, 2, 0] })), { timeout: 5000 });
   expect(useModel.mock.calls.map(([type]) => type)).toEqual([ModelType.TRANSCRIPTION, ModelType.TEXT_LARGE, ModelType.OBJECT_LARGE, ModelType.TEXT_SMALL]);
 });
 
 it('edits nothing for a visitor speaking the same request', async () => {
-  const { manager, send, useModel, box } = voiceTurn(0);
-  manager.debouncedProcessTranscription('player-1' as never);
+  const { send, useModel, box, speak } = voiceTurn(0);
+  speak();
   await vi.waitFor(() => expect(useModel).toHaveBeenCalledWith(ModelType.TEXT_LARGE, expect.anything()), { timeout: 5000 });
   await new Promise((resolve) => setTimeout(resolve, 50));
   expect(send).not.toHaveBeenCalled();

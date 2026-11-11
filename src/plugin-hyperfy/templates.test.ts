@@ -4,7 +4,7 @@ import { autoTemplate, hyperfyMessageHandlerTemplate, hyperfyShouldRespondTempla
 describe('templates and the OpenPay shop', () => {
   it('show the shop shelf in conversation and autonomous prompts', () => {
     expect(hyperfyMessageHandlerTemplate).toContain('{{openpayStore}}');
-    expect(autoTemplate('actions')).toContain('{{openpayStore}}');
+    expect(autoTemplate).toContain('{{openpayStore}}');
   });
   it('let the reply carry which product to share, only while the shop has products', () => {
     expect(hyperfyMessageHandlerTemplate).toContain('{{openpayProductIdKey}}');

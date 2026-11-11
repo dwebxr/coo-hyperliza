@@ -5,7 +5,8 @@ import { Packr } from 'msgpackr';
 vi.mock('../hyperfy/src/core/storage.js', () => ({ storage: { get: () => null, set: () => {}, remove: () => {} } }));
 
 import { ClientNetwork } from '../hyperfy/src/core/systems/ClientNetwork.js';
-import { PACKET_NAMES, PROTOCOL_VERSION, adaptToWorldProtocol, describeClose, readServerPacket, writeClientPacket } from './world-protocol';
+import { MAX_REPORTED_PACKET_IDS, MAX_SERVER_FRAME_BYTES, PACKET_NAMES, PROTOCOL_VERSION, adaptToWorldProtocol, describeClose, readServerPacket, resetReportedPacketIds, writeClientPacket } from './world-protocol';
+import { sessionTokenProblem } from './world-url';
 
 const TOKEN = 'test-session-token';
 // How the world encodes what it sends
@@ -115,7 +116,19 @@ describe('writeClientPacket', () => {
 });
 
 describe('readServerPacket', () => {
+  beforeEach(() => resetReportedPacketIds());
   afterEach(() => vi.restoreAllMocks());
+
+  it('reports at most 32 different unknown packet ids, however many the world invents', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    for (let id = 1000; id < 6000; id++) expect(readServerPacket(serverPackr.pack([id, {}]))).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(MAX_REPORTED_PACKET_IDS);
+    expect(String(warn.mock.calls.at(-1)![0])).toContain('Further unknown packet ids are not reported.');
+    expect(String(warn.mock.calls[0][0])).not.toContain('Further unknown');
+    // One of the reported ids again: still not repeated
+    readServerPacket(serverPackr.pack([1000, {}]));
+    expect(warn).toHaveBeenCalledTimes(MAX_REPORTED_PACKET_IDS);
+  });
 
   it("reads the world's packets, including the ones the engine's table lacks", () => {
     expect(readServerPacket(serverPackr.pack([18, 'outdated']))).toEqual(['onKick', 'outdated']);
@@ -156,6 +169,7 @@ describe('adaptToWorldProtocol on the engine ClientNetwork', () => {
   let network: any;
 
   beforeEach(() => {
+    resetReportedPacketIds();
     FakeWebSocket.instances = [];
     vi.stubGlobal('WebSocket', FakeWebSocket);
     world = { chat: { add: vi.fn() }, emit: vi.fn() };
@@ -204,10 +218,95 @@ describe('adaptToWorldProtocol on the engine ClientNetwork', () => {
     expect(FakeWebSocket.instances).toHaveLength(0);
   });
 
+  it.each([
+    'wss://world.test/ws',
+    'https://world.test/ws',
+    'ws://127.0.0.1:3000/ws',
+    'ws://127.8.9.10/ws',
+    'ws://0x7f.1/ws',
+    'ws://localhost:3000/ws',
+    'http://localhost:3000/ws',
+    'ws://[::1]:3000/ws',
+    'ws://10.0.0.5/ws',
+    'ws://172.16.0.1/ws',
+    'ws://172.31.255.255/ws',
+    'ws://192.168.1.20:3000/ws',
+    'ws://[fd12:3456::1]/ws',
+  ])('sends the session token to %s: encrypted, or a loopback or private address', (wsUrl) => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const protocol = adaptToWorldProtocol(network, () => TOKEN);
+    network.init({ wsUrl });
+    expect(new URL(socket().url).searchParams.getAll('authToken')).toEqual([TOKEN]);
+    expect(protocol.sessionToken()).toBe(TOKEN);
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'ws://world.test/ws',
+    'http://world.test/ws',
+    'ws://8.8.8.8/ws',
+    'ws://172.32.0.1/ws',
+    'ws://172.15.0.1/ws',
+    'ws://192.169.1.1/ws',
+    'ws://11.0.0.1/ws',
+    'ws://169.254.169.254/ws',
+    'ws://0.0.0.0/ws',
+    'ws://[2001:db8::1]/ws',
+    'ws://[fe80::1]/ws',
+    'ws://localhost.evil.test/ws',
+    'ws://127.0.0.1.nip.io/ws',
+    'ws://127.0.0.1@evil.test/ws',
+    'ws://my-lan-box:3000/ws',
+  ])('connects to %s without the session token, says why once, and never prints the token', (wsUrl) => {
+    const logs = (['log', 'warn', 'error', 'info', 'debug'] as const).map((method) => vi.spyOn(console, method).mockImplementation(() => {}));
+    const protocol = adaptToWorldProtocol(network, () => TOKEN);
+    network.init({ wsUrl: `${wsUrl}?authToken=old&other=keep`, name: 'Coo Bot' });
+    const url = new URL(socket().url);
+    expect(url.searchParams.has('authToken')).toBe(false);
+    expect(socket().url).not.toContain(TOKEN);
+    expect(url.searchParams.get('other')).toBe('keep');
+    expect(url.searchParams.get('v')).toBe(String(PROTOCOL_VERSION));
+    // Nothing else of this connection gets the token either (the upload reads it from here)
+    expect(protocol.sessionToken()).toBeNull();
+    const lines = logs.flatMap((log) => log.mock.calls.flat()).map(String);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('[Hyperfy] Not sending the saved session token');
+    expect(lines[0]).toContain('is not encrypted and is not a loopback or private address');
+    expect(lines.join('\n')).not.toContain(TOKEN);
+  });
+
+  it('says nothing and withholds nothing when there is no saved token to protect', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const protocol = adaptToWorldProtocol(network, () => null);
+    network.init({ wsUrl: 'ws://world.test/ws' });
+    expect(error).not.toHaveBeenCalled();
+    expect(protocol.sessionToken()).toBeNull();
+  });
+
+  it("does not let the engine replace the saved token with the guest token of a connection made without it", () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    // The engine's onSnapshot stores data.authToken (ClientNetwork.js: storage.set('authToken', data.authToken))
+    const stored: unknown[] = [];
+    const engine = (wsUrl: string) => {
+      const fake: any = { onClose: () => {}, onSnapshot: (data: { authToken: unknown }) => void stored.push(data.authToken) };
+      adaptToWorldProtocol(fake, () => TOKEN);
+      fake.init({ wsUrl });
+      return fake;
+    };
+    const snapshot = { id: 'guest-1', authToken: 'token-of-a-new-guest', chat: [] };
+    engine('ws://world.test/ws').onSnapshot(snapshot);
+    expect(stored).toEqual([TOKEN]);
+    // The snapshot itself is not changed
+    expect(snapshot.authToken).toBe('token-of-a-new-guest');
+    // A connection that sent the token keeps what the world answers (it may renew it)
+    engine('wss://world.test/ws').onSnapshot({ ...snapshot, authToken: 'renewed-token' });
+    expect(stored).toEqual([TOKEN, 'renewed-token']);
+  });
+
   it.each(['ws:', 'wss:', 'http:', 'https:'])('accepts %s and replaces existing parameters and the fragment', (protocol) => {
     adaptToWorldProtocol(network, () => TOKEN);
     network.init({
-      wsUrl: `${protocol}//world.test/ws?v=1&v=0&authToken=old&authToken=older&name=old&name=older&avatar=old&avatar=older&other=keep#hash`,
+      wsUrl: `${protocol}//localhost/ws?v=1&v=0&authToken=old&authToken=older&name=old&name=older&avatar=old&avatar=older&other=keep#hash`,
       name: 'Coo Bot',
       avatar: 'asset://coo.vrm',
     });
@@ -253,6 +352,27 @@ describe('adaptToWorldProtocol on the engine ClientNetwork', () => {
     socket().dispatch('message', { data: serverPackr.pack([100, {}]) });
     expect(warn).toHaveBeenCalledTimes(1);
     expect(network.queue).toEqual([['onKick', 'outdated']]);
+  });
+
+  it('drops a frame above 8 MB before decoding it, and frames that are not binary, with one line for the burst', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    adaptToWorldProtocol(network, () => TOKEN);
+    network.init({ wsUrl: 'wss://world.test/ws' });
+    // A well-formed chat packet that would be queued if it were decoded
+    const big = serverPackr.pack([2, { id: 'm1', body: 'x'.repeat(MAX_SERVER_FRAME_BYTES) }]);
+    expect(big.byteLength).toBeGreaterThan(MAX_SERVER_FRAME_BYTES);
+    for (let i = 0; i < 5; i++) socket().dispatch('message', { data: big });
+    socket().dispatch('message', { data: big.buffer.slice(big.byteOffset, big.byteOffset + big.byteLength) });
+    socket().dispatch('message', { data: 'a text frame' });
+    socket().dispatch('message', { data: null });
+    socket().dispatch('message', {});
+    expect(network.queue).toEqual([]);
+    expect(warn.mock.calls.flat().map(String)).toEqual([`[Hyperfy] Dropped 1 frame(s) from the world: ${big.byteLength} bytes exceeds the ${MAX_SERVER_FRAME_BYTES}-byte limit`]);
+
+    // A large frame within the limit is read
+    const fits = serverPackr.pack([2, { id: 'm2', body: 'x'.repeat(1024 * 1024) }]);
+    socket().dispatch('message', { data: fits });
+    expect(network.queue.map(([method]: [string]) => method)).toEqual(['onChatAdded']);
   });
 
   it('drops oversized chat packets and warns once without their contents', () => {
@@ -317,5 +437,15 @@ describe('describeClose', () => {
       wasClean: true,
     });
     expect(describeClose(1006)).toBe(1006);
+  });
+});
+
+describe('sessionTokenProblem', () => {
+  it('reads the host as the URL parser writes it, whatever the spelling', () => {
+    expect(sessionTokenProblem(new URL('ws://2130706433/ws'))).toBeNull();
+    expect(sessionTokenProblem(new URL('ws://LOCALHOST/ws'))).toBeNull();
+    expect(sessionTokenProblem(new URL('ws://[::ffff:127.0.0.1]/ws'))).toBeNull();
+    expect(sessionTokenProblem(new URL('ws://localhost./ws'))).toBe('ws://localhost. is not encrypted and is not a loopback or private address');
+    expect(sessionTokenProblem(new URL('ws://user:pw@world.test:8080/ws'))).toBe('ws://world.test:8080 is not encrypted and is not a loopback or private address');
   });
 });

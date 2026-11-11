@@ -8,6 +8,8 @@ import { isOpenPayLink } from "../../openpay-store";
 import { getUsageBudget } from "../../usage-budget";
 import { type TurnContext, currentTurn, neverAbortedSignal, noteDelivered, runTurn } from "../lib/turn-context";
 import type { PlaybackOutcome, Played } from "../systems/liveKit";
+import { oneLine, shownName, truncateCodePoints } from "../lib/text";
+import { CHAT_BODY_MAX_CODE_POINTS, CHAT_ID_MAX_LENGTH } from "../lib/chat-intake";
 
 type LiveKitAudioData = {
   participant: string;
@@ -22,21 +24,64 @@ const PCM_BYTES_PER_SECOND = 48000 * 2;
 // How often the "voice is paused" chat notice / log may repeat
 const VOICE_LIMIT_NOTICE_INTERVAL_MS = 10 * 60_000;
 
+// --- Voice input. Everything a speaker can make the agent hold or spend is bounded here. ---
+// A speaker's utterance ends after this much silence (no loud frame)
+export const UTTERANCE_PAUSE_MS = 1500;
+// One speaker without a pause: after 30 s the audio so far is transcribed and a new utterance starts
+export const MAX_UTTERANCE_BYTES = 30 * PCM_BYTES_PER_SECOND;
+// All speakers together, waiting or being transcribed: four full utterances (11.5 MB of PCM; a
+// request holds its audio about twice while it builds the WAV)
+export const MAX_HELD_VOICE_BYTES = 4 * MAX_UTTERANCE_BYTES;
+// People buffered at once; a ninth speaker is not heard until one of them pauses
+export const MAX_SPEAKERS = 8;
+// LiveKit frames are 10 ms (960 bytes); one second is already not a frame
+export const MAX_FRAME_BYTES = PCM_BYTES_PER_SECOND;
+// Whether speech-to-text is there and within its budget is looked up at most this often
+const INGRESS_GATE_RECHECK_MS = 2000;
+// At most one line about dropped audio in this time; the line carries the count
+const VOICE_DROP_LOG_INTERVAL_MS = 10_000;
+// What is said aloud of one reply. 600 code points are under a minute of speech in English and
+// under two in Japanese, within PLAYBACK_TIMEOUT_MS; a longer reply is spoken up to a sentence end
+// before that, and reported as partly spoken
+export const MAX_SPOKEN_CODE_POINTS = 600;
+
+interface Utterance {
+  buffers: Buffer[];
+  bytes: number;
+  /** Fires when the speaker has been silent for UTTERANCE_PAUSE_MS */
+  timer: NodeJS.Timeout | null;
+}
+
+/** Average absolute amplitude of 16-bit PCM above the threshold: someone is speaking. */
+function isLoudEnough(pcm: Buffer, threshold = 1000): boolean {
+  let sum = 0;
+  const samples = Math.floor(pcm.length / 2);
+  for (let i = 0; i + 1 < pcm.length; i += 2) sum += Math.abs(pcm.readInt16LE(i));
+  return samples > 0 && sum / samples > threshold;
+}
+
+/** `text` for speech: whole when short enough, else up to the last sentence end within the cap. */
+export function spokenPart(text: string): { text: string; cut: boolean } {
+  if (Array.from(text).length <= MAX_SPOKEN_CODE_POINTS) return { text, cut: false };
+  const head = truncateCodePoints(text, MAX_SPOKEN_CODE_POINTS);
+  const end = Math.max(...['. ', '! ', '? ', '。', '！', '？', '\n'].map((mark) => head.lastIndexOf(mark)));
+  // A sentence end in the second half; otherwise the cap itself
+  return { text: end > head.length / 2 ? head.slice(0, end + 1).trimEnd() : head, cut: true };
+}
+
 export class VoiceManager {
   private runtime: IAgentRuntime;
-  private userStates: Map<
-    string,
-    {
-      buffers: Buffer[];
-      totalLength: number;
-      lastActive: number;
-      transcriptionText: string;
-    }
-  > = new Map();
-  private isTranscribing: boolean = false;
+  /** The utterance each speaker is in the middle of; gone as soon as it is handed to transcription. */
+  private speakers: Map<string, Utterance> = new Map();
+  /** Speakers whose previous utterance is being transcribed: at most one request per speaker. */
+  private transcribing: Set<string> = new Set();
+  /** PCM bytes held: buffered for all speakers, plus what is being transcribed. */
+  private heldVoiceBytes = 0;
+  private ingressGate = { checkedAt: Number.NEGATIVE_INFINITY, open: false };
+  private droppedFrames = 0;
+  private droppedFramesLoggedAt = Number.NEGATIVE_INFINITY;
   private isSpeaking: boolean = false;
-  private transcriptionTimeout: NodeJS.Timeout | null = null;
-  private audioListener: ((data: LiveKitAudioData) => void) | null = null;
+  private audioListener: ((data: unknown) => void) | null = null;
   private audioSource: any = null;
   private playbackChain: Promise<void> = Promise.resolve();
   private pendingPlaybacks = 0;
@@ -66,35 +111,7 @@ export class VoiceManager {
       logger.warn('[VoiceManager] No TRANSCRIPTION model (set ELEVENLABS_XI_API_KEY with the speech_to_text permission): voice input is ignored');
     }
 
-    this.audioListener = (data: LiveKitAudioData) => {
-      function isLoudEnough(pcmBuffer: Buffer, threshold = 1000): boolean {
-        let sum = 0;
-        const sampleCount = Math.floor(pcmBuffer.length / 2); // 16-bit samples
-
-        for (let i = 0; i + 1 < pcmBuffer.length; i += 2) {
-          const sample = pcmBuffer.readInt16LE(i);
-          sum += Math.abs(sample);
-        }
-
-        const avgAmplitude = sum / sampleCount;
-        return avgAmplitude > threshold;
-      }
-
-      const playerId = data.participant;
-      if (!this.userStates.has(playerId)) {
-        this.userStates.set(playerId, {
-          buffers: [],
-          totalLength: 0,
-          lastActive: Date.now(),
-          transcriptionText: '',
-        });
-      }
-
-      const pcmBuffer = data.buffer;
-      if (isLoudEnough(pcmBuffer)) {
-        this.handleUserBuffer(playerId, pcmBuffer)
-      }
-    };
+    this.audioListener = (data: unknown) => this.onAudio(data);
     this.audioSource = world.livekit;
     this.audioSource.on('audio', this.audioListener);
   }
@@ -108,12 +125,7 @@ export class VoiceManager {
     }
     this.audioSource = null;
     this.audioListener = null;
-    if (this.transcriptionTimeout) {
-      clearTimeout(this.transcriptionTimeout);
-      this.transcriptionTimeout = null;
-    }
-    this.userStates.clear();
-    this.isTranscribing = false;
+    for (const participant of [...this.speakers.keys()]) this.discard(participant);
     this.isSpeaking = false;
     this.stopped = true;
     this.playbackGeneration++;
@@ -123,111 +135,176 @@ export class VoiceManager {
     this.activePlayback = null;
   }
 
-  async handleUserBuffer(playerId, buffer) {
-    const state = this.userStates.get(playerId);
+  /**
+   * One audio frame from LiveKit. Never throws and starts nothing that can reject unhandled.
+   * Dropped here, before anything is kept: frames while the agent itself is talking, quiet frames,
+   * and every frame while speech-to-text is not available or its budget is used up.
+   */
+  private onAudio(data: unknown): void {
     try {
-      state?.buffers.push(buffer);
-      state!.totalLength += buffer.length;
-      state!.lastActive = Date.now();
-      this.debouncedProcessTranscription(playerId);
+      if (this.stopped) return;
+      const { participant, buffer } = (data ?? {}) as Partial<LiveKitAudioData>;
+      // The LiveKit identity is the player id
+      if (typeof participant !== 'string' || !participant || participant.length > CHAT_ID_MAX_LENGTH) return;
+      if (!Buffer.isBuffer(buffer) || buffer.length < 2 || buffer.length > MAX_FRAME_BYTES) return;
+      if (!isLoudEnough(buffer)) return;
+      // Not while the agent is talking: its own voice comes back through open microphones
+      if (this.isSpeaking) return this.discard(participant);
+      if (!this.ingressOpen()) return this.discard(participant);
+
+      let utterance = this.speakers.get(participant);
+      if (utterance && utterance.bytes + buffer.length > MAX_UTTERANCE_BYTES) {
+        // Their previous utterance is still with speech-to-text: nowhere to put more
+        if (this.transcribing.has(participant)) return this.dropFrame('a speaker went on past the utterance limit while still being transcribed');
+        this.flush(participant);
+        utterance = undefined;
+      }
+      if (this.heldVoiceBytes + buffer.length > MAX_HELD_VOICE_BYTES) {
+        // Whoever has waited with the most audio is transcribed now instead of at their next pause
+        this.flushLargest();
+        return this.dropFrame('the voice buffers are full');
+      }
+      if (!utterance) {
+        if (this.speakers.size >= MAX_SPEAKERS) return this.dropFrame(`more than ${MAX_SPEAKERS} people are speaking at once`);
+        utterance = { buffers: [], bytes: 0, timer: null };
+        this.speakers.set(participant, utterance);
+      }
+      // A copy: the frame's own memory is LiveKit's
+      utterance.buffers.push(Buffer.from(buffer));
+      utterance.bytes += buffer.length;
+      this.heldVoiceBytes += buffer.length;
+      if (utterance.timer) clearTimeout(utterance.timer);
+      utterance.timer = setTimeout(() => this.onPause(participant), UTTERANCE_PAUSE_MS);
     } catch (error) {
-      console.error(`Error processing buffer for user ${playerId}:`, error);
+      this.dropFrame(`handling it failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  async debouncedProcessTranscription(
-    playerId: UUID,
-  ) {
-    const DEBOUNCE_TRANSCRIPTION_THRESHOLD = 1500; // wait for 1.5 seconds of silence
+  /**
+   * Whether voice input can be transcribed at all right now: a TRANSCRIPTION model is registered
+   * and the speech-to-text budget is not used up. Looked up at most every INGRESS_GATE_RECHECK_MS.
+   */
+  private ingressOpen(): boolean {
+    const now = Date.now();
+    if (now - this.ingressGate.checkedAt < INGRESS_GATE_RECHECK_MS) return this.ingressGate.open;
+    this.ingressGate.checkedAt = now;
+    this.ingressGate.open = false;
+    // ElevenLabs (src/elevenlabs-speech.ts) when configured, otherwise e.g. OpenAI. Without any,
+    // voice input is simply unavailable (start() said so)
+    if (!this.runtime.getModel(ModelType.TRANSCRIPTION)) return false;
+    const budget = getUsageBudget();
+    if (!budget.sttAvailable()) {
+      budget.recordSkip('stt');
+      this.noticeVoiceInputPaused();
+      return false;
+    }
+    return (this.ingressGate.open = true);
+  }
 
-    // Don't listen while transcribing or while the agent itself is talking.
-    if (this.isTranscribing || this.isSpeaking) {
-      const state = this.userStates.get(playerId);
-      state.buffers.length = 0;
-      state.totalLength = 0;
+  /** Counts a frame that was not kept and says so at most once per VOICE_DROP_LOG_INTERVAL_MS. */
+  private dropFrame(reason: string): void {
+    this.droppedFrames++;
+    if (Date.now() - this.droppedFramesLoggedAt < VOICE_DROP_LOG_INTERVAL_MS) return;
+    this.droppedFramesLoggedAt = Date.now();
+    logger.warn(`[VoiceManager] Dropped ${this.droppedFrames} audio frame(s): ${reason}`);
+    this.droppedFrames = 0;
+  }
+
+  /** Forgets what a speaker has said so far in their current utterance. */
+  private discard(participant: string): void {
+    const utterance = this.speakers.get(participant);
+    if (!utterance) return;
+    if (utterance.timer) clearTimeout(utterance.timer);
+    this.speakers.delete(participant);
+    this.heldVoiceBytes -= utterance.bytes;
+  }
+
+  /** The speaker has been silent for UTTERANCE_PAUSE_MS. */
+  private onPause(participant: string): void {
+    const utterance = this.speakers.get(participant);
+    if (!utterance) return;
+    utterance.timer = null;
+    if (this.transcribing.has(participant)) {
+      // One request per speaker: this utterance waits for the previous one, growing at most to its cap
+      utterance.timer = setTimeout(() => this.onPause(participant), UTTERANCE_PAUSE_MS);
       return;
     }
-
-    if (this.transcriptionTimeout) {
-      clearTimeout(this.transcriptionTimeout);
-    }
-
-    this.transcriptionTimeout = setTimeout(() => {
-      this.transcriptionTimeout = null;
-      const service = this.getService();
-      const world = service?.getWorld();
-      if (!world) return;
-      const turn: TurnContext = {
-        origin: 'voice',
-        // The LiveKit participant identity, which the world's server sets to the player id
-        requesterId: playerId,
-        world,
-        generation: service.getConnectionGeneration(),
-        signal: neverAbortedSignal(),
-      };
-      agentActivityLock
-        .run(() => runTurn(turn, () => this.processTranscription(playerId)))
-        .catch((error) => console.error(`Error handling voice from ${playerId}:`, error));
-    }, DEBOUNCE_TRANSCRIPTION_THRESHOLD) as unknown as NodeJS.Timeout;
+    this.flush(participant);
   }
 
-  private async processTranscription(
-    playerId: UUID,
-  ) {
-    const state = this.userStates.get(playerId);
-    if (!state || state.buffers.length === 0) return;
+  private flushLargest(): void {
+    let largest: string | undefined;
+    for (const [participant, utterance] of this.speakers) {
+      if (this.transcribing.has(participant)) continue;
+      if (largest === undefined || utterance.bytes > this.speakers.get(largest)!.bytes) largest = participant;
+    }
+    if (largest !== undefined) this.flush(largest);
+  }
 
-    let transcriptionText: string;
-    this.isTranscribing = true;
+  /**
+   * Hands a speaker's utterance to transcription as a voice turn of its own, and frees the speaker
+   * for the next utterance. Its bytes stay counted until the speech-to-text request has ended.
+   */
+  private flush(participant: string): void {
+    const utterance = this.speakers.get(participant);
+    if (!utterance) return;
+    if (utterance.timer) clearTimeout(utterance.timer);
+    utterance.timer = null;
+    this.speakers.delete(participant);
+    const service = this.getService();
+    const world = service?.getWorld();
+    if (this.stopped || !world || utterance.bytes === 0) {
+      this.heldVoiceBytes -= utterance.bytes;
+      return;
+    }
+    const turn: TurnContext = {
+      origin: 'voice',
+      // The LiveKit participant identity, which the world's server sets to the player id
+      requesterId: participant,
+      world,
+      generation: service.getConnectionGeneration(),
+      signal: neverAbortedSignal(),
+    };
+    this.transcribing.add(participant);
+    agentActivityLock
+      .run(() => runTurn(turn, () => this.processTranscription(participant, utterance)))
+      .catch((error) => console.error(`Error handling voice from ${participant}:`, error));
+  }
+
+  private async processTranscription(participant: string, utterance: Utterance) {
+    let transcript: unknown;
     try {
-      const inputBuffer = Buffer.concat(state.buffers, state.totalLength);
-      state.buffers.length = 0; // Clear the buffers
-      state.totalLength = 0;
-      const wavHeader = getWavHeader(inputBuffer.length, 48000);
-      const wavBuffer = Buffer.concat([wavHeader, inputBuffer]);
-      logger.debug('Starting transcription...');
-
-      // One attempt through the registered model: ElevenLabs (src/elevenlabs-speech.ts) when
-      // configured, otherwise e.g. OpenAI. Without any, voice input is simply unavailable.
+      // One attempt through the registered model
       if (!this.runtime.getModel(ModelType.TRANSCRIPTION)) return;
+      const pcm = Buffer.concat(utterance.buffers, utterance.bytes);
+      utterance.buffers.length = 0;
       const budget = getUsageBudget();
-      if (!budget.sttAvailable()) {
+      // Counted before the request and whatever its result: billed by audio length. An utterance
+      // that does not fit in what is left of the daily limit is not transcribed.
+      if (!budget.reserveStt(pcm.length / PCM_BYTES_PER_SECOND)) {
         budget.recordSkip('stt');
         this.noticeVoiceInputPaused();
         return;
       }
-      // Billed by audio length, whatever the result
-      budget.recordStt(inputBuffer.length / PCM_BYTES_PER_SECOND);
-      transcriptionText = await this.runtime.useModel(ModelType.TRANSCRIPTION, wavBuffer);
-      console.log("[VOICE MANAGER] Transcription: ", transcriptionText)
+      logger.debug('Starting transcription...');
+      transcript = await this.runtime.useModel(ModelType.TRANSCRIPTION, Buffer.concat([getWavHeader(pcm.length, 48000), pcm]));
     } catch (error) {
-      console.error(`Error transcribing audio for user ${playerId}:`, error);
+      console.error(`Error transcribing audio for user ${participant}:`, error);
       return;
     } finally {
-      this.isTranscribing = false;
-      // Drop whatever anyone said during transcription
-      this.userStates.forEach((userState) => {
-        userState.buffers.length = 0;
-        userState.totalLength = 0;
-      });
+      // The audio is no longer held, and the speaker's next utterance may be transcribed
+      this.transcribing.delete(participant);
+      this.heldVoiceBytes -= utterance.bytes;
+      utterance.buffers.length = 0;
     }
 
     if (this.stopped) return;
-
-    function isValidTranscription(text: string): boolean {
-      if (!text || text.includes('[BLANK_AUDIO]')) return false;
-      return true;
-    }
-
-    if (transcriptionText && isValidTranscription(transcriptionText)) {
-      state.transcriptionText += transcriptionText;
-    }
-
-    if (state.transcriptionText.length) {
-      const finalText = state.transcriptionText;
-      state.transcriptionText = '';
-      await this.handleMessage(finalText, playerId);
-    }
+    if (typeof transcript !== 'string' || transcript.includes('[BLANK_AUDIO]')) return;
+    // What was said enters memory and prompts like a chat message: one line, at most 500 code points
+    const text = oneLine(transcript, CHAT_BODY_MAX_CODE_POINTS);
+    if (!text) return;
+    console.log("[VOICE MANAGER] Transcription: ", text)
+    await this.handleMessage(text, participant as UUID);
   }
 
   private async handleMessage(
@@ -247,7 +324,8 @@ export class VoiceManager {
       if (!live()) return;
 
       const playerInfo = world.entities.getPlayer(playerId);
-      const userName = playerInfo?.data?.name || playerId;
+      // The name goes into memory and prompts: one short line, like a chat sender's
+      const userName = shownName(playerInfo?.data?.name) || playerId;
       const name = userName;
       const _currentWorldId = service.currentWorldId;
       const channelId = _currentWorldId;
@@ -360,8 +438,13 @@ export class VoiceManager {
     // Never read URLs aloud
     text = text?.replace(/https?:\/\/\S+/g, '').trim();
     if (!text || this.stopped) return 'none';
+    // Capped before anything is synthesized or counted
+    const spoken = spokenPart(text);
+    text = spoken.text;
     const budget = getUsageBudget();
-    if (!budget.ttsAvailable()) {
+    // Counted before the request, and whatever becomes of it; text that does not fit in what is
+    // left of the daily limit is not spoken
+    if (!budget.reserveTts(text.length)) {
       budget.recordSkip('tts');
       if (Date.now() - this.lastTtsLimitLogAt >= VOICE_LIMIT_NOTICE_INTERVAL_MS) {
         this.lastTtsLimitLogAt = Date.now();
@@ -377,10 +460,10 @@ export class VoiceManager {
         console.log('[VoiceManager] No audio generated - check ELEVENLABS_XI_API_KEY or OPENAI_API_KEY in .env');
         return 'none';
       }
-      budget.recordTts(text.length);
       const played = await this.playAudio(audioBuffer, generation);
       if (played !== 'none') noteDelivered();
-      return played;
+      // All of the capped text was played, but not all of the reply
+      return played === 'all' && spoken.cut ? 'partial' : played;
     } catch (error) {
       logger.warn('[VoiceManager] TTS failed, text-only response sent:', error);
       return 'none';

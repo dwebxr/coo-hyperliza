@@ -309,7 +309,7 @@ export class BehaviorManager {
 
     const actionsText = actionsData.length > 0 ? formatActions(actionsData) : '';
 
-    const responsePrompt = composePromptFromState({ state, template: autoTemplate(actionsText) });
+    const responsePrompt = composePromptFromState({ state: { ...state, values: { ...state.values, autonomousActions: actionsText } }, template: autoTemplate });
 
     // decide
     const response = await this.runtime.useModel(ModelType.TEXT_LARGE, forPurpose('autonomous', {

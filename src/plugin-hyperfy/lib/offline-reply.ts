@@ -1,5 +1,5 @@
 import type { Content } from '@elizaos/core';
-import { OPENPAY_LINK_FLAG, SHARE_ACTION, formatLinkMessage, resolveProduct } from '../../openpay-store';
+import { OPENPAY_LINK_FLAG, SHARE_ACTION, formatLinkMessage, isSpecificTitle, resolveProduct } from '../../openpay-store';
 import type { StoreProduct } from '../../openpay-store/catalog';
 import { IDLE_EMOTES } from './idle-behavior';
 
@@ -35,7 +35,11 @@ export function composeOfflineReply({
     };
   }
 
-  const examples = products.slice(0, EXAMPLE_TITLES).map((p) => p.title);
+  // Only names that would be recognised when said (resolveProduct looks for specific titles only)
+  const examples = products
+    .map((p) => p.title)
+    .filter(isSpecificTitle)
+    .slice(0, EXAMPLE_TITLES);
   const shopHint = examples.length
     ? japanese
       ? ` 商品名を言ってもらえれば、購入リンクをお送りします（例: ${examples.join('、')}）。`

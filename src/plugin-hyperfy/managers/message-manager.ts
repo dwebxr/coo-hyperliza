@@ -7,16 +7,21 @@ import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
 import { splitChatText } from "../lib/chat-chunks";
 import { isOpenPayLink } from "../../openpay-store";
 import { type TurnContext, neverAbortedSignal, noteDelivered, runTurn } from "../lib/turn-context";
-import { postAgentChat } from "../lib/world-chat";
+import { postAgentChat, worldChat } from "../lib/world-chat";
+import type { ChatMessage, ChatTurn } from "../lib/chat-intake";
 import { isJapanese } from "../lib/simple-commands";
-import { type TipNotice, parseTipNotice, tipThanks } from "../lib/tip-notice";
+import { type TipNotice, TipThanksLimiter, parseTipNotice, tipThanks, tipThought } from "../lib/tip-notice";
+import { oneLine, shownName } from "../lib/text";
 import moment from 'moment'
 import { uuid } from '../hyperfy/src/core/utils';
 
-/** Set by the chat queue when a turn outlives its slot, so its late output is dropped. */
-export interface ChatTurn {
-  cancelled: boolean;
-}
+export type { ChatTurn };
+
+// One message of the history in a prompt: what a stored memory holds was bounded when it was
+// received, but rows stored by earlier versions were not
+const HISTORY_TEXT_MAX_CODE_POINTS = 1000;
+// How often the log says that tip announcements were not thanked for (they are counted)
+const TIP_SKIP_LOG_INTERVAL_MS = 60_000;
 
 // Players whose language is remembered for tip thanks
 const MAX_REMEMBERED_SENDERS = 500;
@@ -27,7 +32,11 @@ export class MessageManager {
   private stopped = false;
   /** Whether each player (by display name) last wrote in Japanese. */
   private senderJapanese = new Map<string, boolean>();
-  
+  /** Per connection, like the manager: how often tip announcements are thanked for */
+  private tipThanksLimiter = new TipThanksLimiter();
+  private tipThanksSkipped = 0;
+  private tipThanksSkipLoggedAt = Number.NEGATIVE_INFINITY;
+
   constructor(runtime: IAgentRuntime) {
     this.runtime = runtime;
     if (!this.runtime.character.templates) {
@@ -39,7 +48,11 @@ export class MessageManager {
     this.stopped = true;
   }
 
-  async handleMessage(msg, turn?: ChatTurn): Promise<void> {
+  /**
+   * Handles one chat message as a turn. `msg` is what lib/chat-intake.ts readChatMessage made of a
+   * packet (one-line body of at most 500 code points, bounded name and ids).
+   */
+  async handleMessage(msg: ChatMessage, turn?: ChatTurn): Promise<void> {
     const service = this.getService();
     const world = service.getWorld();
     const context: TurnContext = {
@@ -53,21 +66,28 @@ export class MessageManager {
     // maybe a thinking emote here?
     await runTurn(context, () => agentActivityLock.run(async () => {
       const agentPlayerId = world.entities.player.data.id // Get agent's ID
-      const senderName = msg.from || 'System'
+      // A player without a visible name is not shown as anything that sounds like the world itself
+      const senderName = msg.from || (msg.fromId ? 'Anonymous' : 'World')
       const messageBody = msg.body || ''
       const _currentWorldId = service.currentWorldId;
       console.info(`[Chat Received] From: ${senderName}, ID: ${msg.id}, Body: "${messageBody}"`)
 
       // World notices have no sender. coo-world sets fromId itself, so players cannot send one;
       // a server that relays chat as clients wrote it can, so a tip announcement counts only once
-      // this connection's tip wallet has been signed in and shown as receiving tips. Nothing is
-      // checked on chain: such a world can still announce a tip that did not happen.
+      // this connection's tip wallet has been signed in and shown as receiving tips, and only when
+      // the message object is one the world's server sent on this connection. Nothing is checked
+      // on chain: such a world can still announce a tip that did not happen.
       if (!msg.fromId) {
         const agentName = world.entities.player.data?.name || this.runtime.character.name
         const tip = parseTipNotice(messageBody, agentName)
-        if (tip && !service.getTipWallet?.()?.receivedOnThisConnection) {
+        if (!tip) return
+        if (!worldChat(world)?.isLiveFromNetwork(msg)) {
+          logger.warn(`[Tips] Ignoring a tip announcement that did not come from the world's server`)
+        } else if (!service.getTipWallet?.()?.receivedOnThisConnection) {
           logger.info(`[Tips] Ignoring a tip announcement: the agent has not been receiving tips on this connection`)
-        } else if (tip) {
+        } else if (!this.tipThanksLimiter.allow(tip.fromName)) {
+          this.noteTipNotThanked()
+        } else {
           await this.thankForTip(tip, service, world)
         }
         return
@@ -210,13 +230,14 @@ export class MessageManager {
   /** Thanks a player for a tip without a model call: turns to them, says thanks, remembers it. */
   private async thankForTip(tip: TipNotice, service: HyperfyService, world: any) {
     if (this.stopped || service.getWorld() !== world) return
-    logger.info(`[Tips] ${tip.fromName} tipped ${tip.amount} ${tip.token}`)
+    logger.info(`[Tips] The world announced a tip: ${tip.fromName} tipped ${tip.amount} ${tip.token} (not checked on chain)`)
     // JPYC tippers are most likely Japanese speakers
     const text = tipThanks(tip, this.senderJapanese.get(tip.fromName) ?? true)
 
     const selfId = world.entities.player?.data?.id
     for (const [id, entity] of world.entities.items?.entries?.() ?? []) {
-      if (id !== selfId && entity?.data?.type === 'player' && entity.data.name === tip.fromName) {
+      // The announcement names the tipper as coo-world's shown() writes names
+      if (id !== selfId && entity?.data?.type === 'player' && shownName(entity.data.name) === tip.fromName) {
         world.controls?.faceEntity?.(id)?.catch?.(() => {})
         break
       }
@@ -233,12 +254,21 @@ export class MessageManager {
       roomId: createUniqueUuid(this.runtime, service.currentWorldId || 'hyperfy-unknown-world'),
       content: {
         text,
-        thought: `${tip.fromName} tipped me ${tip.amount} ${tip.token}.`,
+        thought: tipThought(tip),
         source: 'hyperfy',
         channelType: ChannelType.WORLD,
       },
       createdAt: Date.now(),
     }, 'messages')
+  }
+
+  /** Counts an announcement that was not thanked for (rate limit) and says so at most once a minute. */
+  private noteTipNotThanked() {
+    this.tipThanksSkipped++
+    if (Date.now() - this.tipThanksSkipLoggedAt < TIP_SKIP_LOG_INTERVAL_MS) return
+    this.tipThanksSkipLoggedAt = Date.now()
+    logger.info(`[Tips] Not thanking for ${this.tipThanksSkipped} tip announcement(s): thanks are limited per name and overall`)
+    this.tipThanksSkipped = 0
   }
 
   /**
@@ -294,7 +324,7 @@ export class MessageManager {
       .reverse()
       .map((message: Memory) => {
         const content = message.content as Content;
-        const messageText = content.text || "";
+        const messageText = oneLine(typeof content.text === 'string' ? content.text : '', HISTORY_TEXT_MAX_CODE_POINTS);
         const messageActions = content.actions;
   
         const entity = entities.find((e: Entity) => e.id === message.entityId) as any;
@@ -338,7 +368,7 @@ export class MessageManager {
   
         const textPart = messageText ? `: ${messageText}` : "";
   
-        const formattedLine = `- ${timeString} (${timestamp}) ${formattedName} [${formattedId}]${actionString}${textPart}`;
+        const formattedLine = `- ${timeString} (${timestamp}) ${shownName(formattedName) || 'Unknown User'} [${shownName(String(formattedId), 64)}]${actionString}${textPart}`;
   
         return formattedLine;
       })
