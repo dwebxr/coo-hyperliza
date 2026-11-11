@@ -227,6 +227,42 @@ async function main() {
     const environmentSource = file('assets/base-environment.glb');
     const stripped = await manager.loadGlbBytes(environmentSource);
     const environment = await parseStrippedGlb(stripped);
+    // The page refuses to hand back more than the export budget (lib/gltf-budget.ts), before encoding it
+    const texturesBefore = await page.evaluate(() => window.texturesMap.size);
+    const overBudget = await manager.loadGlbBytes(environmentSource, { maxExportBytes: 1000 }).then(() => 'returned', (error) => String(error?.message ?? error));
+    const vrmOverBudget = await manager.loadVRMBytes(file('avatars/avatar.vrm'), 'https://world.invalid/assets/too-big.vrm', { maxExportBytes: 1000 }).then(() => 'returned', (error) => String(error?.message ?? error));
+    const leftover = await page.evaluate(() => ({ avatar: window.avatarMap.has('https://world.invalid/assets/too-big.vrm'), textures: window.texturesMap.size }));
+    check(
+      'a model or avatar whose export is over the budget is refused by the page, and neither it nor its textures are kept',
+      /the exported model is \d+ bytes, more than 1000/.test(overBudget) && /the exported model is \d+ bytes, more than 1000/.test(vrmOverBudget) && !leftover.avatar && leftover.textures === texturesBefore,
+      `${overBudget.slice(0, 100)} | ${vrmOverBudget.slice(0, 100)} | avatar kept: ${leftover.avatar}, textures ${texturesBefore} -> ${leftover.textures}`
+    );
+    // A page call whose world went away while it ran: the manager takes back what it kept (assets.js undo)
+    const keptBefore = await page.evaluate(() => ({ textures: window.texturesMap.size, environment: window.environment ?? null }));
+    const cancelled = [];
+    for (const call of [
+      (signal) => manager.loadGlbBytes(environmentSource, { signal }),
+      (signal) => manager.loadVRMBytes(file('avatars/avatar.vrm'), 'https://world.invalid/assets/cancelled.vrm', { signal }),
+      (signal) => manager.registerTexture({ bytes: file('assets/day2-2k.jpg'), contentType: 'image/jpeg', url: 'https://world.invalid/assets/cancelled.jpg' }, 'map', { signal }),
+    ]) {
+      const stop = new AbortController();
+      // Fired right after the page was asked, while it works on it
+      const evaluate = page.evaluate;
+      page.evaluate = function (...args) {
+        page.evaluate = evaluate;
+        const result = evaluate.apply(this, args);
+        stop.abort();
+        return result;
+      };
+      cancelled.push(await call(stop.signal).then(() => 'returned', (error) => error?.name));
+      page.evaluate = evaluate;
+    }
+    const keptAfter = await page.evaluate(() => ({ textures: window.texturesMap.size, avatar: window.avatarMap.has('https://world.invalid/assets/cancelled.vrm') }));
+    check(
+      'a page call whose signal fired while it ran fails, and what it kept in the page is taken back',
+      cancelled.every((outcome) => outcome === 'AbortError') && keptAfter.textures === keptBefore.textures && !keptAfter.avatar,
+      `${cancelled.join(', ')}; textures ${keptBefore.textures} -> ${keptAfter.textures}, avatar kept: ${keptAfter.avatar}`
+    );
     const materialIds = new Set();
     environment.scene.traverse((node) => node.material?.userData?.materialId && materialIds.add(node.material.userData.materialId));
     const kept = await page.evaluate(() => window.texturesMap.size);

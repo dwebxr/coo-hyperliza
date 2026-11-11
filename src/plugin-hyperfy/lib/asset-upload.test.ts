@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { hashFileBuffer } from '../utils';
-import { AssetUploadError, apiUrlProblem, assetServed, ensureAsset, isPermanentRefusal, uploadAsset, worldEndpointProblems } from './asset-upload';
-import { NetPolicy, installWorldNet } from './net-policy';
+import { AssetUploadError, apiUrlProblem, assetServed, ensureAsset, isPermanentRefusal, uploadAsset, worldApiSender, worldEndpointProblems } from './asset-upload';
+import { NetPolicy, installWorldNet, toResponse } from './net-policy';
 import { PUBLIC_ADDRESS, type TestServer, closeServers, startServer, testNet } from '../test-support/net';
 
 const TOKEN = 'test-session-token';
@@ -147,7 +147,7 @@ describe('where the session token goes (real requests, against servers on loopba
   });
 
   it.each([
-    ['another host', (port: number) => `http://localhost:${port}/api`],
+    ['another host', (port: number) => `http://api-host.test:${port}/api`],
     ['another port', (port: number) => `http://127.0.0.1:${port}/api`],
     ['a URL that only starts like the world', (port: number) => `http://127.0.0.1:1@127.0.0.1:${port}/api`],
   ])('refuses an API URL on %s and sends it nothing, token or otherwise', async (_name, apiUrl) => {
@@ -173,6 +173,64 @@ describe('where the session token goes (real requests, against servers on loopba
     expect(apiUrlProblem('https://world.test/api', 'https://world.test')).toBeNull();
     expect(apiUrlProblem('https://world.test:8443/api', 'https://world.test')).toContain('https://world.test:8443');
     expect(apiUrlProblem('http://world.test/api', 'https://world.test')).toContain('http://world.test');
+  });
+
+  it('sends both requests to the API URL it checked, when the world names another one in between', async () => {
+    const foreign = await worldApi();
+    const network: { apiUrl: string } = { apiUrl: '' };
+    const world = await startServer((request, response) => {
+      // Between the check and the upload the world's API URL changes to a foreign server
+      if (request.url?.includes('upload-check')) network.apiUrl = `http://127.0.0.1:${foreign.port}/api`;
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify(request.url?.includes('upload-check') ? { exists: false } : {}));
+    });
+    network.apiUrl = `http://127.0.0.1:${world.port}/api`;
+
+    await uploadAsset(network, file(), { net: new NetPolicy({ worldOrigin: `http://127.0.0.1:${world.port}` }), authToken: TOKEN });
+
+    expect(network.apiUrl).toContain(String(foreign.port));
+    expect(world.hits.map((hit) => `${hit.method} ${hit.url.split('?')[0]}`)).toEqual(['GET /api/upload-check', 'POST /api/upload']);
+    expect(foreign.connections).toBe(0);
+  });
+
+  it('posts nothing when the check stops holding while the upload body is encoded (the last await before the POST)', async () => {
+    const world = await worldApi();
+    const auth = { allowed: true };
+    class Stopped extends Error {}
+    const check = () => {
+      if (!auth.allowed) throw new Stopped('the requester may no longer build');
+    };
+    // The multipart body is encoded with Response.arrayBuffer(); authorization goes while it runs
+    const encode = Response.prototype.arrayBuffer;
+    vi.spyOn(Response.prototype, 'arrayBuffer').mockImplementation(function (this: Response) {
+      auth.allowed = false;
+      return encode.call(this);
+    });
+
+    const error = await uploadAsset({ apiUrl: `http://127.0.0.1:${world.port}/api` }, file(), { net: new NetPolicy({ worldOrigin: `http://127.0.0.1:${world.port}` }), authToken: TOKEN, check }).catch((e) => e);
+
+    // What the check threw, unchanged
+    expect(error).toBeInstanceOf(Stopped);
+    expect(world.hits.map((hit) => `${hit.method} ${hit.url.split('?')[0]}`)).toEqual(['GET /api/upload-check']);
+  });
+
+  it('checks the destination of every request it attaches the token to, before calling check or sending', async () => {
+    const world = await worldApi();
+    const foreign = await worldApi();
+    const net = new NetPolicy({ worldOrigin: `http://127.0.0.1:${world.port}` });
+    const check = vi.fn();
+    // The requests themselves through the real policy, counted
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => toResponse(await net.fetch(String(input), { method: init?.method ?? 'GET', maxBytes: 1000, followRedirects: false })));
+    const send = worldApiSender(net, { authToken: TOKEN, fetchImpl: fetchImpl as typeof fetch, signal: AbortSignal.timeout(5000), check });
+
+    await expect(send(`http://127.0.0.1:${world.port}/api/upload-check?filename=x`)).resolves.toMatchObject({ status: 200 });
+    for (const url of [`http://127.0.0.1:${foreign.port}/api/upload`, 'https://world.test/api/upload', `http://user:pw@127.0.0.1:${world.port}/api/upload`]) {
+      const error = await send(url, { method: 'POST' }).catch((e) => e);
+      expect(error).toBeInstanceOf(AssetUploadError);
+      expect(isPermanentRefusal(error)).toBe(true);
+      expect(error.message).not.toContain(TOKEN);
+    }
+    expect([check.mock.calls.length, fetchImpl.mock.calls.length, world.hits.length, foreign.connections]).toEqual([1, 1, 1, 0]);
   });
 
   it.each([301, 302, 303, 307, 308])('does not follow a %i from the world API: the token and the file go nowhere else', async (status) => {
@@ -212,10 +270,13 @@ describe('where the session token goes (real requests, against servers on loopba
     expect(worldEndpointProblems(net, { apiUrl: 'https://api.example.com/api', assetsUrl: 'https://cdn.example.com/assets' })).toEqual([
       expect.stringContaining("the world's API URL is on https://api.example.com, not on the world's own origin (http://127.0.0.1:3000, from WS_URL)"),
     ]);
-    // The same machine under another name is another origin
-    const [api, assets] = worldEndpointProblems(net, { apiUrl: 'http://localhost:3000/api', assetsUrl: 'http://localhost:3000/assets/' });
+    // Another loopback spelling of the same port is the same world (net-policy onWorldOrigin)
+    expect(worldEndpointProblems(net, { apiUrl: 'http://localhost:3000/api', assetsUrl: 'http://[::1]:3000/assets/' })).toEqual([]);
+    // A LAN world under another name for the machine is another origin
+    const lan = new NetPolicy({ worldOrigin: 'http://192.168.1.5:3000' });
+    const [api, assets] = worldEndpointProblems(lan, { apiUrl: 'http://world.lan:3000/api', assetsUrl: 'http://world.lan:3000/assets/' });
     expect(api).toContain('Uploads to this world are refused');
-    expect(assets).toContain("its assets URL http://localhost:3000 is neither the world's own origin (http://127.0.0.1:3000, from WS_URL) nor a public https address");
+    expect(assets).toContain("its assets URL http://world.lan:3000 is neither the world's own origin (http://192.168.1.5:3000, from WS_URL) nor a public https address");
     expect(worldEndpointProblems(net, {})).toEqual([]);
   });
 });

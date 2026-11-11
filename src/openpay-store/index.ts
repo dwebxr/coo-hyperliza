@@ -10,6 +10,7 @@ import {
 import { isDirectlyAddressed } from '../plugin-hyperfy/lib/addressing';
 import { actionFailed, actionSucceeded, tellFailure } from '../plugin-hyperfy/lib/action-result';
 import { guardActions } from '../plugin-hyperfy/lib/authorization';
+import { describeUrl } from '../plugin-hyperfy/lib/log-url';
 import {
   DEFAULT_OPENPAY_STORE_API_URL,
   StoreCatalog,
@@ -126,7 +127,7 @@ export function createOpenPayStorePlugin(env: Record<string, string | undefined>
   try {
     new URL(apiUrl);
   } catch {
-    logger.warn(`[OpenPayStore] Invalid OPENPAY_STORE_API_URL "${apiUrl}"; using the default`);
+    logger.warn(`[OpenPayStore] Invalid OPENPAY_STORE_API_URL "${describeUrl(apiUrl)}"; using the default`);
     apiUrl = DEFAULT_OPENPAY_STORE_API_URL;
   }
   const catalog = new StoreCatalog({ apiUrl, handles, locale: parseLocale(env.OPENPAY_STORE_LOCALE) }, { fetchImpl });

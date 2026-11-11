@@ -6,7 +6,8 @@ import { hyperfyEventType } from "../events";
 import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
 import { isOpenPayLink } from "../../openpay-store";
 import { getUsageBudget } from "../../usage-budget";
-import { type TurnContext, neverAbortedSignal, noteDelivered, runTurn } from "../lib/turn-context";
+import { type TurnContext, currentTurn, neverAbortedSignal, noteDelivered, runTurn } from "../lib/turn-context";
+import type { PlaybackOutcome, Played } from "../systems/liveKit";
 
 type LiveKitAudioData = {
   participant: string;
@@ -240,6 +241,10 @@ export class VoiceManager {
       const service = this.getService();
       const world = service.getWorld();
       if (!world) return;
+      // The connection the voice was heard on (the turn's): nothing is posted on another one
+      const generation = currentTurn()?.generation ?? service.getConnectionGeneration();
+      const live = () => !this.stopped && service.getWorld() === world && service.getConnectionGeneration() === generation;
+      if (!live()) return;
 
       const playerInfo = world.entities.getPlayer(playerId);
       const userName = playerInfo?.data?.name || playerId;
@@ -289,8 +294,8 @@ export class VoiceManager {
 
       const callback: HandlerCallback = async (content: Content, _files: any[] = []) => {
         console.info(`[Hyperfy Voice Chat Callback] Received response: ${JSON.stringify(content)}`)
-        // The connection this turn belonged to was torn down; don't act in a newer world
-        if (this.stopped || service.getWorld() !== world) return [];
+        // Checked again after every await below, right before anything is posted or played
+        if (!live()) return [];
         try {
           const responseMemory: Memory = {
             id: createUniqueUuid(this.runtime, `${memory.id}-voice-response-${Date.now()}`),
@@ -308,6 +313,7 @@ export class VoiceManager {
           };
 
           await this.runtime.createMemory(responseMemory, 'messages');
+          if (!live()) return [responseMemory];
 
           if (responseMemory.content.text?.trim() && isOpenPayLink(content)) {
             // Voice replies are only spoken, but a shop link has to be clickable: post it to chat
@@ -316,9 +322,11 @@ export class VoiceManager {
             const emoteManager = service.getEmoteManager();
             const emote = content.emote as string || "TALK";
             emoteManager.playEmote(emote);
-            // Voice replies are normally only spoken; when they can't be (voice limit, TTS
-            // failure), post them so the player still gets an answer
-            if (!(await this.speak(content.text))) {
+            // Voice replies are normally only spoken. When not all of it could be (voice limit, TTS
+            // failure, a playback that failed part way), the whole reply is posted too, so none of it is lost
+            const spoken = await this.speak(content.text);
+            if (spoken !== 'all' && live()) {
+              if (spoken === 'partial') logger.info('[VoiceManager] Reply partly spoken, then posted as text');
               service.getMessageManager()?.sendMessage(content.text);
             }
           }
@@ -343,14 +351,15 @@ export class VoiceManager {
   }
 
   /**
-   * Synthesizes text and plays it in the world. Never throws. Resolves to whether it was played:
-   * false when there is nothing to say, the voice limit is reached, TTS failed, or the playback
-   * was dropped, failed or timed out. A played utterance counts as delivered for the turn.
+   * Synthesizes text and plays it in the world. Never throws. Resolves to how much of it was
+   * played: 'none' when there is nothing to say, the voice limit is reached, TTS failed, or no
+   * audio went out; 'partial' when the playback stopped, failed or timed out after some of it
+   * went out. An utterance some of which was played counts as delivered for the turn.
    */
-  async speak(text: string): Promise<boolean> {
+  async speak(text: string): Promise<Played> {
     // Never read URLs aloud
     text = text?.replace(/https?:\/\/\S+/g, '').trim();
-    if (!text || this.stopped) return false;
+    if (!text || this.stopped) return 'none';
     const budget = getUsageBudget();
     if (!budget.ttsAvailable()) {
       budget.recordSkip('tts');
@@ -358,7 +367,7 @@ export class VoiceManager {
         this.lastTtsLimitLogAt = Date.now();
         logger.info(`[VoiceManager] VOICE_TTS_MAX_CHARS_PER_DAY=${budget.limits.ttsCharsPerDay} reached; replying in text only`);
       }
-      return false;
+      return 'none';
     }
     // Captured before synthesis so a stop() during the TTS request discards the result
     const generation = this.playbackGeneration;
@@ -366,15 +375,15 @@ export class VoiceManager {
       const audioBuffer = await generateSpeech(text);
       if (!audioBuffer) {
         console.log('[VoiceManager] No audio generated - check ELEVENLABS_XI_API_KEY or OPENAI_API_KEY in .env');
-        return false;
+        return 'none';
       }
       budget.recordTts(text.length);
       const played = await this.playAudio(audioBuffer, generation);
-      if (played) noteDelivered();
+      if (played !== 'none') noteDelivered();
       return played;
     } catch (error) {
       logger.warn('[VoiceManager] TTS failed, text-only response sent:', error);
-      return false;
+      return 'none';
     }
   }
 
@@ -390,19 +399,20 @@ export class VoiceManager {
 
   /**
    * Queues audio so overlapping replies play one after another instead of being dropped.
-   * A failed or hung playback never blocks the ones after it. Resolves to whether it was played
-   * (the room accepted the whole stream).
+   * A failed or hung playback never blocks the ones after it. Resolves to how much of it went out
+   * to the room (AgentLiveKit.publishAudioStream counts the frames as they go): 'partial' also when
+   * the playback failed or timed out after some of it had played.
    */
-  async playAudio(audioBuffer: Buffer, generation: number = this.playbackGeneration): Promise<boolean> {
-    if (this.stopped || generation !== this.playbackGeneration) return false;
+  async playAudio(audioBuffer: Buffer, generation: number = this.playbackGeneration): Promise<Played> {
+    if (this.stopped || generation !== this.playbackGeneration) return 'none';
     if (this.pendingPlaybacks >= MAX_PENDING_PLAYBACKS) {
       logger.warn(`[VoiceManager] ${this.pendingPlaybacks} utterances already queued, dropping audio`);
-      return false;
+      return 'none';
     }
 
     this.pendingPlaybacks++;
-    const current = this.playbackChain.then(() =>
-      generation === this.playbackGeneration ? this.playNow(audioBuffer) : false
+    const current = this.playbackChain.then((): Played | Promise<Played> =>
+      generation === this.playbackGeneration ? this.playNow(audioBuffer) : 'none'
     );
     this.playbackChain = current.then(() => { }, () => { });
 
@@ -410,15 +420,15 @@ export class VoiceManager {
       return await current;
     } catch (error) {
       logger.error('[VoiceManager] Audio playback failed:', error);
-      return false;
+      return 'none';
     } finally {
       if (generation === this.playbackGeneration) this.pendingPlaybacks--;
     }
   }
 
-  private async playNow(audioBuffer: Buffer): Promise<boolean> {
+  private async playNow(audioBuffer: Buffer): Promise<Played> {
     const world = this.getService()?.getWorld();
-    if (!world?.livekit) return false;
+    if (!world?.livekit) return 'none';
 
     // Speaking state makes the engine play the TALK emote
     const player = world.entities?.player;
@@ -435,12 +445,20 @@ export class VoiceManager {
       }, PLAYBACK_TIMEOUT_MS);
     });
 
+    // Survives a failure or a timeout of the playback: how many frames the room took
+    const progress = { frames: 0 };
     try {
-      await Promise.race([
-        world.livekit.publishAudioStream(audioBuffer, { signal: abort.signal }),
+      const outcome: PlaybackOutcome = await Promise.race([
+        world.livekit.publishAudioStream(audioBuffer, { signal: abort.signal, progress }),
         timeout,
       ]);
-      return true;
+      const played: Played = outcome?.played === 'all' || outcome?.played === 'partial' ? outcome.played : progress.frames > 0 ? 'partial' : 'none';
+      if (played !== 'all') logger.warn(`[VoiceManager] Audio ${played === 'none' ? 'not played' : 'only partly played'}: ${outcome?.reason ?? outcome?.error ?? 'no outcome'}`);
+      return played;
+    } catch (error) {
+      const played: Played = progress.frames > 0 ? 'partial' : 'none';
+      logger.warn(`[VoiceManager] Audio ${played === 'none' ? 'not played' : 'only partly played'}: ${error instanceof Error ? error.message : String(error)}`);
+      return played;
     } finally {
       clearTimeout(timer);
       if (this.activePlayback === abort) this.activePlayback = null;

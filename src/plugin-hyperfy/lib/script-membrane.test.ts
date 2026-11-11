@@ -453,6 +453,21 @@ describe('promises a script passes to the host (S-01)', () => {
     expect(handed.includes(secret)).toBe(false);
   });
 
+  it('reject with an Error the host made, never the script\'s own value, when copying their result throws', async () => {
+    const m = membrane();
+    let received: unknown;
+    const api = m.toScript({ take: (value: unknown) => void (received = value) }) as any;
+    const thrown = { message: 'from a getter', [Symbol.for('nodejs.util.inspect.custom')]: () => 'hooked' };
+
+    api.take(Promise.resolve({ get x() { throw thrown; } }));
+    const reason = await (received as Promise<unknown>).catch((err: unknown) => err);
+
+    expect(reason).toBeInstanceOf(Error);
+    expect(reason).not.toBe(thrown);
+    expect((reason as Error).message).toBe('from a getter');
+    expect(Object.getOwnPropertySymbols(reason as object)).toEqual([]);
+  });
+
   it('settle when their then is not callable, instead of being followed forever', async () => {
     const m = membrane();
     let received: unknown;

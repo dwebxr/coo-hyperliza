@@ -18,6 +18,24 @@ const texturesMap = (window.texturesMap = new Map()); // `${materialId}:${slot}`
 const avatarMap = (window.avatarMap = new Map()); // avatar URL -> VRM factory
 window.activeVRMInstances = [];
 
+// How to take back what a recent load kept, by the operation id the agent passed with it: the agent
+// calls undo(op) when the world the load was for went away while it ran. Only the latest are kept.
+const undoable = new Map();
+const UNDO_KEPT = 64;
+function keepUndo(op, undoIt) {
+  if (op !== undefined) remember(undoable, op, undoIt, UNDO_KEPT, () => {});
+}
+function undo(op) {
+  const undoIt = undoable.get(op);
+  undoable.delete(op);
+  if (undoIt) undoIt();
+}
+/** Drops the texture under `key` and frees it, if it is still the one this load put there */
+function forgetTexture(key, texture) {
+  if (texturesMap.get(key) === texture) texturesMap.delete(key);
+  texture.dispose();
+}
+
 function remember(map, key, value, limit, drop) {
   map.delete(key);
   map.set(key, value);
@@ -66,6 +84,13 @@ const parseGltf = (loader, bytes) => new Promise((resolve, reject) => loader.par
 
 const exportGlb = (scene) => new Promise((done) => new window.GLTFExporter().parse(scene, done, { binary: true, embedImages: true }));
 
+/** The exported model as base64, refused (before it is encoded) when larger than `maxBytes` */
+function exportedBase64(glb, maxBytes) {
+  if (!(Number.isSafeInteger(maxBytes) && maxBytes > 0)) throw new Error('no export budget given');
+  if (glb.byteLength > maxBytes) throw new Error(`the exported model is ${glb.byteLength} bytes, more than ${maxBytes}`);
+  return base64Of(glb);
+}
+
 const texturesOf = (material) => Object.values(material).filter((value) => value && value.isTexture);
 
 /** Frees the GPU memory of everything under `root`, except the textures in `keep` */
@@ -87,8 +112,9 @@ function disposeTree(root, keep) {
  * model without them (base64 GLB): the agent's own copy of the scene carries the ids, and
  * rehydrate() puts the textures back for drawing.
  */
-async function loadGlb(base64, stripSlots) {
+async function loadGlb(base64, stripSlots, maxExportBytes, op) {
   const gltf = await parseGltf(new window.GLTFLoader(), bytesOf(base64));
+  const kept = [];
 
   gltf.scene.traverse(obj => {
     if (!obj.isMesh || !obj.material) return;
@@ -105,6 +131,7 @@ async function loadGlb(base64, stripSlots) {
         const tex = mat[slot];
         if (tex && tex.isTexture) {
           remember(texturesMap, `${id}:${slot}`, tex, LIMITS.textures, (dropped) => dropped.dispose());
+          kept.push([`${id}:${slot}`, tex]);
           mat[slot] = null;
         }
       });
@@ -113,11 +140,23 @@ async function loadGlb(base64, stripSlots) {
     });
   });
 
-  return base64Of(await exportGlb(gltf.scene));
+  const takeBack = () => {
+    for (const [key, texture] of kept) forgetTexture(key, texture);
+    disposeTree(gltf.scene, new Set());
+  };
+  try {
+    const glb = exportedBase64(await exportGlb(gltf.scene), maxExportBytes);
+    keepUndo(op, takeBack);
+    return glb;
+  } catch (error) {
+    // Refused: its textures are not kept either
+    takeBack();
+    throw error;
+  }
 }
 
-/** Parses a VRM, keeps a factory for it under `key` (the avatar's URL), and returns it as a GLB. */
-async function loadVrm(key, base64) {
+/** Parses a VRM, keeps a factory for it under `key` (the avatar's URL), and returns it as a GLB (at most `maxExportBytes`). */
+async function loadVrm(key, base64, maxExportBytes, op) {
   const gltf = await parseGltf(window.VRMLoader, bytesOf(base64));
   const factory = window.createVRMFactory(gltf, (m) => m);
 
@@ -127,7 +166,19 @@ async function loadVrm(key, base64) {
   factory.dispose = () => disposeTree(gltf.scene, new Set());
   remember(avatarMap, key, factory, LIMITS.avatars, (dropped) => dropped.dispose());
 
-  return base64Of(await exportGlb(gltf.scene));
+  const takeBack = () => {
+    if (avatarMap.get(key) === factory) avatarMap.delete(key);
+    factory.dispose();
+  };
+  try {
+    const glb = exportedBase64(await exportGlb(gltf.scene), maxExportBytes);
+    keepUndo(op, takeBack);
+    return glb;
+  } catch (error) {
+    // Refused: the avatar is not kept either
+    takeBack();
+    throw error;
+  }
 }
 
 /**
@@ -135,7 +186,7 @@ async function loadVrm(key, base64) {
  * where the agent got the image: three's TextureLoader picks the texture format from the URL it
  * loads, and the URL it loads here is a blob: one, so the same rule is applied to the real one.
  */
-async function registerTexture(base64, contentType, slot, sourceUrl) {
+async function registerTexture(base64, contentType, slot, sourceUrl, op) {
   const blobUrl = URL.createObjectURL(new Blob([bytesOf(base64)], { type: contentType }));
   let texture;
   try {
@@ -156,6 +207,7 @@ async function registerTexture(base64, contentType, slot, sourceUrl) {
 
   const id = uuid();
   remember(texturesMap, `${id}:${slot}`, texture, LIMITS.textures, (dropped) => dropped.dispose());
+  keepUndo(op, () => forgetTexture(`${id}:${slot}`, texture));
 
   return id;
 }
@@ -215,7 +267,7 @@ function hdrTexture(buffer) {
   return texture;
 }
 
-function loadEnvironmentHDR(base64) {
+function loadEnvironmentHDR(base64, op) {
   const previous = window.environment;
   const hdr = hdrTexture(bytesOf(base64).buffer);
 
@@ -225,6 +277,14 @@ function loadEnvironmentHDR(base64) {
 
   window.renderer.render(window.scene, window.camera);
   if (previous && previous !== hdr) previous.dispose();
+  // Taken back, the page has no environment until the next one is set
+  keepUndo(op, () => {
+    if (window.environment !== hdr) return;
+    window.environment = null;
+    window.scene.environment = null;
+    window.scene.background = null;
+    hdr.dispose();
+  });
 }
 
 /**
@@ -311,4 +371,4 @@ function rehydrate(sceneJson, stripSlots, players) {
   window.renderer.render(window.scene, window.camera);
 }
 
-window.agentPage = { LIMITS, loadGlb, loadVrm, registerTexture, loadEnvironmentHDR, hdrTexture, rehydrate };
+window.agentPage = { LIMITS, loadGlb, loadVrm, registerTexture, loadEnvironmentHDR, hdrTexture, rehydrate, undo };

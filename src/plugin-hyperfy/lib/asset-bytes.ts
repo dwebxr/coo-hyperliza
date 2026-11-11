@@ -4,7 +4,8 @@
  * (lib/net-policy.ts) with the operator's byte cap for that kind of asset.
  */
 import { resolveUrl } from '../utils';
-import { MAX_EMOTE_BYTES, MAX_IMAGE_BYTES, MAX_MODEL_BYTES, MAX_SCRIPT_BYTES, worldNet } from './net-policy';
+import { describeUrl } from './log-url';
+import { MAX_EMOTE_BYTES, MAX_IMAGE_BYTES, MAX_MODEL_BYTES, MAX_SCRIPT_BYTES, SafeFetchError, worldNet } from './net-policy';
 
 export type AssetKind = 'model' | 'avatar' | 'emote' | 'script' | 'image' | 'hdr';
 
@@ -28,11 +29,7 @@ export interface AssetBytes {
   url: string;
 }
 
-/** A URL short enough for a log line (a data: URL is megabytes long). */
-export function describeUrl(url: unknown): string {
-  const text = typeof url === 'string' ? url : String(url);
-  return text.length > 200 ? `${text.slice(0, 200)}… (${text.length} characters)` : text;
-}
+export { describeUrl } from './log-url';
 
 /** The bytes and type of a data: URL, read without building anything larger than `maxBytes`. */
 export function decodeDataUrl(url: string, maxBytes: number): { bytes: Uint8Array; contentType: string } {
@@ -62,6 +59,8 @@ export async function fetchAssetBytes(
   { signal }: { signal?: AbortSignal } = {}
 ): Promise<AssetBytes> {
   const resolved = await resolveUrl(url, world);
+  // Also a data: URL or a bundled file is not handed out once the caller has stopped
+  if (signal?.aborted) throw new SafeFetchError('aborted', 'the load was cancelled');
   if (!resolved) throw new Error(`could not resolve ${describeUrl(url)}`);
   const maxBytes = ASSET_BYTE_CAPS[kind];
   if (resolved.startsWith('data:')) return { ...decodeDataUrl(resolved, maxBytes), url: resolved };

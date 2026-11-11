@@ -280,6 +280,10 @@ async function smoke(mode, { locked = false } = {}) {
       HTTPS_PROXY: `http://127.0.0.1:${recorder.port}`,
       ALL_PROXY: `http://127.0.0.1:${recorder.port}`,
       NO_PROXY: '127.0.0.1,localhost',
+      // Sentry's transport (in the elizaOS server) reads only these lower-case names, and no_proxy:
+      // with no no_proxy, whatever Sentry would send reaches the recorder, to any address
+      http_proxy: `http://127.0.0.1:${recorder.port}`,
+      https_proxy: `http://127.0.0.1:${recorder.port}`,
       // Every `elizaos` command but `update` runs `npm view @elizaos/cli@<channel> version` first (its
       // update notice; there is no switch for it). This makes npm answer from nothing instead of
       // asking registry.npmjs.org, and keeps npm from checking for a newer npm; without these the
@@ -436,22 +440,35 @@ async function smoke(mode, { locked = false } = {}) {
       'no secret value appears in the agent log',
       !logText().includes(dummyAnthropicKey) && !logText().includes(dummyTipKey.slice(2)) && !(apiToken && logText().includes(apiToken))
     );
-    if (locked) {
-      // The agent made its token up and never shows it, so nothing can be compared with it: no
-      // 64-hex-character string (its format) may appear, except the ones plugin-sql labels as its
-      // schema migration hash ("hash=<64 hex>")
-      const hex = [...logText().matchAll(/(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])/g)];
-      const unlabelled = hex.filter((match) => logText().slice(Math.max(0, match.index - 5), match.index) !== 'hash=');
-      check(
-        'no 64-hex-character string (the generated token\'s format) appears in the agent log, other than plugin-sql\'s "hash=" migration hashes',
-        unlabelled.length === 0,
-        `${hex.length - unlabelled.length} labelled hash=, ${unlabelled.length} other${unlabelled.length ? ` (first at offset ${unlabelled[0].index})` : ''}`
-      );
+    // elizaOS reports API errors to Sentry, by default to its own project. With SENTRY_DSN unset the
+    // agent hands Sentry a value that is not a DSN: Sentry says so and has no transport to send with.
+    // A malformed JSON body reaches the server's /api error handler, which calls captureException.
+    check('the agent says error reporting is off (SENTRY_DSN is not set)', /\[Security\] SENTRY_DSN is not set, so error reporting is off/.test(logText()));
+    // Sentry's own console.error line, on its own (the agent's [Security] line does not contain it);
+    // the runtime colours it, so the colour codes are taken off first
+    check('Sentry was handed no usable DSN (its own "Invalid Sentry Dsn: off" line)', /^Invalid Sentry Dsn: off\r?$/m.test(logText().replace(/\x1b\[[0-9;]*m/g, '')));
+    // Sentry's transport goes through the recorder (http_proxy/https_proxy above), as a CONNECT or a POST
+    const seenBeforeApiError = recorder.seen.length;
+    let malformedStatus = null;
+    try {
+      const response = await fetch(`http://127.0.0.1:${serverPort}/api/agents`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(apiToken ? { 'X-API-KEY': apiToken } : {}) },
+        body: '{"broken',
+        signal: AbortSignal.timeout(5000),
+      });
+      malformedStatus = response.status;
+      await response.text();
+    } catch (error) {
+      malformedStatus = error instanceof Error ? error.message : String(error);
     }
+    await sleep(500);
+    check('a malformed API request reached the error handler that reports to Sentry', malformedStatus === 500 && logText().includes('API error'), `status ${malformedStatus}`);
 
-    // A little longer, for anything that phones home after start-up
+    // A little longer, for anything that phones home after start-up (Sentry sends at once)
     await sleep(3000);
     sample();
+    check('nothing was sent to Sentry: after the API error, no request reached the recorder its transport would use', recorder.seen.length === seenBeforeApiError, recorder.seen.slice(seenBeforeApiError).join(' | '));
     const external = [...remotes].filter((remote) => !isLoopback(remote.replace(/:\d+$/, '')));
     check('no proxy-aware client tried to reach another host', recorder.seen.length === 0, recorder.seen.join(' | '));
     check('every sampled connection of the agent and of what it started (Chromium included) went to 127.0.0.1', external.length === 0, `remote ends seen: ${JSON.stringify([...remotes].map((remote) => remote.replace(/:\d+$/, '')).filter((v, i, a) => a.indexOf(v) === i))}${external.length ? `, EXTERNAL: ${external.join(', ')}` : ''}`);
@@ -467,6 +484,23 @@ async function smoke(mode, { locked = false } = {}) {
     const deadline = Date.now() + EXIT_TIMEOUT_MS;
     while (!exited && Date.now() < deadline) await sleep(100);
     check('the process exits on SIGTERM', !!exited, exited ? JSON.stringify(exited) : `still running after ${EXIT_TIMEOUT_MS / 1000}s`);
+
+    if (locked) {
+      // On the whole log, after the agent exited. The agent made its token up and never shows it,
+      // so nothing can be compared with it (a heuristic, then): no 64-hex-character string (its
+      // format) may appear, except as the hash in plugin-sql's one log line that carries one, in
+      // exactly the shape elizaOS's logger writes it (formatPrettyLog in @elizaos/core)
+      const text = logText();
+      const migration = /\[PLUGIN:SQL\] No changes detected, skipping migration \(pluginName=[@a-z0-9/._-]+, hash=([0-9a-f]{64})\)/g;
+      const exempt = new Set([...text.matchAll(migration)].map((match) => match.index + match[0].length - 65));
+      const hex = [...text.matchAll(/(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])/g)];
+      const other = hex.filter((match) => !exempt.has(match.index));
+      check(
+        "no 64-hex-character string (the generated token's format) appears in the agent log, other than plugin-sql's migration hashes in their exact log line",
+        other.length === 0,
+        `${hex.length - other.length} migration hash(es), ${other.length} other${other.length ? ` (first at offset ${other[0].index})` : ''}`
+      );
+    }
 
     const storageAfter = [fingerprint(repoStorage), fingerprint(submoduleStorage)];
     check("the repository's localstorage.json is untouched (stat only)", storageBefore[0] === storageAfter[0]);

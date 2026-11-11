@@ -3,6 +3,7 @@ import type { Action, IAgentRuntime, Memory, State } from '@elizaos/core';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import path from 'path';
+import { describeUrl } from './lib/log-url';
 
 
 export async function hashFileBuffer(buffer: Buffer): Promise<string> {
@@ -65,7 +66,7 @@ export const resolveUrl = async (
   }
 
   if (!allowLocal) {
-    console.warn(`[resolveUrl] Refusing to read local path "${url}".`);
+    console.warn(`[resolveUrl] Refusing to read local path "${describeUrl(url)}".`);
     return null;
   }
 
@@ -74,7 +75,7 @@ export const resolveUrl = async (
   const moduleDir = path.resolve(getModuleDirectory());
   const fullPath = path.resolve(moduleDir, url);
   if (path.isAbsolute(url) || (fullPath !== moduleDir && !fullPath.startsWith(moduleDir + path.sep))) {
-    console.warn(`[resolveUrl] Refusing to read "${url}" outside the module directory.`);
+    console.warn(`[resolveUrl] Refusing to read "${describeUrl(url)}" outside the module directory.`);
     return null;
   }
 

@@ -27,7 +27,9 @@
  *     callables that convert the arguments (so a callback the engine invokes with a raw object
  *     sees a facade or a token), drop `this`, and rethrow anything the script throws as a fresh
  *     Error carrying strings only. A raw host function never goes back to host code.
- *   - promises are followed by a promise made here; binary data is copied byte for byte
+ *   - promises are followed by a promise made here; binary data is copied byte for byte. Following
+     a script's promise calls its `then` (the script's own, or the language's) with the two
+     resolving functions of the promise made here, and nothing else of the host
  *   - everything else is copied: own enumerable string-keyed properties, each read once, into a
  *     new plain object or array. The engine never holds a script's own object, so a script
  *     cannot answer differently on a second read, and no getter of its runs later inside host code.
@@ -602,8 +604,17 @@ export function createScriptMembrane(options: MembraneOptions = {}): ScriptMembr
   function adopt(promise: Promise<unknown>): Promise<unknown> {
     return follow(
       promise,
-      // A promise whose `then` is not callable fulfils with itself: stop there instead of following it again
-      (result) => (result === promise ? undefined : toHost(result)),
+      // A promise whose `then` is not callable fulfils with itself: stop there instead of following it again.
+      // A getter that throws while the result is copied rejects with an Error made here, never with
+      // the script's own value, so a host that leaves this promise unhandled reports nothing of the script's.
+      (result) => {
+        if (result === promise) return undefined;
+        try {
+          return toHost(result);
+        } catch (err) {
+          throw toHostError(err);
+        }
+      },
       (err) => {
         throw toHostError(err);
       }

@@ -8,6 +8,7 @@ import type { HyperfyService } from '../service.js'
 import { resolveUrl } from '../utils.js';
 import { getModuleDirectory } from '../utils.js';
 import { childEnv } from '../lib/child-env';
+import { modelBudget } from '../lib/gltf-budget';
 
 // HyperfyService.serviceType. Not imported as a value: this module must load without the service
 // (and the whole engine behind it), which is how scripts/smoke-chromium.mjs runs it.
@@ -45,9 +46,20 @@ export const OFFLINE_CHROMIUM_ARGS = [
 
 const toBase64 = (bytes: Uint8Array) => Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64')
 const fromBase64 = (text: string) => new Uint8Array(Buffer.from(text, 'base64'))
+// The largest model the page returns when the caller names no budget (a model's, lib/gltf-budget.ts)
+const DEFAULT_MAX_EXPORT_BYTES = modelBudget('model').exportBytes
+
+/** A page call whose world went away (the caller's signal fired); what it kept in the page was taken back. */
+export class PageOperationCancelled extends Error {
+  constructor() {
+    super('[PuppeteerManager] The page operation was cancelled')
+    this.name = 'AbortError'
+  }
+}
 
 export class PuppeteerManager {
   private static instance: PuppeteerManager | null = null
+  private operations = 0
   
   private runtime: IAgentRuntime
   private browser: puppeteer.Browser
@@ -315,49 +327,72 @@ export class PuppeteerManager {
   /**
    * The asset loaders below take bytes the agent has already downloaded (lib/asset-bytes.ts): the
    * page cannot fetch anything itself. Bytes cross to the page and back as base64.
+   *
+   * Each takes a `signal` (the world the asset is for going away): checked once the page is ready
+   * and right before the page is asked, so nothing is handed to the page after it fired. A page
+   * call cannot be interrupted; when the signal fired while one ran, what it kept in the page is
+   * taken back right after (assets.js undo) and the call fails with PageOperationCancelled.
    */
+  private async pageCall<T>(signal: AbortSignal | undefined, run: (page: puppeteer.Page, op: string[]) => Promise<T>): Promise<T> {
+    const page = await this.init()
+    if (signal?.aborted) throw new PageOperationCancelled()
+    // The id the page files its undo under; only when there is something to cancel
+    const op = signal ? [`op-${++this.operations}`] : []
+    const result = await run(page, op)
+    if (signal?.aborted) {
+      await page.evaluate((id) => window.agentPage.undo(id), op[0]).catch(() => {})
+      throw new PageOperationCancelled()
+    }
+    return result
+  }
 
-  /** Keeps a model's textures in the page and returns the model without them (GLB). */
-  async loadGlbBytes(bytes: Uint8Array): Promise<Uint8Array> {
-    const page = await this.init();
+  /**
+   * Keeps a model's textures in the page and returns the model without them (GLB). The page
+   * refuses to return more than `maxExportBytes` (lib/gltf-budget.ts).
+   */
+  async loadGlbBytes(bytes: Uint8Array, { maxExportBytes = DEFAULT_MAX_EXPORT_BYTES, signal }: { maxExportBytes?: number; signal?: AbortSignal } = {}): Promise<Uint8Array> {
     const STRIP_SLOTS = this.STRIP_SLOTS;
-
-    const stripped = await page.evaluate(
-      (base64, STRIP_SLOTS) => window.agentPage.loadGlb(base64, STRIP_SLOTS),
-      toBase64(bytes), STRIP_SLOTS
+    const stripped = await this.pageCall(signal, (page, op) =>
+      page.evaluate(
+        (base64, STRIP_SLOTS, maxExportBytes, op) => window.agentPage.loadGlb(base64, STRIP_SLOTS, maxExportBytes, op),
+        toBase64(bytes), STRIP_SLOTS, maxExportBytes, ...op
+      )
     );
     return fromBase64(stripped);
   }
 
-  /** Keeps an avatar in the page under `url` (what rehydrateSceneAssets looks players' avatars up by) and returns it as a GLB. */
-  async loadVRMBytes(bytes: Uint8Array, url: string): Promise<Uint8Array> {
-    const page = await this.init();
-
-    const exported = await page.evaluate(
-      (url, base64) => window.agentPage.loadVrm(url, base64),
-      url, toBase64(bytes)
+  /**
+   * Keeps an avatar in the page under `url` (what rehydrateSceneAssets looks players' avatars up
+   * by) and returns it as a GLB, of at most `maxExportBytes`.
+   */
+  async loadVRMBytes(bytes: Uint8Array, url: string, { maxExportBytes = DEFAULT_MAX_EXPORT_BYTES, signal }: { maxExportBytes?: number; signal?: AbortSignal } = {}): Promise<Uint8Array> {
+    const exported = await this.pageCall(signal, (page, op) =>
+      page.evaluate(
+        (url, base64, maxExportBytes, op) => window.agentPage.loadVrm(url, base64, maxExportBytes, op),
+        url, toBase64(bytes), maxExportBytes, ...op
+      )
     );
     return fromBase64(exported);
   }
 
   /** Keeps an image in the page as a texture and returns the id to name it by. `url` is where it came from. */
-  async registerTexture(image: { bytes: Uint8Array; contentType: string; url: string }, slot: string): Promise<string> {
-    const page = await this.init();
+  async registerTexture(image: { bytes: Uint8Array; contentType: string; url: string }, slot: string, { signal }: { signal?: AbortSignal } = {}): Promise<string> {
     // Only the part three's TextureLoader looks at: of a data: URL, that is what comes before the data
     const source = image.url.startsWith('data:') ? image.url.slice(0, image.url.indexOf(',')) : image.url;
-
-    return page.evaluate(
-      (base64, contentType, slot, source) => window.agentPage.registerTexture(base64, contentType, slot, source),
-      toBase64(image.bytes), image.contentType, slot, source
+    return this.pageCall(signal, (page, op) =>
+      page.evaluate(
+        (base64, contentType, slot, source, op) => window.agentPage.registerTexture(base64, contentType, slot, source, op),
+        toBase64(image.bytes), image.contentType, slot, source, ...op
+      )
     );
   }
 
-  public async loadEnvironmentHDR(bytes: Uint8Array): Promise<void> {
-    const page = await this.init();
-
-    await page.evaluate(
-      (base64) => window.agentPage.loadEnvironmentHDR(base64),
-      toBase64(bytes)
+  public async loadEnvironmentHDR(bytes: Uint8Array, { signal }: { signal?: AbortSignal } = {}): Promise<void> {
+    await this.pageCall(signal, (page, op) =>
+      page.evaluate(
+        (base64, op) => window.agentPage.loadEnvironmentHDR(base64, op),
+        toBase64(bytes), ...op
+      )
     );
   }
 

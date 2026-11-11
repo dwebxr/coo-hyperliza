@@ -9,8 +9,9 @@
  *     so the address that was checked is the address that is dialled (no second resolution to
  *     rebind). A name with several addresses is refused when any of them is not public.
  *   - The world's own origin (WS_URL with wss:->https:, ws:->http:), on any address, any port and
- *     over http: a local or LAN world keeps working. Nothing else gets this exception, and a
- *     redirect that leaves the origin loses it (every hop is judged from scratch).
+ *     over http: a local or LAN world keeps working. A loopback world's scheme and port count on
+ *     every loopback spelling (onWorldOrigin). Nothing else gets this exception, and a redirect
+ *     that leaves the origin loses it (every hop is judged from scratch).
  *
  * Also: no credentials in URLs; redirects are followed by hand, at most MAX_REDIRECTS; one
  * deadline covers the whole exchange; the body is read as a stream and the request is destroyed
@@ -268,14 +269,9 @@ export class NetPolicy {
     this.#ca = ca;
   }
 
-  /** Whether `url` is on the world's own origin (and so gets the exception). */
+  /** Whether `url` is on the world's own origin (and so gets the exception): see onWorldOrigin. */
   isWorldOrigin(url: string | URL): boolean {
-    if (this.worldOrigin === null) return false;
-    try {
-      return new URL(url).origin === this.worldOrigin;
-    } catch {
-      return false;
-    }
+    return onWorldOrigin(url, this.worldOrigin);
   }
 
   /**
@@ -285,6 +281,41 @@ export class NetPolicy {
   urlProblem(url: string, { worldException = true }: { worldException?: boolean } = {}): string | null {
     try {
       this.#admit(parseUrl(url), worldException);
+      return null;
+    } catch (error) {
+      if (error instanceof SafeFetchError) return error.message;
+      throw error;
+    }
+  }
+
+  /**
+   * Why the voice (LiveKit) server URL the world sends must not be handed to the native client, or
+   * null. ws: or wss:, no user name or password. On the world's own host (any scheme and port;
+   * loopback spellings count as one host) it is allowed, as the world's own downloads are. Anywhere
+   * else: wss: on the default port, on a host whose every address is public. The native client
+   * resolves the name again when it connects, and its media (ICE) connections are not checked here.
+   */
+  async voiceUrlProblem(wsUrl: unknown): Promise<string | null> {
+    if (typeof wsUrl !== 'string') return 'the voice server URL is not a string';
+    let url: URL;
+    try {
+      url = new URL(wsUrl);
+    } catch {
+      return 'the voice server URL is not a valid absolute URL';
+    }
+    if (url.protocol !== 'ws:' && url.protocol !== 'wss:') return `${url.protocol}// is not a voice server URL (only ws:// and wss://)`;
+    if (url.username !== '' || url.password !== '') return 'the voice server URL carries a user name or password';
+    const hostname = url.hostname.startsWith('[') ? url.hostname.slice(1, -1) : url.hostname;
+    if (!hostname) return 'the voice server URL has no host';
+    if (this.worldOrigin !== null && sameHost(url.hostname, new URL(this.worldOrigin).hostname)) return null;
+    if (url.protocol !== 'wss:') return "ws:// is only allowed on the world's own host (use wss://)";
+    if (url.port !== '') return `port ${url.port} is not allowed (only the default port, except on the world's own host)`;
+    if (net.isIP(hostname) !== 0) {
+      const problem = addressProblem(hostname);
+      return problem ? `${hostname} is ${problem}` : null;
+    }
+    try {
+      await this.#addressesOf(hostname, false);
       return null;
     } catch (error) {
       if (error instanceof SafeFetchError) return error.message;
@@ -326,7 +357,8 @@ export class NetPolicy {
         } catch {
           throw new SafeFetchError('network', 'the server redirected to an invalid URL');
         }
-        if (answer.status === 303 || ((answer.status === 301 || answer.status === 302) && method === 'POST')) {
+        // RFC 9110 15.4: 303 means "GET this instead" for any method but GET and HEAD, which stay as they are
+        if ((answer.status === 303 && method !== 'GET' && method !== 'HEAD') || ((answer.status === 301 || answer.status === 302) && method === 'POST')) {
           method = 'GET';
           body = undefined;
           delete headers['content-type'];
@@ -345,7 +377,7 @@ export class NetPolicy {
   #admit(url: URL, worldException: boolean): Target {
     if (url.protocol !== 'http:' && url.protocol !== 'https:') refuse(`${url.protocol}// URLs are not fetched`);
     if (url.username !== '' || url.password !== '') refuse('URLs that carry a user name or password are not fetched');
-    const isWorld = worldException && this.worldOrigin !== null && url.origin === this.worldOrigin;
+    const isWorld = worldException && onWorldOrigin(url, this.worldOrigin);
     if (!isWorld) {
       if (url.protocol !== 'https:') refuse("http:// is only allowed on the world's own origin (use https://)");
       if (url.port !== '') refuse(`port ${url.port} is not allowed (only the default port, except on the world's own origin)`);
@@ -493,6 +525,38 @@ function parseUrl(input: string): URL {
     return new URL(input);
   } catch {
     return refuse('not a valid absolute URL');
+  }
+}
+
+/** localhost, 127.0.0.0/8 or ::1, as URL.hostname spells a host */
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.startsWith('[') ? hostname.slice(1, -1) : hostname;
+  if (host === 'localhost') return true;
+  const v4 = ipv4Bytes(host);
+  if (v4) return v4[0] === 127;
+  const v6 = ipv6Bytes(host);
+  return v6 !== null && v6.slice(0, 15).every((byte) => byte === 0) && v6[15] === 1;
+}
+
+/** Two host names for the same host: equal, or both a spelling of loopback. */
+function sameHost(a: string, b: string): boolean {
+  return a === b || (isLoopbackHost(a) && isLoopbackHost(b));
+}
+
+/**
+ * Whether `url` is on `worldOrigin` (as URL.origin spells it). A loopback world (localhost,
+ * 127.0.0.0/8, [::1]) also owns the same scheme and port on the other loopback spellings: a world
+ * reached as 127.0.0.1 often names its assets on localhost. No other host gets this.
+ */
+export function onWorldOrigin(url: string | URL, worldOrigin: string | null): boolean {
+  if (worldOrigin === null) return false;
+  try {
+    const target = new URL(url);
+    if (target.origin === worldOrigin) return true;
+    const world = new URL(worldOrigin);
+    return target.protocol === world.protocol && target.port === world.port && isLoopbackHost(world.hostname) && isLoopbackHost(target.hostname);
+  } catch {
+    return false;
   }
 }
 

@@ -360,6 +360,39 @@ describe('the world-origin exception', () => {
     expect(world.connections).toBe(0);
   });
 
+  it('a loopback world owns its scheme and port on every loopback spelling, in both directions', async () => {
+    const world = await startServer((_request, response) => response.end('asset'));
+    const port = world.port;
+    const hosts = { localhost: '127.0.0.1' };
+    // WS_URL on 127.0.0.1, assets announced on localhost; and the other way round
+    const byAddress = testNet({ hosts, worldOrigin: `http://127.0.0.1:${port}`, tls: false }).policy;
+    const byName = testNet({ hosts, worldOrigin: `http://localhost:${port}`, tls: false }).policy;
+
+    await expect(byAddress.fetch(`http://localhost:${port}/a`, { maxBytes: 100 })).resolves.toMatchObject({ status: 200 });
+    await expect(byName.fetch(`http://127.0.0.1:${port}/b`, { maxBytes: 100 })).resolves.toMatchObject({ status: 200 });
+    expect(world.hits.map((hit) => hit.headers.host)).toEqual([`localhost:${port}`, `127.0.0.1:${port}`]);
+    for (const policy of [byAddress, byName]) {
+      for (const spelling of ['localhost', '127.0.0.1', '127.1.2.3', '[::1]', '[0:0:0:0:0:0:0:1]']) expect(policy.isWorldOrigin(`http://${spelling}:${port}/x`)).toBe(true);
+      // Nothing wider: another port, another scheme, another name for the machine, IPv4-mapped loopback
+      expect(policy.urlProblem(`http://localhost:${port + 1}/x`)).toContain('http:// is only allowed');
+      expect(policy.isWorldOrigin(`https://localhost:${port}/x`)).toBe(false);
+      expect(policy.isWorldOrigin(`http://me.localhost:${port}/x`)).toBe(false);
+      expect(policy.isWorldOrigin(`http://[::ffff:127.0.0.1]:${port}/x`)).toBe(false);
+      expect(policy.isWorldOrigin(`http://192.168.1.5:${port}/x`)).toBe(false);
+    }
+  });
+
+  it('a world that is not on loopback gets no other spelling, even one that resolves to it', async () => {
+    const world = await startServer((_request, response) => response.end('asset'));
+    const { policy } = testNet({ hosts: { 'world.lan': '192.168.1.5', localhost: '127.0.0.1' }, worldOrigin: `http://192.168.1.5:${world.port}`, tls: false });
+
+    expect(policy.isWorldOrigin(`http://192.168.1.5:${world.port}/x`)).toBe(true);
+    expect(policy.isWorldOrigin(`http://world.lan:${world.port}/x`)).toBe(false);
+    expect((await refusal(policy.fetch(`http://localhost:${world.port}/a`, { maxBytes: 100 }))).kind).toBe('refused');
+    expect((await refusal(policy.fetch(`http://127.0.0.1:${world.port}/a`, { maxBytes: 100 }))).kind).toBe('refused');
+    expect(world.connections).toBe(0);
+  });
+
   it('a policy with no world has no exception, and an origin that is not http(s) gives none', async () => {
     const server = await startServer((_request, response) => response.end('x'));
     for (const policy of [new NetPolicy(), new NetPolicy({ worldOrigin: 'ftp://127.0.0.1' }), new NetPolicy({ worldOrigin: 'not a url' })]) {
@@ -480,6 +513,66 @@ describe('redirects', () => {
     await post('/307-away');
     expect([landed(second).method, landed(second).body]).toEqual(['POST', 'payload']);
     expect(landed(second).headers.authorization).toBeUndefined();
+  });
+
+  it('keeps a HEAD a HEAD (and a GET a GET) on every redirect, 303 included, and turns a PUT into a GET on 303', async () => {
+    const server = await startServer((request, response) => {
+      if (request.url?.includes('landed')) return void response.writeHead(200, { 'content-length': '5' }).end(request.method === 'HEAD' ? undefined : 'asset');
+      response.writeHead(Number(request.url?.slice(1, 4)), { location: '/landed' }).end();
+    }, { tls: true });
+    const { policy } = testNet({ hosts: { 'cdn.test': PUBLIC_ADDRESS }, routes: { 'cdn.test:443': { port: server.port, direct: true } } });
+    const landed = () => server.hits.filter((hit) => hit.url === '/landed').at(-1)!;
+
+    for (const status of [301, 302, 303, 307, 308]) {
+      const answer = await policy.fetch(`https://cdn.test/${status}`, { maxBytes: 0, method: 'HEAD' });
+      expect([status, answer.status, answer.body.byteLength, landed().method]).toEqual([status, 200, 0, 'HEAD']);
+      await policy.fetch(`https://cdn.test/${status}`, { maxBytes: 100 });
+      expect([status, landed().method]).toEqual([status, 'GET']);
+    }
+    await policy.fetch('https://cdn.test/303', { maxBytes: 100, method: 'PUT', body: 'x' });
+    expect([landed().method, landed().body]).toEqual(['GET', '']);
+  });
+});
+
+describe('the voice server URL the world sends (voiceUrlProblem)', () => {
+  const world = (origin: string) => testNet({ hosts: { 'lk.example': PUBLIC_ADDRESS, 'lk.internal': '10.0.0.7', 'lk.mixed': [PUBLIC_ADDRESS, '127.0.0.1'], 'world.test': '10.0.0.2' }, worldOrigin: origin });
+
+  it("allows the world's own host on any scheme and port, loopback spellings included", async () => {
+    const { policy, resolved } = world('http://world.test:3000');
+    expect(await policy.voiceUrlProblem('ws://world.test:7880')).toBeNull();
+    expect(await policy.voiceUrlProblem('wss://world.test/rtc')).toBeNull();
+    const loopback = world('http://127.0.0.1:3000').policy;
+    expect(await loopback.voiceUrlProblem('ws://localhost:7880')).toBeNull();
+    expect(await loopback.voiceUrlProblem('ws://[::1]:7880')).toBeNull();
+    // The world's host is trusted as its downloads are: not even resolved
+    expect(resolved).toEqual([]);
+  });
+
+  it('allows wss: on the default port of a host whose every address is public', async () => {
+    const { policy, resolved } = world('http://world.test:3000');
+    expect(await policy.voiceUrlProblem('wss://lk.example')).toBeNull();
+    expect(await policy.voiceUrlProblem(`wss://${PUBLIC_ADDRESS}/`)).toBeNull();
+    expect(resolved).toEqual(['lk.example']);
+  });
+
+  it.each([
+    ['plain ws: elsewhere', 'ws://lk.example', 'ws:// is only allowed'],
+    ['another port', 'wss://lk.example:7880', 'port 7880 is not allowed'],
+    ['a private host', 'wss://lk.internal', 'lk.internal resolves to 10.0.0.7, which is a private address'],
+    ['a host with one loopback address among public ones', 'wss://lk.mixed', '127.0.0.1, which is a loopback address'],
+    ['a loopback literal while the world is elsewhere', 'wss://127.0.0.1', '127.0.0.1 is a loopback address'],
+    ['the metadata address', 'wss://169.254.169.254', 'cloud metadata'],
+    ['a name nobody resolves', 'wss://nowhere.example', 'could not resolve nowhere.example'],
+    ['credentials, even on the world', 'ws://user:pw@world.test:7880', 'user name or password'],
+    ['another scheme', 'https://lk.example', 'https:// is not a voice server URL'],
+    ['not a URL', 'lk.example', 'not a valid absolute URL'],
+  ])('refuses %s', async (_name, url, why) => {
+    expect(await world('http://world.test:3000').policy.voiceUrlProblem(url)).toContain(why);
+  });
+
+  it('refuses anything but a string, and a world with no origin gets no host exception', async () => {
+    expect(await world('http://world.test:3000').policy.voiceUrlProblem(undefined)).toContain('not a string');
+    expect(await new NetPolicy().voiceUrlProblem('ws://localhost:7880')).toContain('ws:// is only allowed');
   });
 });
 

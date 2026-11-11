@@ -1,5 +1,6 @@
 import { Packr } from 'msgpackr';
 import { WORLD_URL_PROTOCOLS } from './world-url';
+import { describeUrl } from './log-url';
 
 /**
  * The network protocol of coo-world (github.com/dwebxr/coo-world, src/core/packets.js as of
@@ -128,7 +129,7 @@ export function adaptToWorldProtocol(network: any, getAuthToken: () => string | 
     try {
       url = new URL(wsUrl);
     } catch {
-      throw new Error(`Invalid Hyperfy WebSocket URL: ${wsUrl}`);
+      throw new Error(`Invalid Hyperfy WebSocket URL: ${describeUrl(wsUrl)}`);
     }
     if (!WORLD_URL_PROTOCOLS.includes(url.protocol)) {
       throw new Error(`Unsupported Hyperfy WebSocket protocol: ${url.protocol}`);

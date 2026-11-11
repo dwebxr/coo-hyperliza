@@ -10,6 +10,7 @@ import {
   createSelfTestCompartment,
   describeRejection,
   failedProbes,
+  guardErrorEventsForWorldScripts,
   isScriptSandboxActive,
   resolveWorldScriptsMode,
   runEscapeProbes,
@@ -33,6 +34,15 @@ describe('HYPERFY_WORLD_SCRIPTS', () => {
       expect(result.mode).toBe('off');
       expect(result.problem).toContain(value);
     }
+  });
+
+  it('sandboxed: the error-event guard is installed as soon as src/index.ts asks, and only then', () => {
+    for (const [value, installed] of [['sandboxed', true], [' SANDBOXED', true], ['off', false], [undefined, false], ['on', false]] as const) {
+      const install = vi.fn();
+      expect(guardErrorEventsForWorldScripts({ HYPERFY_WORLD_SCRIPTS: value }, install), String(value)).toBe(installed);
+      expect(install).toHaveBeenCalledTimes(installed ? 1 : 0);
+    }
+    expect(readFileSync(new URL('../../index.ts', import.meta.url), 'utf8')).toContain('guardErrorEventsForWorldScripts(process.env);');
   });
 });
 
@@ -113,7 +123,7 @@ describe('activating the sandbox', () => {
     const out = log();
     const selfTest = vi.fn(() => [blocked]);
 
-    const ok = await activateScriptSandbox({
+    const ok = await activateScriptSandbox({ guardErrorEvents: () => null,
       lockdown: () => {
         throw new Error('Already locked down');
       },
@@ -131,7 +141,7 @@ describe('activating the sandbox', () => {
   it('refuses, and stays inactive, when one probe is not blocked', async () => {
     const out = log();
 
-    const ok = await activateScriptSandbox({
+    const ok = await activateScriptSandbox({ guardErrorEvents: () => null,
       lockdown: () => {},
       selfTest: () => [blocked, { name: 'Function constructor', blocked: false, detail: 'ESCAPED object' }],
       log: out,
@@ -146,24 +156,24 @@ describe('activating the sandbox', () => {
   });
 
   it('refuses when the self-test itself cannot run, or runs no checks', async () => {
-    const failing = await activateScriptSandbox({
+    const failing = await activateScriptSandbox({ guardErrorEvents: () => null,
       lockdown: () => {},
       selfTest: async () => {
         throw new Error('no Compartment');
       },
       log: log(),
     });
-    const empty = await activateScriptSandbox({ lockdown: () => {}, selfTest: () => [], log: log() });
+    const empty = await activateScriptSandbox({ guardErrorEvents: () => null, lockdown: () => {}, selfTest: () => [], log: log() });
 
     expect(failing).toBe(false);
     expect(empty).toBe(false);
     expect(isScriptSandboxActive()).toBe(false);
   });
 
-  it('allows only self-test compartments while the self-test runs, and refuses a second activation then', async () => {
+  it('allows only self-test compartments while the self-test runs, and hands a second caller the same activation', async () => {
     let during: Record<string, string> = {};
     let concurrent: Promise<boolean> | undefined;
-    const ok = await activateScriptSandbox({
+    const ok = await activateScriptSandbox({ guardErrorEvents: () => null,
       lockdown: () => {},
       selfTest: async () => {
         const attempt = (fn: () => unknown) => {
@@ -175,7 +185,7 @@ describe('activating the sandbox', () => {
           }
         };
         during = { script: attempt(() => createScriptCompartment({})), selfTest: attempt(() => createSelfTestCompartment({})) };
-        concurrent = activateScriptSandbox({ lockdown: () => {}, selfTest: () => [blocked], log: log() });
+        concurrent = activateScriptSandbox({ guardErrorEvents: () => null, lockdown: () => {}, selfTest: () => [blocked], log: log() });
         return [{ name: 'control', blocked: false, detail: 'stop here' }];
       },
       log: log(),
@@ -184,6 +194,7 @@ describe('activating the sandbox', () => {
     expect(ok).toBe(false);
     expect(during.script).toContain('after the sandbox has been activated');
     expect(during.selfTest).toBe('created');
+    // The caller during the activation waited for it and got its result; nothing ran twice
     expect(await concurrent).toBe(false);
   });
 
@@ -191,7 +202,7 @@ describe('activating the sandbox', () => {
     const out = log();
     const membrane = createScriptMembrane();
 
-    const ok = await activateScriptSandbox({
+    const ok = await activateScriptSandbox({ guardErrorEvents: () => null,
       lockdown: () => {},
       selfTest: () =>
         runEscapeProbes({
@@ -213,7 +224,7 @@ describe('activating the sandbox', () => {
     const lock = vi.fn(() => {
       throw new Error('stop here');
     });
-    await activateScriptSandbox({ lockdown: lock, selfTest: () => [], log: log() });
+    await activateScriptSandbox({ guardErrorEvents: () => null, lockdown: lock, selfTest: () => [], log: log() });
     expect(lock).toHaveBeenCalledWith(LOCKDOWN_OPTIONS);
     expect(LOCKDOWN_OPTIONS).toMatchObject({ localeTaming: 'unsafe', overrideTaming: 'severe', errorTrapping: 'none' });
   });

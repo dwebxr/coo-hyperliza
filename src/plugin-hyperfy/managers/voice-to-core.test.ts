@@ -35,7 +35,7 @@ function voiceTurn(speakerRank: number) {
   vi.stubEnv('HYPERFY_SCENE_EDITS', 'builders');
   resetUsageBudget(new UsageBudget(noLimits));
   const send = vi.fn();
-  const box = { data: { id: 'box' }, root: { position: new THREE.Vector3(), quaternion: new THREE.Quaternion(), scale: new THREE.Vector3(1, 1, 1) } };
+  const box = { isApp: true, data: { id: 'box' }, root: { position: new THREE.Vector3(), quaternion: new THREE.Quaternion(), scale: new THREE.Vector3(1, 1, 1) } };
   const world: any = worldFromSnapshot(cooWorldSnapshot({ players: [{ id: 'player-1', name: 'Alice', rank: speakerRank }] }), {
     network: { send },
     controls: { goto: vi.fn().mockResolvedValue(undefined) },
@@ -63,7 +63,7 @@ function voiceTurn(speakerRank: number) {
   vi.spyOn(runtime, 'ensureConnection').mockResolvedValue(undefined);
   for (const handler of hyperfyEvents[hyperfyEventType.VOICE_MESSAGE_RECEIVED]) runtime.registerEvent(hyperfyEventType.VOICE_MESSAGE_RECEIVED, handler as never);
   const manager = new VoiceManager(runtime);
-  vi.spyOn(manager, 'speak').mockResolvedValue(true);
+  vi.spyOn(manager, 'speak').mockResolvedValue('all');
   // What the LiveKit audio listener collects for a loud enough utterance
   (manager as any).userStates.set('player-1', { buffers: [Buffer.alloc(9600)], totalLength: 9600, lastActive: Date.now(), transcriptionText: '' });
   return { manager, send, useModel, box };

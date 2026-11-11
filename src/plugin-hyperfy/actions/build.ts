@@ -18,6 +18,7 @@ import {
   import { readString } from '../lib/model-output';
   import { isJapanese } from '../lib/simple-commands';
   import { currentTurn } from '../lib/turn-context';
+  import { describeUrl } from '../lib/log-url';
   const MAX_RETRIES = 3;
   const EDIT_ENTITY = EDIT_ENTITY_ACTION;
   // Said without a model call to someone who may not have the world edited
@@ -28,11 +29,29 @@ import {
   const OFF_JA = 'ごめんなさい、このワールドでは編集のお手伝いはできません。';
   const STOPPED_EN = 'I had to stop before finishing those edits.';
   const STOPPED_JA = '編集の途中で止めました。';
+  // All a requester who may no longer have the world edited is told at the end: nothing about the scene
+  const NO_LONGER_EN = "I can't go any further with that request.";
+  const NO_LONGER_JA = 'そのご依頼はこれ以上お手伝いできません。';
 
-  /** What was done, said without a model call (when the summary cannot be written). */
-  function outcomeText(executed: number, total: number, japanese: boolean): string {
+  interface OutcomeCounts {
+    executed: number;
+    skipped: number;
+    failed: number;
+  }
+
+  /** What was done, from the counts alone (no model call): the summary when none can be written. */
+  function outcomeText({ executed, skipped, failed }: OutcomeCounts, japanese: boolean): string {
+    const total = executed + skipped + failed;
+    if (total === 0) return japanese ? '変更することはありませんでした。' : 'There was nothing to change.';
     if (executed === 0) return japanese ? 'その変更はできませんでした。' : "I couldn't make any of those changes.";
-    return japanese ? `${total}件中${executed}件の変更をしました。` : `I made ${executed} of the ${total} changes.`;
+    if (executed === total) {
+      if (japanese) return total === 1 ? '変更しました。' : `${total}件の変更をすべてしました。`;
+      return total === 1 ? 'I made the change.' : `I made all ${total} changes.`;
+    }
+    const rest = japanese
+      ? [skipped ? `スキップ${skipped}件` : '', failed ? `失敗${failed}件` : ''].filter(Boolean).join('、')
+      : [skipped ? `${skipped} skipped` : '', failed ? `${failed} failed` : ''].filter(Boolean).join(', ');
+    return japanese ? `${total}件中${executed}件の変更をしました（${rest}）。` : `I made ${executed} of the ${total} changes (${rest}).`;
   }
 
   /**
@@ -50,11 +69,20 @@ import {
 
   const stringOrUndefined = (value: unknown) => (typeof value === 'string' ? value : undefined);
 
+  /**
+   * A target as logs, the summary prompt and the action result show it: a URL (what an import
+   * names) the way every logged URL is written (lib/log-url.ts), an entity id as it is.
+   */
+  function shownTarget(target: unknown): string {
+    if (typeof target !== 'string') return String(target);
+    return /^[a-z][a-z0-9+.-]*:|^\/\/|@/i.test(target) ? describeUrl(target) : target.slice(0, 100);
+  }
+
   /** The operation and target of a plan entry, for its outcome. */
   function describe(entry: unknown): Pick<OperationOutcome, 'operation' | 'target'> {
     if (!entry || typeof entry !== 'object') return {};
     const op = entry as Record<string, unknown>;
-    return { operation: stringOrUndefined(op.operation), target: stringOrUndefined(op.target) };
+    return { operation: stringOrUndefined(op.operation), target: typeof op.target === 'string' ? shownTarget(op.target) : undefined };
   }
 
   export enum EditOperationType {
@@ -265,10 +293,20 @@ ${summary}
       };
       // Posted while the turn runs (core holds callback content until the handler returns), and only
       // while the edit is still allowed: never to another connection, or for a requester who may no
-      // longer build. (The final "had to stop" explanation goes through the callback, which only
-      // checks the connection.)
+      // longer build.
       const postNow = (text: string) => {
         if (!stillAllowed()) service.getMessageManager()?.sendMessage(text);
+      };
+      // Every closing message goes through here, checked as the edits were: a requester who lost the
+      // right meanwhile is told one neutral line, nothing about the scene
+      const sayNoLonger = async (reason: string) => {
+        logger.warn(`[EDIT_ENTITY Action] Not reporting the outcome: ${reason}`);
+        await callback({ thought: 'The edit request ended.', text: japanese ? NO_LONGER_JA : NO_LONGER_EN, actions: [EDIT_ENTITY], source: 'hyperfy' });
+      };
+      // Core holds callback content and delivers it after ACTION_COMPLETED; it is not checked again then
+      const finish = async (content: Parameters<HandlerCallback>[0]) => {
+        const reason = stillAllowed();
+        await (reason ? sayNoLonger(reason) : callback(content));
       };
     
       let operationResults: any = null;
@@ -286,7 +324,8 @@ ${summary}
     
           if (Array.isArray(operationResults?.operations)) break;
     
-          logger.warn(`[EDIT_ENTITY Action] Unexpected structure on attempt ${attempts + 1}:`, operationResults);
+          // Not the plan itself: it can hold the URLs an import names
+          logger.warn(`[EDIT_ENTITY Action] Unexpected structure on attempt ${attempts + 1}: ${operationResults === null ? 'null' : typeof operationResults}`);
         } catch (error) {
           // Retrying cannot help: the budget is used up (the turn's caller falls back to scripted or
           // offline behavior) or the model declined this request
@@ -330,7 +369,7 @@ ${summary}
         const { operation, target, parameters, description } = op;
         const outcome = record({ ...describe(op), outcome: 'executed' }, stringOrUndefined(description));
         if (!op.success) {
-          logger.warn(`[EDIT_ENTITY Action] Skipping failed operation:`, op.reason || op);
+          logger.warn(`[EDIT_ENTITY Action] Skipping ${stringOrUndefined(operation) ?? 'an operation'} on "${shownTarget(target)}" the plan marked as failed`);
           outcome.outcome = 'skipped';
           outcome.reason = stringOrUndefined(op.reason);
           continue;
@@ -375,19 +414,19 @@ ${summary}
           }
         } catch (error: any) {
           if (error instanceof SceneEditStopped) {
-            logger.warn(`[EDIT_ENTITY Action] Stopped before ${operation} on "${target}": ${error.message}`);
+            logger.warn(`[EDIT_ENTITY Action] Stopped before ${operation} on "${shownTarget(target)}": ${error.message}`);
             stopped = error.message;
             outcome.outcome = 'failed';
             outcome.reason = `not run: ${error.message}`;
             continue;
           }
-          logger.error(`[EDIT_ENTITY Action] Operation ${operation} on "${target}" failed:`, error);
+          logger.error(`[EDIT_ENTITY Action] Operation ${operation} on "${shownTarget(target)}" failed:`, error);
           done = { outcome: 'failed', reason: String(error?.message ?? error) };
         }
         if (done.outcome === 'applied') {
           if (typeof description === 'string' && description) postNow(description);
         } else {
-          logger.warn(`[EDIT_ENTITY Action] ${operation} on "${target}" ${done.outcome}: ${done.reason}`);
+          logger.warn(`[EDIT_ENTITY Action] ${operation} on "${shownTarget(target)}" ${done.outcome}: ${done.reason}`);
           outcome.outcome = done.outcome;
           outcome.reason = done.reason;
         }
@@ -397,6 +436,7 @@ ${summary}
       const executed = outcomes.filter((o) => o.outcome === 'executed').length;
       const skipped = outcomes.filter((o) => o.outcome === 'skipped').length;
       const failed = outcomes.filter((o) => o.outcome === 'failed').length;
+      const counts: OutcomeCounts = { executed, skipped, failed };
       const resultData = { executed, skipped, failed, outcomes };
       const result = executed > 0 && failed === 0
         ? actionSucceeded(EDIT_ENTITY, resultData)
@@ -407,13 +447,19 @@ ${summary}
           );
 
       if (stopped) {
-        // No summary call: say what happened as it is (the callback only checks the connection)
-        await callback({
+        // No summary call: say what happened as it is (to a requester who may still build)
+        await finish({
           thought: `Stopped editing: ${stopped}.`,
-          text: `${japanese ? STOPPED_JA : STOPPED_EN} ${outcomeText(executed, outcomes.length, japanese)}`,
+          text: `${japanese ? STOPPED_JA : STOPPED_EN} ${outcomeText(counts, japanese)}`,
           actions: [EDIT_ENTITY],
           source: 'hyperfy',
         });
+        return result;
+      }
+      // No summary call for a requester who may no longer have the world edited
+      const noLonger = stillAllowed();
+      if (noLonger) {
+        await sayNoLonger(noLonger);
         return result;
       }
 
@@ -426,6 +472,12 @@ ${summary}
       }).join('\n');
       
       const stateForResponse = await runtime.composeState(message);
+      // Checked again after that await: no summary call for a requester who lost the right meanwhile
+      const noLongerAfterState = stillAllowed();
+      if (noLongerAfterState) {
+        await sayNoLonger(noLongerAfterState);
+        return result;
+      }
       const agentResponsePrompt = composePromptFromState({
         state: stateForResponse,
         template: sceneEditSummaryResponseTemplate(summaryText),
@@ -436,15 +488,22 @@ ${summary}
         finalXml = await runtime.useModel(ModelType.TEXT_SMALL, forPurpose('build', { prompt: agentResponsePrompt }));
       } catch (err) {
         if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError) {
+          // A requester who lost the right meanwhile (on this connection) gets the neutral closing
+          // line, as everywhere else, and the turn ends here
+          const reason = stillAllowed();
+          if (reason && connectionLive()) {
+            await sayNoLonger(reason);
+            return result;
+          }
           // The edits stand: say what was done now (callback content would be lost with the
           // error), then let the turn's caller handle the used-up budget or the refusal
-          postNow(outcomeText(executed, outcomes.length, japanese));
+          postNow(outcomeText(counts, japanese));
           throw err;
         }
         logger.error('[EDIT_ENTITY Action] Final summarization failed:', err);
-        await callback({
+        await finish({
           thought: 'Scene edits finished, but the summary could not be written.',
-          text: outcomeText(executed, outcomes.length, japanese),
+          text: outcomeText(counts, japanese),
         });
         return result;
       }
@@ -452,17 +511,18 @@ ${summary}
       const response = parseKeyValueXml(finalXml);
       if (!response) {
         logger.error('[EDIT_ENTITY Action] Failed to parse summary XML.');
-        await callback({
+        await finish({
           thought: 'Could not interpret response XML.',
-          text: outcomeText(executed, outcomes.length, japanese),
+          text: outcomeText(counts, japanese),
         });
         return result;
       }
       
-      await callback({
+      await finish({
         ...response,
         thought: readString(response, 'thought') || 'Finished with scene edits.',
-        text: readString(response, 'text') || 'Scene updates complete!',
+        // A summary with no text says what the counts say, never more
+        text: readString(response, 'text') || outcomeText(counts, japanese),
         emote: readString(response, 'emote') || '',
       });
       return result;

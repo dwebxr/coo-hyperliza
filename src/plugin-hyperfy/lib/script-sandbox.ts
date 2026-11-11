@@ -12,6 +12,9 @@
  */
 
 import 'ses';
+import { type ErrorEventGuard, type ErrorEventTarget, describeRejection, guardErrorEvents } from './error-events';
+
+export { describeRejection };
 
 export type WorldScriptsMode = 'off' | 'sandboxed';
 
@@ -22,7 +25,7 @@ export type WorldScriptsMode = 'off' | 'sandboxed';
 export const WORLD_SCRIPTS_RESIDUAL_RISK = [
   "A sandboxed world script still runs inside the agent's process, on its only thread.",
   'There is no CPU or memory isolation: `while (true) {}` hangs the agent for good, and a script can allocate until the process dies.',
-  "A script can use everything the engine's script API offers it: create and move nodes, read every player's position, name and id, teleport, push, freeze and re-skin the agent's own avatar, send app events to the world's server, post to the agent's local chat view, make the agent download models and avatars from the world's own origin or from any public https URL it names (of a download it learns only whether it worked and, for a model, the names and positions of its parts), and with `fetch()` send whatever it can read to any public https host and read the answer.",
+  "A script can use everything the engine's script API offers it: create and move nodes, read every player's position, name and id, teleport, push, freeze and re-skin the agent's own avatar, send app events to the world's server, post to the agent's local chat view, make the agent download models, avatars, emotes, sky images and HDR environments from the world's own origin or from any public https URL it names (of a model or avatar it loads it learns only whether that worked and the names and positions of its parts), and with `fetch()` send whatever it can read to any public https host and read the answer.",
   "A script can break the engine code it calls into by passing it nonsense, which can stop that app, the world's update loop, or the whole process.",
   "A script's own error stack traces name the agent's files and where they are on disk.",
   'The sandbox is defence for worlds whose builders you mostly trust. It is not a guarantee against a hostile world: use `off` there.',
@@ -37,6 +40,21 @@ export function resolveWorldScriptsMode(raw: string | undefined): { mode: WorldS
     mode: 'off',
     problem: `HYPERFY_WORLD_SCRIPTS="${raw}" is not a known value (use "off" or "sandboxed"). World scripts stay off.`,
   };
+}
+
+/**
+ * When HYPERFY_WORLD_SCRIPTS is `sandboxed`, installs the guard of the process's error events
+ * (lib/error-events.ts) now rather than at activation: Bun does not tell a once listener that was
+ * registered before the guard apart, so the earlier it is installed the fewer there can be.
+ * Activation installs it if it is not there yet. Returns whether it did.
+ */
+export function guardErrorEventsForWorldScripts(
+  env: Record<string, string | undefined>,
+  install: () => unknown = () => guardErrorEvents()
+): boolean {
+  if (resolveWorldScriptsMode(env.HYPERFY_WORLD_SCRIPTS).mode !== 'sandboxed') return false;
+  install();
+  return true;
 }
 
 /**
@@ -203,15 +221,23 @@ const SCRIPT_PROBES: [name: string, code: string][] = [
   ],
   [
     'a copy of a script object poses as an engine reference',
-    `(() => { try { __probeHost.take({ _isRef: true, _ref: __probeHost.plain }) } catch { return 'refused' } return 'passed' })()`,
+    `(() => { try { __probeHost.take({ _isRef: true, _ref: __probeHost.plain }) } catch { return 'refused' } return 'ESCAPED the host took it' })()`,
   ],
   [
     'a host function runs with an endowed function as its this',
-    `(() => { try { __probeHost.setX.call(__probeHost.fn, 1) } catch { return 'refused' } return 'passed' })()`,
+    `(() => { try { __probeHost.setX.call(__probeHost.fn, 1) } catch { return 'refused' } return 'ESCAPED the host function ran' })()`,
   ],
   [
     'a host function a script passes back reaches the host as itself',
     `(() => { try { __probeHost.take(__probeHost.fn) } catch {} return 'passed' })()`,
+  ],
+  [
+    'a host function that calls back on its `this` hands the callback a host value',
+    `(() => {
+      let got = 'not called'
+      try { __probeHost.callOnThis.call({ callback(value) { got = value } }) } catch (e) { return 'threw ' + e.message }
+      return got === __probeHost.plain ? 'the facade' : 'ESCAPED ' + typeof got
+    })()`,
   ],
   [
     'a host error reaches a script with its stack, cause or file paths',
@@ -239,6 +265,7 @@ const ASYNC_PROBES: [name: string, code: string][] = [
       const seen = { values: [] }
       const p = Promise.resolve(__probeHost.plain)
       Object.defineProperty(p, 'constructor', { value: { [Symbol.species]: function (executor) { executor((v) => { seen.values.push(v) }, () => {}); return Promise.resolve() } } })
+      seen.promise = p
       try { __probeHost.take(p) } catch {}
       return seen
     })()`,
@@ -251,6 +278,7 @@ const ASYNC_PROBES: [name: string, code: string][] = [
         __probeHost.callAndKeep(() => {
           const p = Promise.resolve(__probeHost.plain)
           Object.defineProperty(p, 'constructor', { value: { [Symbol.species]: function (executor) { executor((v) => { seen.values.push(v) }, () => {}); return Promise.resolve() } } })
+          seen.promise = p
           return p
         })
       } catch {}
@@ -258,6 +286,24 @@ const ASYNC_PROBES: [name: string, code: string][] = [
     })()`,
   ],
 ];
+
+// A host promise handed to a script: the script must get a promise of its own that resolves to the facade
+const HOST_PROMISE_PROBE = `(() => {
+  const seen = { values: [] }
+  try { seen.promise = __probeHost.later(); seen.promise.then((v) => { seen.values.push(v) }) } catch (e) { seen.error = e.message }
+  return seen
+})()`;
+
+// An unhandled rejection with a reason that has a custom-inspect hook and a stack getter
+const REJECTION_PROBE = `(() => {
+  const seen = { hook: 0, getter: 0 }
+  seen.reason = {
+    [Symbol.for('nodejs.util.inspect.custom')]() { seen.hook++; return 'hooked' },
+    get stack() { seen.getter++; return 'Error: from a script' },
+  }
+  seen.promise = Promise.reject(seen.reason)
+  return seen
+})()`;
 
 // Rejected when the source is parsed, before anything runs
 const REJECTED_SOURCES: [name: string, code: string][] = [
@@ -270,6 +316,11 @@ export interface SelfTestTools {
   evaluate(code: string, extraGlobals: Record<string, unknown>): unknown;
   /** Converts a host value the way a script would receive it */
   toScript(value: unknown): unknown;
+  /**
+   * The process and its error-event guard (lib/error-events.ts). With these, a probe rejects a
+   * promise for real and checks what a process listener receives; without them it is not run.
+   */
+  errorEvents?: { target: ErrorEventTarget; guard: ErrorEventGuard };
 }
 
 const isObjectLike = (value: unknown): value is object =>
@@ -277,6 +328,48 @@ const isObjectLike = (value: unknown): value is object =>
 
 /** Two turns of the event loop: every promise job a probe started has run */
 const settle = () => new Promise<void>((resolve) => setTimeout(() => setTimeout(resolve, 0), 0));
+
+/**
+ * Rejects a promise in a compartment, with a reason that has an inspect hook and a stack getter,
+ * and listens for it on the process like any other listener would. Only this probe's listener gets
+ * that rejection (ErrorEventGuard.deliverOnlyTo). Returns the check, to be called after a turn of
+ * the event loop: the listener must have been called, with an Error made by the host and not the
+ * script's reason or promise, the hook must not have run, and nothing the guard does not cover
+ * may be there to get an error event (ErrorEventGuard.coversAllListeners).
+ */
+function startRejectionProbe(
+  evaluate: SelfTestTools['evaluate'],
+  globals: Record<string, unknown>,
+  { target, guard }: NonNullable<SelfTestTools['errorEvents']>
+): () => ProbeResult {
+  const name = 'an unhandled rejection reaches a process listener with the script\'s own values';
+  const delivered: unknown[][] = [];
+  const listener = (...args: unknown[]) => void delivered.push(args);
+  let seen: unknown;
+  target.on('unhandledRejection', listener);
+  try {
+    seen = evaluate(REJECTION_PROBE, globals);
+    const reason = isObjectLike(seen) ? (seen as Record<string, unknown>).reason : undefined;
+    if (isObjectLike(reason)) guard.deliverOnlyTo(reason, listener);
+  } catch (err) {
+    seen = { error: err instanceof Error ? err.message : String(err) };
+  }
+  return () => {
+    target.removeListener('unhandledRejection', listener);
+    guard.deliverOnlyTo(null);
+    const record = (isObjectLike(seen) ? seen : {}) as Record<string, unknown>;
+    const [reason, promise] = delivered[0] ?? [];
+    const problems = [
+      delivered.length !== 1 && `the listener was called ${delivered.length} times`,
+      delivered.length && (reason === record.reason || !(reason instanceof Error)) && 'the listener got the script\'s reason',
+      delivered.length && promise === record.promise && 'the listener got the script\'s promise',
+      record.hook !== 0 && 'the inspect hook ran',
+      !guard.coversAllListeners() && 'an error-event listener is not guarded',
+      typeof record.error === 'string' && `the probe threw ${record.error}`,
+    ].filter((problem): problem is string => typeof problem === 'string');
+    return { name, blocked: problems.length === 0, detail: problems.length ? problems.join('; ') : 'an Error made by the host' };
+  };
+}
 
 /**
  * Runs the escape probes. Must be called after lockdown; `tools` come from the real script runtime
@@ -291,6 +384,7 @@ export async function runEscapeProbes(tools: SelfTestTools): Promise<ProbeResult
   // A plain host object (scripts see a facade of it) and a host function (scripts see a wrapper)
   const plain = { marker: 'a host object' };
   const fn = function probeTarget() {};
+  const hostPromise = Promise.resolve(plain);
   const received: unknown[] = [];
   const probeHost = {
     process: () => process,
@@ -312,6 +406,10 @@ export async function runEscapeProbes(tools: SelfTestTools): Promise<ProbeResult
     setX(this: Record<string, unknown>, x: unknown) {
       this.x = x;
     },
+    callOnThis(this: { callback?: (value: unknown) => unknown }) {
+      return this.callback?.(plain);
+    },
+    later: () => hostPromise,
     fail: () => {
       throw Object.assign(new Error("ENOENT: no such file or directory, open '/home/agent/project/.env'"), { cause: new Opaque(), secret: 1 });
     },
@@ -347,21 +445,48 @@ export async function runEscapeProbes(tools: SelfTestTools): Promise<ProbeResult
     try {
       pending.push([name, tools.evaluate(code, globals)]);
     } catch (err) {
-      results.push({ name, blocked: true, detail: `threw ${err instanceof Error ? err.message : String(err)}` });
+      results.push({ name, blocked: false, detail: `threw ${err instanceof Error ? err.message : String(err)}` });
     }
   }
+  let hostPromiseSeen: unknown;
+  try {
+    hostPromiseSeen = tools.evaluate(HOST_PROMISE_PROBE, globals);
+  } catch (err) {
+    hostPromiseSeen = { error: err instanceof Error ? err.message : String(err) };
+  }
+  const rejection = tools.errorEvents ? startRejectionProbe(tools.evaluate, globals, tools.errorEvents) : null;
   await settle();
   const plainFacade = tools.toScript(plain);
+  const field = (value: unknown, key: string): unknown => (isObjectLike(value) ? (value as Record<string, unknown>)[key] : undefined);
   for (const [name, seen] of pending) {
-    const values = (seen as { values?: unknown }).values;
-    // Fixed: the species constructor is only ever handed the result of a resolving function (undefined)
-    const leaked = Array.isArray(values) ? values.filter((value) => value !== undefined && value !== plainFacade) : ['no values'];
+    const values = field(seen, 'values');
+    // The species constructor runs (when the host follows the promise) and is handed only what a
+    // resolving function returns: undefined. The host holds a promise of its own, never the script's.
+    const ran = Array.isArray(values) && values.length > 0;
+    const leaked = Array.isArray(values) ? values.filter((value) => value !== undefined) : [];
+    const kept = received.includes(field(seen, 'promise'));
     results.push({
       name,
-      blocked: leaked.length === 0,
-      detail: leaked.length ? `handed ${leaked.map((value) => (value === plain ? 'the raw host object' : typeof value)).join(', ')}` : 'handed nothing',
+      blocked: ran && leaked.length === 0 && !kept,
+      detail: !ran
+        ? 'the species constructor never ran'
+        : leaked.length
+          ? `handed ${leaked.map((value) => (value === plain ? 'the raw host object' : value === plainFacade ? 'the facade' : typeof value)).join(', ')}`
+          : kept
+            ? "the host kept the script's own promise"
+            : 'handed nothing',
     });
   }
+  {
+    const values = field(hostPromiseSeen, 'values');
+    const ok = Array.isArray(values) && values.length === 1 && values[0] === plainFacade && field(hostPromiseSeen, 'promise') !== hostPromise;
+    results.push({
+      name: 'a host promise reaches a script as itself, or resolves to a host value',
+      blocked: ok,
+      detail: ok ? 'a promise of its own, resolving to the facade' : `got ${Array.isArray(values) ? values.map((value) => (value === plain ? 'the raw host object' : typeof value)).join(', ') || 'nothing' : String(field(hostPromiseSeen, 'error'))}`,
+    });
+  }
+  if (rejection) results.push(rejection());
 
   const hostChecks: [name: string, escaped: boolean][] = [
     [
@@ -437,23 +562,47 @@ export function isScriptSandboxActive(): boolean {
 
 export interface ActivationDeps {
   lockdown?: (options: typeof LOCKDOWN_OPTIONS) => void;
-  /** Builds the self-test tools; called after lockdown */
-  selfTest: () => ProbeResult[] | Promise<ProbeResult[]>;
+  /**
+   * Guards the process's error events (lib/error-events.ts); called after lockdown, before the
+   * self-test (src/index.ts may have installed the guard already; installing it again returns
+   * that guard). Returns null when there is none.
+   */
+  guardErrorEvents?: () => ErrorEventGuard | null;
+  /** Runs the self-test; called after lockdown and the guard */
+  selfTest: (context: { errorEvents: ErrorEventGuard | null }) => ProbeResult[] | Promise<ProbeResult[]>;
   log?: Pick<Console, 'info' | 'error'>;
 }
+
+let activation: Promise<boolean> | null = null;
 
 /**
  * Locks the realm down and proves it. Resolves to false, having said why, when lockdown threw or
  * any probe got through: the caller must then stop the process, because a realm that is half
  * tamed (or tamed but leaking) must not go on to run scripts, and it cannot be un-locked either.
- * Idempotent once it has succeeded; a second call while the self-test runs is refused.
+ * Idempotent once it has succeeded; a call while an activation runs gets that activation's result.
  */
-export async function activateScriptSandbox({ lockdown: lock = lockdown, selfTest, log = console }: ActivationDeps): Promise<boolean> {
-  if (sandboxState === 'active') return true;
-  if (sandboxState === 'testing') {
-    log.error('[Hyperfy] World scripts: the sandbox is already being activated');
-    return false;
-  }
+export function activateScriptSandbox(deps: ActivationDeps): Promise<boolean> {
+  if (sandboxState === 'active') return Promise.resolve(true);
+  if (activation) return activation;
+  // Set before activate() runs: its synchronous part (lockdown, the self-test's start) may already
+  // see a second caller
+  let resolveActivation!: (ok: boolean) => void;
+  const current = new Promise<boolean>((resolve) => {
+    resolveActivation = resolve;
+  });
+  activation = current;
+  void activate(deps).then(resolveActivation, () => resolveActivation(false)).finally(() => {
+    if (activation === current) activation = null;
+  });
+  return current;
+}
+
+async function activate({
+  lockdown: lock = lockdown,
+  guardErrorEvents: guard = () => guardErrorEvents(),
+  selfTest,
+  log = console,
+}: ActivationDeps): Promise<boolean> {
   try {
     lock(LOCKDOWN_OPTIONS);
   } catch (err) {
@@ -463,7 +612,8 @@ export async function activateScriptSandbox({ lockdown: lock = lockdown, selfTes
   sandboxState = 'testing';
   let results: ProbeResult[];
   try {
-    results = await selfTest();
+    const errorEvents = guard();
+    results = await selfTest({ errorEvents });
   } catch (err) {
     sandboxState = 'inactive';
     log.error(`[Hyperfy] World scripts: the sandbox self-test could not run: ${err instanceof Error ? err.message : String(err)}`);
@@ -483,37 +633,17 @@ export async function activateScriptSandbox({ lockdown: lock = lockdown, selfTes
 
 // ---- unhandled rejections ----
 
-function readText(value: object, key: string): string | null {
-  try {
-    const text = (value as Record<string, unknown>)[key];
-    return typeof text === 'string' ? text : null;
-  } catch {
-    return null;
-  }
-}
-
-/** A rejection reason as text, built from its name, message and stack strings and nothing else */
-export function describeRejection(reason: unknown): string {
-  if (reason === null || (typeof reason !== 'object' && typeof reason !== 'function')) return String(reason);
-  const stack = readText(reason, 'stack');
-  if (stack) return stack;
-  const message = readText(reason, 'message');
-  return message === null ? 'a value that is not an error' : `${readText(reason, 'name') ?? 'Error'}: ${message}`;
-}
-
 let rejectionsLogged = false;
 
 /**
  * Keeps the process alive when a promise is rejected and nobody handles it, and logs it as text.
  *
  * A script needs one line to cause that (`Promise.reject()`, or an async function that throws),
- * no membrane can prevent it, and without a listener Bun and Node end the process. The reason is
- * an object of the script's choosing: it is never handed to console.*, whose formatter would call
- * its custom-inspect method with the runtime's own inspect function and options.
+ * no membrane can prevent it, and without a listener Bun and Node end the process.
  *
  * This is process-wide: the agent's own unhandled rejections are logged and survived as well.
- * Other listeners still run. One that prints the reason with console.* (none is registered by
- * `elizaos start` as of 1.7.2) would run a script's inspect hook after all.
+ * Other listeners still run. Like this one, they get an Error made from the reason's strings
+ * instead of the reason itself (lib/error-events.ts, which says what it does not cover).
  */
 export function surviveUnhandledRejections(log: Pick<Console, 'error'> = console): void {
   if (rejectionsLogged) return;

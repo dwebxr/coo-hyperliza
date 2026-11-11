@@ -225,7 +225,7 @@ describe('messageReceivedHandler answers when an action stops the turn before an
   it('adds no offline notice after a scene edit reported its edits and then ran out of budget', async () => {
     vi.stubEnv('HYPERFY_SCENE_EDITS', 'builders');
     const sent: [string, any][] = [];
-    const box = { data: { id: 'box' }, root: { position: new THREE.Vector3(), quaternion: new THREE.Quaternion(), scale: new THREE.Vector3(1, 1, 1) } };
+    const box = { isApp: true, data: { id: 'box' }, root: { position: new THREE.Vector3(), quaternion: new THREE.Quaternion(), scale: new THREE.Vector3(1, 1, 1) } };
     const world: any = worldFromSnapshot(cooWorldSnapshot({ selfId: 'coo', players: [{ id: 'builder-1', name: 'Bob', rank: 1 }] }), {
       network: { send: (name: string, data: unknown) => sent.push([name, data]) },
       chat: { msgs: [], listeners: new Set(), add: vi.fn() },
@@ -245,7 +245,7 @@ describe('messageReceivedHandler answers when an action stops the turn before an
     const messageManager = new MessageManager(runtime as never);
     service.getMessageManager = () => messageManager;
     await inChatTurn(world, () => messageReceivedHandler({ runtime, message, callback }), 'builder-1');
-    expect(sent.filter(([name]) => name === 'chatAdded').map(([, msg]) => msg.body)).toEqual(['Moved the box up', 'I made 1 of the 1 changes.']);
+    expect(sent.filter(([name]) => name === 'chatAdded').map(([, msg]) => msg.body)).toEqual(['Moved the box up', 'I made the change.']);
     expect(sent).toContainEqual(['entityModified', expect.objectContaining({ id: 'box', position: [0, 2, 0] })]);
     expect(callback).not.toHaveBeenCalled();
   });

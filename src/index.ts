@@ -20,14 +20,20 @@ import { elevenLabsSpeechPlugin } from './elevenlabs-speech';
 import { createOpenPayStorePlugin } from './openpay-store';
 import { planModelPlugins } from './llm-provider';
 import { startUsageReports } from './usage-budget';
-import { characterSecrets, removeStaleStoredSecrets, secureServerDefaults } from './agent-secrets';
+import { characterSecrets, errorReportingDefaults, removeStaleStoredSecrets, secureServerDefaults } from './agent-secrets';
 import { takeTipWalletAccount } from './plugin-hyperfy/lib/tip-wallet';
+import { guardErrorEventsForWorldScripts } from './plugin-hyperfy/lib/script-sandbox';
 
 // The tip wallet's key moves into memory and out of process.env before elizaOS copies anything
 takeTipWalletAccount();
+// HYPERFY_WORLD_SCRIPTS=sandboxed: the process's error events are guarded from here on, before
+// elizaOS's server and the plugins register their listeners (src/plugin-hyperfy/lib/error-events.ts)
+guardErrorEventsForWorldScripts(process.env);
 // Before the server starts listening: loopback unless SERVER_HOST says otherwise, and a locked API
 // unless ELIZA_SERVER_AUTH_TOKEN is set
 for (const line of secureServerDefaults(process.env)) logger.warn(line);
+// Before the server starts: no error reports to elizaOS's Sentry project unless SENTRY_DSN says where
+for (const line of errorReportingDefaults(process.env)) logger.warn(line);
 
 let modelPlan: ReturnType<typeof planModelPlugins>;
 try {

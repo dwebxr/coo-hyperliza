@@ -166,8 +166,121 @@ describe('BuildManager reports what each operation did', () => {
     entity.isApp = false;
     await expect(manager.delete(guard, 'box')).resolves.toEqual({ outcome: 'skipped', reason: 'only apps can be deleted' });
     await expect(manager.duplicate(guard, 'box')).resolves.toEqual({ outcome: 'skipped', reason: 'only apps can be duplicated' });
-    await expect(manager.translate(guard, 'box', ['up'] as never)).resolves.toEqual({ outcome: 'failed', reason: 'invalid position' });
-    await expect(manager.scale(guard, 'box', undefined as never)).resolves.toEqual({ outcome: 'failed', reason: 'invalid scale' });
+    entity.isApp = true;
+    await expect(manager.translate(guard, 'box', ['up'] as never)).resolves.toEqual({ outcome: 'failed', reason: 'invalid position (three finite numbers within ±1e6)' });
+    await expect(manager.scale(guard, 'box', undefined as never)).resolves.toEqual({ outcome: 'failed', reason: 'invalid scale (three finite numbers, none of them zero)' });
+    expect(effects()).toEqual(none);
+  });
+
+  it('skips a player: the server takes transforms for apps only', async () => {
+    const { guard, world, effects, manager } = setup();
+    const player = { isApp: false, isPlayer: true, data: { id: 'p1' }, root: { position: new THREE.Vector3(), quaternion: new THREE.Quaternion(), scale: new THREE.Vector3(1, 1, 1) } };
+    world.entities.items.set('p1', player);
+    for (const run of [() => manager.translate(guard, 'p1', [0, 2, 0]), () => manager.rotate(guard, 'p1', [0, 0, 0, 1]), () => manager.scale(guard, 'p1', [2, 2, 2])]) {
+      await expect(run()).resolves.toEqual({ outcome: 'skipped', reason: 'only apps can be moved, rotated or scaled' });
+    }
+    expect(player.root.position.toArray()).toEqual([0, 0, 0]);
+    expect(effects()).toEqual(none);
+    expect(world.controls.goto).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a position beyond ±1e6', (m: BuildManager, g: EditGuard) => m.translate(g, 'box', [1e6 + 1, 0, 0]), 'invalid position'],
+    ['a position that is not finite', (m: BuildManager, g: EditGuard) => m.translate(g, 'box', [Number.NaN, 0, 0]), 'invalid position'],
+    ['a quaternion far from unit length', (m: BuildManager, g: EditGuard) => m.rotate(g, 'box', [0, 0, 0, 2]), 'invalid quaternion'],
+    ['a zero quaternion', (m: BuildManager, g: EditGuard) => m.rotate(g, 'box', [0, 0, 0, 0]), 'invalid quaternion'],
+    ['a zero scale', (m: BuildManager, g: EditGuard) => m.scale(g, 'box', [0, 1, 1]), 'invalid scale'],
+    ['a scale that vanishes as a 32-bit float', (m: BuildManager, g: EditGuard) => m.scale(g, 'box', [1e-50, 1, 1]), 'invalid scale'],
+    ['a scale that overflows as a 32-bit float', (m: BuildManager, g: EditGuard) => m.scale(g, 'box', [1e39, 1, 1]), 'invalid scale'],
+  ])('fails %s, which the world would drop, and sends nothing', async (_name, run, reason) => {
+    const { guard, world, entity, effects, manager } = setup();
+    const result = await run(manager, guard);
+    expect(result).toMatchObject({ outcome: 'failed' });
+    expect((result as { reason: string }).reason.startsWith(reason)).toBe(true);
+    expect(effects()).toEqual(none);
+    expect(world.controls.goto).not.toHaveBeenCalled();
+    expect([entity.root.position.toArray(), entity.root.scale.toArray()]).toEqual([[1, 0, 1], [1, 1, 1]]);
+  });
+
+  it('applies and sends a nearly unit quaternion normalized, as the server stores it, and the largest allowed position', async () => {
+    const { guard, world, entity, manager } = setup();
+    await expect(manager.rotate(guard, 'box', [0, 0, 0, 1.05])).resolves.toEqual({ outcome: 'applied' });
+    expect(entity.root.quaternion.toArray()).toEqual([0, 0, 0, 1]);
+    await expect(manager.translate(guard, 'box', [-1e6, 0, 1e6])).resolves.toEqual({ outcome: 'applied' });
+    expect(world.network.send).toHaveBeenLastCalledWith('entityModified', expect.objectContaining({ id: 'box', position: [-1e6, 0, 1e6], quaternion: [0, 0, 0, 1] }));
+  });
+
+  it.each([
+    ['translate', (m: BuildManager, g: EditGuard) => m.translate(g, 'box', [0, 2, 0])],
+    ['rotate', (m: BuildManager, g: EditGuard) => m.rotate(g, 'box', [0, 0, 0, 1])],
+    ['scale', (m: BuildManager, g: EditGuard) => m.scale(g, 'box', [2, 2, 2])],
+    ['duplicate', (m: BuildManager, g: EditGuard) => m.duplicate(g, 'box')],
+    ['delete', (m: BuildManager, g: EditGuard) => m.delete(g, 'box')],
+  ])('%s of a target removed, destroyed or replaced while the agent walked over is skipped, and nothing is sent', async (_name, run) => {
+    for (const removal of ['removed', 'destroyed', 'replaced'] as const) {
+      const { world, guard, entity, effects, manager } = setup();
+      const replacement = { ...entity, root: { position: new THREE.Vector3(), quaternion: new THREE.Quaternion(), scale: new THREE.Vector3(1, 1, 1) }, destroy: vi.fn() };
+      world.controls.goto.mockImplementation(async () => {
+        if (removal === 'removed') world.entities.items.delete('box');
+        if (removal === 'destroyed') Object.assign(entity, { destroyed: true });
+        if (removal === 'replaced') world.entities.items.set('box', replacement);
+      });
+      await expect(run(manager, guard), removal).resolves.toEqual({ outcome: 'skipped', reason: 'the target was removed while I walked over' });
+      expect(effects(), removal).toEqual(none);
+      expect(replacement.destroy).not.toHaveBeenCalled();
+      expect([entity.root.position.toArray(), entity.root.scale.toArray(), replacement.root.position.toArray()]).toEqual([[1, 0, 1], [1, 1, 1], [0, 0, 0]]);
+    }
+  });
+
+  it.each([
+    ['a zero scale', (e: any) => e.root.scale.set(0, 1, 1), 'invalid scale'],
+    ['a scale that vanishes as a 32-bit float', (e: any) => e.root.scale.set(1e-50, 1, 1), 'invalid scale'],
+    ['a position beyond ±1e6', (e: any) => e.root.position.set(2e6, 0, 0), 'invalid position'],
+    ['a rotation far from unit length', (e: any) => e.root.quaternion.set(0, 0, 0, 2), 'invalid quaternion'],
+  ])('fails a duplicate of an app that has %s (the world would refuse the copy), and adds nothing', async (_name, spoil, reason) => {
+    const { guard, entity, effects, manager } = setup();
+    spoil(entity);
+    const result = await manager.duplicate(guard, 'box');
+    expect(result).toMatchObject({ outcome: 'failed' });
+    expect((result as { reason: string }).reason.startsWith(reason)).toBe(true);
+    expect(effects()).toEqual(none);
+  });
+
+  it('duplicates with the rotation normalised, as the world stores it', async () => {
+    const { guard, world, entity, manager } = setup();
+    entity.root.quaternion.set(0, 0, 0, 1.05);
+    await expect(manager.duplicate(guard, 'box')).resolves.toEqual({ outcome: 'applied' });
+    expect(world.entities.add).toHaveBeenCalledWith(expect.objectContaining({ quaternion: [0, 0, 0, 1], position: [1, 0, 1], scale: [1, 1, 1] }), true);
+  });
+
+  it('fails a duplicate of a unique app whose blueprint names a file the world would refuse in a new blueprint', async () => {
+    for (const [field, value] of [['model', 'file:///etc/hosts'], ['script', 'asset://../x.js'], ['image', { url: 'javascript:alert(1)' }]] as const) {
+      const { guard, entity, effects, manager } = setup();
+      Object.assign(entity.blueprint, { unique: true, model: 'asset://a.glb', [field]: value });
+      await expect(manager.duplicate(guard, 'box'), field).resolves.toEqual({ outcome: 'failed', reason: "the app's blueprint names a file the world would refuse in a copy" });
+      expect(effects()).toEqual(none);
+    }
+    const { guard, entity, effects, manager } = setup();
+    Object.assign(entity.blueprint, { unique: true, model: 'asset://a.glb', script: 'https://cdn.example.com/a.js', image: null });
+    await expect(manager.duplicate(guard, 'box')).resolves.toEqual({ outcome: 'applied' });
+    expect(effects()).toMatchObject({ blueprints: 1, added: 1 });
+  });
+
+  it('skips a delete when the app was pinned while the agent walked over', async () => {
+    const { world, guard, entity, effects, manager } = setup();
+    world.controls.goto.mockImplementation(async () => {
+      entity.data.pinned = true;
+    });
+    await expect(manager.delete(guard, 'box')).resolves.toEqual({ outcome: 'skipped', reason: 'the app is pinned' });
+    expect(effects()).toEqual(none);
+  });
+
+  it('fails an import placed where the world would refuse the app, before downloading anything', async () => {
+    const { guard, world, effects, manager } = setup();
+    const { cdn } = await download(world, glb);
+    await expect(manager.importEntity(guard, 'https://cdn.test/thing.glb', [0, 2e6, 0])).resolves.toMatchObject({ outcome: 'failed', reason: expect.stringMatching(/^invalid position/) });
+    await expect(manager.importEntity(guard, 'https://cdn.test/thing.glb', [0, 0, 0], [0, 0, 0, 0])).resolves.toMatchObject({ outcome: 'failed', reason: expect.stringMatching(/^invalid quaternion/) });
+    expect(cdn.connections).toBe(0);
     expect(effects()).toEqual(none);
   });
 
@@ -206,6 +319,17 @@ describe('BuildManager downloads imports under the network policy', () => {
     expect(effects()).toEqual(none);
     expect(world.controls.goto).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('(refused)'));
+  });
+
+  it('logs a failed import without the query, credentials or fragment of its URL', async () => {
+    const { guard, world, manager } = setup();
+    await download(world, glb, { status: 404 });
+    const logged = [vi.spyOn(console, 'warn').mockImplementation(() => {}), vi.spyOn(console, 'error').mockImplementation(() => {})];
+    await manager.importEntity(guard, 'https://cdn.test/thing.glb?X-Amz-Signature=sig-value#frag-value');
+    await manager.importEntity(guard, 'https://user:pw-value@cdn.test/thing.glb?token=token-value');
+    const lines = logged.flatMap((spy) => spy.mock.calls.map((call) => call.join(' ')));
+    expect(lines.join('\n')).toContain('https://cdn.test/thing.glb?X-Amz-Signature=…');
+    expect(lines.join('\n')).not.toMatch(/sig-value|frag-value|pw-value|token-value/);
   });
 
   it('an import that is redirected inward stops at the redirect', async () => {

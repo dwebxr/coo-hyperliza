@@ -22,7 +22,9 @@
  *
  * Behind the membrane a script gets, per app:
  *   world  an object built here from a fixed list of the engine's world methods (below)
- *   app    the engine's app proxy through a facade: the app methods and the root node's properties
+ *   app    the engine's app proxy through a facade: the app methods and the root node's properties,
+ *          with on/off/emit/send/sendTo/create checked first (createRuntime appApi)
+ *   players  the engine's player proxies, with applyEffect checked first (createRuntime playerApi)
  *   props  the blueprint's props through a facade
  *   fetch, setTimeout, console  lib/script-facades.ts
  * and as globals the names Scripts.js endows, minus Object3D (see SCRIPT_CLASSES).
@@ -36,7 +38,8 @@ import { prng } from '../hyperfy/src/core/extras/prng.js';
 import { DEG2RAD, RAD2DEG } from '../hyperfy/src/core/extras/general.js';
 import { clamp, num, uuid } from '../hyperfy/src/core/utils.js';
 import { Node, getRef } from '../hyperfy/src/core/nodes/Node.js';
-import { type CallGuard, type ScriptClass, type ScriptMembrane, createScriptMembrane } from './script-membrane';
+import { type CallGuard, type MembraneOptions, type ScriptClass, type ScriptMembrane, createScriptMembrane } from './script-membrane';
+import type { ErrorEventGuard, ErrorEventTarget } from './error-events';
 import {
   type ConsoleTarget,
   type ScriptNetwork,
@@ -138,6 +141,24 @@ export const NODE_SETTERS: ReadonlySet<string> = new Set(['body0', 'body1']); //
 export const GEOMETRY_SETTERS: ReadonlySet<string> = new Set(['geometry']); // nodes/Collider.js, Video.js (Mesh.js checks itself)
 /** The world methods (systems/Apps.js) that take a node; createWorldApi refuses anything else */
 export const WORLD_NODE_METHODS: ReadonlySet<string> = new Set(['add', 'remove', 'attach']);
+/**
+ * Properties of `app.create(type, data)` that a node constructor hands to the same setters, and
+ * what each may be: a geometry a node handed out (Mesh.js, Collider.js, Video.js), nothing (a
+ * Mesh's material: the engine refuses to set one, and a script has no engine material to give).
+ */
+export const CONSTRUCTION_REFERENCES: ReadonlyMap<string, 'geometry' | 'node' | 'nothing'> = new Map([
+  ['geometry', 'geometry'],
+  ['material', 'nothing'],
+  ['body0', 'node'],
+  ['body1', 'node'],
+]);
+/**
+ * Node properties the engine calls as functions, unchecked (onLoad, onPointerDown, onEnd, ...;
+ * every `on` + capital property of a node is one). A script may set them to a function or to
+ * nothing, as a node property and in the data of `app.create()`; a player effect's onEnd likewise.
+ */
+export const CALLBACK_PROPERTY = /^on[A-Z]/;
+const isCallbackOrNothing = (value: unknown): boolean => value === null || value === undefined || typeof value === 'function';
 
 /** The node a node proxy stands for, or undefined. Asks the engine (getRef), never the shape. */
 function engineNodeOf(value: object): object | undefined {
@@ -145,15 +166,19 @@ function engineNodeOf(value: object): object | undefined {
   return node instanceof Node && (node as { proxy?: unknown }).proxy === value ? node : undefined;
 }
 
+const BufferGeometry = (engineThree as unknown as { BufferGeometry: Constructor }).BufferGeometry;
+
 /**
- * Whether `value` is a geometry reference (what a Mesh/Collider/Video `geometry` getter returns):
- * the engine's reference object, standing for a geometry or for none yet. Never a node.
+ * Whether `value` is a geometry reference the engine made (what a Mesh/Collider/Video `geometry`
+ * getter returns: Node.js secureRef, whose `_ref` is an accessor) that stands for one of the
+ * engine's geometries (an instance of the host's three.js BufferGeometry) or for none yet. JSON
+ * from the world and copies of a script's objects have no accessors and are never instances,
+ * whatever their shape.
  */
-function isEngineGeometryRef(value: object): boolean {
-  if ((value as { _isRef?: unknown })._isRef !== true) return false;
+export function isEngineGeometryRef(value: object): boolean {
+  if (typeof Object.getOwnPropertyDescriptor(value, '_ref')?.get !== 'function') return false;
   const geometry: unknown = getRef(value);
-  if (geometry === null || geometry === undefined) return true;
-  return isObject(geometry) && (geometry as { isBufferGeometry?: unknown }).isBufferGeometry === true && !(geometry instanceof Node);
+  return geometry === null || geometry === undefined || geometry instanceof BufferGeometry;
 }
 
 export interface WorldScriptsOptions {
@@ -179,6 +204,10 @@ interface Runtime {
   appProxies: WeakSet<object>;
   /** A node proxy or an app proxy */
   isNode(value: unknown): boolean;
+  /** What a script's `app` stands for (see createRuntime) */
+  appApi(engineApp: object): object;
+  /** What a script's player stands for (see createRuntime) */
+  playerApi(enginePlayer: unknown): unknown;
 }
 
 /**
@@ -195,26 +224,54 @@ function freezeEndowedFunctions(): void {
   }
 }
 
-function createRuntime(log: ConsoleTarget): Runtime {
-  freezeEndowedFunctions();
-  const appProxies = new WeakSet<object>();
-  // By identity only: an app proxy the engine handed to exec(), or a node proxy that this
-  // membrane showed to a script and that the engine itself says is a node's own proxy
-  const isNode = (value: unknown): boolean =>
-    isObject(value) && (appProxies.has(value) || (membrane.handedOut(value) && engineNodeOf(value) !== undefined));
-  const isGeometry = (value: unknown): boolean => isObject(value) && membrane.handedOut(value) && isEngineGeometryRef(value);
-  const membrane: ScriptMembrane = createScriptMembrane({
-    classes: SCRIPT_CLASSES,
-    // node.add(x)/remove(x)/insert(x): the engine would call x.activate(ctx) on anything, and keep it as a child
+/**
+ * Whether an object the engine made claims to be a node or geometry reference (`_isRef`), whatever
+ * it is. Scripts cannot give a host object that name (script-membrane.ts REF_KEYS).
+ */
+function claimsReference(value: object): boolean {
+  try {
+    return Boolean((value as { _isRef?: unknown })._isRef);
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * The membrane's guards of node members (MembraneOptions guardFor/guardSet), given what the
+ * runtime takes for a node and for a geometry. On a node: a method in NODE_ARGUMENTS takes only a
+ * node (the engine would call x.activate(ctx) on anything, and keep it as a child), a setter in
+ * NODE_SETTERS only a node or nothing, one in GEOMETRY_SETTERS only a geometry or nothing, and a
+ * CALLBACK_PROPERTY only a function or nothing. Fails closed: on an object that claims to be a
+ * reference but is not a node the runtime recognises (a node class whose proxy it cannot see
+ * through), the node and geometry members are refused.
+ */
+export function createNodeGuards(
+  isNode: (value: unknown) => boolean,
+  isGeometry: (value: unknown) => boolean
+): Required<Pick<MembraneOptions, 'guardFor' | 'guardSet'>> {
+  return {
     guardFor: (owner, prop): CallGuard | undefined => {
       const index = NODE_ARGUMENTS.get(prop);
-      if (index === undefined || !isNode(owner)) return undefined;
+      if (index === undefined) return undefined;
+      if (!isNode(owner)) {
+        return claimsReference(owner)
+          ? () => {
+              throw new TypeError(`${prop}() is not available on this node`);
+            }
+          : undefined;
+      }
       return (args) => {
         if (!isNode(args[index])) throw new TypeError(`${prop}() expects a node`);
       };
     },
     guardSet: (owner, prop): CallGuard | undefined => {
-      if (!isNode(owner)) return undefined;
+      if (!isNode(owner)) {
+        return (NODE_SETTERS.has(prop) || GEOMETRY_SETTERS.has(prop)) && claimsReference(owner)
+          ? () => {
+              throw new TypeError(`${prop} cannot be set on this node`);
+            }
+          : undefined;
+      }
       if (NODE_SETTERS.has(prop)) {
         return ([value]) => {
           if (value != null && !isNode(value)) throw new TypeError(`${prop} must be a node`);
@@ -225,8 +282,27 @@ function createRuntime(log: ConsoleTarget): Runtime {
           if (value != null && !isGeometry(value)) throw new TypeError(`${prop} must be the geometry of a node`);
         };
       }
+      if (CALLBACK_PROPERTY.test(prop)) {
+        return ([value]) => {
+          if (!isCallbackOrNothing(value)) throw new TypeError(`${prop} must be a function`);
+        };
+      }
       return undefined;
     },
+  };
+}
+
+function createRuntime(log: ConsoleTarget): Runtime {
+  freezeEndowedFunctions();
+  const appProxies = new WeakSet<object>();
+  // By identity only: an app proxy the engine handed to exec(), or a node proxy that this
+  // membrane showed to a script and that the engine itself says is a node's own proxy
+  const isNode = (value: unknown): boolean =>
+    isObject(value) && (appProxies.has(value) || (membrane.handedOut(value) && engineNodeOf(value) !== undefined));
+  const isGeometry = (value: unknown): boolean => isObject(value) && membrane.handedOut(value) && isEngineGeometryRef(value);
+  const membrane: ScriptMembrane = createScriptMembrane({
+    classes: SCRIPT_CLASSES,
+    ...createNodeGuards(isNode, isGeometry),
     onAsyncError: (error) => log.error(`[script] an async callback failed: ${error.message}`),
   });
   const host = <T extends object>(value: T) => membrane.toScript(Object.freeze(value));
@@ -252,7 +328,116 @@ function createRuntime(log: ConsoleTarget): Runtime {
     DEG2RAD,
     RAD2DEG,
   });
-  return { membrane, globals, appProxies, isNode };
+  const appApis = new WeakMap<object, object>();
+  const playerApis = new WeakMap<object, object>();
+  /** What app.create(type, data) may be given under the names in CONSTRUCTION_REFERENCES, and as callbacks */
+  const checkConstruction = (data: unknown) => {
+    if (!isObject(data)) return;
+    for (const key of Object.keys(data)) {
+      if (CALLBACK_PROPERTY.test(key) && !isCallbackOrNothing((data as Record<string, unknown>)[key])) {
+        throw new TypeError(`app.create(): ${key} must be a function`);
+      }
+    }
+    for (const [key, kind] of CONSTRUCTION_REFERENCES) {
+      const value: unknown = (data as Record<string, unknown>)[key];
+      if (value == null) continue;
+      if (kind === 'geometry' && isGeometry(value)) continue;
+      if (kind === 'node' && isNode(value)) continue;
+      throw new TypeError(
+        kind === 'nothing' ? `app.create(): ${key} cannot be given` : `app.create(): ${key} must be the ${kind === 'node' ? 'proxy of a node' : 'geometry of a node'}`
+      );
+    }
+  };
+  const eventName = (name: unknown, method: string) => {
+    if (typeof name !== 'string') throw new TypeError(`${method}: the event name must be a string`);
+    return name;
+  };
+  /**
+   * The object a script's `app` facade stands for: the engine's app proxy, with on/off/emit/send/
+   * sendTo/create checked first (event names must be strings, construction data goes through the
+   * reference guards), and 'destroy' listeners that cannot throw out of the engine's teardown.
+   */
+  const appApi = (engineApp: object): object => {
+    const known = appApis.get(engineApp);
+    if (known) return known;
+    const engine = engineApp as Record<string, Fn>;
+    const contained = new WeakMap<object, Fn>();
+    const containedListener = (fn: unknown): unknown => {
+      if (typeof fn !== 'function') return fn;
+      let listener = contained.get(fn);
+      if (!listener) {
+        listener = (...args: unknown[]) => {
+          try {
+            return Reflect.apply(fn, undefined, args);
+          } catch (err) {
+            log.error(`[script] a destroy listener threw: ${err instanceof Error ? err.message : String(err)}`);
+            return undefined;
+          }
+        };
+        contained.set(fn, listener);
+      }
+      return listener;
+    };
+    const own: Record<string, Fn> = {
+      on: (name: unknown, fn: unknown) => {
+        if (typeof fn !== 'function') throw new TypeError('app.on(): the listener must be a function');
+        const event = eventName(name, 'app.on()');
+        return engine.on(event, event === 'destroy' ? containedListener(fn) : fn);
+      },
+      off: (name: unknown, fn: unknown) => {
+        const event = eventName(name, 'app.off()');
+        return engine.off(event, event === 'destroy' && typeof fn === 'function' ? (contained.get(fn) ?? fn) : fn);
+      },
+      emit: (name: unknown, data: unknown) => engine.emit(eventName(name, 'app.emit()'), data),
+      send: (name: unknown, data: unknown, ignoreSocketId?: unknown) => engine.send(eventName(name, 'app.send()'), data, ignoreSocketId),
+      sendTo: (playerId: unknown, name: unknown, data: unknown) => engine.sendTo(playerId, eventName(name, 'app.sendTo()'), data),
+      create: (name: unknown, data: unknown) => {
+        if (typeof name !== 'string') throw new TypeError('app.create(): the node type must be a string');
+        checkConstruction(data);
+        return engine.create(name, data);
+      },
+    };
+    const api = new Proxy(engineApp, {
+      get: (target, prop) => (typeof prop === 'string' && Object.hasOwn(own, prop) ? own[prop] : Reflect.get(target, prop)),
+    });
+    appApis.set(engineApp, api);
+    appProxies.add(api);
+    return api;
+  };
+  /**
+   * A player proxy of the engine with applyEffect() checked: the effect's onEnd, which the engine
+   * calls while it tears an app down, must be a function or nothing, and cannot throw out of that
+   * teardown.
+   */
+  const playerApi = (enginePlayer: unknown): unknown => {
+    if (!isObject(enginePlayer)) return enginePlayer;
+    const known = playerApis.get(enginePlayer);
+    if (known) return known;
+    const applyEffect = (opts: unknown) => {
+      const effect = isObject(opts) ? { ...(opts as Record<string, unknown>) } : opts;
+      if (isObject(effect) && !isCallbackOrNothing((effect as { onEnd?: unknown }).onEnd)) {
+        throw new TypeError('applyEffect(): onEnd must be a function');
+      }
+      if (isObject(effect) && typeof (effect as { onEnd?: unknown }).onEnd === 'function') {
+        const onEnd = (effect as { onEnd: Fn }).onEnd;
+        (effect as { onEnd: Fn }).onEnd = () => {
+          try {
+            return onEnd();
+          } catch (err) {
+            log.error(`[script] an effect's onEnd threw: ${err instanceof Error ? err.message : String(err)}`);
+            return undefined;
+          }
+        };
+      }
+      return (enginePlayer as { applyEffect: Fn }).applyEffect(effect);
+    };
+    const api = new Proxy(enginePlayer, {
+      get: (target, prop) => (prop === 'applyEffect' ? applyEffect : Reflect.get(target, prop)),
+    });
+    playerApis.set(enginePlayer, api);
+    return api;
+  };
+  return { membrane, globals, appProxies, isNode, appApi, playerApi };
 }
 
 /**
@@ -263,7 +448,7 @@ function createRuntime(log: ConsoleTarget): Runtime {
  *   - get/set (the engine's key-value storage) and open (browser navigation) do nothing
  *   - load resolves to the loaded node's proxy, and says nothing about why a load failed
  */
-function createWorldApi(engine: EngineWorld, isNode: (value: unknown) => boolean) {
+function createWorldApi(engine: EngineWorld, isNode: (value: unknown) => boolean, playerApi: (player: unknown) => unknown) {
   const node = (value: unknown, method: string) => {
     if (!isNode(value)) throw new TypeError(`world.${method}() expects a node`);
     return value;
@@ -298,8 +483,11 @@ function createWorldApi(engine: EngineWorld, isNode: (value: unknown) => boolean
       if (!isObject(msg)) return;
       engine.chat(msg, false);
     },
-    getPlayer: (playerId?: unknown) => engine.getPlayer(typeof playerId === 'string' ? playerId : undefined),
-    getPlayers: () => engine.getPlayers(),
+    getPlayer: (playerId?: unknown) => playerApi(engine.getPlayer(typeof playerId === 'string' ? playerId : undefined)),
+    getPlayers: () => {
+      const players = engine.getPlayers();
+      return Array.isArray(players) ? players.map(playerApi) : players;
+    },
     createLayerMask: (...groups: unknown[]) => engine.createLayerMask(...groups.map((group) => text(group, 'layer group'))),
     raycast: (origin: unknown, direction: unknown, maxDistance?: unknown, layerMask?: unknown) =>
       engine.raycast(origin, direction, maxDistance, layerMask),
@@ -333,7 +521,7 @@ type ScriptMain = (world: unknown, app: unknown, fetch: unknown, props: unknown,
  * (activateWorldScripts); evaluating before that throws.
  */
 export function createWorldScripts({ network = null, log = console }: WorldScriptsOptions = {}): WorldScripts {
-  const { membrane, globals, appProxies, isNode } = createRuntime(log);
+  const { membrane, globals, appProxies, isNode, appApi, playerApi } = createRuntime(log);
   const worlds = new WeakMap<object, unknown>();
 
   return {
@@ -351,7 +539,7 @@ export function createWorldScripts({ network = null, log = console }: WorldScrip
           appProxies.add(engineApp);
           let world = worlds.get(engineWorld);
           if (!world) {
-            world = membrane.toScript(createWorldApi(engineWorld as EngineWorld, isNode));
+            world = membrane.toScript(createWorldApi(engineWorld as EngineWorld, isNode, playerApi));
             worlds.set(engineWorld, world);
           }
           // The engine emits 'destroy' to the app's listeners when it rebuilds or removes the app
@@ -360,7 +548,7 @@ export function createWorldScripts({ network = null, log = console }: WorldScrip
           try {
             main(
               world,
-              membrane.exposeDynamic(engineApp, appAllows),
+              membrane.exposeDynamic(appApi(engineApp), appAllows),
               membrane.toScript(createScriptFetch(network, run.signal, log)),
               membrane.toScript(props),
               membrane.toScript(createScriptSetTimeout(engineSetTimeout as (fn: () => void, ms: number) => unknown, log))
@@ -378,12 +566,16 @@ export function createWorldScripts({ network = null, log = console }: WorldScrip
 const quiet: ConsoleTarget = { log() {}, warn() {}, error() {} };
 
 /** The self-test, run against compartments and a membrane built exactly as for a world script */
-export function selfTestWorldScripts(): Promise<ProbeResult[]> {
+export async function selfTestWorldScripts({ errorEvents }: { errorEvents: ErrorEventGuard | null }): Promise<ProbeResult[]> {
   const { membrane, globals } = createRuntime(quiet);
-  return runEscapeProbes({
+  const results = await runEscapeProbes({
     toScript: membrane.toScript,
     evaluate: (code, extraGlobals) => createSelfTestCompartment({ ...globals(), ...extraGlobals }).evaluate(code),
+    errorEvents: errorEvents ? { target: process as unknown as ErrorEventTarget, guard: errorEvents } : undefined,
   });
+  // Without the guard the rejection probe cannot run, and world scripts must not either
+  if (!errorEvents) results.push({ name: "the process's error events are guarded", blocked: false, detail: 'no guard was installed' });
+  return results;
 }
 
 /**

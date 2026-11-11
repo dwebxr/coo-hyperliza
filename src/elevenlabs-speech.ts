@@ -1,6 +1,7 @@
 import { Readable } from 'node:stream';
 import { type IAgentRuntime, type Plugin, ModelType } from '@elizaos/core';
 import { generateElevenLabsTTS, transcribeWithElevenLabs } from './plugin-hyperfy/utils';
+import { describeUrl } from './plugin-hyperfy/lib/log-url';
 import { MAX_AUDIO_BYTES, type NetPolicy, publicNet } from './plugin-hyperfy/lib/net-policy';
 
 /**
@@ -23,7 +24,7 @@ export async function toAudioBuffer(input: unknown, net: NetPolicy = publicNet):
     // Whoever calls the model names this URL (another plugin, for a message's attachment): public
     // https hosts only, a byte cap and a deadline (lib/net-policy.ts)
     const response = await net.fetch(url, { maxBytes: MAX_AUDIO_BYTES, timeoutMs: AUDIO_DOWNLOAD_TIMEOUT_MS });
-    if (response.status < 200 || response.status >= 300) throw new Error(`[ElevenLabs] Failed to fetch audio from ${url}: ${response.status}`);
+    if (response.status < 200 || response.status >= 300) throw new Error(`[ElevenLabs] Failed to fetch audio from ${describeUrl(url)}: ${response.status}`);
     return Buffer.from(response.body);
   }
   throw new Error('[ElevenLabs] TRANSCRIPTION expects audio bytes, an audio URL, { audio } or { audioUrl }');

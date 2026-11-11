@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { build } from 'tsup';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Scenario } from '../test-support/sandbox/scenario';
+import type { EventsScenario } from '../test-support/sandbox/events-child';
 
 /*
  * World scripts under real SES lockdown, in a child process per scenario: test-support/sandbox/child.ts
@@ -42,6 +43,7 @@ if (!hasBun) {
 let dir = '';
 let bundle = '';
 let serviceBundle = '';
+let eventsBundle = '';
 let scenarios = 0;
 
 beforeAll(async () => {
@@ -49,7 +51,11 @@ beforeAll(async () => {
   // Packages stay external, as in the real build, and resolve through this link
   symlinkSync(path.join(repo, 'node_modules'), path.join(dir, 'node_modules'), 'dir');
   await build({
-    entry: { child: path.join(support, 'child.ts'), 'service-child': path.join(support, 'service-child.ts') },
+    entry: {
+      child: path.join(support, 'child.ts'),
+      'service-child': path.join(support, 'service-child.ts'),
+      'events-child': path.join(support, 'events-child.ts'),
+    },
     outDir: dir,
     format: ['esm'],
     platform: 'node',
@@ -77,10 +83,11 @@ beforeAll(async () => {
   });
   bundle = path.join(dir, 'child.js');
   serviceBundle = path.join(dir, 'service-child.js');
+  eventsBundle = path.join(dir, 'events-child.js');
   // The stand-in must really have replaced the module that touches localstorage.json
   const storageSource = readFileSync(engineStorage, 'utf8');
   expect(storageSource).toContain('error writing to storage file');
-  for (const file of [bundle, serviceBundle]) expect(readFileSync(file, 'utf8')).not.toContain('error writing to storage file');
+  for (const file of [bundle, serviceBundle, eventsBundle]) expect(readFileSync(file, 'utf8')).not.toContain('error writing to storage file');
   expect(readFileSync(bundle, 'utf8')).not.toContain('localstorage.json');
 }, 120_000);
 
@@ -111,6 +118,15 @@ interface Report {
   releaseItem?: boolean;
   host: Record<string, boolean>;
   endowedFrozen?: boolean;
+  activations?: boolean[];
+  errorListenerCalls?: { when: string; isError: boolean; ownSymbols: number; message: string; promiseIsPromise: boolean }[];
+  teardownFailures?: string[];
+  systemsDestroyed?: string[];
+  systemsTotal?: string[];
+  socketClosed?: boolean;
+  tickedAfterDestroy?: boolean;
+  sentAfterWorldDestroy?: unknown[];
+  sentAfterAppDestroy?: unknown[];
 }
 
 function requireRuntime(runtime: string) {
@@ -141,7 +157,7 @@ function run(runtime: string, scenario: Scenario): Report {
 const events = (report: Report, name: string) => report.sent.filter(([packet, data]) => packet === 'entityEvent' && data[2] === name).map(([, data]) => data[3]);
 const packets = (report: Report) => [...new Set(report.sent.map(([packet]) => packet))];
 const untouchedHost = Object.fromEntries(
-  ['objectProto', 'arrayPush', 'functionCall', 'blobProto', 'timerProto', 'vector3Proto', 'quaternionProto', 'inspectDefaults', 'env', 'noMarker', 'endowedUntouched'].map((key) => [key, true])
+  ['objectProto', 'arrayPush', 'functionCall', 'blobProto', 'timerProto', 'vector3Proto', 'quaternionProto', 'matrix4Proto', 'eulerProto', 'inspectDefaults', 'env', 'noMarker', 'endowedUntouched'].map((key) => [key, true])
 );
 
 // Without bun the Bun runs still run (and fail in requireRuntime) unless they are skipped knowingly
@@ -149,6 +165,40 @@ interface ServiceRun {
   status: number | null;
   stderr: string;
   report: { survived: boolean; logs: string[] } | null;
+}
+
+interface EventsRun {
+  status: number | null;
+  stderr: string;
+  report: {
+    activated?: boolean;
+    done?: boolean;
+    calls: Record<string, number>;
+    raw: Record<string, number>;
+    hooks: string[];
+    logs: string[];
+    semanticsBefore?: Record<string, boolean>;
+    semanticsAfter?: Record<string, boolean>;
+  } | null;
+}
+
+/** The error-event guard on the real process (test-support/sandbox/events-child.ts) */
+function runEvents(runtime: string, scenario: EventsScenario): EventsRun {
+  requireRuntime(runtime);
+  const file = path.join(dir, `events-${++scenarios}.json`);
+  const reportFile = path.join(dir, `events-report-${scenarios}.json`);
+  writeFileSync(file, JSON.stringify(scenario));
+  const result = spawnSync(runtime, [eventsBundle, file, reportFile], {
+    cwd: dir,
+    encoding: 'utf8',
+    timeout: 60_000,
+    env: { PATH: process.env.PATH, HOME: process.env.HOME },
+  });
+  return {
+    status: result.status,
+    stderr: result.stderr,
+    report: existsSync(reportFile) ? (JSON.parse(readFileSync(reportFile, 'utf8')) as EventsRun['report']) : null,
+  };
 }
 
 /** HyperfyService.start in a child (test-support/sandbox/service-child.ts), then an unhandled rejection */
@@ -599,6 +649,333 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     const logs = report!.logs.join('\n');
     expect(logs).toMatch(/sandbox self-test passed \(\d+ checks\)/);
     expect(logs).toContain('Unhandled promise rejection (the agent keeps running): Error: unhandled in the agent');
+  });
+
+  // ---- regressions of the second P1a2 review (V-01 ... V-09) ----
+
+  test("V-01: a script's unhandled rejections reach every process listener, registered before or after activation, only as Errors the host made; its inspect hooks never run", () => {
+    // The listeners do what elizaOS's Sentry integration does: console.error(reason or reason.stack), and util.inspect
+    const report = run(runtime, { mode: 'sandboxed', script: fixture('hostile-rejections.js'), waitForEvent: 'report', errorListeners: 'both' });
+    const calls = report.errorListenerCalls!;
+    const logs = report.logs.join('\n');
+
+    expect(events(report, 'report')).toHaveLength(1);
+    // Before the fix: the hooks ran with the runtime's own inspect and rewrote inspect.defaultOptions
+    expect(events(report, 'hook')).toEqual([]);
+    expect(report.host).toEqual(untouchedHost);
+    // Nine routes (the tenth, an async callback the engine calls, is handled by the membrane), each to both listeners
+    expect(calls.filter((call) => call.when === 'before')).toHaveLength(9);
+    expect(calls.filter((call) => call.when === 'after')).toHaveLength(9);
+    for (const call of calls) expect(call).toMatchObject({ isError: true, ownSymbols: 0, promiseIsPromise: true });
+    expect([...new Set(calls.map((call) => call.message))].sort()).toEqual([
+      'a function',
+      'a value that is not an error',
+      'rejected by a script: async function',
+      'rejected by a script: plain',
+      'rejected by a script: proxy',
+      'rejected by a script: thenable',
+      'rejected by a script: timer',
+      'world.load() failed',
+    ]);
+    expect(logs.match(/Unhandled promise rejection \(the agent keeps running\)/g)).toHaveLength(9);
+    expect(logs).toContain('[script] an async callback failed: rejected by a script: async callback');
+  });
+
+  test('V-02: tearing the world down stops every system, the socket and every script, even when a script\'s teardown throws', () => {
+    const script = `
+      // A teardown listener that throws, a video screen (its unmount calls the agent's LiveKit), an effect whose end throws
+      app.on('destroy', () => { throw new Error('not now') })
+      app.add(app.create('video', { src: 'asset://screen.mp4', width: 2, height: 1 }))
+      world.getPlayer().applyEffect({ emote: 'asset://wave.glb', onEnd() { throw new Error('effect end refused') } })
+      let ticks = 0
+      const tick = () => { ticks++; app.send('tick', { ticks }); setTimeout(tick, 20) }
+      tick()
+      setTimeout(() => app.send('report', { ticking: true }), 60)
+    `;
+    const report = run(runtime, { mode: 'sandboxed', script, waitForEvent: 'report', worldDestroy: true });
+    const logs = report.logs.join('\n');
+
+    expect(events(report, 'tick').length).toBeGreaterThan(1);
+    // Before the fix: World.destroy() stopped at Entities, so Physics, Stage, NodeClient (the tick
+    // loop), ClientNetwork (the socket) and NodeEnvironment were never destroyed
+    expect(report.teardownFailures).toEqual([]);
+    expect(report.systemsDestroyed).toEqual(report.systemsTotal);
+    expect(report.systemsTotal).toEqual(expect.arrayContaining(['Entities', 'Physics', 'Stage', 'NodeClient', 'ClientNetwork']));
+    expect(report.socketClosed).toBe(true);
+    expect(report.tickedAfterDestroy).toBeUndefined();
+    // No script runs on after the world is gone
+    expect(report.sentAfterWorldDestroy).toEqual([]);
+    expect(logs).toContain('[script] a destroy listener threw: not now');
+    expect(logs).toContain("[script] an effect's onEnd threw: effect end refused");
+  });
+
+  test("V-03: the agent's own avatar node (a .vrm model) is a node to the guards: it refuses a fake child and takes a real one", () => {
+    const script = `
+      const out = {}
+      const fake = () => ({ children: [], activate(ctx) { out.activated = Object.keys(ctx) }, deactivate() {}, traverse() {}, updateTransform() {} })
+      const avatar = app.children[0]
+      out.kind = avatar.name + ':' + typeof avatar.getHeight
+      const attempt = (name, fn) => { try { fn(); out[name] = 'ok' } catch (e) { out[name] = 'threw ' + e.message } }
+      attempt('avatar.add(fake)', () => avatar.add(fake()))
+      attempt('avatar.remove(fake)', () => avatar.remove(fake()))
+      attempt('avatar.add(group)', () => avatar.add(app.create('group')))
+      attempt('app.add(avatar)', () => app.add(avatar))
+      attempt('world.add(avatar)', () => world.add(avatar))
+      world.load('avatar', '%WORLD%/npc.vrm').then((npc) => {
+        attempt('npc.add(fake)', () => npc.add(fake()))
+        attempt('app.add(npc)', () => app.add(npc))
+        app.send('report', out)
+      }, (e) => { out.load = e.message; app.send('report', out) })
+    `;
+    const report = run(runtime, { mode: 'sandboxed', script, waitForEvent: 'report', model: 'vrm' });
+    const [found] = events(report, 'report');
+
+    // Before the fix: avatar.add(fake) was accepted, and the engine called the fake's activate with the app's ctx
+    expect(found).toEqual({
+      kind: 'avatar:function',
+      'avatar.add(fake)': 'threw add() expects a node',
+      'avatar.remove(fake)': 'threw remove() expects a node',
+      'avatar.add(group)': 'ok',
+      'app.add(avatar)': 'ok',
+      'world.add(avatar)': 'ok',
+      'npc.add(fake)': 'threw add() expects a node',
+      'app.add(npc)': 'ok',
+    });
+    expect(report.crashes).toBe(0);
+  });
+
+  test('V-04: two activations at once share one: both succeed, the self-test runs once', () => {
+    const report = run(runtime, { mode: 'sandboxed', script: '', concurrentActivations: 2 });
+
+    // Before the fix: [true, false], and HyperfyService would have exited the process
+    expect(report.activations).toEqual([true, true]);
+    expect(report.logs.filter((line) => /sandbox self-test passed/.test(line))).toHaveLength(1);
+  });
+
+  test('V-05: a host method that calls back on a script\'s `this` hands the callback a facade; no host prototype can be written through it', () => {
+    const script = `
+      let leaked
+      const evil = { setFromRotationMatrix(m) { leaked = m; return 1 }, _order: 'XYZ' }
+      const out = {}
+      try { new Euler().setFromQuaternion.call(evil, new Quaternion()) } catch (e) { out.call = 'threw ' + e.message }
+      out.leakedIsMatrix4 = !!leaked && leaked instanceof Matrix4
+      try { Object.getPrototypeOf(leaked).__pwnedMatrix = 1; out.prototype = 'wrote' } catch (e) { out.prototype = 'refused' }
+      try { leaked.constructor.prototype.__pwnedMatrix = 1; out.constructorPrototype = 'wrote' } catch (e) { out.constructorPrototype = 'refused' }
+      app.send('report', out)
+    `;
+    const report = run(runtime, { mode: 'sandboxed', script, waitForEvent: 'report' });
+
+    expect(events(report, 'report')).toEqual([{ leakedIsMatrix4: true, prototype: 'refused', constructorPrototype: 'refused' }]);
+    expect(report.host).toEqual(untouchedHost);
+  });
+
+  test('V-07 and V-09: app.create() data goes through the reference guards, and event names must be strings', () => {
+    const script = `
+      const out = {}
+      const attempt = (name, fn) => { try { fn(); out[name] = 'ok' } catch (e) { out[name] = 'threw ' + e.message } }
+      const fakeGeometry = () => ({ isBufferGeometry: true, attributes: { position: { count: 3, array: [0, 0, 0, 0, 0, 0, 0, 0, 0], itemSize: 3 } }, index: null })
+      attempt('mesh', () => app.create('mesh', { type: 'geometry', geometry: fakeGeometry() }))
+      attempt('collider', () => app.create('collider', { type: 'geometry', geometry: fakeGeometry() }))
+      attempt('video', () => app.create('video', { geometry: fakeGeometry() }))
+      attempt('material', () => app.create('mesh', { material: { isMaterial: true } }))
+      attempt('real geometry', () => app.create('collider', { type: 'geometry', geometry: app.create('mesh').geometry }))
+      attempt('type not a string', () => app.create(['mesh'], {}))
+      attempt('group', () => app.create('group', { position: [1, 2, 3] }))
+      const heard = []
+      world.on('chat', (m) => heard.push(['chat', m && m.fromId]))
+      world.on('command', (c) => heard.push(['command', c && c.playerId]))
+      attempt('emit chat', () => app.emit(['chat'], { body: 'spoofed', fromId: 'owner-id' }))
+      attempt('emit command', () => app.emit(['command'], { playerId: 'owner-id', args: ['give'] }))
+      attempt('send', () => app.send(['report'], {}))
+      attempt('on', () => app.on(['update'], () => {}))
+      attempt('on number', () => app.on(7, () => {}))
+      attempt('on no function', () => app.on('update', 'not a function'))
+      attempt('off', () => app.off(['update'], () => {}))
+      attempt('sendTo', () => app.sendTo('visitor', ['x'], {}))
+      attempt('emit string', () => app.emit('custom', { ok: true }))
+      setTimeout(() => { out.heard = heard; app.send('report', out) }, 50)
+    `;
+    const [found] = events(run(runtime, { mode: 'sandboxed', script, waitForEvent: 'report' }), 'report');
+    const name = (method: string) => `threw ${method}: the event name must be a string`;
+
+    // Before the fix: the made-up geometries reached the engine (and PhysX cooking), and the array
+    // names went past the engine's filter and were delivered to other apps as 'chat' and 'command'
+    expect(found).toEqual({
+      mesh: 'threw app.create(): geometry must be the geometry of a node',
+      collider: 'threw app.create(): geometry must be the geometry of a node',
+      video: 'threw app.create(): geometry must be the geometry of a node',
+      material: 'threw app.create(): material cannot be given',
+      'real geometry': 'ok',
+      'type not a string': 'threw app.create(): the node type must be a string',
+      group: 'ok',
+      'emit chat': name('app.emit()'),
+      'emit command': name('app.emit()'),
+      send: name('app.send()'),
+      on: name('app.on()'),
+      'on number': name('app.on()'),
+      'on no function': 'threw app.on(): the listener must be a function',
+      off: name('app.off()'),
+      sendTo: name('app.sendTo()'),
+      'emit string': 'ok',
+      heard: [],
+    });
+  });
+
+  // ---- the third review (W-01 ... W-06) ----
+
+  test("W-01: a callback a script hands the engine (an effect's onEnd, a node's on… property) must be a function or nothing; the app's teardown then completes", () => {
+    const script = `
+      const out = {}
+      const attempt = (name, fn) => { try { fn(); out[name] = 'ok' } catch (e) { out[name] = 'threw ' + e.message } }
+      const me = world.getPlayer()
+      // The engine calls opts.onEnd?.() while it tears the app down
+      attempt('effect, onEnd an object', () => me.applyEffect({ freeze: true, onEnd: { not: 'a function' } }))
+      attempt('effect, onEnd a string', () => me.applyEffect({ freeze: true, onEnd: 'later' }))
+      attempt('effect, onEnd a function', () => me.applyEffect({ emote: 'asset://wave.glb', onEnd() {} }))
+      attempt('create, onLoad an object', () => app.create('video', { onLoad: {} }))
+      attempt('create, onTrigger a string', () => app.create('action', { onTrigger: 'x' }))
+      attempt('create, onPointerDown a number', () => app.create('group', { onPointerDown: 42 }))
+      attempt('create, onTrigger a function', () => app.create('action', { onTrigger: () => {} }))
+      const group = app.create('group')
+      const video = app.create('video')
+      attempt('set onPointerDown an object', () => { group.onPointerDown = {} })
+      attempt('set onPointerDown a function', () => { group.onPointerDown = () => {} })
+      attempt('set onPointerDown null', () => { group.onPointerDown = null })
+      attempt('set onLoad a string', () => { video.onLoad = 'x' })
+      app.on('update', () => {})
+      let ticks = 0
+      const tick = () => { ticks++; app.send('tick', { ticks }); setTimeout(tick, 20) }
+      tick()
+      app.send('report', out)
+    `;
+    const report = run(runtime, { mode: 'sandboxed', script, waitForEvent: 'report', watchAfterDestroy: true });
+    const [found] = events(report, 'report');
+    const callback = (name: string) => `threw ${name} must be a function`;
+
+    // Before the fix: the object was accepted, app.destroy() threw "opts.onEnd is not a function"
+    // halfway through the engine's unbuild, and the script's listeners and timers stayed alive
+    expect(found).toEqual({
+      'effect, onEnd an object': callback('applyEffect(): onEnd'),
+      'effect, onEnd a string': callback('applyEffect(): onEnd'),
+      'effect, onEnd a function': 'ok',
+      'create, onLoad an object': callback('app.create(): onLoad'),
+      'create, onTrigger a string': callback('app.create(): onTrigger'),
+      'create, onPointerDown a number': callback('app.create(): onPointerDown'),
+      'create, onTrigger a function': 'ok',
+      'set onPointerDown an object': callback('onPointerDown'),
+      'set onPointerDown a function': 'ok',
+      'set onPointerDown null': 'ok',
+      'set onLoad a string': callback('onLoad'),
+    });
+    expect(events(report, 'tick').length).toBeGreaterThan(1);
+    expect(report.sentAfterAppDestroy).toEqual([]);
+    expect(report.crashes).toBe(0);
+  });
+
+  test("W-06: a geometry made of JSON the world supplies is refused through the setter and app.create(); one of the engine's own is taken", () => {
+    const script = `
+      const out = {}
+      const attempt = (name, fn) => { try { fn(); out[name] = 'ok' } catch (e) { out[name] = 'threw ' + e.message } }
+      const forged = props.forged
+      attempt('collider setter, forged', () => { app.create('collider', { type: 'geometry' }).geometry = forged })
+      attempt('create collider, forged', () => app.create('collider', { type: 'geometry', geometry: forged }))
+      attempt('create video, forged', () => app.create('video', { geometry: forged }))
+      attempt('create mesh, forged', () => app.create('mesh', { type: 'geometry', geometry: forged }))
+      world.load('model', '%WORLD%/mesh.glb').then((model) => {
+        const mesh = model.get('Triangle')
+        out.mesh = mesh ? mesh.name : 'none'
+        attempt('collider setter, real', () => { app.create('collider', { type: 'geometry' }).geometry = mesh.geometry })
+        attempt('create collider, real', () => app.create('collider', { type: 'geometry', geometry: mesh.geometry }))
+        attempt('create video, real', () => app.create('video', { geometry: mesh.geometry }))
+        app.send('report', out)
+      }, (e) => { out.load = e.message; app.send('report', out) })
+    `;
+    // What a geometry reference looks like to a shape check: JSON, as a blueprint's props are
+    const forged = { _isRef: true, _ref: { isBufferGeometry: true, attributes: { position: { count: 3, array: [0, 0, 0, 1, 0, 0, 0, 1, 0], itemSize: 3 } }, index: null } };
+    const [found] = events(run(runtime, { mode: 'sandboxed', script, waitForEvent: 'report', props: { forged } }), 'report');
+
+    // Before the fix: the forged ones were taken, and a collider's PhysX cooking would read them
+    expect(found).toEqual({
+      'collider setter, forged': 'threw geometry must be the geometry of a node',
+      'create collider, forged': 'threw app.create(): geometry must be the geometry of a node',
+      'create video, forged': 'threw app.create(): geometry must be the geometry of a node',
+      'create mesh, forged': 'threw app.create(): geometry must be the geometry of a node',
+      mesh: 'mesh',
+      'collider setter, real': 'ok',
+      'create collider, real': 'ok',
+      'create video, real': 'ok',
+    });
+  });
+
+  test('W-02 and W-03: on the real process, every error-event listener, however and whenever registered, gets only values the host made, and once, removal, listing and order still work (guard installed as src/index.ts does)', () => {
+    const { status, stderr, report } = runEvents(runtime, { early: true });
+
+    expect(status, stderr.slice(-2000)).toBe(0);
+    expect(report).toMatchObject({ activated: true, done: true, hooks: [], raw: {} });
+    const allTrue = { listed: true, rawListedInNodeShape: true, counted: true, removedBeforeFiring: true, onceFiredOnce: true, onceGone: true, allRemoved: true };
+    expect(report!.semanticsBefore).toEqual(allTrue);
+    expect(report!.semanticsAfter).toEqual(allTrue);
+    // Five unhandled rejections: three from the script, one more later, one emitted by hand
+    expect(report!.calls).toMatchObject({
+      'before: on': 5,
+      'before: once': 1,
+      'after: on': 5,
+      'after: prependListener': 5,
+      'after: once': 1,
+      "after: the prototype's on": 5,
+      'after: rejectionHandled': 1,
+      'after: uncaughtException': 1,
+      'after: uncaughtExceptionMonitor': 1,
+    });
+    expect(report!.calls['after: once, removed before it fired']).toBeUndefined();
+    // Node delivers multipleResolves (the guard covers it); Bun never emits it, and does not call
+    // a listener EventEmitter.prototype.on stores on the process
+    expect(report!.calls['after: multipleResolves']).toBe(runtime === 'node' ? 1 : undefined);
+    expect(report!.calls['after: EventEmitter.prototype.on']).toBe(runtime === 'node' ? 5 : undefined);
+  });
+
+  test('W-03: installed at activation instead, a once listener registered before stays one-shot on Node; on Bun, which does not tell once listeners apart, it becomes an ordinary one (README)', () => {
+    const { status, stderr, report } = runEvents(runtime, { early: false });
+
+    expect(status, stderr.slice(-2000)).toBe(0);
+    expect(report).toMatchObject({ activated: true, done: true, hooks: [], raw: {} });
+    expect(report!.semanticsAfter).toEqual({ listed: true, rawListedInNodeShape: true, counted: true, removedBeforeFiring: true, onceFiredOnce: true, onceGone: true, allRemoved: true });
+    expect(report!.calls['before: once']).toBe(runtime === 'node' ? 1 : 5);
+    expect(report!.calls['after: once']).toBe(1);
+  });
+
+  test('W-02: a listener registered after activation through process.on taken before the guard gets host values on Node; on Bun the process logs it and ends before that listener is called', () => {
+    const { status, stderr, report } = runEvents(runtime, { early: true, capturedOn: true });
+    const tag = 'after: process.on taken before the guard';
+
+    expect(report).toMatchObject({ activated: true, hooks: [], raw: {} });
+    if (runtime === 'node') {
+      expect(status, stderr.slice(-2000)).toBe(0);
+      expect(report!.calls[tag]).toBe(5);
+    } else {
+      expect(status).toBe(1);
+      expect(stderr).toContain('a process unhandledRejection listener is registered past the error-event guard (lib/error-events.ts) and would get a world script\'s values. Exiting.');
+      expect(report!.calls[tag]).toBeUndefined();
+      expect(report!.done).toBeUndefined();
+    }
+  });
+
+  test('W-02, not covered on Bun (README): one prepended through process.prependListener taken before the guard gets one event\'s values, then the process ends; Node covers it', () => {
+    const { status, stderr, report } = runEvents(runtime, { early: true, capturedPrepend: true });
+    const tag = 'after: process.prependListener taken before the guard';
+
+    expect(report?.activated).toBe(true);
+    if (runtime === 'node') {
+      expect(status, stderr.slice(-2000)).toBe(0);
+      expect(report).toMatchObject({ hooks: [], raw: {} });
+      expect(report!.calls[tag]).toBe(5);
+    } else {
+      expect(status).toBe(1);
+      expect(stderr).toContain('is registered past the error-event guard');
+      expect(report!.calls[tag]).toBe(1);
+      expect(report!.raw).toEqual({ [tag]: 1 });
+      expect(report!.hooks).toEqual(['reject:function']);
+    }
   });
 
   test('S-08 off: the same unhandled rejection ends the process, as the runtime does by default', () => {

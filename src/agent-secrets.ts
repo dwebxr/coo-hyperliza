@@ -173,3 +173,27 @@ export function secureServerDefaults(env: Env, newToken: () => string = () => ra
   }
   return lines;
 }
+
+/**
+ * What SENTRY_DSN becomes when the operator set none. The elizaOS server (initializeServer) uses
+ * `process.env.SENTRY_DSN?.trim() || <elizaOS's own DSN>`, so an unset or empty value sends error
+ * reports to elizaOS's Sentry project. This value does not parse as a DSN: Sentry's client is
+ * then created without a transport, so it sends nothing and sets up none of its integrations
+ * (Sentry logs "Invalid Sentry Dsn: off" once).
+ */
+export const SENTRY_DSN_OFF = 'off';
+
+/**
+ * Turns elizaOS's default error reporting off for this run when SENTRY_DSN is unset or empty, and
+ * leaves an operator's DSN alone. Applied to `env` (process.env) when the project is loaded, which
+ * `elizaos start` does before the server starts. Returns what to log.
+ */
+export function errorReportingDefaults(env: Env): string[] {
+  if (env.SENTRY_DSN?.trim()) return [];
+  env.SENTRY_DSN = SENTRY_DSN_OFF;
+  return [
+    '[Security] SENTRY_DSN is not set, so error reporting is off for this run: elizaOS would otherwise send its error reports ' +
+      '(which can hold chat text, file paths and settings) to its own Sentry project. Sentry reports the value "off" as an invalid DSN once for this. ' +
+      'Set SENTRY_DSN to your own DSN to report there.',
+  ];
+}

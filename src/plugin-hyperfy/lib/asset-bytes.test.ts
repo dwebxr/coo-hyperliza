@@ -106,11 +106,9 @@ describe('decodeDataUrl', () => {
   });
 });
 
-describe('describeUrl', () => {
-  it('cuts a long URL for the log', () => {
+describe('describeUrl (lib/log-url.ts)', () => {
+  it('is the shared formatter: a data: URL keeps its type and length only', () => {
     expect(describeUrl('asset://a.glb')).toBe('asset://a.glb');
-    const long = describeUrl(`data:model/gltf-binary;base64,${'A'.repeat(5000)}`);
-    expect(long.length).toBeLessThan(260);
-    expect(long).toContain('(5030 characters)');
+    expect(describeUrl(`data:model/gltf-binary;base64,${'A'.repeat(5000)}`)).toBe('data:model/gltf-binary… (5030 characters)');
   });
 });

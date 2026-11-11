@@ -66,7 +66,7 @@ vi.mock('fs', async (importOriginal) => {
   return { ...mocked, default: mocked };
 });
 
-import { OFFLINE_CHROMIUM_ARGS, PuppeteerManager } from './puppeteer-manager';
+import { OFFLINE_CHROMIUM_ARGS, PageOperationCancelled, PuppeteerManager } from './puppeteer-manager';
 
 const text = (bytes: Uint8Array) => Buffer.from(bytes).toString();
 
@@ -181,14 +181,63 @@ describe('PuppeteerManager', () => {
     const manager = PuppeteerManager.getOrCreate({} as any);
     const glb = new Uint8Array([103, 108, 84, 70]);
 
-    expect(text(await manager.loadGlbBytes(glb))).toMatch(/^page got Z2xURg==\|\[/);
-    expect(text(await manager.loadVRMBytes(glb, 'https://world.test/assets/me.vrm'))).toBe('page got https://world.test/assets/me.vrm|Z2xURg==');
+    // With the export budget: a model's unless the caller names one (lib/gltf-budget.ts)
+    expect(text(await manager.loadGlbBytes(glb))).toMatch(/^page got Z2xURg==\|\[.*\]\|209715200$/);
+    expect(text(await manager.loadVRMBytes(glb, 'https://world.test/assets/me.vrm', { maxExportBytes: 1234 }))).toBe('page got https://world.test/assets/me.vrm|Z2xURg==|1234');
     const [page] = launched[0].pages;
     await manager.registerTexture({ bytes: glb, contentType: 'image/jpeg', url: 'data:image/jpeg;base64,Z2xURg==' }, 'map');
     // Of a data: URL only the part before the data travels again
     expect(page.evaluate.mock.calls.at(-1)!.slice(1)).toEqual(['Z2xURg==', 'image/jpeg', 'map', 'data:image/jpeg;base64']);
     await manager.loadEnvironmentHDR(glb);
     expect(page.evaluate.mock.calls.at(-1)!.slice(1)).toEqual(['Z2xURg==']);
+  });
+
+  it('asks the page nothing once the signal fired while the page was being made ready', async () => {
+    const manager = PuppeteerManager.getOrCreate({} as any) as any;
+    const page = await manager.init();
+    const waiting: (() => void)[] = [];
+    const ready = () => waiting.splice(0).forEach((go) => go());
+    const init = manager.init.bind(manager);
+    vi.spyOn(manager, 'init').mockImplementation(() => new Promise((resolve) => waiting.push(() => resolve(init()))));
+    const stop = new AbortController();
+    const calls = page.evaluate.mock.calls.length;
+
+    const pending = Promise.allSettled([
+      manager.loadGlbBytes(new Uint8Array([1]), { signal: stop.signal }),
+      manager.loadVRMBytes(new Uint8Array([1]), 'https://world.test/a.vrm', { signal: stop.signal }),
+      manager.registerTexture({ bytes: new Uint8Array([1]), contentType: 'image/png', url: 'https://world.test/a.png' }, 'map', { signal: stop.signal }),
+      manager.loadEnvironmentHDR(new Uint8Array([1]), { signal: stop.signal }),
+    ]);
+    stop.abort();
+    ready();
+    const results = await pending;
+
+    expect(results.map((result) => result.status === 'rejected' && (result.reason as Error).name)).toEqual(['AbortError', 'AbortError', 'AbortError', 'AbortError']);
+    expect(results.every((result) => result.status === 'rejected' && result.reason instanceof PageOperationCancelled)).toBe(true);
+    expect(page.evaluate.mock.calls.length).toBe(calls);
+    vi.restoreAllMocks();
+  });
+
+  it('takes back what a page call kept when the signal fired while it ran, under the id it passed', async () => {
+    const manager = PuppeteerManager.getOrCreate({} as any) as any;
+    const page = await manager.init();
+    const stop = new AbortController();
+    page.evaluate.mockImplementationOnce(async (_fn: unknown, ...args: any[]) => {
+      stop.abort();
+      return `texture id for ${args.at(-1)}`;
+    });
+
+    await expect(manager.registerTexture({ bytes: new Uint8Array([1]), contentType: 'image/png', url: 'https://world.test/a.png' }, 'map', { signal: stop.signal })).rejects.toBeInstanceOf(PageOperationCancelled);
+
+    const [loadCall, undoCall] = page.evaluate.mock.calls.slice(-2);
+    const op = loadCall.at(-1);
+    expect(op).toMatch(/^op-\d+$/);
+    expect(undoCall.slice(1)).toEqual([op]);
+    // The undo call runs agentPage.undo with that id
+    const undone: string[] = [];
+    (globalThis as any).window = { agentPage: { undo: (id: string) => undone.push(id) } };
+    undoCall[0](op);
+    expect(undone).toEqual([op]);
   });
 
   it('writes diagnostic snapshots to disk only when HYPERFY_DEBUG_SNAPSHOTS=true', async () => {

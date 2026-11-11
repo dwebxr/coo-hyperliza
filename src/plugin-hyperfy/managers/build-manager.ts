@@ -5,6 +5,7 @@ import { importApp } from '../hyperfy/src/core/extras/appTools.js'
 import { hashFile } from '../hyperfy/src/core/utils-client.js'
 import { resolveUrl } from "../utils.js";
 import { SceneEditStopped } from "../lib/authorization";
+import { describeUrl } from "../lib/log-url";
 import { MAX_MODEL_BYTES, SafeFetchError, worldNet } from "../lib/net-policy";
 
 const IMPORT_DOWNLOAD_TIMEOUT_MS = 60_000;
@@ -47,6 +48,50 @@ const failed = (reason: string): EditResult => ({ outcome: 'failed', reason });
 const numbers = (value: unknown, length: number): value is number[] =>
   Array.isArray(value) && value.length === length && value.every((n) => typeof n === 'number' && Number.isFinite(n));
 
+// What coo-world accepts in an app's entityAdded and entityModified (src/core/extras/entityModifyPolicy.js)
+const TRANSFORM_LIMIT = 1e6;
+const QUATERNION_NORM_TOLERANCE = 0.1;
+type TransformField = 'position' | 'quaternion' | 'scale';
+const ACCEPTED: Record<TransformField, string> = {
+  position: 'three finite numbers within ±1e6',
+  quaternion: 'four finite numbers of length 1 (±0.1)',
+  scale: 'three finite numbers, none of them zero',
+};
+
+/**
+ * `value` as the world's server would store it for `field` (a quaternion normalized), or null when
+ * the server would drop it: then the change would show here and nowhere else.
+ */
+export function acceptedTransform(field: TransformField, value: unknown): number[] | null {
+  if (field === 'quaternion') {
+    if (!numbers(value, 4)) return null;
+    const norm = Math.hypot(...value);
+    return Number.isFinite(norm) && Math.abs(norm - 1) <= QUATERNION_NORM_TOLERANCE ? value.map((v) => v / norm) : null;
+  }
+  if (!numbers(value, 3)) return null;
+  if (field === 'position') return value.every((v) => Math.abs(v) <= TRANSFORM_LIMIT) ? value : null;
+  // A scale that vanishes or overflows as a 32-bit float
+  return value.every((v) => Number.isFinite(Math.fround(v)) && Math.fround(v) !== 0) ? value : null;
+}
+
+const invalid = (field: TransformField) => failed(`invalid ${field} (${ACCEPTED[field]})`);
+
+/** What coo-world's isBlueprintURL (src/core/extras/assetURL.js) accepts: asset://<one file name> or an http(s) URL. */
+function blueprintReference(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  if (value.startsWith('asset://')) {
+    const name = value.slice('asset://'.length);
+    return /^[A-Za-z0-9._-]{1,128}$/.test(name) && name !== '.' && name !== '..';
+  }
+  if (!/^https?:\/\//.test(value)) return false;
+  try {
+    const { protocol } = new URL(value);
+    return protocol === 'http:' || protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 export class BuildManager {
   constructor(_runtime: IAgentRuntime) {}
 
@@ -58,27 +103,40 @@ export class BuildManager {
     await controls.goto(x, z);
   }
 
-  private async transform(guard: EditGuard, entityId, field: 'position' | 'quaternion' | 'scale', value: unknown, length: number): Promise<EditResult> {
-    if (!numbers(value, length)) return failed(`invalid ${field}`);
+  /**
+   * Why the target found before walking over can no longer be acted on, or null: it was removed (or
+   * replaced under the same id) while the agent walked.
+   */
+  private gone(guard: EditGuard, entityId, entity): EditResult | null {
+    return guard.world.entities.items.get(entityId) === entity && !entity.destroyed ? null : skipped('the target was removed while I walked over');
+  }
+
+  private async transform(guard: EditGuard, entityId, field: TransformField, value: unknown): Promise<EditResult> {
+    const accepted = acceptedTransform(field, value);
+    if (!accepted) return invalid(field);
     const entity = guard.world.entities.items.get(entityId);
     if (!entity) return skipped('target not found');
+    // The server takes transforms for apps only (a player moves itself)
+    if (!entity.isApp) return skipped('only apps can be moved, rotated or scaled');
     await this.walkTo(guard, entity.root.position.x, entity.root.position.z);
+    const gone = this.gone(guard, entityId, entity);
+    if (gone) return gone;
     guard.check();
-    entity.root[field].fromArray(value);
+    entity.root[field].fromArray(accepted);
     this.entityUpdate(guard, entity);
     return applied;
   }
 
   translate(guard: EditGuard, entityId, position: [number, number, number]): Promise<EditResult> {
-    return this.transform(guard, entityId, 'position', position, 3);
+    return this.transform(guard, entityId, 'position', position);
   }
 
   rotate(guard: EditGuard, entityId, quaternion: [number, number, number, number]): Promise<EditResult> {
-    return this.transform(guard, entityId, 'quaternion', quaternion, 4);
+    return this.transform(guard, entityId, 'quaternion', quaternion);
   }
 
   scale(guard: EditGuard, entityId, scale: [number, number, number]): Promise<EditResult> {
-    return this.transform(guard, entityId, 'scale', scale, 3);
+    return this.transform(guard, entityId, 'scale', scale);
   }
 
   async duplicate(guard: EditGuard, entityId): Promise<EditResult> {
@@ -87,6 +145,21 @@ export class BuildManager {
     if (!entity) return skipped('target not found');
     if (!entity.isApp) return skipped('only apps can be duplicated');
     await this.walkTo(guard, entity.root.position.x, entity.root.position.z);
+    const gone = this.gone(guard, entityId, entity);
+    if (gone) return gone;
+    // The copy is added with the original's transform as it is now (a script may have set it to
+    // anything): coo-world's sanitizeEntityAdd refuses the whole app when one of them is invalid
+    const position = acceptedTransform('position', entity.root.position.toArray());
+    const quaternion = acceptedTransform('quaternion', entity.root.quaternion.toArray());
+    const scale = acceptedTransform('scale', entity.root.scale.toArray());
+    if (!position) return invalid('position');
+    if (!quaternion) return invalid('quaternion');
+    if (!scale) return invalid('scale');
+    // ...and sanitizeBlueprintAdd refuses a new blueprint whose model, script or image is not an asset or an http(s) URL
+    if (entity.blueprint.unique) {
+      const reference = [entity.blueprint.model, entity.blueprint.script, entity.blueprint.image?.url].find((value) => value != null && !blueprintReference(value));
+      if (reference !== undefined) return failed("the app's blueprint names a file the world would refuse in a copy");
+    }
     {
       guard.check();
       let blueprintId = entity.data.blueprint
@@ -117,9 +190,9 @@ export class BuildManager {
         id: uuid(),
         type: 'app',
         blueprint: blueprintId,
-        position: entity.root.position.toArray(),
-        quaternion: entity.root.quaternion.toArray(),
-        scale: entity.root.scale.toArray(),
+        position,
+        quaternion,
+        scale,
         mover: null,
         uploader: null,
         pinned: false,
@@ -136,6 +209,9 @@ export class BuildManager {
     if (!entity.isApp) return skipped('only apps can be deleted');
     if (entity.data.pinned) return skipped('the app is pinned');
     await this.walkTo(guard, entity.root.position.x, entity.root.position.z);
+    const gone = this.gone(guard, entityId, entity);
+    if (gone) return gone;
+    if (entity.data.pinned) return skipped('the app is pinned');
     guard.check();
     entity.destroy(true)
     this.entityUpdate(guard, entity);
@@ -149,15 +225,21 @@ export class BuildManager {
     quaternion?: any
   ): Promise<EditResult> {
     if (typeof url !== 'string' || !/^(https?|asset):\/\//.test(url)) {
-      console.warn(`[BuildManager] importEntity: rejected url (only http://, https:// and asset:// are allowed): ${url}`)
+      console.warn(`[BuildManager] importEntity: rejected url (only http://, https:// and asset:// are allowed): ${describeUrl(url)}`)
       return failed('only http(s):// and asset:// URLs can be imported')
     }
     const ext = url.split('?')[0].split('.').pop()?.toLowerCase()
     if (ext !== 'hyp' && ext !== 'glb' && ext !== 'vrm') return failed('only .hyp, .glb and .vrm files can be imported')
+    // Left out: the origin, facing forward. Given but not what the server accepts: refused, as the
+    // server would refuse the whole app
+    position = position == null ? [0, 0, 0] : acceptedTransform('position', position)
+    if (!position) return invalid('position')
+    quaternion = quaternion == null ? [0, 0, 0, 1] : acceptedTransform('quaternion', quaternion)
+    if (!quaternion) return invalid('quaternion')
     const world = guard.world;
     const resolvedUrl = await resolveUrl(url, world, { allowLocal: false });
     if (!resolvedUrl) {
-      console.warn(`[BuildManager] importEntity: could not resolve url: ${url}`)
+      console.warn(`[BuildManager] importEntity: could not resolve url: ${describeUrl(url)}`)
       return failed('the URL could not be resolved')
     }
     // The file is downloaded under the world's network policy (lib/net-policy.ts): public https
@@ -170,29 +252,20 @@ export class BuildManager {
       resp = await worldNet(world).fetch(resolvedUrl, { maxBytes, timeoutMs: IMPORT_DOWNLOAD_TIMEOUT_MS })
     } catch (err) {
       if (!(err instanceof SafeFetchError)) throw err
-      console.warn(`[BuildManager] importEntity: download of ${url} failed (${err.kind}): ${err.message}`)
+      console.warn(`[BuildManager] importEntity: download of ${describeUrl(url)} failed (${err.kind}): ${err.message}`)
       if (err.kind === 'too-large') return failed(maxBytes < MAX_MODEL_BYTES ? 'the file is too large for the world' : 'the file is too large to import')
       // What a name resolves to stays in the log: the reason given here can end up in chat
       if (err.kind === 'refused') return failed("the URL is not allowed by the agent's network policy")
       return failed(err.kind === 'timeout' ? 'download timed out' : 'download failed')
     }
     if (resp.status < 200 || resp.status >= 300) {
-      console.error(`[BuildManager] importEntity: fetch failed with ${resp.status} ${resp.statusText} for ${url}`)
+      console.error(`[BuildManager] importEntity: fetch failed with ${resp.status} ${resp.statusText} for ${describeUrl(url)}`)
       return failed(`download failed (HTTP ${resp.status})`)
     }
     const file = new File([new Uint8Array(resp.body)], url.split('?')[0].split('/').pop(), { type: resp.headers['content-type'] ?? '' })
     
     await new Promise(resolve => setTimeout(resolve, 100))
-    
-    const validVec3 = (v: any): v is [number, number, number] =>
-      Array.isArray(v) && v.length === 3 && v.every(n => typeof n === 'number');
 
-    const validQuat = (q: any): q is [number, number, number, number] =>
-      Array.isArray(q) && q.length === 4 && q.every(n => typeof n === 'number');
-
-    position = validVec3(position) ? position : [0, 0, 0];
-    quaternion = validQuat(quaternion) ? quaternion : [0, 0, 0, 1];
-    
     await this.walkTo(guard, position[0], position[2]);
     
     const transform = {

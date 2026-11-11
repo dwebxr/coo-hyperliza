@@ -1,5 +1,6 @@
 import { hashFileBuffer, resolveUrl } from '../utils';
-import { type NetPolicy, SafeFetchError, toResponse, worldNet } from './net-policy';
+import { describeUrl } from './log-url';
+import { type NetPolicy, onWorldOrigin, SafeFetchError, toResponse, worldNet } from './net-policy';
 
 /**
  * Asset uploads that work with the world's upload rules.
@@ -22,8 +23,17 @@ const HEAD_TIMEOUT_MS = 5_000;
 // The API answers { exists } or { error }
 const API_ANSWER_MAX_BYTES = 64 * 1024;
 
-/** fetch() for the world's API, through the policy: the answer is small, and a redirect comes back as it is. */
-function worldApiFetch(net: NetPolicy, timeoutMs: number): typeof fetch {
+/** What `check` threw inside the transport, passed through the sender unchanged. */
+class GuardStopped {
+  constructor(readonly reason: unknown) {}
+}
+
+/**
+ * fetch() for the world's API, through the policy: the answer is small, and a redirect comes back
+ * as it is. The destination and `check` are judged again after the body is encoded (which is
+ * awaited), immediately before the request goes out.
+ */
+function worldApiFetch(net: NetPolicy, timeoutMs: number, check?: () => void): typeof fetch {
   return async (input, init = {}) => {
     const headers = { ...(init.headers as Record<string, string> | undefined) };
     let body: Uint8Array | undefined;
@@ -33,7 +43,15 @@ function worldApiFetch(net: NetPolicy, timeoutMs: number): typeof fetch {
       headers['content-type'] = encoded.headers.get('content-type') ?? 'multipart/form-data';
       body = new Uint8Array(await encoded.arrayBuffer());
     }
-    const answer = await net.fetch(String(input), { method: init.method ?? 'GET', headers, body, maxBytes: API_ANSWER_MAX_BYTES, timeoutMs, signal: init.signal ?? undefined, followRedirects: false });
+    const url = String(input);
+    const problem = apiUrlProblem(url, net.worldOrigin);
+    if (problem) throw new AssetUploadError(`Upload refused: ${problem}`, undefined, true);
+    try {
+      check?.();
+    } catch (error) {
+      throw new GuardStopped(error);
+    }
+    const answer = await net.fetch(url, { method: init.method ?? 'GET', headers, body, maxBytes: API_ANSWER_MAX_BYTES, timeoutMs, signal: init.signal ?? undefined, followRedirects: false });
     return toResponse(answer);
   };
 }
@@ -76,7 +94,10 @@ const originOf = (url: string): string | null => {
  */
 export function apiUrlProblem(apiUrl: string, worldOrigin: string | null): string | null {
   const origin = originOf(apiUrl);
-  if (origin !== null && origin !== 'null' && origin === worldOrigin) return null;
+  if (origin !== null && origin !== 'null' && onWorldOrigin(apiUrl, worldOrigin)) {
+    const { username, password } = new URL(apiUrl);
+    return username || password ? "the world's API URL carries a user name or password, and the session token is not sent with one" : null;
+  }
   return `the world's API URL is on ${origin === null || origin === 'null' ? 'no usable origin' : origin}, not on the world's own origin (${worldOrigin ?? 'unknown'}, from WS_URL), and the session token is only sent there`;
 }
 
@@ -130,47 +151,26 @@ export interface UploadOptions {
 }
 
 /**
- * Uploads a file the way the world's own client does: upload-check, then the multipart upload,
- * both with the session's token. Throws AssetUploadError (with the HTTP status when the world
- * answered) instead of failing silently, or whatever `check` throws.
+ * The one function that sends the session token: each call checks its own URL against the world's
+ * origin (apiUrlProblem) before anything is sent, then calls `check`, and never follows a redirect.
+ * Throws AssetUploadError, or whatever `check` throws.
  */
-export async function uploadAsset(
-  network: UploadNetwork,
-  file: File,
-  {
-    net,
-    authToken,
-    timeoutMs = UPLOAD_TIMEOUT_MS,
-    fetchImpl = worldApiFetch(net, timeoutMs),
-    check,
-  }: {
-    /** The world's policy (worldNet): its world origin is the only place the token is sent */
-    net: NetPolicy;
-    authToken?: string | null;
-    /** Replaces the requests themselves (tests); the origin check above them stays */
-    fetchImpl?: typeof fetch;
-    timeoutMs?: number;
-  } & UploadOptions
-): Promise<void> {
-  if (!network.apiUrl) throw new AssetUploadError('Upload failed: the world has not sent its API URL yet');
-  const problem = apiUrlProblem(network.apiUrl, net.worldOrigin);
-  if (problem) throw new AssetUploadError(`Upload refused: ${problem}`, undefined, true);
-  // The world enforces the same cap; refusing here spares a doomed transfer
-  const maxMb = Number(network.maxUploadSize);
-  if (Number.isFinite(maxMb) && maxMb > 0 && file.size > maxMb * 1024 * 1024) {
-    throw new AssetUploadError(`Upload failed: ${file.name} exceeds ${maxMb}MB`, 413);
-  }
-
-  const headers: Record<string, string> = authToken ? { Authorization: `Bearer ${authToken}` } : {};
-  // One deadline for the whole upload
-  const signal = AbortSignal.timeout(timeoutMs);
-  const send = async (url: string, init: RequestInit = {}): Promise<Response> => {
+export function worldApiSender(
+  net: NetPolicy,
+  { authToken, fetchImpl, signal, check }: { authToken?: string | null; fetchImpl: typeof fetch; signal: AbortSignal; check?: () => void }
+): (url: string, init?: RequestInit) => Promise<Response> {
+  return async (url, init = {}) => {
+    const problem = apiUrlProblem(url, net.worldOrigin);
+    if (problem) throw new AssetUploadError(`Upload refused: ${problem}`, undefined, true);
     check?.();
+    const headers: Record<string, string> = authToken ? { Authorization: `Bearer ${authToken}` } : {};
     let resp: Response;
     try {
       // Never followed: a redirect would take the token (or the file) wherever the answer says
       resp = await fetchImpl(url, { ...init, headers, signal, redirect: 'manual' });
     } catch (error: any) {
+      if (error instanceof GuardStopped) throw error.reason;
+      if (error instanceof AssetUploadError) throw error;
       const timedOut = error?.name === 'TimeoutError' || signal.aborted || (error instanceof SafeFetchError && error.kind === 'timeout');
       if (error instanceof SafeFetchError && error.kind === 'refused') throw new AssetUploadError(`Upload refused: ${error.message}`, undefined, true);
       throw new AssetUploadError(`Upload failed: ${timedOut ? 'timed out' : error?.message || error}`);
@@ -181,17 +181,55 @@ export async function uploadAsset(
     if (!resp.ok) throw await uploadError(resp);
     return resp;
   };
+}
+
+/**
+ * Uploads a file the way the world's own client does: upload-check, then the multipart upload,
+ * both with the session's token. Throws AssetUploadError (with the HTTP status when the world
+ * answered) instead of failing silently, or whatever `check` throws. The API URL is read once:
+ * both requests go to the URL that was checked, whatever the world sends meanwhile.
+ */
+export async function uploadAsset(
+  network: UploadNetwork,
+  file: File,
+  {
+    net,
+    authToken,
+    timeoutMs = UPLOAD_TIMEOUT_MS,
+    check,
+    fetchImpl = worldApiFetch(net, timeoutMs, check),
+  }: {
+    /** The world's policy (worldNet): its world origin is the only place the token is sent */
+    net: NetPolicy;
+    authToken?: string | null;
+    /** Replaces the requests themselves (tests); the checks in worldApiSender stay */
+    fetchImpl?: typeof fetch;
+    timeoutMs?: number;
+  } & UploadOptions
+): Promise<void> {
+  const apiUrl = network.apiUrl;
+  if (!apiUrl) throw new AssetUploadError('Upload failed: the world has not sent its API URL yet');
+  const problem = apiUrlProblem(apiUrl, net.worldOrigin);
+  if (problem) throw new AssetUploadError(`Upload refused: ${problem}`, undefined, true);
+  // The world enforces the same cap; refusing here spares a doomed transfer
+  const maxMb = Number(network.maxUploadSize);
+  if (Number.isFinite(maxMb) && maxMb > 0 && file.size > maxMb * 1024 * 1024) {
+    throw new AssetUploadError(`Upload failed: ${file.name} exceeds ${maxMb}MB`, 413);
+  }
+
+  // One deadline for the whole upload
+  const send = worldApiSender(net, { authToken, fetchImpl, signal: AbortSignal.timeout(timeoutMs), check });
 
   const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
   const filename = `${await hashFileBuffer(Buffer.from(await file.arrayBuffer()))}.${ext}`;
   // First check whether the world already has it
-  const existing = await send(`${network.apiUrl}/upload-check?filename=${encodeURIComponent(filename)}`);
+  const existing = await send(`${apiUrl}/upload-check?filename=${encodeURIComponent(filename)}`);
   const data: any = await existing.json().catch(() => null);
   if (data?.exists === true) return;
 
   const form = new FormData();
   form.append('file', file);
-  await send(`${network.apiUrl}/upload`, { method: 'POST', body: form });
+  await send(`${apiUrl}/upload`, { method: 'POST', body: form });
 }
 
 /**
@@ -203,13 +241,13 @@ export async function assetServed(url: string, net: NetPolicy): Promise<boolean 
     const resp = await net.fetch(url, { method: 'HEAD', maxBytes: 0, timeoutMs: HEAD_TIMEOUT_MS });
     if (resp.status >= 200 && resp.status < 300) return true;
     if (resp.status < 500) return false;
-    console.warn(`[Assets] Could not check ${url}: HTTP ${resp.status}`);
+    console.warn(`[Assets] Could not check ${describeUrl(url)}: HTTP ${resp.status}`);
     return null;
   } catch (error: any) {
     if (error instanceof SafeFetchError && error.kind === 'refused') {
       throw new AssetUploadError(`the world's assets URL is not allowed by the agent's network policy (${error.message})`, undefined, true);
     }
-    console.warn(`[Assets] Could not check ${url}: ${error?.message || error}`);
+    console.warn(`[Assets] Could not check ${describeUrl(url)}: ${error?.message || error}`);
     return null;
   }
 }

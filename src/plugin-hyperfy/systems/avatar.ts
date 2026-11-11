@@ -174,10 +174,10 @@ export class AgentAvatar extends Node {
     if (!this.proxy) {
       const self = this
       const baseProxy = super.getProxy()
-  
-      this.proxy = {
-        ...baseProxy,
-  
+
+      // The base proxy's descriptors, not a spread of it: a spread would read its getters once,
+      // freezing `_ref` (the engine's node reference) to null and every other getter to its value now
+      const proxy: Record<string, unknown> = {
         get src() {
           return self.src
         },
@@ -219,6 +219,8 @@ export class AgentAvatar extends Node {
           return self.height
         },
       }
+      const own = Object.getOwnPropertyDescriptors(proxy)
+      this.proxy = Object.defineProperties(Object.defineProperties({}, Object.getOwnPropertyDescriptors(baseProxy)), own) as typeof baseProxy
     }
 
     return this.proxy

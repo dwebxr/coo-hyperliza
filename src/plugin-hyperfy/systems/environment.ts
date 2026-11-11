@@ -33,6 +33,9 @@ export class AgentEnvironment extends System {
   bgUrl: string | null = null
   hdrUrl: string | null = null
   csm!: CSM
+  /** The sky update in progress: a newer one, or destroy(), stops it */
+  private skyWork: AbortController | null = null
+  private destroyed = false
 
   constructor(world: any) {
     super(world)
@@ -86,9 +89,25 @@ export class AgentEnvironment extends System {
     return this.sky
   }
 
-  /** updateSky without an unhandled rejection: a disconnect closes the page it draws on mid-call. */
+  /**
+   * Starts a sky update and stops the one before it (latest wins): at most one sky download is in
+   * flight. Without an unhandled rejection: a disconnect closes the page it draws on mid-call.
+   */
   private refreshSky() {
-    this.updateSky().catch(error => this.reportRenderError('sky', error))
+    this.skyWork?.abort()
+    const work = new AbortController()
+    this.skyWork = work
+    this.updateSky(work.signal).catch(error => {
+      // A stopped update fails as it was meant to
+      if (!work.signal.aborted) this.reportRenderError('sky', error)
+    })
+  }
+
+  destroy() {
+    this.destroyed = true
+    this.skyWork?.abort()
+    this.skyWork = null
+    this.world.settings?.off?.('change', this.onSettingsChange)
   }
 
   private reportRenderError(what: string, error: any) {
@@ -100,7 +119,10 @@ export class AgentEnvironment extends System {
     }
   }
 
-  async updateSky() {
+  /** Applies the current sky. Every change to the scene or the render page is made only while `signal` holds. */
+  async updateSky(signal: AbortSignal = new AbortController().signal) {
+    const stopped = () => signal.aborted || this.destroyed
+    if (stopped()) return
     if (!this.sky) {
       const geometry = new THREE.SphereGeometry(1000, 60, 40)
       const material = new THREE.MeshBasicMaterial({side: THREE.BackSide});      
@@ -130,9 +152,11 @@ export class AgentEnvironment extends System {
     let bgUUID
     if (bgUrl) {
       // Downloaded here, under the world's network policy: the render page has no network
-      const image = await fetchAssetBytes(this.world, bgUrl, 'image');
+      const image = await fetchAssetBytes(this.world, bgUrl, 'image', { signal });
+      if (stopped()) return
       bgUrl = image.url;
-      bgUUID = await puppeteerManager.registerTexture(image, 'map');
+      bgUUID = await puppeteerManager.registerTexture(image, 'map', { signal });
+      if (stopped()) return
     }
     if (bgUUID) {
       this.sky.material.userData.materialId = bgUUID;
@@ -142,10 +166,11 @@ export class AgentEnvironment extends System {
     }
 
     if (hdrUrl) {
-      const hdr = await fetchAssetBytes(this.world, hdrUrl, 'hdr');
-      await puppeteerManager.loadEnvironmentHDR(hdr.bytes);
+      const hdr = await fetchAssetBytes(this.world, hdrUrl, 'hdr', { signal });
+      if (stopped()) return
+      await puppeteerManager.loadEnvironmentHDR(hdr.bytes, { signal });
     }
-    if (n !== this.skyN) return
+    if (n !== this.skyN || stopped()) return
 
     this.csm.lightDirection = sunDirection
 

@@ -24,6 +24,8 @@ import { AgentLoader } from '../../systems/loader';
 import { installWorldChat } from '../../lib/world-chat';
 import { activateWorldScripts, createWorldScripts } from '../../lib/script-api';
 import { surviveUnhandledRejections } from '../../lib/script-sandbox';
+import { destroyWorld } from '../../lib/world-teardown';
+import { AgentLiveKit } from '../../systems/liveKit';
 import type { ScriptNetwork } from '../../lib/script-facades';
 import { NetPolicy, installWorldNet } from '../../lib/net-policy';
 import { createScriptNetwork } from '../../lib/script-network';
@@ -37,18 +39,44 @@ import { pathToFileURL } from 'node:url';
 const endowed: Function[] = [num, clamp, uuid, prng];
 const THREE = engineThree as any;
 
-function minimalGlb(): Uint8Array {
-  const json = JSON.stringify({ asset: { version: '2.0' }, scene: 0, scenes: [{ nodes: [0] }], nodes: [{ name: 'Root' }] });
+function glb(gltf: object, bin?: Uint8Array): Uint8Array {
+  const json = JSON.stringify(gltf);
   const text = new TextEncoder().encode(json.padEnd(Math.ceil(json.length / 4) * 4, ' '));
-  const glb = new Uint8Array(12 + 8 + text.length);
-  const view = new DataView(glb.buffer);
+  const binLength = bin ? 8 + bin.length : 0;
+  const bytes = new Uint8Array(12 + 8 + text.length + binLength);
+  const view = new DataView(bytes.buffer);
   view.setUint32(0, 0x46546c67, true);
   view.setUint32(4, 2, true);
-  view.setUint32(8, glb.length, true);
+  view.setUint32(8, bytes.length, true);
   view.setUint32(12, text.length, true);
   view.setUint32(16, 0x4e4f534a, true);
-  glb.set(text, 20);
-  return glb;
+  bytes.set(text, 20);
+  if (bin) {
+    view.setUint32(20 + text.length, bin.length, true);
+    view.setUint32(24 + text.length, 0x004e4942, true);
+    bytes.set(bin, 28 + text.length);
+  }
+  return bytes;
+}
+
+const minimalGlb = () => glb({ asset: { version: '2.0' }, scene: 0, scenes: [{ nodes: [0] }], nodes: [{ name: 'Root' }] });
+
+/** One mesh, 'Triangle', with a real geometry: what the engine's own geometries look like */
+function triangleGlb(): Uint8Array {
+  const positions = new Uint8Array(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]).buffer);
+  return glb(
+    {
+      asset: { version: '2.0' },
+      scene: 0,
+      scenes: [{ nodes: [0] }],
+      nodes: [{ name: 'Triangle', mesh: 0 }],
+      meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }],
+      buffers: [{ byteLength: positions.length }],
+      bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: positions.length }],
+      accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: 'VEC3', min: [0, 0, 0], max: [1, 1, 0] }],
+    },
+    positions
+  );
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -59,12 +87,15 @@ async function main() {
   const outbound: string[] = [];
   const report: Record<string, unknown> = { runtime: (globalThis as any).Bun ? 'bun' : 'node', logs, outbound };
 
+  // The runtime's own console, which formats objects with the host's util.inspect
+  const realConsole = { warn: console.warn.bind(console), error: console.error.bind(console) };
   // Everything the agent or a script logs, as the strings the host console was given
   for (const level of ['log', 'info', 'warn', 'error', 'debug'] as const) {
     console[level] = (...args: unknown[]) => void logs.push(`${level}: ${args.map((arg) => (typeof arg === 'string' ? arg : inspect(arg, { depth: 1 }))).join(' ')}`);
   }
 
-  const glb = minimalGlb();
+  const model = minimalGlb();
+  const triangle = triangleGlb();
   // Something inside the agent's network. Nothing may reach it: not a script's fetch, not the loader.
   const inward = (name: string, tls: boolean): Promise<TestServer> =>
     startServer((_request, response, hit) => {
@@ -75,7 +106,8 @@ async function main() {
   let script = scenario.script.replaceAll('http://127.0.0.1:9/', `http://127.0.0.1:${internal.port}/`);
   // The world: its assets, on its own origin
   const assets = await startServer((request, response) => {
-    if (request.url === '/app.glb' || request.url === '/crash-block.glb') response.end(Buffer.from(glb));
+    if (['/app.glb', '/crash-block.glb', '/app.vrm', '/npc.vrm'].includes(request.url ?? '')) response.end(Buffer.from(model));
+    else if (request.url === '/mesh.glb') response.end(Buffer.from(triangle));
     else if (request.url === '/app.js') response.end(script);
     else response.writeHead(404).end();
   });
@@ -110,12 +142,41 @@ async function main() {
     scriptNetwork = createScriptNetwork({ policy });
   }
 
+  // scenario.errorListeners: what elizaOS's Sentry integration does with an unhandled rejection
+  // (console.error of the reason, or of its stack), plus util.inspect, from listeners registered
+  // before the sandbox is activated (as the elizaOS server's are) and after it (as a later plugin's)
+  const errorListenerCalls: unknown[] = [];
+  report.errorListenerCalls = errorListenerCalls;
+  const sentryLike = (when: string) => (reason: any, promise: unknown) => {
+    errorListenerCalls.push({
+      when,
+      isError: reason instanceof Error,
+      ownSymbols: reason !== null && typeof reason === 'object' ? Object.getOwnPropertySymbols(reason).length : -1,
+      message: typeof reason?.message === 'string' ? reason.message.slice(0, 200) : String(typeof reason),
+      promiseIsPromise: promise instanceof Promise,
+    });
+    realConsole.warn('This error originated either by throwing inside of an async function without a catch block, or by rejecting a promise which was not handled with .catch().');
+    realConsole.error(reason && typeof reason === 'object' && 'stack' in reason ? reason.stack : reason);
+    inspect(reason);
+    inspect(promise);
+  };
+  const listen = (when: string) => {
+    process.on('unhandledRejection', sentryLike(when));
+    process.on('uncaughtExceptionMonitor', (error: unknown) => void errorListenerCalls.push({ when, uncaught: true, isError: error instanceof Error }));
+  };
+  if (scenario.errorListeners === 'before' || scenario.errorListeners === 'both') listen('before');
+
   if (scenario.mode !== 'off') {
-    report.activated = await activateWorldScripts({ info: (m: string) => void logs.push(`info: ${m}`), error: (m: string) => void logs.push(`error: ${m}`) });
+    const activationLog = { info: (m: string) => void logs.push(`info: ${m}`), error: (m: string) => void logs.push(`error: ${m}`) };
+    // Two callers at once (two agents starting together) share one activation
+    const results = await Promise.all(Array.from({ length: scenario.concurrentActivations ?? 1 }, () => activateWorldScripts(activationLog)));
+    report.activations = results;
+    report.activated = results.every(Boolean);
     if (!report.activated) return report;
     // As HyperfyService.prepareWorldScripts does
     surviveUnhandledRejections({ error: (m: string) => void logs.push(`error: ${m}`) });
   }
+  if (scenario.errorListeners === 'after' || scenario.errorListeners === 'both') listen('after');
 
   if (scenario.physxModule) {
     // As the engine's Physics system does on init, which in the agent is after lockdown:
@@ -136,6 +197,8 @@ async function main() {
     vector3Proto: Reflect.ownKeys(THREE.Vector3.prototype).length,
     vector3Copy: THREE.Vector3.prototype.copy,
     quaternionProto: Reflect.ownKeys(THREE.Quaternion.prototype).length,
+    matrix4Proto: Reflect.ownKeys(THREE.Matrix4.prototype).length,
+    eulerProto: Reflect.ownKeys(THREE.Euler.prototype).length,
     inspectDefaults: JSON.stringify(inspect.defaultOptions),
     env: Object.keys(process.env).length,
   };
@@ -147,7 +210,14 @@ async function main() {
   const sent: [string, unknown][] = [];
   const handlerCalls: string[] = [];
   world.network.id = 'coo';
-  world.network.ws = { url: 'ws://world.test/ws?authToken=SECRET-SESSION-TOKEN', send() { handlerCalls.push('ws.send'); } };
+  world.network.ws = {
+    url: 'ws://world.test/ws?authToken=SECRET-SESSION-TOKEN',
+    readyState: 1,
+    send() { handlerCalls.push('ws.send'); },
+    addEventListener() {},
+    removeEventListener() {},
+    close() { report.socketClosed = true; },
+  };
   world.network.send = (name: string, data: unknown) => void sent.push([name, data]);
   world.assetsUrl = ASSETS;
   // As service.ts does for a world it connects to
@@ -161,7 +231,8 @@ async function main() {
       return original?.apply(world.network, args);
     };
   }
-  world.livekit = { marker: 'livekit' };
+  // The agent's own LiveKit system where teardown is tested (nodes/Video.js calls it on unmount)
+  world.livekit = scenario.worldDestroy ? new AgentLiveKit(world) : { marker: 'livekit' };
   world.controls = new AgentControls(world);
   world.actions = new AgentActions(world);
   const scripts = scenario.mode === 'sandboxed'
@@ -193,6 +264,7 @@ async function main() {
       push(force: unknown) { playerCalls.push(['push', id, force]); },
       // The engine's own Chat.add shows a bubble over the sender
       chat(body: unknown) { playerCalls.push(['chat', id, body]); },
+      destroy() {},
     };
     world.entities.players.set(id, entity);
     world.entities.items.set(id, entity);
@@ -201,7 +273,13 @@ async function main() {
   world.entities.player = player('coo', 1);
   player('visitor', 5);
 
-  world.blueprints.add({ id: 'bp', version: 0, model: 'asset://app.glb', script: 'asset://app.js', props: { greeting: 'hello', nested: { list: [1, 2, 3] } } });
+  world.blueprints.add({
+    id: 'bp',
+    version: 0,
+    model: scenario.model === 'vrm' ? 'asset://app.vrm' : 'asset://app.glb',
+    script: 'asset://app.js',
+    props: { greeting: 'hello', nested: { list: [1, 2, 3] }, ...scenario.props },
+  });
   let crashes = 0;
   const app = world.entities.add({ id: 'app', type: 'app', blueprint: 'bp', position: [0, 0, 0], quaternion: [0, 0, 0, 1], scale: [1, 1, 1], mover: null, uploader: null, pinned: false, state: {} });
   const crash = app.crash.bind(app);
@@ -248,7 +326,31 @@ async function main() {
   report.appState = app.data.state;
   report.playerPosition = world.entities.player.base.position.toArray();
 
-  app.destroy();
+  if (scenario.worldDestroy) {
+    // As service.ts tears a world down: every system, then the socket and the tick timer
+    const reached: string[] = [];
+    for (const system of world.systems) {
+      const original = system.destroy?.bind(system);
+      system.destroy = () => {
+        reached.push(system.constructor?.name);
+        return original?.();
+      };
+    }
+    world.client.timerId = setTimeout(() => void (report.tickedAfterDestroy = true), 100);
+    report.teardownFailures = destroyWorld(world, { warn: (m: string) => void logs.push(`warn: ${m}`) });
+    report.systemsDestroyed = reached;
+    report.systemsTotal = world.systems.map((system: any) => system.constructor?.name);
+    const sentAtDestroy = sent.length;
+    await sleep(200);
+    report.sentAfterWorldDestroy = sent.slice(sentAtDestroy);
+  } else {
+    const sentAtDestroy = sent.length;
+    app.destroy();
+    if (scenario.watchAfterDestroy) {
+      await sleep(200);
+      report.sentAfterAppDestroy = sent.slice(sentAtDestroy);
+    }
+  }
   await sleep(20);
   report.sentAfterDestroy = sent.slice();
 
@@ -260,6 +362,8 @@ async function main() {
     timerProto: Reflect.ownKeys(Object.getPrototypeOf(setTimeout(() => {}, 0))).length === before.timerProto,
     vector3Proto: Reflect.ownKeys(THREE.Vector3.prototype).length === before.vector3Proto && THREE.Vector3.prototype.copy === before.vector3Copy,
     quaternionProto: Reflect.ownKeys(THREE.Quaternion.prototype).length === before.quaternionProto,
+    matrix4Proto: Reflect.ownKeys(THREE.Matrix4.prototype).length === before.matrix4Proto,
+    eulerProto: Reflect.ownKeys(THREE.Euler.prototype).length === before.eulerProto,
     inspectDefaults: JSON.stringify(inspect.defaultOptions) === before.inspectDefaults,
     env: Object.keys(process.env).length === before.env,
     noMarker: !('__pwned' in globalThis) && !('__pwned' in Object.prototype) && !('__pwned' in world) && !('__pwned' in world.network),

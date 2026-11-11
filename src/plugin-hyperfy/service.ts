@@ -35,6 +35,8 @@ import { trackWorldIdentity } from './lib/world-identity'
 import { describeSceneEditsMode, readSceneEditsMode } from './lib/authorization'
 import { resolveWorldScriptsMode, surviveUnhandledRejections } from './lib/script-sandbox'
 import { activateWorldScripts, createWorldScripts } from './lib/script-api'
+import { destroyWorld } from './lib/world-teardown'
+import { describeUrl } from './lib/log-url'
 import { type HyperfyDisconnectedPayload, hyperfyEventType } from './events'
 
 const moduleDirPath = getModuleDirectory();
@@ -106,7 +108,7 @@ export class HyperfyService extends Service {
     this.reconnectController = new ReconnectController(
       async () => {
         if (!this.lastConnectConfig) return
-        console.info(`[Hyperfy Reconnect] Reconnecting to ${this.lastConnectConfig.wsUrl} (attempt ${this.reconnectController.attemptCount})...`)
+        console.info(`[Hyperfy Reconnect] Reconnecting to ${describeUrl(this.lastConnectConfig.wsUrl)} (attempt ${this.reconnectController.attemptCount})...`)
         await this.connect(this.lastConnectConfig)
       },
       { onError: (error: any) => console.error(`[Hyperfy Reconnect] Reconnect failed: ${error?.message || error}`) }
@@ -129,7 +131,7 @@ export class HyperfyService extends Service {
       console.error(`[Hyperfy] ${error.message}. Not connecting to any world.`)
       return service
     }
-    console.info(`Attempting automatic connection to default Hyperfy URL: ${wsUrl}`)
+    console.info(`Attempting automatic connection to default Hyperfy URL: ${describeUrl(wsUrl)}`)
     const defaultWorldId = createUniqueUuid(runtime, runtime.agentId + '-default-hyperfy') as UUID
 
     service
@@ -203,7 +205,7 @@ export class HyperfyService extends Service {
     // This attempt supersedes any retry that was waiting to fire
     this.reconnectController.cancelPending()
 
-    console.info(`Attempting to connect HyperfyService to ${config.wsUrl} for world ${config.worldId}`)
+    console.info(`Attempting to connect HyperfyService to ${describeUrl(config.wsUrl)} for world ${config.worldId}`)
     this.lastConnectConfig = config
     this.wsUrl = config.wsUrl
     this._currentWorldId = config.worldId
@@ -322,7 +324,7 @@ export class HyperfyService extends Service {
       // Everything after this point is synchronous, so one check is enough.
       if (this.world !== world || this.connectionGeneration !== generation) {
         // init may have started the tick loop / socket after teardown destroyed the world
-        world.destroy()
+        destroyWorld(world)
         throw new Error('Hyperfy connection closed during initialization')
       }
       console.info('Hyperfy world initialized.')
@@ -350,9 +352,9 @@ export class HyperfyService extends Service {
 
       this.connectionTime = Date.now(); // Record connection time
 
-      console.info(`HyperfyService connected successfully to ${this.wsUrl}`)
+      console.info(`HyperfyService connected successfully to ${describeUrl(this.wsUrl)}`)
     } catch (error: any) {
-      console.error(`HyperfyService connection failed for ${config.worldId} at ${config.wsUrl}: ${error.message}`, error.stack)
+      console.error(`HyperfyService connection failed for ${config.worldId} at ${describeUrl(config.wsUrl)}: ${error.message}`, error.stack)
       await this.handleDisconnect()
       throw error
     }
@@ -477,7 +479,7 @@ export class HyperfyService extends Service {
       console.error(`[Appearance] Avatar not available yet: ${error.message}`);
       return { outcome: 'retry', error: error.message };
     }
-    console.info(`[Appearance] Avatar ${result.uploaded ? "uploaded" : "already on the server"}: ${result.url}`);
+    console.info(`[Appearance] Avatar ${result.uploaded ? "uploaded" : "already on the server"}: ${describeUrl(result.url)}`);
 
     // A destroyed world has no socket to send it on
     if (this.world !== world) return { outcome: 'retry', error: 'the connection was replaced' };
@@ -652,8 +654,9 @@ export class HyperfyService extends Service {
       try {
         // Destroy before awaiting anything so the old world stops ticking (and loading assets
         // into the Puppeteer page) while we wait for LiveKit and the page to close.
-        console.info("[Hyperfy Cleanup] Calling world.destroy()...")
-        this.world.destroy()
+        console.info("[Hyperfy Cleanup] Destroying the world...")
+        // Each system on its own, then the socket and the tick timer, whatever failed before
+        destroyWorld(this.world)
       } catch (e: any) {
         console.warn(`[Hyperfy Cleanup] Error during world destroy: ${e.message}`)
       }
@@ -839,7 +842,7 @@ export class HyperfyService extends Service {
     if (!account) return null
     const host = signInHost(wsUrl)
     if (!host) {
-      console.warn(`[Tips] Cannot tell the world's sign-in domain from ${wsUrl}; tips stay off`)
+      console.warn(`[Tips] Cannot tell the world's sign-in domain from ${describeUrl(wsUrl)}; tips stay off`)
       return null
     }
     return new TipWallet(world.network, account, {

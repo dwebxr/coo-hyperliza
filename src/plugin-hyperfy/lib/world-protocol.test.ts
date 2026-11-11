@@ -184,10 +184,14 @@ describe('adaptToWorldProtocol on the engine ClientNetwork', () => {
     expect(new URL(socket().url).searchParams.has('authToken')).toBe(false);
   });
 
-  it.each(['not a url', 'ws://'])('rejects a malformed URL before reading the token: %s', (wsUrl) => {
+  it.each([
+    ['not a url', 'not a url'],
+    // Text with a scheme that does not parse keeps only its length (lib/log-url.ts)
+    ['ws://', '<invalid URL, 5 characters>'],
+  ])('rejects a malformed URL before reading the token: %s', (wsUrl, shown) => {
     const getAuthToken = vi.fn(() => TOKEN);
     adaptToWorldProtocol(network, getAuthToken);
-    expect(() => network.init({ wsUrl })).toThrow(`Invalid Hyperfy WebSocket URL: ${wsUrl}`);
+    expect(() => network.init({ wsUrl })).toThrow(`Invalid Hyperfy WebSocket URL: ${shown}`);
     expect(getAuthToken).not.toHaveBeenCalled();
     expect(FakeWebSocket.instances).toHaveLength(0);
   });

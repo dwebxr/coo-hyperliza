@@ -16,6 +16,17 @@ export interface Scenario {
    * internal.test resolves to a private address. `%WORLD%` in the script becomes the world's origin.
    */
   policyNetwork?: boolean;
+  /**
+   * Listeners of unhandled rejections that do what elizaOS's Sentry integration does with the
+   * reason (console.error, util.inspect), registered before the sandbox is activated, after, or both
+   */
+  errorListeners?: 'before' | 'after' | 'both';
+  /** Tear the whole world down (lib/world-teardown.ts) instead of removing the app */
+  worldDestroy?: boolean;
+  /** How many callers activate the sandbox at once (default 1) */
+  concurrentActivations?: number;
+  /** The app's model: a .vrm is loaded as the agent's own avatar node (systems/avatar.ts) */
+  model?: 'glb' | 'vrm';
   /** Leave the engine's own Chat.add in place instead of the agent's (lib/world-chat.ts) */
   engineChat?: boolean;
   /** Have the agent use the nearest action node, then release it */
@@ -24,4 +35,8 @@ export interface Scenario {
   waitForEvent?: string;
   /** Absolute path of physx/loadPhysX.js: load real PhysX and let the engine extend three.js with it */
   physxModule?: string;
+  /** More blueprint props: JSON the world hands every script of the app */
+  props?: Record<string, unknown>;
+  /** After app.destroy(), wait and report what the app still sent (sentAfterAppDestroy) */
+  watchAfterDestroy?: boolean;
 }

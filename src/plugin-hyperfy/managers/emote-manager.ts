@@ -5,6 +5,7 @@ import { Emotes } from '../hyperfy/src/core/extras/playerEmotes.js'
 import { getModuleDirectory, resolveUrl } from '../utils'
 import { AssetUploadError, assetServed, ensureAsset } from '../lib/asset-upload'
 import { worldNet } from '../lib/net-policy'
+import { describeUrl } from '../lib/log-url'
 import { IAgentRuntime, logger } from '@elizaos/core'
 import { HyperfyService } from '../service.js'
 
@@ -107,7 +108,7 @@ export class EmoteManager {
     agentPlayer.data.effect = agentPlayer.data.effect || {};
     agentPlayer.data.effect.emote = emoteUrl;
 
-    console.info(`[Emote] Playing '${name}' → ${emoteUrl}`);
+    console.info(`[Emote] Playing '${name}' → ${describeUrl(emoteUrl)}`);
 
     this.clearTimers();
 
@@ -171,7 +172,7 @@ export class EmoteManager {
       return await assetServed(url, worldNet(world));
     } catch (error: any) {
       // The network policy does not allow asking this world's assets URL
-      console.warn(`[Assets] Could not check ${url}: ${error?.message || error}`);
+      console.warn(`[Assets] Could not check ${describeUrl(url)}: ${error?.message || error}`);
       return null;
     }
   }

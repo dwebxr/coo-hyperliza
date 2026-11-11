@@ -12,6 +12,8 @@ import {
 import { System } from '../hyperfy/src/core/systems/System';
 import { spawn } from 'node:child_process';
 import { childEnv } from '../lib/child-env';
+import { describeUrl } from '../lib/log-url';
+import { worldNet } from '../lib/net-policy';
 
 export interface LiveKitInitOptions {
   wsUrl: string;
@@ -20,6 +22,18 @@ export interface LiveKitInitOptions {
 
 export interface PublishAudioOptions {
   signal?: AbortSignal;
+  /** Counts the frames of the audio the room took as they go out, so it holds also when the stream fails or hangs */
+  progress?: { frames: number };
+}
+
+/** How much of the audio went out to the room */
+export type Played = 'none' | 'partial' | 'all';
+
+/** What publishAudioStream did, and why not all of it played (`reason`, or the `error` it ended with). */
+export interface PlaybackOutcome {
+  played: Played;
+  reason?: string;
+  error?: string;
 }
 
 const FFMPEG_TIMEOUT_MS = 30_000;
@@ -28,6 +42,8 @@ export class AgentLiveKit extends System {
   private room: Room | null = null;
   private audioSource: AudioSource | null = null;
   private localTrack: LocalAudioTrack | null = null;
+  /** Bumped by every join and every teardown: a join that is no longer the latest stops */
+  private joinId = 0;
 
   constructor(world: any) {
     super(world);
@@ -40,8 +56,18 @@ export class AgentLiveKit extends System {
       return;
     }
     const { wsUrl, token } = opts;
-    console.log('[LiveKit] Connecting to:', wsUrl);
-    await this.disconnectRoom();
+    // Taken before the first await: a teardown (disconnectRoom) or a later join from here on wins
+    const join = ++this.joinId;
+    await this.leaveRoom();
+    // The world names the voice server: judged like the world's downloads before the native client
+    // gets it (lib/net-policy.ts voiceUrlProblem)
+    const problem = await worldNet(this.world).voiceUrlProblem(wsUrl);
+    if (join !== this.joinId) return;
+    if (problem) {
+      console.warn(`[LiveKit] Voice chat off: the voice server ${describeUrl(wsUrl)} the world named is refused (${problem})`);
+      return;
+    }
+    console.log('[LiveKit] Connecting to:', describeUrl(wsUrl));
     const room = new Room();
     this.room = room;
     try {
@@ -66,10 +92,15 @@ export class AgentLiveKit extends System {
   }
 
   /**
-   * Leaves the current room. Does not call rtc-node's dispose(), which would
-   * shut down the native runtime and make later reconnects impossible.
+   * Leaves the current room, and stops a join in progress. Does not call rtc-node's dispose(),
+   * which would shut down the native runtime and make later reconnects impossible.
    */
   async disconnectRoom(): Promise<void> {
+    this.joinId++;
+    await this.leaveRoom();
+  }
+
+  private async leaveRoom(): Promise<void> {
     const room = this.room;
     this.room = null;
     // The track and source belong to the old room's publication.
@@ -88,6 +119,14 @@ export class AgentLiveKit extends System {
   destroy() {
     this.disconnectRoom().catch(() => { });
   }
+
+  // nodes/Video.js calls these on mount and unmount. The agent shows no screen shares: no screen
+  // is registered, and the video node falls back to its own source.
+  registerScreenNode(_node: unknown): undefined {
+    return undefined;
+  }
+
+  unregisterScreenNode(_node: unknown): void {}
 
   private setupRoomEvents(room: Room): void {
     room.on(RoomEvent.ParticipantConnected, (p) => {
@@ -133,11 +172,23 @@ export class AgentLiveKit extends System {
   postTick() { }
   start() { }
 
-  async publishAudioStream(audioBuffer: Buffer, { signal }: PublishAudioOptions = {}): Promise<void> {
+  /** Plays audio into the room. Never rejects: a failure ends the outcome with how much had played. */
+  async publishAudioStream(audioBuffer: Buffer, { signal, progress = { frames: 0 } }: PublishAudioOptions = {}): Promise<PlaybackOutcome> {
+    const before = progress.frames;
+    try {
+      return await this.streamAudio(audioBuffer, signal, progress);
+    } catch (error: any) {
+      const message = String(error?.message ?? error);
+      console.warn('[LiveKit] Audio playback failed:', message);
+      return { played: progress.frames > before ? 'partial' : 'none', error: message };
+    }
+  }
+
+  private async streamAudio(audioBuffer: Buffer, signal: AbortSignal | undefined, progress: { frames: number }): Promise<PlaybackOutcome> {
     console.log('[LiveKit] publishAudioStream called with buffer size:', audioBuffer.length);
     if (!this.room) {
       console.warn('[LiveKit] Not connected to a room - skipping audio playback');
-      return;
+      return { played: 'none', reason: 'not connected to a voice room' };
     }
     const sampleRate = 48000;
     const numChannels = 1;
@@ -148,12 +199,13 @@ export class AgentLiveKit extends System {
     const int16 = await this.convertToPcm(audioBuffer, sampleRate);
     if (!int16 || int16.length === 0) {
       console.warn('[LiveKit] No PCM data decoded');
-      return;
+      return { played: 'none', reason: 'no audio was decoded' };
     }
     console.log('[LiveKit] PCM data decoded, samples:', int16.length);
 
     const room = this.room;
-    if (!room || signal?.aborted) return;
+    if (!room) return { played: 'none', reason: 'the voice room went away' };
+    if (signal?.aborted) return { played: 'none', reason: 'stopped' };
 
     if (!this.audioSource) {
       console.log('[LiveKit] Creating audio source and track...');
@@ -164,7 +216,7 @@ export class AgentLiveKit extends System {
       options.source = TrackSource.SOURCE_MICROPHONE;
       console.log('[LiveKit] Publishing track to room...');
       await room.localParticipant.publishTrack(localTrack, options);
-      if (this.room !== room) return;
+      if (this.room !== room) return { played: 'none', reason: 'the voice room went away' };
       this.audioSource = audioSource;
       this.localTrack = localTrack;
       console.log('[LiveKit] Track published successfully');
@@ -177,6 +229,7 @@ export class AgentLiveKit extends System {
     console.log('[LiveKit] Streaming audio frames...');
     const totalFrames = Math.ceil(int16.length / samplesPerFrame);
     const startTime = Date.now();
+    let sent = 0;
 
     for (let i = 0; i < int16.length; i += samplesPerFrame) {
       if (signal?.aborted || this.room !== room) {
@@ -195,10 +248,15 @@ export class AgentLiveKit extends System {
       const slice = int16.slice(i, i + samplesPerFrame);
       const frame = new AudioFrame(slice, sampleRate, numChannels, slice.length);
       await audioSource.captureFrame(frame);
+      sent++;
+      progress.frames++;
     }
 
+    const stoppedWhy = signal?.aborted ? 'stopped' : 'the voice room went away';
+    if (sent === 0) return { played: 'none', reason: stoppedWhy };
     const actualDuration = Date.now() - startTime;
-    console.log(`[LiveKit] Audio streaming complete (${totalFrames} frames, ${actualDuration}ms)`);
+    console.log(`[LiveKit] Audio streaming complete (${sent} of ${totalFrames} frames, ${actualDuration}ms)`);
+    return sent === totalFrames ? { played: 'all' } : { played: 'partial', reason: stoppedWhy };
   }
 
   private async convertToPcm(buffer: Buffer, sampleRate = 48000): Promise<Int16Array> {

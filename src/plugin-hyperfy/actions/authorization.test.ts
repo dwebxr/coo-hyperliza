@@ -1,4 +1,4 @@
-import { ModelType } from '@elizaos/core';
+import { ModelType, logger } from '@elizaos/core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
 import { hyperfyPlugin } from '../index';
@@ -253,6 +253,7 @@ describe('with scene edits off (the default)', () => {
  */
 describe('a scene edit that loses its authorization while it runs', () => {
   const box = () => ({
+    isApp: true,
     data: { id: 'box' },
     root: { position: new THREE.Vector3(1, 0, 1), quaternion: new THREE.Quaternion(), scale: new THREE.Vector3(1, 1, 1) },
   });
@@ -283,7 +284,7 @@ describe('a scene edit that loses its authorization while it runs', () => {
       models: { [ModelType.OBJECT_LARGE]: { operations }, [ModelType.TEXT_SMALL]: summary, ...models },
     });
     const edit = () => inChatTurn(first.world, () => run(runtime, recorded, 'HYPERFY_EDIT_ENTITY'), 'builder-1');
-    return { first, connection, sendMessage, recorded, useModel, edit };
+    return { first, connection, sendMessage, recorded, useModel, edit, runtime };
   }
 
   it('edits the world and announces it when nothing changed (control)', async () => {
@@ -326,7 +327,8 @@ describe('a scene edit that loses its authorization while it runs', () => {
     expect(ctx.first.world.controls.goto).not.toHaveBeenCalled();
     expect(ctx.first.send).not.toHaveBeenCalled();
     expect(ctx.first.box.root.position.toArray()).toEqual([1, 0, 1]);
-    expect(ctx.recorded.callbacks.map((c) => c.text)).toEqual(["I had to stop before finishing those edits. I couldn't make any of those changes."]);
+    // Told one neutral line, nothing about the scene
+    expect(ctx.recorded.callbacks.map((c) => c.text)).toEqual(["I can't go any further with that request."]);
   });
 
   it('changes nothing, and runs no later operation, when the requester was demoted while the agent walked over', async () => {
@@ -369,19 +371,93 @@ describe('a scene edit that loses its authorization while it runs', () => {
     await expect(ctx.edit()).rejects.toBe(error);
     expect(ctx.first.send).toHaveBeenCalledWith('entityModified', expect.objectContaining({ id: 'box', position: [0, 2, 0] }));
     // Posted directly: core drops callback content when the action throws
-    expect(ctx.sendMessage.mock.calls.map(([text]) => text)).toEqual(['Moved the box up', 'I made 1 of the 1 changes.']);
+    expect(ctx.sendMessage.mock.calls.map(([text]) => text)).toEqual(['Moved the box up', 'I made the change.']);
   });
 
-  it('does not report the edits to a requester demoted during the summary call', async () => {
-    const error = new AiBudgetExceededError('AI_MAX_CALLS_PER_HOUR=2');
+  it.each([
+    ['a budget error', new AiBudgetExceededError('AI_MAX_CALLS_PER_HOUR=2')],
+    ['a model refusal', new AnthropicRefusalError('claude', 'cyber')],
+  ])('ends with the neutral line, not the edits, for a requester demoted during a summary call that ended in %s', async (_what, error) => {
     const ctx = liveEdit(plan, {
       [ModelType.TEXT_SMALL]: () => {
         ctx.first.world.network.onEntityModified({ id: 'builder-1', rank: 0 });
         throw error;
       },
     });
-    await expect(ctx.edit()).rejects.toBe(error);
+    const stored = await ctx.edit();
+    expect(stored.actionResult.data).toMatchObject({ executed: 1 });
     expect(ctx.sendMessage.mock.calls.map(([text]) => text)).toEqual(['Moved the box up']);
+    expect(ctx.recorded.callbacks.map((c) => c.text)).toEqual(["I can't go any further with that request."]);
+  });
+
+  it('makes no summary call for a requester demoted while the summary state was composed', async () => {
+    const ctx = liveEdit(plan, {});
+    const compose = ctx.runtime.composeState.bind(ctx.runtime);
+    ctx.runtime.composeState = async (...args: Parameters<typeof compose>) => {
+      const state = await compose(...args);
+      // The state composed once the edit went out is the summary's
+      if (ctx.first.send.mock.calls.length > 0) ctx.first.world.network.onEntityModified({ id: 'builder-1', rank: 0 });
+      return state;
+    };
+    await ctx.edit();
+    expect(ctx.first.send).toHaveBeenCalledWith('entityModified', expect.objectContaining({ id: 'box' }));
+    expect(ctx.useModel.mock.calls.map(([type]) => type)).toEqual([ModelType.OBJECT_LARGE]);
+    expect(ctx.recorded.callbacks.map((c) => c.text)).toEqual(["I can't go any further with that request."]);
+  });
+
+  it.each([
+    ['a summary', summary],
+    ['a summary with no text', '<response><thought>t</thought></response>'],
+    ['an unreadable summary', 'not xml'],
+    ['a failed summary call', new Error('model down')],
+  ])('tells a requester demoted during the summary call one neutral line instead of %s', async (_what, answer) => {
+    const ctx = liveEdit(plan, {
+      [ModelType.TEXT_SMALL]: () => {
+        ctx.first.world.network.onEntityModified({ id: 'builder-1', rank: 0 });
+        if (answer instanceof Error) throw answer;
+        return answer;
+      },
+    });
+    await ctx.edit();
+    expect(ctx.recorded.callbacks.map((c) => c.text)).toEqual(["I can't go any further with that request."]);
+    expect(JSON.stringify(ctx.recorded.callbacks)).not.toMatch(/box|Box|change/);
+  });
+
+  it('makes no summary call for a requester demoted after the edits, and tells them one neutral line', async () => {
+    const ctx = liveEdit(plan, {});
+    // Demoted once the edit went out (after its announcement)
+    ctx.sendMessage.mockImplementation(() => ctx.first.world.network.onEntityModified({ id: 'builder-1', rank: 0 }));
+    await ctx.edit();
+    expect(ctx.useModel.mock.calls.map(([type]) => type)).toEqual([ModelType.OBJECT_LARGE]);
+    expect(ctx.recorded.callbacks.map((c) => c.text)).toEqual(["I can't go any further with that request."]);
+  });
+
+  it.each([
+    ['the change was made', [], 'I made the change.'],
+    ['the target had vanished', ['box'], "I couldn't make any of those changes."],
+  ])('says what the counts say when the summary has no text and %s', async (_what, vanish, text) => {
+    const ctx = liveEdit(plan, {
+      [ModelType.OBJECT_LARGE]: () => {
+        for (const id of vanish) ctx.first.world.entities.items.delete(id);
+        return { operations: plan };
+      },
+      [ModelType.TEXT_SMALL]: '<response><thought>t</thought></response>',
+    });
+    await ctx.edit();
+    expect(ctx.recorded.callbacks.map((c) => c.text)).toEqual([text]);
+  });
+
+  it('logs, summarises and records an import target without its credentials or signed query', async () => {
+    const target = 'https://user:secret-pw@cdn.example/a.glb?token=signed-secret#frag-secret';
+    const ctx = liveEdit([{ success: true, operation: 'import', target, parameters: {}, description: 'Imported it' }], {});
+    const lines: string[] = [];
+    for (const level of ['warn', 'error', 'info'] as const) vi.spyOn(logger, level).mockImplementation((...args: unknown[]) => void lines.push(args.map(String).join(' ')));
+    vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => void lines.push(args.map(String).join(' ')));
+    const stored = await ctx.edit();
+    const prompt = (ctx.useModel.mock.calls.find(([type]) => type === ModelType.TEXT_SMALL)![1] as { prompt: string }).prompt;
+    const seen = [lines.join('\n'), prompt, JSON.stringify(stored.actionResult.data)].join('\n');
+    expect(seen).toContain('https://cdn.example/a.glb?token=…');
+    expect(seen).not.toMatch(/secret-pw|signed-secret|frag-secret/);
   });
 
   it("does not announce an operation whose requester lost the right as it was sent", async () => {

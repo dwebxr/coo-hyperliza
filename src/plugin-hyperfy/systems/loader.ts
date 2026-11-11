@@ -9,6 +9,7 @@ import { PuppeteerManager } from "../managers/puppeteer-manager.js";
 import type { WorldScripts } from "../lib/script-api";
 import { type AssetBytes, type AssetKind, describeUrl, fetchAssetBytes } from "../lib/asset-bytes";
 import { SafeFetchError } from "../lib/net-policy";
+import { gltfStorageProblem, modelBudget } from "../lib/gltf-budget";
 
 // --- Mock Browser Environment for Loaders ---
 // These might need adjustment based on GLTFLoader/VRMLoaderPlugin requirements
@@ -72,7 +73,7 @@ export interface LoaderLimits {
 export const LOADER_LIMITS: Readonly<LoaderLimits> = Object.freeze({
   /** Loaded assets kept for reuse; the least recently used are dropped first */
   cacheEntries: 256,
-  /** Downloaded bytes those assets add up to */
+  /** What those assets hold: for a model, the larger of its download and the copy the render page returned */
   cacheBytes: 512 * 1024 * 1024,
   /** Downloads (and their parsing) in progress at once */
   concurrent: 8,
@@ -151,7 +152,11 @@ export class AgentLoader extends System {
     }
     const key = `${type}/${url}`;
     const existing = this.promises.get(key);
-    if (existing) return existing;
+    if (existing) {
+      // A load served from the cache counts as a use, as get() does
+      this.get(type, url);
+      return existing;
+    }
     const promise = this.loadOnce(type as AssetKind, url, key);
     // Registered before anything is awaited: until here, a concurrent load would start a second download
     this.promises.set(key, promise);
@@ -167,10 +172,16 @@ export class AgentLoader extends System {
     for (const waiter of this.waiting.splice(0)) waiter.cancel(error);
   }
 
+  /** Called after every await of a load: nothing is evaluated, rendered or kept after destroy(). */
+  private throwIfStopped() {
+    if (this.stopped.signal.aborted) throw new Error("[AgentLoader] The world was destroyed");
+  }
+
   private async loadOnce(type: AssetKind, url: unknown, key: string) {
     try {
       return await this.inSlot(async () => {
         const asset = await fetchAssetBytes(this.world, url, type, { signal: this.stopped.signal });
+        this.throwIfStopped();
         if (type === "script") {
           const code = new TextDecoder().decode(asset.bytes);
           // HYPERFY_WORLD_SCRIPTS=off (the default): the code is kept for the engine's bookkeeping
@@ -231,17 +242,24 @@ export class AgentLoader extends System {
   }
 
   async parseGLB(type: AssetKind, key: string, asset: AssetBytes) {
+    if (type !== 'model' && type !== 'avatar' && type !== 'emote') throw new Error(`[AgentLoader] Unsupported GLTF type: ${type}`);
+    // Refused before the render page (or anything else) parses it: lib/gltf-budget.ts
+    const budget = modelBudget(type);
+    const problem = gltfStorageProblem(asset.bytes, budget);
+    if (problem) throw new Error(`[AgentLoader] ${problem}`);
     const puppeteerManager = PuppeteerManager.getInstance()
     // The render page keeps the textures (and the whole avatar) and hands back a copy without them
     const stripped =
       type === 'avatar' ?
-        await puppeteerManager.loadVRMBytes(asset.bytes, asset.url) :
-        await puppeteerManager.loadGlbBytes(asset.bytes);
+        await puppeteerManager.loadVRMBytes(asset.bytes, asset.url, { maxExportBytes: budget.exportBytes, signal: this.stopped.signal }) :
+        await puppeteerManager.loadGlbBytes(asset.bytes, { maxExportBytes: budget.exportBytes, signal: this.stopped.signal });
+    this.throwIfStopped();
     const arrayBuffer = Uint8Array.from(stripped).buffer;
 
     const gltf: THREE.GLTF = await new Promise((ok, bad) =>
       this.gltfLoader.parse(arrayBuffer, '', ok, bad)
     );
+    this.throwIfStopped();
 
     let result: any;
 
@@ -263,7 +281,8 @@ export class AgentLoader extends System {
       throw new Error(`[AgentLoader] Unsupported GLTF type: ${type}`);
     }
 
-    this.keep(key, result, asset.bytes.byteLength);
+    // What is held: the parsed copy the page returned (its buffer stays referenced), or the download if larger
+    this.keep(key, result, Math.max(asset.bytes.byteLength, stripped.byteLength));
     return result;
   }
 }

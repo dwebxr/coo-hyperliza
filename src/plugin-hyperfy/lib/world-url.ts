@@ -1,3 +1,5 @@
+import { describeUrl } from './log-url';
+
 /** The world the agent joins when WS_URL is unset or empty. */
 export const DEFAULT_WORLD_WS_URL = 'wss://chill.hyperfy.xyz/ws';
 
@@ -17,7 +19,7 @@ export function resolveWorldWsUrl(raw: string | undefined): string {
   try {
     url = new URL(value);
   } catch {
-    throw new Error(`WS_URL is not a valid URL: "${value}"`);
+    throw new Error(`WS_URL is not a valid URL: "${describeUrl(value)}"`);
   }
   if (!WORLD_URL_PROTOCOLS.includes(url.protocol)) {
     throw new Error(`WS_URL must start with ws://, wss://, http:// or https://, not ${url.protocol}//`);

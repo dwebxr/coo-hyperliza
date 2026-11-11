@@ -59,6 +59,17 @@ describe('elevenLabsSpeechPlugin', () => {
     }
   });
 
+  it('names a failed download without its query, credentials or fragment (the error can reach chat)', async () => {
+    const server = await startServer((_request, response) => response.writeHead(403).end(), { tls: true });
+    const { policy } = testNet({ hosts: { 'cdn.test': PUBLIC_ADDRESS }, routes: { 'cdn.test:443': { port: server.port, direct: true } } });
+    try {
+      const error = await toAudioBuffer('https://cdn.test/a.mp3?X-Amz-Signature=sig-value&token=token-value#frag-value', policy).catch((e: Error) => e);
+      expect((error as Error).message).toBe('[ElevenLabs] Failed to fetch audio from https://cdn.test/a.mp3?X-Amz-Signature=…&token=…: 403');
+    } finally {
+      await closeServers();
+    }
+  });
+
   it('downloads no audio from a private address, over http, or beyond the audio cap, and transcribes nothing then', async () => {
     const internal = await startServer((_request, response) => response.end('internal'));
     const huge = await startServer((_request, response) => response.writeHead(200, { 'content-length': String(MAX_AUDIO_BYTES + 1) }).end(), { tls: true });

@@ -13,7 +13,16 @@ vi.mock('@anthropic-ai/sdk', () => ({
 
 import { AgentRuntime, ElizaOS, ModelType, logger, setAllowedEnvVars, type Character, type IAgentRuntime, type UUID } from '@elizaos/core';
 import * as sql from '@elizaos/plugin-sql';
-import { characterSecrets, removeStaleStoredSecrets, secureServerDefaults, staleSecretKeys } from './agent-secrets';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import {
+  SENTRY_DSN_OFF,
+  characterSecrets,
+  errorReportingDefaults,
+  removeStaleStoredSecrets,
+  secureServerDefaults,
+  staleSecretKeys,
+} from './agent-secrets';
 import { anthropicModelsPlugin } from './anthropic-models';
 
 // The elizaOS CLI's own allow-list (cli/dist/index.js CORE_ALLOWED_VARS); no installed plugin declares more
@@ -253,3 +262,38 @@ describe('secureServerDefaults', () => {
   });
 });
 
+
+describe('errorReportingDefaults', () => {
+  it('turns elizaOS error reporting off when SENTRY_DSN is unset or empty, and says so', () => {
+    for (const env of [{}, { SENTRY_DSN: '' }, { SENTRY_DSN: '   ' }] as Record<string, string | undefined>[]) {
+      const lines = errorReportingDefaults(env);
+      expect(env.SENTRY_DSN).toBe(SENTRY_DSN_OFF);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatch(/^\[Security\] SENTRY_DSN is not set, so error reporting is off for this run/);
+      // The boot smoke looks for Sentry's own line; this one must not stand in for it
+      expect(lines[0]).not.toContain('Invalid Sentry Dsn');
+    }
+  });
+
+  it("leaves an operator's DSN alone", () => {
+    const env = { SENTRY_DSN: 'https://key@sentry.example.org/42' };
+    expect(errorReportingDefaults(env)).toEqual([]);
+    expect(env.SENTRY_DSN).toBe('https://key@sentry.example.org/42');
+  });
+
+  it('sets a value the installed elizaOS server reads, and that its bundled Sentry does not accept as a DSN', () => {
+    // If an elizaOS upgrade changes either of these, this default must be checked again
+    const server = readFileSync(fileURLToPath(new URL('../node_modules/@elizaos/server/dist/index.js', import.meta.url)), 'utf8');
+    expect(server).toContain('const sentryDsn = process.env.SENTRY_DSN?.trim() || DEFAULT_SENTRY_DSN;');
+    // A DSN that does not match is dropped: the client gets no transport, and an enabled client needs one
+    expect(server).toMatch(/if \(this\._dsn\) \{\s*const url = getEnvelopeEndpointWithUrlEncodedAuth/);
+    expect(server).toContain('return this.getOptions().enabled !== false && this._transport !== undefined;');
+    const source = /var DSN_REGEX = (\/.+\/);/.exec(server)?.[1];
+    expect(source).toBeDefined();
+    const dsnPattern = new RegExp(source!.slice(1, -1));
+    expect(dsnPattern.test(SENTRY_DSN_OFF)).toBe(false);
+    // The pattern is the one that accepts elizaOS's own DSN
+    const builtIn = /const DEFAULT_SENTRY_DSN = "([^"]+)";/.exec(server)?.[1];
+    expect(builtIn && dsnPattern.test(builtIn)).toBe(true);
+  });
+});
