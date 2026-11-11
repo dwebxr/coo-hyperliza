@@ -1,10 +1,7 @@
 import {
-    type Action,
-    type HandlerCallback,
-    type IAgentRuntime,
-    type Memory,
-    type State,
-    logger
+  type Action,
+  type IAgentRuntime,
+  logger,
 } from '@elizaos/core';
 import { actingSession, connectedSession } from '../service';
 import { AgentControls } from '../systems/controls'; // Import AgentControls type
@@ -19,19 +16,13 @@ export const hyperfyStopMovingAction: Action = {
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
       return !!connectedSession(runtime)?.world?.controls;
     },
-    handler: async (
-      runtime: IAgentRuntime,
-      _message: Memory,
-      _state: State,
-      _options: unknown,
-      callback: HandlerCallback
-    ) => {
+    handler: async (runtime, _message, _state, _options, callback) => {
       // The turn's own connection (never a newer one); throws when the turn may no longer act.
       // Stopping waits for nobody: it ends whatever walk is in progress, whoever started it.
       const controls = actingSession(runtime)?.world?.controls as AgentControls | undefined;
 
       if (!controls) {
-        // Should not happen if validate works, but good practice
+        // Core runs a handler without calling validate() first, so this can happen
         logger.error('Hyperfy service or controls not found for HYPERFY_STOP_MOVING action.');
         await tellFailure(callback, STOP_MOVING, "Error: Cannot stop movement. Hyperfy connection/controls unavailable.");
         return actionFailed(STOP_MOVING, 'Hyperfy connection/controls unavailable');
@@ -50,7 +41,7 @@ export const hyperfyStopMovingAction: Action = {
         // Call the stop navigation method
         controls.stopAllActions(reason);
 
-        await callback({
+        await callback?.({
            text: ``,
            actions: [STOP_MOVING],
            source: 'hyperfy',

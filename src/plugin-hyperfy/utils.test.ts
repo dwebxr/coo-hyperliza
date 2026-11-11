@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TurnCancelled, neverAbortedSignal, runTurn } from './lib/turn-context';
-import { MAX_SPEECH_AUDIO_BYTES, MAX_TRANSCRIPT_RESPONSE_BYTES, TtsLimitReached, countOtherPlayers, generateElevenLabsTTS, generateOpenAITTS, generateSpeech, resolveUrl, transcribeWithElevenLabs } from './utils';
+import { MAX_SPEECH_AUDIO_BYTES, MAX_TRANSCRIPT_RESPONSE_BYTES, TtsLimitReached, countOtherPlayers, generateSpeech, resolveUrl, transcribeWithElevenLabs } from './utils';
 import { UsageBudget, resetUsageBudget } from '../usage-budget';
 
 const world = { assetsUrl: 'https://assets.example.com/' };
 
 describe('resolveUrl', () => {
+  afterEach(() => vi.restoreAllMocks());
+
   it('maps asset:// to the world assets URL', async () => {
     expect(await resolveUrl('asset://abc.glb', world)).toBe('https://assets.example.com/abc.glb');
   });
@@ -18,14 +20,17 @@ describe('resolveUrl', () => {
     }
   });
 
-  it('reads module-relative files as data URLs', async () => {
-    const result = await resolveUrl('constants.ts', world);
-    expect(result).toMatch(/^data:application\/octet-stream;base64,/);
+  it('reads a bundled file as a data URL of its type', async () => {
+    const result = await resolveUrl('assets/day2.hdr', world);
+    expect(result).toMatch(/^data:image\/vnd\.radiance;base64,/);
+    expect(Buffer.from(result!.split(',')[1], 'base64').subarray(0, 10).toString()).toBe('#?RADIANCE');
   });
 
-  it('refuses paths that escape the module directory', async () => {
-    expect(await resolveUrl('../../package.json', world)).toBeNull();
-    expect(await resolveUrl('../../.env', world)).toBeNull();
+  it('refuses local paths that are not bundled files: outside the asset root, or elsewhere inside it', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    for (const url of ['../../package.json', '../../.env', 'assets/../../constants.ts', 'constants.ts', 'puppeteer/page.js', 'assets']) {
+      expect(await resolveUrl(url, world), url).toBeNull();
+    }
   });
 
   it('refuses absolute paths', async () => {
@@ -33,12 +38,14 @@ describe('resolveUrl', () => {
   });
 
   it('refuses all local paths when allowLocal is false', async () => {
-    expect(await resolveUrl('constants.ts', world, { allowLocal: false })).toBeNull();
+    expect(await resolveUrl('assets/day2.hdr', world, { allowLocal: false })).toBeNull();
     expect(await resolveUrl('https://x.test/a.glb', world, { allowLocal: false })).toBe('https://x.test/a.glb');
   });
 
   it('returns null for non-strings', async () => {
-    expect(await resolveUrl(undefined, world)).toBeNull();
+    for (const value of [undefined, null, 42, { href: 'https://x.test/a.glb' }, ['asset://abc.glb']]) {
+      expect(await resolveUrl(value as never, world), String(value)).toBeNull();
+    }
   });
 });
 
@@ -65,7 +72,10 @@ describe('transcribeWithElevenLabs', () => {
   const realKey = process.env.ELEVENLABS_XI_API_KEY;
   afterEach(() => {
     globalThis.fetch = realFetch;
-    process.env.ELEVENLABS_XI_API_KEY = realKey;
+    // Assigning undefined would set the variable to the text "undefined"
+    if (realKey === undefined) delete process.env.ELEVENLABS_XI_API_KEY;
+    else process.env.ELEVENLABS_XI_API_KEY = realKey;
+    vi.restoreAllMocks();
   });
 
   it('posts the audio to the correct speech-to-text URL and returns the text', async () => {
@@ -81,13 +91,17 @@ describe('transcribeWithElevenLabs', () => {
     expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 
-  it('returns null without a key or on an API error, so the caller can fall back', async () => {
+  it('returns null without a key (making no request) or on an API error, so the caller can fall back', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{"detail":"missing_permissions"}', { status: 401 }));
+    globalThis.fetch = fetchMock as any;
     delete process.env.ELEVENLABS_XI_API_KEY;
     await expect(transcribeWithElevenLabs(Buffer.from('x'))).resolves.toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
 
     process.env.ELEVENLABS_XI_API_KEY = 'test-key';
-    globalThis.fetch = vi.fn().mockResolvedValue(new Response('{"detail":"missing_permissions"}', { status: 401 })) as any;
     await expect(transcribeWithElevenLabs(Buffer.from('x'))).resolves.toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -105,6 +119,7 @@ describe('speech API answers are read within a byte cap and a deadline', () => {
       if (env[key] === undefined) delete process.env[key];
       else process.env[key] = env[key];
     }
+    resetUsageBudget();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -147,9 +162,22 @@ describe('speech API answers are read within a byte cap and a deadline', () => {
     return { state, response: new Response(body, { status: 200 }) };
   }
 
+  /**
+   * generateSpeech with only that provider's key set, so its one request goes to that provider
+   * (checked: the request the stubbed fetch saw was for `url`).
+   */
+  const only = (key: 'ELEVENLABS_XI_API_KEY' | 'OPENAI_API_KEY', url: string) => async (text: string) => {
+    for (const other of ['ELEVENLABS_XI_API_KEY', 'OPENAI_API_KEY']) if (other !== key) delete process.env[other];
+    const audio = await generateSpeech(text);
+    const asked = vi.mocked(globalThis.fetch).mock.calls.map(([input]) => String(input));
+    expect(asked).toHaveLength(1);
+    expect(asked[0].startsWith(url)).toBe(true);
+    return audio;
+  };
+  const elevenLabsOnly = only('ELEVENLABS_XI_API_KEY', 'https://api.elevenlabs.io/v1/text-to-speech/');
   const speech = [
-    ['ElevenLabs text-to-speech', generateElevenLabsTTS],
-    ['OpenAI text-to-speech', generateOpenAITTS],
+    ['ElevenLabs text-to-speech', elevenLabsOnly],
+    ['OpenAI text-to-speech', only('OPENAI_API_KEY', 'https://api.openai.com/v1/audio/speech')],
   ] as const;
 
   it.each(speech)('%s: gives up on audio larger than 16 MB while it arrives, and downloads no more of it', async (_what, generate) => {
@@ -227,7 +255,7 @@ describe('speech API answers are read within a byte cap and a deadline', () => {
       { highWaterMark: 0 }
     );
     globalThis.fetch = vi.fn().mockResolvedValue(new Response(body, { status: 500 })) as never;
-    await expect(generateElevenLabsTTS('hello')).resolves.toBeNull();
+    await expect(elevenLabsOnly('hello')).resolves.toBeNull();
     const line = String(error.mock.calls[0][0]);
     expect(line.startsWith('[ElevenLabs TTS] API error 500: eee')).toBe(true);
     expect(line.length).toBeLessThanOrEqual(2048 + 40);

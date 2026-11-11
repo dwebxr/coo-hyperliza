@@ -69,6 +69,8 @@ describe('uploadAsset', () => {
     expect(isPermanentRefusal(badGateway)).toBe(false);
 
     const limited = await uploadAsset(network, file(), { net, fetchImpl: fakeFetch(() => json({ error: 'slow down' }, 429)) }).catch((e) => e);
+    expect(limited).toBeInstanceOf(AssetUploadError);
+    expect(limited.status).toBe(429);
     expect(isPermanentRefusal(limited)).toBe(false);
 
     const down = fakeFetch(() => {
@@ -86,7 +88,8 @@ describe('uploadAsset', () => {
         new Promise((_resolve, reject) => init.signal?.addEventListener('abort', () => reject(init.signal!.reason)))
     );
     const error = await uploadAsset(network, file(), { net, fetchImpl: hang, timeoutMs: 20 }).catch((e) => e);
-    expect(error.message).toContain('timed out');
+    expect(error).toBeInstanceOf(AssetUploadError);
+    expect(error.message).toBe('Upload failed: timed out');
     expect(isPermanentRefusal(error)).toBe(false);
   });
 
@@ -111,10 +114,13 @@ describe('uploadAsset', () => {
     expect(authOf((fetchImpl.mock.calls[0] as [string, RequestInit])[1])).toBeUndefined();
   });
 
-  it('fails clearly before the world has sent its API URL', async () => {
-    const error = await uploadAsset({ apiUrl: null }, file(), { net, fetchImpl: fakeFetch(() => json({})) }).catch((e) => e);
+  it('fails, saying why and as worth retrying, before the world has sent its API URL, and sends nothing', async () => {
+    const fetchImpl = fakeFetch(() => json({}));
+    const error = await uploadAsset({ apiUrl: null }, file(), { net, fetchImpl }).catch((e) => e);
     expect(error).toBeInstanceOf(AssetUploadError);
+    expect(error.message).toBe('Upload failed: the world has not sent its API URL yet');
     expect(isPermanentRefusal(error)).toBe(false);
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
 
@@ -163,10 +169,16 @@ describe('where the session token goes (real requests, against servers on loopba
     expect(foreign.connections + world.connections).toBe(0);
   });
 
-  it('refuses every API URL when the world origin is unknown, and one that is not a URL', async () => {
+  it('refuses an API URL when the world origin is unknown, one that is not absolute, one with no origin of its own, and one on another port or scheme of the world', async () => {
     const foreign = await worldApi();
-    for (const [apiUrl, origin] of [[`http://127.0.0.1:${foreign.port}/api`, null], ['/api', 'https://world.test'], ['data:text/plain,x', 'null']] as const) {
+    for (const [apiUrl, origin, why] of [
+      [`http://127.0.0.1:${foreign.port}/api`, null, "not on the world's own origin (unknown, from WS_URL)"],
+      ['/api', 'https://world.test', "the world's API URL is on no usable origin"],
+      ['data:text/plain,x', 'null', "the world's API URL is on no usable origin"],
+    ] as const) {
       const error = await uploadAsset({ apiUrl }, file(), { net: new NetPolicy({ worldOrigin: origin }), authToken: TOKEN }).catch((e) => e);
+      expect(error, apiUrl).toBeInstanceOf(AssetUploadError);
+      expect(error.message, apiUrl).toContain(why);
       expect(isPermanentRefusal(error)).toBe(true);
     }
     expect(foreign.connections).toBe(0);
@@ -258,12 +270,14 @@ describe('where the session token goes (real requests, against servers on loopba
 
     const error = await uploadAsset({ apiUrl: `${origin}/api` }, file(), { net: new NetPolicy({ worldOrigin: origin }), authToken: TOKEN }).catch((e) => e);
 
+    expect(error).toBeInstanceOf(AssetUploadError);
+    expect(error.message).toContain('answered with a redirect (HTTP 302)');
     expect(isPermanentRefusal(error)).toBe(true);
     expect(world.hits).toHaveLength(1);
     expect(elsewhere.connections).toBe(0);
   });
 
-  it('tells the operator, once the snapshot is in, when the world names an API or assets URL the agent will not use', () => {
+  it('says, for the operator, which of the API and assets URLs a world names the agent will not use, and why', () => {
     const net = new NetPolicy({ worldOrigin: 'http://127.0.0.1:3000' });
     expect(worldEndpointProblems(net, { apiUrl: 'http://127.0.0.1:3000/api', assetsUrl: 'http://127.0.0.1:3000/assets' })).toEqual([]);
     // A public https assets host (a bucket or CDN) is fine; the API is not
@@ -358,9 +372,12 @@ describe('ensureAsset', () => {
   });
 
   it('is not ok when an upload "succeeds" but the file never appears', async () => {
-    const { world: w } = await world(vi.fn().mockResolvedValue(undefined));
+    const upload = vi.fn().mockResolvedValue(undefined);
+    const { world: w } = await world(upload);
     const result = await ensureAsset(w, asset);
     expect(result).toMatchObject({ ok: false, retryable: true });
+    expect(result.ok === false && result.error.message).toMatch(/^uploaded [0-9a-f]{64}\.vrm, but the world does not serve it$/);
+    expect(upload).toHaveBeenCalledTimes(1);
   });
 
   it("passes the world's refusal through", async () => {
@@ -370,20 +387,24 @@ describe('ensureAsset', () => {
     expect(result).toEqual({ ok: false, fileName: expect.stringMatching(/\.vrm$/), error: refusal, retryable: false });
   });
 
-  it('retries after a failure that may pass', async () => {
+  it('reports a failure that may pass as worth retrying', async () => {
     const outage = new AssetUploadError('Upload failed (HTTP 503): Service Unavailable', 503);
     const { world: w } = await world(vi.fn().mockRejectedValue(outage));
     const result = await ensureAsset(w, asset);
-    expect(result).toMatchObject({ ok: false, retryable: true });
+    expect(result).toMatchObject({ ok: false, retryable: true, error: outage });
   });
 
-  it('without uploading, retries only when the lookup itself failed', async () => {
+  it('asked not to upload, uploads nothing, and reports a missing file as worth retrying only when the lookup itself failed', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     let status: number | undefined;
-    const { world: w } = await world(vi.fn(), new Set(), () => status);
+    const upload = vi.fn();
+    const { world: w, server } = await world(upload, new Set(), () => status);
     expect(await ensureAsset(w, asset, { upload: false })).toMatchObject({ ok: false, retryable: false });
     status = 503;
     expect(await ensureAsset(w, asset, { upload: false })).toMatchObject({ ok: false, retryable: true });
+    // Both are looked up
+    expect(server.hits.map((hit) => hit.method)).toEqual(['HEAD', 'HEAD']);
+    expect(upload).not.toHaveBeenCalled();
   });
 
   it('does not hand out an upload it could not confirm', async () => {
@@ -391,7 +412,9 @@ describe('ensureAsset', () => {
     let uploaded = false;
     const { world: w } = await world(async () => { uploaded = true; }, new Set(), () => (uploaded ? 503 : 404));
     const result = await ensureAsset(w, asset);
+    expect(uploaded).toBe(true);
     expect(result).toMatchObject({ ok: false, retryable: true });
+    expect(result.ok === false && result.error.message).toMatch(/^uploaded [0-9a-f]{64}\.vrm, but it could not be looked up$/);
   });
 
   it('checks assets on another, public https origin without the exception (a bucket or CDN), and gives up on an assets URL the policy refuses', async () => {

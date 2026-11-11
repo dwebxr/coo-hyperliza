@@ -7,9 +7,10 @@ import { truncateCodePoints } from './plugin-hyperfy/lib/text';
 import { getUsageBudget } from './usage-budget';
 
 /**
- * ElevenLabs speech for other plugins (e.g. Discord voice), which go through runtime models.
- * Hyperfy voice calls the same helpers directly. Replaces @elizaos/plugin-elevenlabs, whose
- * TRANSCRIPTION handler requests .../v1/v1/speech-to-text (404).
+ * ElevenLabs speech as runtime models: speech-to-text for Hyperfy voice input
+ * (managers/voice-manager.ts) and for other plugins, text-to-speech for other plugins (e.g.
+ * Discord voice). Hyperfy's own speech output calls the helper directly (utils.ts generateSpeech).
+ * Used instead of @elizaos/plugin-elevenlabs.
  */
 
 const AUDIO_DOWNLOAD_TIMEOUT_MS = 30_000;
@@ -48,7 +49,7 @@ async function textToSpeech(_runtime: IAgentRuntime, input: string | { text: str
   const spoken = truncateCodePoints(text.trim(), MAX_TTS_CODE_POINTS);
   // Counted against VOICE_TTS_MAX_CHARS_PER_DAY before the request and settled by the same rule
   // as Hyperfy voice (utils.ts generateSpeech, usage-budget.ts reserveTts): a request the
-  // provider refused (a 4xx answer) is given back; any other failed one stays counted, as it may
+  // provider refused (a 4xx answer other than 408 and 409) is given back; any other failed one stays counted, as it may
   // have been billed
   const budget = getUsageBudget();
   const reservation = budget.reserveTts(spoken.length);

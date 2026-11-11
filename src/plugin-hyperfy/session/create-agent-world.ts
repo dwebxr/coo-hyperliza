@@ -5,7 +5,6 @@ import { AgentEnvironment } from '../systems/environment.js'
 import { AgentLoader } from '../systems/loader'
 import { AgentLiveKit } from '../systems/liveKit.js'
 import { AgentActions } from '../systems/actions.js'
-import { loadPhysX } from '../physx/loadPhysX.js'
 import { type UploadOptions, uploadAsset, worldEndpointProblems } from '../lib/asset-upload'
 import { NetPolicy, installWorldNet } from '../lib/net-policy'
 import { createScriptNetwork } from '../lib/script-network'
@@ -138,7 +137,7 @@ export function createAgentWorld({ wsUrl, sandboxedScripts }: { wsUrl: string; s
     async init(authToken?: string) {
       if (typeof world.init !== 'function') throw new Error('world.init is not a function')
       // The auth token comes from localstorage.json (ClientNetwork ignores initialAuthToken)
-      await world.init({ wsUrl, viewport: mockElement, ui: mockElement, initialAuthToken: authToken, loadPhysX })
+      await world.init({ wsUrl, viewport: mockElement, ui: mockElement, initialAuthToken: authToken })
     },
   }
 }

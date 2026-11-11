@@ -501,16 +501,23 @@ describe('redirects', () => {
     const post = (path: string) => policy.fetch(`https://cdn.test${path}`, { maxBytes: 100, method: 'post', body: 'payload', headers: { Authorization: 'Bearer caller', 'Content-Type': 'text/plain' } });
     const landed = (server: typeof first) => server.hits.filter((hit) => hit.url === '/landed').at(-1)!;
 
-    for (const status of [301, 302, 303]) {
-      await post(`/${status}`);
+    const landings = (server: typeof first) => server.hits.filter((hit) => hit.url === '/landed').length;
+
+    // Each request lands once more: what is read below is this request's landing, not an earlier one
+    for (const [done, status] of [301, 302, 303].entries()) {
+      await expect(post(`/${status}`)).resolves.toMatchObject({ status: 200, url: 'https://cdn.test/landed' });
+      expect([status, landings(first)]).toEqual([status, done + 1]);
       expect([landed(first).method, landed(first).body, landed(first).headers['content-type']]).toEqual(['GET', '', undefined]);
       expect(landed(first).headers.authorization).toBe('Bearer caller');
     }
-    for (const status of [307, 308]) {
-      await post(`/${status}`);
+    for (const [done, status] of [307, 308].entries()) {
+      await expect(post(`/${status}`)).resolves.toMatchObject({ status: 200, url: 'https://cdn.test/landed' });
+      expect([status, landings(first)]).toEqual([status, done + 4]);
       expect([landed(first).method, landed(first).body, landed(first).headers['content-type']]).toEqual(['POST', 'payload', 'text/plain']);
+      expect(landed(first).headers.authorization).toBe('Bearer caller');
     }
-    await post('/307-away');
+    await expect(post('/307-away')).resolves.toMatchObject({ status: 200, url: 'https://assets.test/landed' });
+    expect(landings(second)).toBe(1);
     expect([landed(second).method, landed(second).body]).toEqual(['POST', 'payload']);
     expect(landed(second).headers.authorization).toBeUndefined();
   });
@@ -529,7 +536,9 @@ describe('redirects', () => {
       await policy.fetch(`https://cdn.test/${status}`, { maxBytes: 100 });
       expect([status, landed().method]).toEqual([status, 'GET']);
     }
-    await policy.fetch('https://cdn.test/303', { maxBytes: 100, method: 'PUT', body: 'x' });
+    const landingsSoFar = server.hits.filter((hit) => hit.url === '/landed').length;
+    await expect(policy.fetch('https://cdn.test/303', { maxBytes: 100, method: 'PUT', body: 'x' })).resolves.toMatchObject({ status: 200, url: 'https://cdn.test/landed' });
+    expect(server.hits.filter((hit) => hit.url === '/landed')).toHaveLength(landingsSoFar + 1);
     expect([landed().method, landed().body]).toEqual(['GET', '']);
   });
 });
@@ -594,13 +603,21 @@ describe('the body', () => {
 
 describe('bounds', () => {
   it('refuses a body that declares more than the cap without reading it', async () => {
-    const server = await startServer((_request, response) => response.writeHead(200, { 'content-length': '1000' }).end(Buffer.alloc(1000)), { tls: true });
+    const server = await startServer((request, response) => {
+      response.writeHead(200, { 'content-length': '1000' });
+      // /declared sends its headers and never a byte of its body: only the declaration can be judged
+      if (request.url === '/declared') return void response.flushHeaders();
+      response.end(Buffer.alloc(1000));
+    }, { tls: true });
     const { policy } = testNet({ hosts: { 'cdn.test': PUBLIC_ADDRESS }, routes: { 'cdn.test:443': { port: server.port, direct: true } } });
 
-    const error = await refusal(policy.fetch('https://cdn.test/big', { maxBytes: 999 }));
+    const error = await refusal(policy.fetch('https://cdn.test/declared', { maxBytes: 999, timeoutMs: 10_000 }));
 
     expect(error.kind).toBe('too-large');
     expect(error.message).toBe('the response is larger than 999 bytes');
+    await expect.poll(() => server.cutShort).toBe(1);
+    const sent = await refusal(policy.fetch('https://cdn.test/big', { maxBytes: 999 }));
+    expect([sent.kind, sent.message]).toEqual(['too-large', 'the response is larger than 999 bytes']);
     await expect(policy.fetch('https://cdn.test/big', { maxBytes: 1000 })).resolves.toMatchObject({ status: 200 });
   });
 

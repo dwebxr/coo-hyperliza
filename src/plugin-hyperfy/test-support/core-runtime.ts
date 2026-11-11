@@ -4,8 +4,10 @@ import { hyperfyPlugin } from '../index';
 import { type SessionOverrides, serviceFor, sessionFor, withParts } from './session';
 
 /*
- * A real elizaOS core AgentRuntime (1.7.2) for driving real processActions in tests: only the two
- * adapter calls processActions makes, composeState, getService and useModel are stubbed.
+ * A real elizaOS core AgentRuntime (1.7.2) for driving real processActions in tests: the adapter
+ * is replaced by three calls (createMemory and log, which processActions makes, and
+ * getParticipantUserState for the message handler), and composeState, getService and useModel are
+ * stubbed.
  */
 
 export const uuid = () => crypto.randomUUID() as UUID;
@@ -25,7 +27,8 @@ export function createRuntime({
 }: { service?: unknown; models?: Record<string, ModelStub>; actions?: Action[] } = {}) {
   const runtime = new AgentRuntime({ character: { name: 'Coo', bio: [], settings: {} }, plugins: [] });
   const recorded: Recorded = { memories: [], callbacks: [] };
-  // Only the two adapter calls processActions makes; runtime.createMemory itself stays real
+  // The two adapter calls processActions makes and the one the message handler makes;
+  // runtime.createMemory itself stays real
   (runtime as { adapter: unknown }).adapter = {
     createMemory: async (memory: Memory) => {
       recorded.memories.push(memory);

@@ -232,6 +232,13 @@ const SPECIES_REPORT = `
   }, 100)
 `;
 const RECEIVER_REFUSED = 'A function cannot be the `this` of a world API function';
+/**
+ * The attempts of a hostile fixture that ended in a throw (its notes say 'threw <message>'). A
+ * fixture's attempt that throws stops there, and what it would have looked at next is not looked
+ * at: the tests list the attempts that may end that way, so that one more of them fails the test
+ * instead of passing as "found nothing".
+ */
+const threw = (notes: Record<string, unknown>) => Object.keys(notes).filter((name) => typeof notes[name] === 'string' && (notes[name] as string).startsWith('threw ')).sort();
 
 const runtimes: [string, boolean][] = [
   ['bun', hasBun || !withoutBun],
@@ -260,6 +267,19 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     expect(found.notes.walked).toBeGreaterThan(500);
     expect(found.notes.captured).toBeGreaterThan(10);
     expect(report.crashes).toBe(0);
+    // The attempts that ended in a throw: what the sandbox refuses, and what the engine itself
+    // cannot do here (no PhysX in this scenario, node types that do not exist). Every other attempt
+    // ran to its end. ('state' ends at the refused app.state.__proto__ assignment: the fixture does
+    // not get to walking app.state.)
+    expect(threw(found.notes)).toEqual([
+      'Array.prototype', 'AsyncFunction', 'AsyncGeneratorFunction', 'Function', 'Function.prototype', 'GeneratorFunction', 'Object.prototype',
+      'app.__defineGetter__', 'app.__defineSetter__', 'app.add(fake)', 'app.remove(fake)',
+      'create __proto__', 'create constructor', 'create joint', 'create rigidbody',
+      'globals are locked', 'host error',
+      'math: __proto__', 'math: instance prototype', 'math: prototype', 'math: shadow a method',
+      'overlapSphere', 'player position: shadow copy()', 'raycast', 'ref getter', 'state',
+      'world.__defineGetter__', 'world.add(fake)', 'world.add(geometry ref)', 'world.attach(fake)',
+    ]);
 
     // Evaluators and intrinsics
     expect(found.notes.Function).toContain('threw');
@@ -271,6 +291,11 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     expect(found.notes['app.add(fake)']).toBe('threw add() expects a node');
     expect(found.notes['world.add(fake)']).toBe('threw world.add() expects a node');
     expect(found.notes['world.attach(fake)']).toBe('threw world.attach() expects a node');
+    expect(found.notes['app.remove(fake)']).toBe('threw remove() expects a node');
+    // Forged references: refused when the script's object is copied, before any node guard
+    expect(found.notes['world.add(geometry ref)']).toBe('threw A world script cannot pass a property named _isRef');
+    expect(found.notes['ref getter']).toBe('threw A world script cannot pass a property named _isRef');
+    expect(found.notes['host error']).toBe('threw [raycast] origin must be Vector3');
     // Math objects: no method replaced, on the instance or on the shared class
     expect(found.notes['math: shadow a method']).toContain('threw');
     expect(found.notes['math: prototype']).toContain('threw');
@@ -286,8 +311,11 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     // The item's trigger and the control's keyX handler ran with nothing but the script's own values
     expect(events(report, 'triggered')).toHaveLength(1);
     expect(events(report, 'keyX')).toHaveLength(1);
-    // console.log of objects with custom-inspect hooks reached the host console as text
-    expect(report.logs.filter((line) => line.includes('[script]')).every((line) => !line.includes('nodejs.util.inspect.custom'))).toBe(true);
+    // console.log of objects with custom-inspect hooks reached the host console as text: the
+    // copies' own fields, not what the hooks return, and no hook among them
+    const scriptLines = report.logs.filter((line) => line.includes('[script]'));
+    expect(scriptLines.slice(0, 3)).toEqual(['log: [script] { secret: 1 } [ { secret: 1 } ] { nested: { secret: 1 } }', 'warn: [script] { secret: 1 }', 'error: [script] { secret: 1 }']);
+    expect(scriptLines.every((line) => !line.includes('nodejs.util.inspect.custom'))).toBe(true);
   });
 
   test('the same script in the engine\'s own compartment (lockdown, no membrane) reaches the raw world', () => {
@@ -321,7 +349,7 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     expect(report.logs.join('\n')).toContain('fetch() is not available');
     // world.load() of a URL inside the agent's network (the fixture's http://127.0.0.1:9/internal.glb
     // is a server that is really listening, in the child): the loader's network policy refuses it,
-    // and the server is never asked. Before the policy was applied in the loader, this was one request.
+    // and the server is never asked (a request would be in report.outbound).
     expect(report.outbound).toEqual([]);
     expect(found.notes.loadFailure).toBe('world.load() failed');
     expect(found.notes.load).toBe('node');
@@ -393,7 +421,7 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
       mode: 'sandboxed',
       script: fixture('hostile-app.js'),
       waitForEvent: 'report',
-      physxModule: path.join(repo, 'src/plugin-hyperfy/physx/loadPhysX.js'),
+      physxModule: path.join(repo, 'src/plugin-hyperfy/hyperfy/src/core/loadPhysX.js'),
     });
     const [found] = events(report, 'report');
 
@@ -499,14 +527,15 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     expect(report.outbound).toEqual([]);
   });
 
-  // ---- regressions of the P1a2 review: before the fix each of these was a way out of the sandbox ----
+  // ---- the ways out of the sandbox the P1a2 review found (S-01 ... S-08): each stays closed ----
 
   test('S-01: a promise a script passes to the host never hands its species constructor a host value', () => {
     const script = `${SPECIES} console.log('innocent', speciesPromise()); app.state = { p: speciesPromise() }; world.emit('species', speciesPromise()); ${SPECIES_REPORT}`;
     const report = run(runtime, { mode: 'sandboxed', script, waitForEvent: 'report' });
     const [found] = events(report, 'report');
 
-    // Before the fix: the raw engine app proxy, and through it the World
+    // The species constructors did run, and were handed nothing: not the raw engine app proxy
+    // (through which a script has the World), which is what then() on the script's promise hands them
     expect(found.handed.length).toBeGreaterThan(0);
     expect(found.handed.every((value: string) => value === 'undefined')).toBe(true);
     expect(found.entity.every((value: string) => value === 'undefined')).toBe(true);
@@ -548,8 +577,9 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     const report = run(runtime, { mode: 'sandboxed', script, waitForEvent: 'report' });
     const [found] = events(report, 'report');
 
-    // Before the fix: asked 2, the carrier's activate() was handed the raw { world, entity }, and the
-    // host's bytes were the script's own buffer
+    // The species constructor is never asked (slice() on the script's buffer asks it), so its
+    // carrier never reaches the engine, whose add() would call carrier.activate({ world, entity });
+    // and the host's bytes are a copy, not the script's own buffer
     expect(found).toEqual({ asked: 0, used: [], add: 'add() expects a node', worldAdd: 'world.add() expects a node', stored: [1, 0, 0, 0] });
     expect(packets(report)).toEqual(['entityEvent']);
   });
@@ -588,7 +618,7 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     const report = run(runtime, { mode: 'sandboxed', script, waitForEvent: 'report' });
     const [found] = events(report, 'report');
 
-    // Before the fix: 'ran', and the engine's num() had own properties x, y, z
+    // Refused each time: a call that ran would have written x, y and z onto the engine's own num()
     expect(found).toEqual({ num: RECEIVER_REFUSED, Vector3: RECEIVER_REFUSED, 'world.add': RECEIVER_REFUSED, own: RECEIVER_REFUSED, roundTrip: true });
     expect(report.host.endowedUntouched).toBe(true);
     expect(report.endowedFrozen).toBe(true);
@@ -600,7 +630,7 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
       script: fixture('hostile-hooks.js'),
       waitForEvent: 'report',
       // Joints need PhysX
-      physxModule: path.join(repo, 'src/plugin-hyperfy/physx/loadPhysX.js'),
+      physxModule: path.join(repo, 'src/plugin-hyperfy/hyperfy/src/core/loadPhysX.js'),
     });
     const [found] = events(report, 'report');
 
@@ -617,6 +647,17 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     expect(notes.trapped).toBeGreaterThan(50);
     expect(notes.handed).toEqual(expect.arrayContaining(['valueOf', 'own then', 'error message', 'reentrant getter', 'getter this']));
     expect(notes.reThrown).toBe('thrown by the script');
+    // The attempts that ended in a throw: the refusals below, and the joint that is not mounted.
+    // Every other attempt ran to its end, handing the host its hooks.
+    expect(threw(notes)).toEqual([
+      'buffer species: app.add', 'buffer species: world.add', 'coercion: emit name', 'coercion: event name',
+      'fake node: lod.insert', 'fake: collider.geometry', 'fake: joint.body1',
+      'forged: app.add', 'forged: collider.geometry', 'forged: joint.body0', 'forged: lod.insert', 'forged: props', 'forged: video.geometry', 'forged: world.add',
+      'lookalike: geometry reference with traverse', 'real: joint.body0',
+      'receiver: class', 'receiver: copy', 'receiver: endowed helper', 'receiver: own function', 'receiver: world API function',
+    ]);
+    expect(notes['coercion: event name']).toBe('threw app.send(): the event name must be a string');
+    expect(notes['coercion: emit name']).toBe('threw app.emit(): the event name must be a string');
     // Forged references and fake nodes, refused by every member that takes a node...
     for (const name of ['forged: app.add', 'forged: world.add', 'forged: lod.insert', 'forged: collider.geometry', 'forged: joint.body0', 'forged: video.geometry']) {
       expect(notes[name], name).toBe('threw A world script cannot pass a property named _isRef');
@@ -628,11 +669,14 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     expect(notes['fake: joint.body1']).toBe('threw body1 must be a node');
     expect(notes['buffer species: app.add']).toBe('threw add() expects a node');
     expect(notes['buffer species: world.add']).toBe('threw world.add() expects a node');
-    expect(notes['forged: props']).toMatch(/^threw /);
+    // The assignment itself is refused (V8 and JavaScriptCore word it differently)
+    expect(notes['forged: props']).toMatch(/^threw .*'set'.*trap returned fals(ish|y).* '_isRef'$/);
     // ...while the real uses still work (the joint then needs to be mounted, which it is not here)
     expect(notes['real node: lod.insert']).toBe('ok');
     expect(notes['real: collider.geometry']).toBe('ok');
     expect(notes['real: joint.body0']).not.toContain('must be a node');
+    // (past the guard, in the engine's own setter, which reads the missing ctx)
+    expect(notes['real: joint.body0']).toMatch(/^threw .*\bnull\b.*world/);
     for (const name of ['receiver: endowed helper', 'receiver: class', 'receiver: world API function', 'receiver: own function', 'receiver: copy']) {
       expect(notes[name], name).toBe(`threw ${RECEIVER_REFUSED}`);
     }
@@ -660,7 +704,7 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     const logs = report.logs.join('\n');
 
     expect(events(report, 'report')).toHaveLength(1);
-    // Before the fix: the hooks ran with the runtime's own inspect and rewrote inspect.defaultOptions
+    // No hook ran: one that does gets the runtime's own inspect, and rewrites inspect.defaultOptions
     expect(events(report, 'hook')).toEqual([]);
     expect(report.host).toEqual(untouchedHost);
     // Nine routes (the tenth, an async callback the engine calls, is handled by the membrane), each to both listeners
@@ -696,8 +740,9 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     const logs = report.logs.join('\n');
 
     expect(events(report, 'tick').length).toBeGreaterThan(1);
-    // Before the fix: World.destroy() stopped at Entities, so Physics, Stage, NodeClient (the tick
-    // loop), ClientNetwork (the socket) and NodeEnvironment were never destroyed
+    // Every system is reached: the engine's own World.destroy() stops at the first that throws
+    // (Entities, with this script), leaving Physics, Stage, NodeClient (the tick loop),
+    // ClientNetwork (the socket) and NodeEnvironment alive
     expect(report.teardownFailures).toEqual([]);
     expect(report.systemsDestroyed).toEqual(report.systemsTotal);
     expect(report.systemsTotal).toEqual(expect.arrayContaining(['Entities', 'Physics', 'Stage', 'NodeClient', 'ClientNetwork']));
@@ -730,7 +775,7 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     const report = run(runtime, { mode: 'sandboxed', script, waitForEvent: 'report', model: 'vrm' });
     const [found] = events(report, 'report');
 
-    // Before the fix: avatar.add(fake) was accepted, and the engine called the fake's activate with the app's ctx
+    // A fake child that was accepted would have its activate() called by the engine with the app's ctx
     expect(found).toEqual({
       kind: 'avatar:function',
       'avatar.add(fake)': 'threw add() expects a node',
@@ -747,7 +792,7 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
   test('V-04: two activations at once share one: both succeed, the self-test runs once', () => {
     const report = run(runtime, { mode: 'sandboxed', script: '', concurrentActivations: 2 });
 
-    // Before the fix: [true, false], and HyperfyService would have exited the process
+    // Both true: HyperfyService exits the process when its activation says false
     expect(report.activations).toEqual([true, true]);
     expect(report.logs.filter((line) => /sandbox self-test passed/.test(line))).toHaveLength(1);
   });
@@ -798,8 +843,8 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     const [found] = events(run(runtime, { mode: 'sandboxed', script, waitForEvent: 'report' }), 'report');
     const name = (method: string) => `threw ${method}: the event name must be a string`;
 
-    // Before the fix: the made-up geometries reached the engine (and PhysX cooking), and the array
-    // names went past the engine's filter and were delivered to other apps as 'chat' and 'command'
+    // Refused here: made-up geometries would reach the engine (and PhysX cooking), and array names
+    // pass the engine's own filter and are delivered to other apps as 'chat' and 'command'
     expect(found).toEqual({
       mesh: 'threw app.create(): geometry must be the geometry of a node',
       collider: 'threw app.create(): geometry must be the geometry of a node',
@@ -852,8 +897,8 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     const [found] = events(report, 'report');
     const callback = (name: string) => `threw ${name} must be a function`;
 
-    // Before the fix: the object was accepted, app.destroy() threw "opts.onEnd is not a function"
-    // halfway through the engine's unbuild, and the script's listeners and timers stayed alive
+    // Refused here: with an object accepted as onEnd, app.destroy() throws "opts.onEnd is not a
+    // function" halfway through the engine's unbuild, and the script's listeners and timers stay alive
     expect(found).toEqual({
       'effect, onEnd an object': callback('applyEffect(): onEnd'),
       'effect, onEnd a string': callback('applyEffect(): onEnd'),
@@ -894,7 +939,7 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     const forged = { _isRef: true, _ref: { isBufferGeometry: true, attributes: { position: { count: 3, array: [0, 0, 0, 1, 0, 0, 0, 1, 0], itemSize: 3 } }, index: null } };
     const [found] = events(run(runtime, { mode: 'sandboxed', script, waitForEvent: 'report', props: { forged } }), 'report');
 
-    // Before the fix: the forged ones were taken, and a collider's PhysX cooking would read them
+    // The forged ones are refused: a collider's PhysX cooking would read them
     expect(found).toEqual({
       'collider setter, forged': 'threw geometry must be the geometry of a node',
       'create collider, forged': 'threw app.create(): geometry must be the geometry of a node',
@@ -911,7 +956,9 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     const { status, stderr, report } = runEvents(runtime, { early: true });
 
     expect(status, stderr.slice(-2000)).toBe(0);
-    expect(report).toMatchObject({ activated: true, done: true, hooks: [], raw: {} });
+    expect(report).toMatchObject({ activated: true, done: true, hooks: [] });
+    // No listener was called with a value a script made
+    expect(report!.raw).toEqual({});
     const allTrue = { listed: true, rawListedInNodeShape: true, counted: true, removedBeforeFiring: true, onceFiredOnce: true, onceGone: true, allRemoved: true };
     expect(report!.semanticsBefore).toEqual(allTrue);
     expect(report!.semanticsAfter).toEqual(allTrue);
@@ -938,7 +985,8 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     const { status, stderr, report } = runEvents(runtime, { early: false });
 
     expect(status, stderr.slice(-2000)).toBe(0);
-    expect(report).toMatchObject({ activated: true, done: true, hooks: [], raw: {} });
+    expect(report).toMatchObject({ activated: true, done: true, hooks: [] });
+    expect(report!.raw).toEqual({});
     expect(report!.semanticsAfter).toEqual({ listed: true, rawListedInNodeShape: true, counted: true, removedBeforeFiring: true, onceFiredOnce: true, onceGone: true, allRemoved: true });
     expect(report!.calls['before: once']).toBe(runtime === 'node' ? 1 : 5);
     expect(report!.calls['after: once']).toBe(1);
@@ -948,7 +996,8 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     const { status, stderr, report } = runEvents(runtime, { early: true, capturedOn: true });
     const tag = 'after: process.on taken before the guard';
 
-    expect(report).toMatchObject({ activated: true, hooks: [], raw: {} });
+    expect(report).toMatchObject({ activated: true, hooks: [] });
+    expect(report!.raw).toEqual({});
     if (runtime === 'node') {
       expect(status, stderr.slice(-2000)).toBe(0);
       expect(report!.calls[tag]).toBe(5);
@@ -967,7 +1016,8 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     expect(report?.activated).toBe(true);
     if (runtime === 'node') {
       expect(status, stderr.slice(-2000)).toBe(0);
-      expect(report).toMatchObject({ hooks: [], raw: {} });
+      expect(report!.hooks).toEqual([]);
+      expect(report!.raw).toEqual({});
       expect(report!.calls[tag]).toBe(5);
     } else {
       expect(status).toBe(1);

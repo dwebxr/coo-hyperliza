@@ -1,7 +1,7 @@
 /**
  * The bytes of an asset a world names (a model, avatar, emote, script, image or HDR environment):
  * a bundled file, an inline data: URL, or a download under the world's network policy
- * (lib/net-policy.ts) with the operator's byte cap for that kind of asset.
+ * (lib/net-policy.ts) with the agent's byte cap for that kind of asset.
  */
 import { resolveUrl } from '../utils';
 import type { AssetLease } from './asset-memory';
@@ -26,13 +26,17 @@ export interface AssetBytes {
   bytes: Uint8Array;
   /** The Content-Type the source gave (lower case, without parameters), or '' */
   contentType: string;
-  /** Where the bytes came from, as resolveUrl spelled it (the last URL, after redirects) */
+  /** What was asked for, as resolveUrl spelled it: the first URL (redirects do not show), or the whole data: URL for an inline or bundled file */
   url: string;
 }
 
 export { describeUrl } from './log-url';
 
-/** The bytes and type of a data: URL, read without building anything larger than `maxBytes`. */
+/**
+ * The bytes and type of a data: URL. A base64 payload that would decode to more than `maxBytes` is
+ * refused before it is decoded; any other payload only when it is longer than 3 × `maxBytes`
+ * characters, and after decoding otherwise.
+ */
 export function decodeDataUrl(url: string, maxBytes: number): { bytes: Uint8Array; contentType: string } {
   const comma = url.indexOf(',');
   if (!url.startsWith('data:') || comma === -1) throw new Error('not a valid data: URL');
@@ -40,7 +44,7 @@ export function decodeDataUrl(url: string, maxBytes: number): { bytes: Uint8Arra
   const base64 = meta.at(-1)?.trim().toLowerCase() === 'base64';
   const contentType = (meta[0] ?? '').trim().toLowerCase();
   const payload = url.slice(comma + 1);
-  // Base64 is 4 characters for 3 bytes; percent-encoding is never shorter than what it encodes
+  // Base64 is 4 characters for 3 bytes; any other payload holds at least one byte per 3 characters (%XX)
   const atLeast = base64 ? Math.floor((payload.length * 3) / 4) - 2 : Math.ceil(payload.length / 3);
   if (atLeast > maxBytes) throw new Error(`the data: URL holds more than ${maxBytes} bytes`);
   const bytes = base64 ? Buffer.from(payload, 'base64') : Buffer.from(decodeURIComponent(payload), 'utf8');
@@ -50,7 +54,7 @@ export function decodeDataUrl(url: string, maxBytes: number): { bytes: Uint8Arra
 
 /**
  * Loads what `url` names for `world`: `asset://` on the world's assets URL, an http(s) URL, a
- * data: URL, or a path inside the module directory (a bundled file). Throws when it cannot be
+ * data: URL, or a bundled file (lib/asset-root.ts). Throws when it cannot be
  * resolved, is refused by the policy, is too large, or is not answered with a 2xx status.
  */
 export async function fetchAssetBytes(

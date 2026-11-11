@@ -33,7 +33,7 @@ export interface Scenario {
   useItem?: boolean;
   /** Wait (up to 10 s) until the script has sent this app event */
   waitForEvent?: string;
-  /** Absolute path of physx/loadPhysX.js: load real PhysX and let the engine extend three.js with it */
+  /** Absolute path of the engine's loadPhysX.js (hyperfy/src/core): load real PhysX and let the engine extend three.js with it */
   physxModule?: string;
   /** More blueprint props: JSON the world hands every script of the app */
   props?: Record<string, unknown>;

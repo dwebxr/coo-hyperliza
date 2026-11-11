@@ -1,11 +1,11 @@
 /**
- * The environment the agent's helper processes (headless Chromium, ffmpeg) are started with.
+ * The environment the agent's helper processes (headless Chromium, ffmpeg, ps) are started with.
  *
  * A child process inherits the whole environment unless told otherwise, and the agent's holds API
  * keys, the elizaOS API token, the database URL and, until the service has read it, the tip
  * wallet's private key. None of that is of any use to a browser or to ffmpeg, so they get only
  * what a program needs to start and find its files, by name. Proxy settings are left out on
- * purpose (neither helper may use the network). Checked on macOS; the Linux names (display,
+ * purpose (none of them may use the network). Checked on macOS; the Linux names (display,
  * fontconfig, library path) are listed from what Chromium documents, not from a run.
  */
 const PASSED_ON: readonly string[] = [

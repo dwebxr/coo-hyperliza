@@ -70,7 +70,8 @@ describe('deliverReply', () => {
   it("a voice turn's own emote replaces the talking gesture", async () => {
     const set = channels();
     await deliver('voice', { text: 'Hello!', emote: 'wave' }, set);
-    expect(set.did[0]).toBe('emote wave');
+    // One emote, the reply's own: no TALK before or after it
+    expect(set.did).toEqual(['emote wave', 'speak Hello!', 'remember messages']);
   });
 
   it('posts a shop link and never reads it aloud, in a chat and in a voice turn', async () => {
@@ -204,7 +205,9 @@ describe('deliverReply', () => {
       const set = channels();
       vi.spyOn(logger, 'warn').mockImplementation(() => {});
       await deliver('voice', reply, set);
-      expect(set.did.join('\n')).not.toContain('box');
+      // The neutral line went out in its place, by the voice turn's own path
+      expect(set.did).toEqual(['emote TALK', 'speak I cannot go any further with that request.', 'remember messages']);
+      expect(JSON.stringify(set.stored)).not.toContain('box');
     });
   });
 });

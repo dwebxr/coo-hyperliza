@@ -1,13 +1,11 @@
 import {
   type Action,
-  type HandlerCallback,
   type IAgentRuntime,
-  type Memory,
   type State,
   logger,
   parseKeyValueXml,
   composePromptFromState,
-  ModelType
+  ModelType,
 } from '@elizaos/core';
 
 import { actingSession, connectedSession } from '../service';
@@ -17,15 +15,19 @@ import { AnthropicRefusalError } from '../../anthropic-models';
 import { chooseSnapshot, type NamedEntity } from '../lib/snapshot-choice';
 import { isJapanese } from '../lib/simple-commands';
 import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
+import { errorText } from '../lib/error-text';
 import { readString } from '../lib/model-output';
 import { shownName } from '../lib/text';
 import { notArrivedText } from '../lib/move-outcome';
 import type { MoveOutcome } from '../systems/controls';
 
-/** Raised inside the look when the walk to the entity did not get it close enough to see it. */
+/**
+ * Raised inside the look when the walk to the entity did not get it close enough to see it, or the
+ * entity is no longer there once the walk ended ('gone').
+ */
 class NotThere extends Error {
-  constructor(readonly outcome: Exclude<MoveOutcome, 'arrived'>) {
-    super(`the walk to the entity ended ${outcome}`);
+  constructor(readonly outcome: Exclude<MoveOutcome, 'arrived'> | 'gone') {
+    super(outcome === 'gone' ? 'the entity is gone' : `the walk to the entity ended ${outcome}`);
   }
 }
 
@@ -128,13 +130,7 @@ export const hyperfyScenePerceptionAction: Action = {
     return !!connectedSession(runtime);
   },
 
-  handler: async (
-    runtime: IAgentRuntime,
-    message: Memory,
-    state: State,
-    _options: {},
-    callback: HandlerCallback
-  ) => {
+  handler: async (runtime, message, state, _options, callback) => {
     // The turn's own connection (never a newer one); throws when the turn may no longer act
     const session = actingSession(runtime);
     const world = session?.world;
@@ -197,16 +193,20 @@ export const hyperfyScenePerceptionAction: Action = {
             return renderPage.capture(world, { kind: 'facing', direction: choice.direction }, { signal });
           case 'LOOK_AT_ENTITY': {
             const ent = world.entities.items.get(choice.entityId);
-            const pos = ent?.base?.position || ent?.root?.position;
-            if (!pos) throw new Error('No position');
+            if (!(ent?.base?.position || ent?.root?.position)) throw new Error('No position');
             const outcome: MoveOutcome = await world.controls.followEntity(choice.entityId, undefined, { signal });
             session.assertLive();
+            // Stopped, replaced or cancelled: whoever ended the walk did not want this look
+            if (outcome === 'stopped' || outcome === 'replaced' || outcome === 'cancelled') throw new NotThere(outcome);
+            // The entity as it is now: it may have moved during the walk, or been removed (or replaced under its id)
+            const now = world.entities.items.get(choice.entityId);
+            const pos = now === ent && !now.destroyed ? now.base?.position || now.root?.position : undefined;
+            if (!pos) throw new NotThere('gone');
             if (outcome !== 'arrived') {
-              // Stopped, replaced or cancelled: whoever ended the walk did not want this look. Timed
-              // out or no path: still worth a picture from here when the entity is near enough.
+              // Timed out or no path: still worth a picture from here when the entity is near enough
               const here = world.entities.player?.base?.position;
               const near = here && typeof here.distanceTo === 'function' && here.distanceTo(pos) <= LOOK_VIEW_DISTANCE_M;
-              if (!((outcome === 'timed-out' || outcome === 'unreachable') && near)) throw new NotThere(outcome);
+              if (!near) throw new NotThere(outcome);
             }
             return renderPage.capture(world, { kind: 'target', position: [pos.x, pos.y, pos.z] }, { signal });
           }
@@ -219,6 +219,15 @@ export const hyperfyScenePerceptionAction: Action = {
       if (err instanceof NotThere) {
         logger.info(`[Perception] Not looking: ${err.message}`);
         const name = shownName(entities.find((e) => e.id === (choice as { entityId?: string }).entityId)?.name, 64) || 'it';
+        if (err.outcome === 'gone') {
+          await tellFailure(
+            callback,
+            SCENE_PERCEPTION,
+            japanese ? `${name}がもう見当たらないので、見られませんでした。` : `I couldn't take a look at ${name}: it isn't there any more.`,
+            { thought: 'The entity is gone.', metadata: { error: 'not_there', outcome: 'gone', snapshotType } }
+          );
+          return actionFailed(SCENE_PERCEPTION, 'the entity is gone', { snapshotType });
+        }
         await tellFailure(
           callback,
           SCENE_PERCEPTION,
@@ -227,7 +236,7 @@ export const hyperfyScenePerceptionAction: Action = {
         );
         return actionFailed(SCENE_PERCEPTION, `did not get to the entity (${err.outcome})`, { snapshotType });
       }
-      logger.error('Snapshot failed:', err);
+      logger.error(`Snapshot failed: ${errorText(err)}`);
       await tellFailure(callback, SCENE_PERCEPTION, japanese ? LOOK_FAILED_JA : LOOK_FAILED_EN, { thought: 'Snapshot failed.', metadata: { error: 'snapshot_failure', snapshotType } });
       return actionFailed(SCENE_PERCEPTION, 'snapshot failed', { snapshotType });
     }
@@ -267,7 +276,7 @@ export const hyperfyScenePerceptionAction: Action = {
       // Refused by the Claude budget, or the turn was cancelled: no request was made for this look
       if (err instanceof AiBudgetExceededError || err instanceof TurnCancelled) look.release();
       if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError || err instanceof TurnCancelled) throw err;
-      logger.error('Vision response failed:', err);
+      logger.error(`Vision response failed: ${errorText(err)}`);
       await tellFailure(callback, SCENE_PERCEPTION, japanese ? LOOK_FAILED_JA : LOOK_FAILED_EN, { thought: 'Cannot understand the scene.', metadata: { error: 'vision_failure' } });
       return actionFailed(SCENE_PERCEPTION, 'vision model failed', { snapshotType });
     }
@@ -279,7 +288,7 @@ export const hyperfyScenePerceptionAction: Action = {
       return actionFailed(SCENE_PERCEPTION, 'could not parse the vision reply', { snapshotType });
     }
 
-    await callback({
+    await callback?.({
       ...parsed,
       thought: readString(parsed, 'thought') || '',
       text: readString(parsed, 'text') || '',

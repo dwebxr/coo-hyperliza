@@ -85,9 +85,10 @@ describe('the node and geometry guards of the script API', () => {
     ]);
     for (const { dataKey } of relevant) expect(CONSTRUCTION_REFERENCES.has(dataKey), dataKey).toBe(true);
     // Callbacks a constructor stores are checked by name (CALLBACK_PROPERTY), whatever the class
-    for (const { property, dataKey } of properties) {
-      if (/^_?on[A-Z]/.test(property)) expect(CALLBACK_PROPERTY.test(dataKey), `${property} <- data.${dataKey}`).toBe(true);
-    }
+    const callbacks = properties.filter(({ property }) => /^_?on[A-Z]/.test(property));
+    for (const { property, dataKey } of callbacks) expect(CALLBACK_PROPERTY.test(dataKey), `${property} <- data.${dataKey}`).toBe(true);
+    // (the node classes do store callbacks from their construction data: these among them)
+    expect(callbacks.map(({ className, property }) => `${className}.${property}`)).toEqual(expect.arrayContaining(['Action.onTrigger', 'Node._onPointerDown', 'RigidBody.onContactStart']));
   });
 
   it('find the forms a line search misses (the scanner checked against a made-up node class)', () => {

@@ -1,18 +1,18 @@
 import {
-    type Action,
-    type HandlerCallback,
-    type IAgentRuntime,
-    type Memory,
-    type State,
-    logger,
-    composePromptFromState,
-    ModelType,
-    parseKeyValueXml
-  } from '@elizaos/core';
+  type Action,
+  type HandlerCallback,
+  type IAgentRuntime,
+  type State,
+  logger,
+  composePromptFromState,
+  ModelType,
+  parseKeyValueXml,
+} from '@elizaos/core';
   import { actingSession, connectedSession } from '../service';
   import { AiBudgetExceededError, forPurpose } from '../../usage-budget';
   import { AnthropicRefusalError } from '../../anthropic-models';
   import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
+  import { errorText } from '../lib/error-text';
   import { EDIT_ENTITY_ACTION, SceneEditStopped, readSceneEditsMode, reportsPrivilegedAction, sceneEditRefusal, sceneEditStillAllowed } from '../lib/authorization';
   import type { EditGuard, EditResult } from '../managers/build-manager';
   import { MAX_OPERATIONS_PER_REQUEST, planLabelProblem, readPlanEntry } from '../lib/edit-plan';
@@ -62,7 +62,8 @@ import {
   /**
    * What happened to one entry of the model's edit plan, from what the build manager reported:
    * executed (the change was made), skipped (the plan itself said it cannot be done, or there was
-   * nothing to do: the target was gone, pinned, not an app, or the walk to it did not get there),
+   * nothing to do: the target was gone, pinned, the world's scene, not an app, or the walk to it did
+   * not get there),
    * or failed (refused or failed import, an entry that is no operation (lib/edit-plan.ts), invalid
    * parameters, a copy it refers to that was not made, threw, or not run: the edit stopped, or the
    * request already ran MAX_OPERATIONS_PER_REQUEST operations). `newId`: the entity a duplicate made.
@@ -272,14 +273,7 @@ Don't list every action like a log — instead, summarize the overall outcome na
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
       return !!connectedSession(runtime)?.world?.controls;
     },
-    handler: async (
-      runtime: IAgentRuntime,
-      message: Memory,
-      state: State,
-      options: Record<string, any>,
-      callback: HandlerCallback,
-      responses,
-    ) => {
+    handler: async (runtime, message, state, _options, callback, responses) => {
       // Checked first, so a refused request costs no model call: only a builder who asked in chat or voice
       const turn = currentTurn();
       const refusal = sceneEditRefusal(turn);
@@ -331,7 +325,7 @@ Don't list every action like a log — instead, summarize the overall outcome na
       const neutral = (): Parameters<HandlerCallback>[0] => ({ thought: 'The edit request ended.', text: japanese ? NO_LONGER_JA : NO_LONGER_EN, actions: [EDIT_ENTITY], source: 'hyperfy' });
       const sayNoLonger = async (reason: string) => {
         logger.warn(`[EDIT_ENTITY Action] Not reporting the outcome: ${reason}`);
-        await callback(neutral());
+        await callback?.(neutral());
       };
       // Every closing message that says what was done goes through here, checked as the edits were.
       // Core holds it until this handler has returned, so it is registered to be checked once more
@@ -339,7 +333,7 @@ Don't list every action like a log — instead, summarize the overall outcome na
       // gets the neutral line then.
       const finish = async (content: Parameters<HandlerCallback>[0]) => {
         const reason = stillAllowed();
-        await (reason ? sayNoLonger(reason) : callback(reportsPrivilegedAction(content, { refusal: stillAllowed, instead: neutral() })));
+        await (reason ? sayNoLonger(reason) : callback?.(reportsPrivilegedAction(content, { refusal: stillAllowed, instead: neutral() })));
       };
     
       let operationResults: any = null;
@@ -371,7 +365,7 @@ Don't list every action like a log — instead, summarize the overall outcome na
           // Retrying cannot help: the budget is used up (the turn's caller falls back to scripted or
           // offline behavior) or the model declined this request
           if (error instanceof AiBudgetExceededError || error instanceof AnthropicRefusalError) throw error;
-          logger.error(`[EDIT_ENTITY Action] Model error on attempt ${attempts + 1}:`, error);
+          logger.error(`[EDIT_ENTITY Action] Model error on attempt ${attempts + 1}: ${errorText(error)}`);
         }
     
         attempts++;
@@ -577,7 +571,7 @@ Don't list every action like a log — instead, summarize the overall outcome na
           postNow(outcomeText(counts, japanese));
           throw err;
         }
-        logger.error('[EDIT_ENTITY Action] Final summarization failed:', err);
+        logger.error(`[EDIT_ENTITY Action] Final summarization failed: ${errorText(err)}`);
         await finish({
           thought: 'Scene edits finished, but the summary could not be written.',
           text: outcomeText(counts, japanese),

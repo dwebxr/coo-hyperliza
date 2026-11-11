@@ -39,8 +39,10 @@ beforeAll(async () => {
 afterAll(() => closeServers());
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
   resetUsageBudget();
+  answers = [];
 });
 
 /** A chat call through the plugin's real client; a key of its own so that client is new */
@@ -55,6 +57,15 @@ function chat(limits: Partial<UsageLimits> = {}) {
 }
 
 describe('Claude requests and what they are counted as', () => {
+  it('makes its request in a process that has a global window and document, which the SDK takes for a browser', async () => {
+    const { call } = chat();
+    // With these and Node's own navigator the SDK sees a browser, where it refuses to make a client unless told otherwise
+    vi.stubGlobal('window', { document: {} });
+    expect(typeof navigator).toBe('object');
+    await expect(call()).resolves.toBe('ok');
+    expect(api.hits).toHaveLength(1);
+  });
+
   it('sends a request whose connection was lost once, and keeps its reservation counted: the SDK retries nothing', async () => {
     const { budget, call } = chat();
     answers = ['drop', { status: 200, body: message }];
@@ -128,7 +139,6 @@ describe('Claude requests and what they are counted as', () => {
     await expect(call()).rejects.toThrow();
     expect(api.hits).toHaveLength(2);
     expect(budget.snapshot(60_000).ai).toMatchObject({ calls: 2, reservedTokens: 2 * each });
-    answers = [];
   });
 
   it('makes no second attempt the budget does not admit, and says the budget stopped it', async () => {
@@ -137,6 +147,5 @@ describe('Claude requests and what they are counted as', () => {
     await expect(call()).rejects.toBeInstanceOf(AiBudgetExceededError);
     expect(api.hits).toHaveLength(1);
     expect(budget.snapshot(60_000)).toMatchObject({ ai: { calls: 1, reservedTokens: each }, skipped: { 'ai-call': 1 } });
-    answers = [];
   });
 });

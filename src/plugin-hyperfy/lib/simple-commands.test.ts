@@ -38,14 +38,25 @@ describe('matchSimpleCommand', () => {
 
   it('does not strip names inside other words', () => {
     expect(matchSimpleCommand('cool, come here', names)).toBeNull();
+    // An agent named Top: its name goes as a word, and stays where it is part of "stop"
+    expect(matchSimpleCommand('Top, stop!', ['Top'])).toBe('stop');
+    expect(matchSimpleCommand('stop', ['Top'])).toBe('stop');
+    expect(matchSimpleCommand('stcooop', names)).toBeNull();
+  });
+
+  it('takes no message longer than 60 characters for a command, whatever is left of it without punctuation', () => {
+    expect(matchSimpleCommand(`come here${'!'.repeat(51)}`, names)).toBe('come');
+    expect(matchSimpleCommand(`come here${'!'.repeat(52)}`, names)).toBeNull();
   });
 });
 
 describe('replies', () => {
-  it('answers in Japanese to Japanese messages', () => {
+  it('answers in Japanese to Japanese messages, in English otherwise', () => {
     expect(isJapanese('こっちに来て')).toBe(true);
     expect(isJapanese('come here')).toBe(false);
     expect(simpleCommandReply('come', true)).toBe('今行きます！');
+    expect(simpleCommandReply('stop', true)).toBe('はい、ここで止まりますね。');
+    expect(simpleCommandReply('come', false)).toBe('On my way!');
     expect(simpleCommandReply('stop', false)).toBe("Okay, I'll stay right here.");
   });
 });

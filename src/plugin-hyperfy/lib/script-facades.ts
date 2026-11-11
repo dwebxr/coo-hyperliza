@@ -8,8 +8,10 @@ import { inspect } from 'node:util';
 
 // ---- console ----
 
-// One bounded line per call. Arguments are copies with string keys only, so no custom-inspect
-// hook of a script can be among them; customInspect is switched off regardless.
+// One bounded string per call (a line break in a script's own string stays in it). Arguments are
+// host values the membrane made (copies with string keys only, or the host objects behind
+// facades), so no custom-inspect hook of a script can be among them; customInspect is switched
+// off regardless.
 const INSPECT_OPTIONS = { customInspect: false, depth: 4, breakLength: Infinity, compact: true } as const;
 const MAX_LOG_CHARS = 2000;
 

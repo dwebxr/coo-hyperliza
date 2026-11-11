@@ -5,6 +5,8 @@ import { currentUsageOrigin, runWithUsageOrigin } from './plugin-hyperfy/lib/tur
  * Usage meter and budgets for everything that costs money: Claude calls, vision, text-to-speech
  * and speech-to-text. Each is limited separately so running out of one (say, voice) leaves the
  * others working, and scripted behavior (patrol, waves, product links) needs none of them.
+ * Speech-to-text another plugin asks for through the TRANSCRIPTION model is not metered
+ * (src/elevenlabs-speech.ts).
  *
  * Counts are in memory, over rolling windows (the last hour / the last 24 hours), and start
  * from zero when the agent restarts.

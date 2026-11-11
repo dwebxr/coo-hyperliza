@@ -29,7 +29,7 @@ export { formatLinkMessage, isShareable };
 /**
  * Coo as a shop clerk for OpenPay Store: knows the configured products, recommends them, and
  * shares a product's purchase link when a player wants it. Buyers pay from their own wallet;
- * the agent never holds money or keys.
+ * nothing here holds money or keys (the tip wallet is separate: plugin-hyperfy/lib/tip-wallet.ts).
  */
 
 export const SHARE_ACTION = 'OPENPAY_SHARE_PRODUCT';
@@ -110,8 +110,9 @@ export function isSpecificTitle(title: string): boolean {
 }
 
 /**
- * Which product the reply meant: the id the model put in <productId> (an unknown id shares nothing),
- * else the one product whose title the reply or the player's message names as a whole word.
+ * Which product the reply meant: the id the model put in <productId> (or the exact title of one
+ * product written there); when that names no product, or there is none, the one product whose title
+ * the reply or the player's message names (a whole word for an ASCII title, a substring otherwise).
  * Only titles of at least MIN_TITLE_MATCH_CODE_POINTS code points are looked for in text; a
  * product with a shorter title is shared by its id (or its exact title in <productId>) only.
  * Never a URL from the model, and never a guess.

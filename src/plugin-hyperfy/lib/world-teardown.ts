@@ -3,9 +3,10 @@
  * the rest running. World.destroy() calls each system's destroy() in turn with no try/catch, and
  * the Entities system destroys its entities the same way, so one throw (an app's teardown runs
  * node unmounts and world scripts' code) would leave the other apps, Physics, Stage, the tick loop
- * (NodeClient) and the socket (ClientNetwork) alive. Here every entity and every system is
- * destroyed on its own; afterwards every app is marked dead (its script timers check that) and
- * loses its listeners, the socket is closed and the tick timer cleared, whatever failed before.
+ * (NodeClient) and the socket (ClientNetwork) alive. Here every entity is destroyed on its own,
+ * then every app is marked dead (its script timers check that) and loses its listeners, then every
+ * system is destroyed on its own, the socket is closed and the tick timer cleared, whatever failed
+ * before.
  */
 
 interface EntityLike {

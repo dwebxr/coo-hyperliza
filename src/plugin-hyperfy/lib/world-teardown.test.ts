@@ -52,17 +52,19 @@ describe('destroyWorld', () => {
     const { w, destroyed, ws, timer } = world({ failingSystem: true });
     const log = { warn: vi.fn() };
     const clear = vi.spyOn(globalThis, 'clearTimeout');
+    try {
+      const failures = destroyWorld(w, log);
 
-    const failures = destroyWorld(w, log);
-
-    expect(destroyed).toEqual(['Entities', 'NodeClient', 'ClientNetwork']);
-    expect(failures).toEqual(['Entities: Entities failed']);
-    expect(ws.close).toHaveBeenCalledTimes(1);
-    expect(clear).toHaveBeenCalledWith(timer);
-    // One warning for all of it
-    expect(log.warn).toHaveBeenCalledTimes(1);
-    expect(log.warn.mock.calls[0][0]).toContain('Entities: Entities failed');
-    clear.mockRestore();
+      expect(destroyed).toEqual(['Entities', 'NodeClient', 'ClientNetwork']);
+      expect(failures).toEqual(['Entities: Entities failed']);
+      expect(ws.close).toHaveBeenCalledTimes(1);
+      expect(clear).toHaveBeenCalledWith(timer);
+      // One warning for all of it
+      expect(log.warn).toHaveBeenCalledTimes(1);
+      expect(log.warn.mock.calls[0][0]).toContain('Entities: Entities failed');
+    } finally {
+      clear.mockRestore();
+    }
   });
 
   it('goes on past an app whose teardown throws, and leaves no app running', () => {
@@ -80,10 +82,20 @@ describe('destroyWorld', () => {
     }
   });
 
-  it('does not close a socket that is already closing or closed', () => {
+  it.each([
+    ['closing', 2],
+    ['closed', 3],
+  ])('does not close a socket that is already %s', (_state, readyState) => {
     const { w, ws } = world();
-    ws.readyState = 2;
+    ws.readyState = readyState;
     destroyWorld(w, { warn: vi.fn() });
     expect(ws.close).not.toHaveBeenCalled();
+  });
+
+  it('closes a socket that is still connecting', () => {
+    const { w, ws } = world();
+    ws.readyState = 0;
+    destroyWorld(w, { warn: vi.fn() });
+    expect(ws.close).toHaveBeenCalledTimes(1);
   });
 });

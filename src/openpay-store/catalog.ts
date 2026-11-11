@@ -20,8 +20,8 @@ const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 /**
  * The listings request, under the outbound policy (lib/net-policy.ts): the API must be a public
- * https host, a redirect cannot lead inside the agent's network, and the answer is cut off at
- * MAX_RESPONSE_BYTES and TIMEOUT_MS.
+ * https host, a redirect cannot lead inside the agent's network, and an answer larger than
+ * MAX_RESPONSE_BYTES or slower than TIMEOUT_MS fails the request.
  */
 const fetchListings = async (url: URL): Promise<Response> => toResponse(await safeFetch(url.href, { maxBytes: MAX_RESPONSE_BYTES, timeoutMs: TIMEOUT_MS }));
 
@@ -364,7 +364,7 @@ export class StoreCatalog {
     try {
       body = await response.json();
     } catch (error: any) {
-      // Includes the body read timing out after the headers arrived
+      // With fetchImpl: also the body read timing out after the headers arrived
       throw new TransientError(`${source}: unreadable response (${error?.message || error})`);
     }
     if (body?.ok !== true || !Array.isArray(body.items)) {

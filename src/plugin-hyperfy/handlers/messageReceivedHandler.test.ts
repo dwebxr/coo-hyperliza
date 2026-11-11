@@ -96,21 +96,57 @@ describe('messageReceivedHandler and a turn that may no longer act', () => {
   });
 });
 
-describe('messageReceivedHandler embeddings', () => {
-  it('replies without trying to embed when no embedding model is registered', async () => {
-    const { runtime, message } = setup({ embeddingModel: false });
-    await messageReceivedHandler({ runtime, message, callback: vi.fn() } as any);
+describe('messageReceivedHandler and the agent\'s own messages', () => {
+  it('takes in nothing and answers nothing for a message from the agent itself', async () => {
+    const { runtime, message } = setup({ embeddingModel: true });
+    const callback = vi.fn();
+    await messageReceivedHandler({ runtime, message: { ...message, entityId: runtime.agentId }, callback } as any);
+    expect(runtime.createMemory).not.toHaveBeenCalled();
     expect(runtime.addEmbeddingToMemory).not.toHaveBeenCalled();
-    expect(runtime.createMemory).toHaveBeenCalled();
-    expect(runtime.processActions).toHaveBeenCalled();
+    expect(runtime.useModel).not.toHaveBeenCalled();
+    expect(runtime.processActions).not.toHaveBeenCalled();
+    expect(callback).not.toHaveBeenCalled();
+    // The same message from a player is answered (control)
+    await messageReceivedHandler({ runtime, message, callback } as any);
+    expect(runtime.createMemory).toHaveBeenCalledWith(message, 'messages');
+    expect(runtime.processActions).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('messageReceivedHandler embeddings', () => {
+  /** The message was saved, and the model's reply was handed to core's processActions (a stand-in here) with the platform callback */
+  function expectReplyPlanned(runtime: any, message: any, callback: unknown) {
+    expect(runtime.createMemory).toHaveBeenCalledWith(message, 'messages');
+    expect(runtime.processActions).toHaveBeenCalledTimes(1);
+    const [incoming, responses, , handedCallback] = runtime.processActions.mock.calls[0];
+    expect(incoming).toBe(message);
+    expect(responses).toHaveLength(1);
+    expect(responses[0].content).toMatchObject({ thought: 'hi', text: 'Hello!', actions: ['REPLY'] });
+    expect(handedCallback).toBe(callback);
+  }
+
+  it('saves the message and hands the reply to processActions without trying to embed when no embedding model is registered', async () => {
+    const { runtime, message } = setup({ embeddingModel: false });
+    const callback = vi.fn();
+    await messageReceivedHandler({ runtime, message, callback } as any);
+    expect(runtime.addEmbeddingToMemory).not.toHaveBeenCalled();
+    expectReplyPlanned(runtime, message, callback);
   });
 
-  it('still replies when the embedding provider fails (e.g. out of API credits)', async () => {
+  it('saves the message and hands the reply to processActions when the embedding provider fails (e.g. out of API credits)', async () => {
     const { runtime, message } = setup({ embeddingModel: true, embeddingError: new Error('401 Unauthorized') });
-    await messageReceivedHandler({ runtime, message, callback: vi.fn() } as any);
-    expect(runtime.addEmbeddingToMemory).toHaveBeenCalled();
-    expect(runtime.createMemory).toHaveBeenCalled();
-    expect(runtime.processActions).toHaveBeenCalled();
+    const callback = vi.fn();
+    await messageReceivedHandler({ runtime, message, callback } as any);
+    expect(runtime.addEmbeddingToMemory).toHaveBeenCalledWith(message);
+    expectReplyPlanned(runtime, message, callback);
+  });
+
+  it('embeds the message when an embedding model is registered and works', async () => {
+    const { runtime, message } = setup({ embeddingModel: true });
+    const callback = vi.fn();
+    await messageReceivedHandler({ runtime, message, callback } as any);
+    expect(runtime.addEmbeddingToMemory).toHaveBeenCalledWith(message);
+    expectReplyPlanned(runtime, message, callback);
   });
 });
 
@@ -217,12 +253,19 @@ describe('messageReceivedHandler cost controls', () => {
     expect(runtime.useModel).not.toHaveBeenCalled();
   });
 
-  it('leaves "come here" to the model when it is not addressed to the agent', async () => {
+  it('leaves "come here" to the model when it is not addressed to the agent: it neither walks nor answers by itself', async () => {
     const { runtime, message } = setup({ embeddingModel: false });
-    runtime.getService = vi.fn(() => serviceFor(sessionFor(world())));
+    const w = world();
+    runtime.getService = vi.fn(() => serviceFor(sessionFor(w)));
     message.content = { text: 'come here', metadata: { hyperfyFromId: 'player-bob' } };
-    await messageReceivedHandler({ runtime, message, callback: vi.fn() } as any);
-    expect(runtime.useModel).toHaveBeenCalled();
+    const callback = vi.fn();
+    await messageReceivedHandler({ runtime, message, callback } as any);
+    // The should-respond check is asked first
+    expect(runtime.useModel.mock.calls[0][0]).toBe(ModelType.TEXT_SMALL);
+    expect(runtime.useModel.mock.calls[0][1]).toMatchObject({ purpose: 'should-respond' });
+    expect(w.controls.followEntity).not.toHaveBeenCalled();
+    expect(w.controls.teleportToEntity).not.toHaveBeenCalled();
+    expect(callback.mock.calls.map(([content]) => content.text)).not.toContain('On my way!');
   });
 
   it('answers without Claude once the budget is used up, and only once per player for a while', async () => {
@@ -244,6 +287,9 @@ describe('messageReceivedHandler cost controls', () => {
     const callback = vi.fn();
     await messageReceivedHandler({ runtime, message, callback } as any);
     expect(callback).not.toHaveBeenCalled();
+    expect(runtime.useModel).not.toHaveBeenCalled();
+    // The message itself was taken in
+    expect(runtime.createMemory).toHaveBeenCalledWith(message, 'messages');
   });
 
   it('tags the reply call and does not regenerate a reply just because its thought is empty', async () => {

@@ -117,9 +117,8 @@ function getClient(runtime: IAgentRuntime): Anthropic {
 }
 
 function getSetting(runtime: IAgentRuntime, key: string, fallback: string): string {
-  // .env wins: elizaOS stores a copy of the environment in the agent's database record and
-  // runtime.getSetting prefers that copy, so a key changed in .env would otherwise be ignored
-  // (an old, revoked Anthropic key kept failing with 401 invalid x-api-key).
+  // process.env first: runtime.getSetting reads only the character's settings and secrets, where
+  // a stored copy can differ from .env or be null (src/agent-secrets.ts)
   const value = process.env[key]?.trim() || runtime.getSetting(key);
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
 }
@@ -344,7 +343,7 @@ async function generateText(runtime: IAgentRuntime, size: Size, params: Generate
   });
 }
 
-/** Accepts an http(s) URL, a data: URL, or bare base64 (what the Puppeteer snapshots return). */
+/** Accepts an http(s) URL, a data: URL (what the render page's snapshots are, managers/puppeteer-manager.ts capture), or bare base64. */
 export function toImageSource(image: string): Anthropic.ImageBlockParam['source'] {
   if (/^https?:\/\//.test(image)) return { type: 'url', url: image };
   const dataUrl = image.match(/^data:(image\/[a-z+]+);base64,(.*)$/s);

@@ -281,6 +281,8 @@ describe('what a turn was about to do when its slot ran out', () => {
     expect(renderPage.capture).not.toHaveBeenCalled();
     expect(agent.calls(ModelType.IMAGE_DESCRIPTION)).toBe(0);
     expect(budget.snapshot(60 * 60_000).vision).toBe(0);
+    // The look ended with its turn: it is not recorded as a look that failed, and nothing is said about it
+    expect(agent.results()).toEqual([]);
     expect(on.posted()).toEqual([]);
   });
 });
@@ -335,10 +337,12 @@ describe('a turn whose connection was replaced', () => {
     const on = scene();
     let replacement!: ReturnType<typeof scene>;
     let newer!: ConnectionSession;
+    let postedBefore: string[] | undefined;
     const agent: ReturnType<typeof connected> = connected(on, {
       [ModelType.TEXT_LARGE]: plan('HYPERFY_GOTO_ENTITY,HYPERFY_EDIT_ENTITY,REPLY', 'Done!'),
       [ModelType.OBJECT_LARGE]: inTurn(() => {
         // The connection is replaced while the model is asked where to go
+        postedBefore = on.posted();
         replacement = next(on);
         void agent.session.end();
         newer = agent.open(replacement.world);
@@ -353,7 +357,10 @@ describe('a turn whose connection was replaced', () => {
     expect(agent.session.ended).toBe(true);
     expect(newer.ended).toBe(false);
     // REPLY comes first in a plan and went out on the old connection, before it was replaced
-    expect(on.posted().concat(replacement.posted()).filter((text) => text !== 'Done!')).toEqual([]);
+    expect(postedBefore).toEqual(['Done!']);
+    // Nothing was posted since, on the old world or on the new one
+    expect(on.posted()).toEqual(['Done!']);
+    expect(replacement.posted()).toEqual(replacement === on ? ['Done!'] : []);
     expect(follow).not.toHaveBeenCalled();
     for (const world of [on, replacement]) {
       expect([world.controls.getIsNavigating(), world.walking()]).toEqual([false, false]);

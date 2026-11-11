@@ -4,14 +4,16 @@
  *   - public https hosts on the default port only, judged per request and per redirect. No
  *     world-origin exception: a script has no business with whatever else the world's host serves,
  *     and its own world's assets reach it through world.load().
- *   - GET, HEAD and POST; a small set of request headers; small bodies both ways; a short
- *     deadline; a few requests at a time per world.
+ *   - GET, HEAD and POST; a small set of request headers and the script's own `x-…` ones (not
+ *     x-forwarded-…, x-real-ip, x-client-ip); small bodies both ways; a short deadline; a few
+ *     requests at a time per world.
  *   - nothing of the agent's is attached: no cookies, no credentials, and Host is always the URL's.
  *
  * What remains: a script can send whatever it can read (player names, ids and positions, what it
- * hears in app events) to any public https host, and read the answers. A failure reaches the
- * script as "fetch failed" whatever the reason, so the message does not tell it what a name
- * resolves to; how long the failure took is not hidden.
+ * hears in app events) to any public https host, and read the answers. A request the policy
+ * refuses, or that fails on the way, reaches the script as "fetch failed" whatever the reason, so
+ * the message does not tell it what a name resolves to; how long the failure took is not hidden.
+ * (A request refused here for its method, body, size or count says which.)
  */
 import { type NetPolicy, SafeFetchError, publicNet } from './net-policy';
 import type { ConsoleTarget, ScriptNetwork } from './script-facades';

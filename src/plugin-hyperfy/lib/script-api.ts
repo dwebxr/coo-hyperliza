@@ -139,7 +139,10 @@ export const NODE_ARGUMENTS: ReadonlyMap<string, number> = new Map([
 ]);
 export const NODE_SETTERS: ReadonlySet<string> = new Set(['body0', 'body1']); // nodes/Joint.js
 export const GEOMETRY_SETTERS: ReadonlySet<string> = new Set(['geometry']); // nodes/Collider.js, Video.js (Mesh.js checks itself)
-/** The world methods (systems/Apps.js) that take a node; createWorldApi refuses anything else */
+/**
+ * The world methods (systems/Apps.js) that take a node: the list script-api.test.ts holds the
+ * engine scan against. createWorldApi checks the same three by name and does not read this set.
+ */
 export const WORLD_NODE_METHODS: ReadonlySet<string> = new Set(['add', 'remove', 'attach']);
 /**
  * Properties of `app.create(type, data)` that a node constructor hands to the same setters, and

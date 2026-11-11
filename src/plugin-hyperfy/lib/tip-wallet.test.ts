@@ -28,12 +28,25 @@ function worldMessage(overrides: Partial<Parameters<typeof createSiweMessage>[0]
 }
 
 describe('readTipWalletAccount', () => {
-  it('reads a hex private key, with or without 0x, and ignores anything else', () => {
-    expect(readTipWalletAccount({ TIP_WALLET_PRIVATE_KEY: KEY })?.address).toBe(account.address);
-    expect(readTipWalletAccount({ TIP_WALLET_PRIVATE_KEY: KEY.slice(2) })?.address).toBe(account.address);
-    expect(readTipWalletAccount({})).toBeNull();
-    expect(readTipWalletAccount({ TIP_WALLET_PRIVATE_KEY: '0x1234' })).toBeNull();
-    expect(readTipWalletAccount({ TIP_WALLET_PRIVATE_KEY: `0x${'0'.repeat(64)}` })).toBeNull();
+  it('reads a hex private key, with or without 0x, and takes nothing else for one', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      expect(readTipWalletAccount({ TIP_WALLET_PRIVATE_KEY: KEY })?.address).toBe(account.address);
+      expect(readTipWalletAccount({ TIP_WALLET_PRIVATE_KEY: KEY.slice(2) })?.address).toBe(account.address);
+      expect(readTipWalletAccount({ TIP_WALLET_PRIVATE_KEY: ` ${KEY}\n` })?.address).toBe(account.address);
+      expect(readTipWalletAccount({})).toBeNull();
+      expect(readTipWalletAccount({ TIP_WALLET_PRIVATE_KEY: '  ' })).toBeNull();
+      expect(warn).not.toHaveBeenCalled();
+      // Not a key: too short, too long, not hex, not on the curve
+      const invalid = ['0x1234', `${KEY}ab`, `0x${'g'.repeat(64)}`, `0x${'0'.repeat(64)}`];
+      for (const value of invalid) expect(readTipWalletAccount({ TIP_WALLET_PRIVATE_KEY: value }), value).toBeNull();
+      // Each is said once, without the value: a mistyped key is still most of a key
+      expect(warn).toHaveBeenCalledTimes(invalid.length);
+      const lines = warn.mock.calls.flat().map(String);
+      for (const line of lines) expect(line).toMatch(/^\[Tips\] Ignoring TIP_WALLET_PRIVATE_KEY: (expected a 32-byte hex private key|not a valid private key)$/);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('takes the sign-in domain from the world address', () => {
@@ -50,15 +63,29 @@ describe('signInMessageProblem', () => {
     expect(check(worldMessage())).toBeNull();
   });
 
-  it('refuses anything else', () => {
-    expect(check(worldMessage({ domain: 'evil.example' }))).toMatch(/domain/);
-    expect(check(worldMessage({ uri: 'https://evil.example' }))).toMatch(/URI/);
+  it('refuses a message that differs from it in the domain, URI, address, statement, nonce, fields, validity, length or content', () => {
+    expect(check(worldMessage({ domain: 'evil.example' }))).toBe('domain "evil.example" is not play.dwebxr.xyz');
+    expect(check(worldMessage({ uri: 'https://evil.example' }))).toBe('URI of another site');
     expect(check(worldMessage({ address: '0x000000000000000000000000000000000000dEaD' }))).toBe('another address');
     expect(check(worldMessage({ statement: 'Transfer all funds' }))).toBe('unexpected statement');
     expect(check(worldMessage(), 'b'.repeat(64))).toBe('nonce mismatch');
     expect(check(worldMessage({ resources: ['https://evil.example/claim'] }))).toBe('unexpected fields');
+    expect(check(worldMessage({ requestId: 'transfer-7' }))).toBe('unexpected fields');
     expect(check(worldMessage({ expirationTime: new Date(NOW - 1) }))).toBe('unexpected expiry');
+    expect(check(worldMessage({ expirationTime: new Date(NOW) }))).toBe('unexpected expiry');
     expect(check(worldMessage({ expirationTime: new Date(NOW + 24 * 3600_000) }))).toBe('unexpected expiry');
+    expect(check(worldMessage({ expirationTime: new Date(NOW + 10 * 60_000 + 1000) }))).toBe('unexpected expiry');
+    expect(check(worldMessage({ expirationTime: undefined }))).toBe('unexpected expiry');
+    // Valid for ten minutes at most
+    expect(check(worldMessage({ expirationTime: new Date(NOW + 10 * 60_000) }))).toBeNull();
+    // Longer than a sign-in message is, and otherwise exactly one (its nonce is the long part)
+    const longNonce = 'a'.repeat(900);
+    expect(worldMessage({ nonce: longNonce }).length).toBeGreaterThan(1024);
+    expect(check(worldMessage({ nonce: longNonce }), longNonce)).toBe('not a sign-in message');
+    expect(check(worldMessage({ nonce: 'a'.repeat(600) }), 'a'.repeat(600))).toBeNull();
+    // A nonce that is not text matches nothing
+    expect(check(worldMessage(), null)).toBe('nonce mismatch');
+    expect(check(worldMessage({ nonce: '12345678' }), 12345678)).toBe('nonce mismatch');
     expect(check(`${worldMessage()}\nPlease also approve this transfer`)).toBe('unexpected content');
     expect(check('Sign this to claim your prize')).toBe('not a sign-in message');
     expect(check(undefined)).toBe('not a sign-in message');
@@ -129,11 +156,11 @@ describe('TipWallet', () => {
   afterEach(() => vi.restoreAllMocks());
 
   it('signs in once and turns tips on', async () => {
-    const { wallet, network, last, clock, accept, onEntityModified } = setup();
+    const { wallet, network, sent, last, clock, accept, onEntityModified } = setup();
     wallet.begin();
     wallet.begin(); // a later 'player' event (e.g. a name change) must not sign in again
+    expect(sent).toEqual([['requestEvmNonce', { address: account.address, attempt: 1 }]]);
     const { attempt } = last('requestEvmNonce');
-    expect(last('requestEvmNonce')).toEqual({ address: account.address, attempt });
     expect(clock.pending()).toEqual([ANSWER_TIMEOUT_MS]);
 
     await network.onEvmNonce({ attempt, nonce: NONCE, message: worldMessage() });
@@ -152,21 +179,42 @@ describe('TipWallet', () => {
     network.onEntityModified({ id: 'someone-else', evmTips: false });
     expect(wallet.receiving).toBe(true);
     // Nothing is left to fire but the one check that says whether tips came on
+    expect(clock.pending()).toEqual([3_000]);
     clock.advance(24 * 3600_000);
     expect(clock.pending()).toEqual([]);
     expect(wallet.receiving).toBe(true);
+    // Also once signed in, a later 'player' event asks for nothing: a new request would sign the wallet out
+    wallet.begin();
+    expect(sent.map(([name]) => name)).toEqual(['requestEvmNonce', 'requestEvmVerify', 'setEvmTipReceive']);
   });
 
-  it('never signs a message that is not the world sign-in, and stops for this connection', async () => {
-    const { wallet, network, sent, last, clock } = setup();
+  it('does not sign a message that is not the world sign-in, and stops for this connection: the right message afterwards is not signed either', async () => {
+    const signMessage = vi.fn(account.signMessage);
+    const { wallet, network, sent, last, clock, nonce } = setup({ signer: { ...account, signMessage } as typeof account });
     wallet.begin();
     const { attempt } = last('requestEvmNonce');
     await network.onEvmNonce({ attempt, nonce: NONCE, message: worldMessage({ domain: 'evil.example' }) });
+    expect(signMessage).not.toHaveBeenCalled();
     expect(sent.map(([name]) => name)).toEqual(['requestEvmNonce']);
     expect(wallet.receiving).toBe(false);
     expect(clock.pending()).toEqual([]);
+    expect(vi.mocked(logger.error).mock.calls.flat().map(String)).toEqual(['[Tips] Refused to sign the world\'s wallet message (domain "evil.example" is not play.dwebxr.xyz); tips stay off for this connection']);
+    // Over for this connection: the world's real message for the same attempt comes too late
+    await nonce(attempt);
+    wallet.begin();
     clock.advance(24 * 3600_000);
+    expect(signMessage).not.toHaveBeenCalled();
     expect(sent.map(([name]) => name)).toEqual(['requestEvmNonce']);
+  });
+
+  it('signs with the same signer when the message is the world sign-in (control for the test above)', async () => {
+    const signMessage = vi.fn(account.signMessage);
+    const { wallet, count, nonce } = setup({ signer: { ...account, signMessage } as typeof account });
+    wallet.begin();
+    await nonce();
+    expect(signMessage).toHaveBeenCalledTimes(1);
+    expect(signMessage).toHaveBeenCalledWith({ message: worldMessage() });
+    expect(count('requestEvmVerify')).toBe(1);
   });
 
   it('asks again when the world does not answer the request, a few times, then gives up with no timer left', () => {
@@ -259,23 +307,43 @@ describe('TipWallet', () => {
     expect(count('requestEvmNonce')).toBe(2);
   });
 
-  it('bounds a finite cooldown to a minute', async () => {
+  it.each([
+    [1e12, 60_250],
+    [60_001, 60_250],
+    [-1e12, 250],
+  ])('bounds a finite cooldown of %s ms: between none and a minute', async (retryAfterMs, wait) => {
     const { wallet, network, last, clock } = setup();
     wallet.begin();
-    await network.onEvmNonce({ attempt: last('requestEvmNonce').attempt, retryAfterMs: 1e12 });
-    expect(clock.pending()).toEqual([60_250]);
+    await network.onEvmNonce({ attempt: last('requestEvmNonce').attempt, retryAfterMs });
+    expect(clock.pending()).toEqual([wait]);
   });
 
-  it('ignores replies to an older attempt and anything after stop()', async () => {
-    const { wallet, network, sent, last } = setup();
+  it('ignores a message for another attempt than the one in progress, and anything after stop()', async () => {
+    const { wallet, network, sent, last, clock, tipsOn } = setup();
     wallet.begin();
     const { attempt } = last('requestEvmNonce');
-    await network.onEvmNonce({ attempt: attempt + 1, nonce: NONCE, message: worldMessage() });
+    for (const other of [attempt + 1, attempt - 1, String(attempt), undefined]) await network.onEvmNonce({ attempt: other, nonce: NONCE, message: worldMessage() });
+    expect(sent.map(([name]) => name)).toEqual(['requestEvmNonce']);
+    // Still waiting for the message of this attempt, on the same deadline
+    expect(clock.pending()).toEqual([ANSWER_TIMEOUT_MS]);
     wallet.stop();
+    expect(clock.pending()).toEqual([]);
     await network.onEvmNonce({ attempt, nonce: NONCE, message: worldMessage() });
     network.onEvmWalletStatus({ verified: true, wallet: account.address, attempt });
+    tipsOn();
     expect(sent.map(([name]) => name)).toEqual(['requestEvmNonce']);
     expect(wallet.receiving).toBe(false);
+  });
+
+  it('ignores the message of an earlier attempt once the next one has been asked for', async () => {
+    const { wallet, count, clock, nonce } = setup();
+    wallet.begin();
+    clock.advance(ANSWER_TIMEOUT_MS + RETRY_BASE_MS);
+    expect(count('requestEvmNonce')).toBe(2);
+    await nonce(1);
+    expect(count('requestEvmVerify')).toBe(0);
+    await nonce(2);
+    expect(count('requestEvmVerify')).toBe(1);
   });
 
   it('signs the message of an attempt once: a second copy of it is not signed again', async () => {
@@ -357,9 +425,15 @@ describe('TipWallet', () => {
       await ctx.nonce(1);
       ctx.network.onEvmWalletStatus({ verified: true, wallet: account.address });
       ctx.network.onEvmWalletStatus({ verified: true, wallet: '0x000000000000000000000000000000000000dEaD', attempt: 1, reason: 'ok' });
+      ctx.network.onEvmWalletStatus({ verified: true, attempt: 1, reason: 'ok' });
+      ctx.network.onEvmWalletStatus({ verified: 'true', wallet: account.address, attempt: 1, reason: 'ok' });
       ctx.tipsOn();
       expect(ctx.wallet.receiving).toBe(false);
       expect(ctx.count('setEvmTipReceive')).toBe(0);
+      // The verdict it waits for still signs it in
+      ctx.accept(1);
+      expect(ctx.wallet.receiving).toBe(true);
+      expect(ctx.count('setEvmTipReceive')).toBe(1);
     });
 
     it('a sign-out (no attempt) signs a signed-in wallet out and starts a new attempt; while not signed in it changes nothing', async () => {
@@ -384,28 +458,47 @@ describe('TipWallet', () => {
     });
   });
 
-  it('keeps at most one timer whatever the world sends, in any order', async () => {
-    const { wallet, network, clock, last } = setup();
-    wallet.begin();
-    const packets: (() => unknown)[] = [
-      () => network.onEvmNonce({ attempt: last('requestEvmNonce').attempt, nonce: NONCE, message: worldMessage() }),
-      () => network.onEvmNonce({ attempt: last('requestEvmNonce').attempt, retryAfterMs: 100 }),
-      () => network.onEvmNonce({ attempt: 0, nonce: NONCE, message: worldMessage() }),
-      () => network.onEvmWalletStatus({ verified: true, wallet: account.address, attempt: last('requestEvmNonce').attempt, reason: 'ok' }),
-      () => network.onEvmWalletStatus({ verified: false, attempt: last('requestEvmNonce').attempt, reason: 'x' }),
-      () => network.onEvmWalletStatus({ verified: false, attempt: 1 }),
-      () => network.onEvmWalletStatus({ verified: false }),
-      () => network.onEvmWalletStatus({ verified: true, wallet: account.address }),
-      () => clock.advance(7_000),
-      () => clock.advance(31_000),
-    ];
-    // A fixed pseudo-random order
+  it('keeps at most one timer through forty pseudo-random sequences of everything the world can send', async () => {
+    // A fixed pseudo-random sequence
     let seed = 12345;
-    for (let i = 0; i < 400; i++) {
-      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-      await packets[seed % packets.length]();
-      expect(clock.pending().length).toBeLessThanOrEqual(1);
+    const pick = (count: number) => {
+      seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
+      // The high bits: the low ones of this generator repeat after a few steps
+      return (seed >>> 16) % count;
+    };
+    let signedIn = 0;
+    let retried = 0;
+    let gaveUp = 0;
+    for (let run = 0; run < 40; run++) {
+      const { wallet, network, clock, last, count } = setup();
+      wallet.begin();
+      const packets: (() => unknown)[] = [
+        () => network.onEvmNonce({ attempt: last('requestEvmNonce').attempt, nonce: NONCE, message: worldMessage() }),
+        () => network.onEvmNonce({ attempt: last('requestEvmNonce').attempt, retryAfterMs: 100 }),
+        () => network.onEvmNonce({ attempt: 0, nonce: NONCE, message: worldMessage() }),
+        () => network.onEvmWalletStatus({ verified: true, wallet: account.address, attempt: last('requestEvmNonce').attempt, reason: 'ok' }),
+        () => network.onEvmWalletStatus({ verified: false, attempt: last('requestEvmNonce').attempt, reason: 'x' }),
+        () => network.onEvmWalletStatus({ verified: false, attempt: 1 }),
+        () => network.onEvmWalletStatus({ verified: false }),
+        () => network.onEvmWalletStatus({ verified: true, wallet: account.address }),
+        () => clock.advance(7_000),
+        () => clock.advance(31_000),
+      ];
+      for (let i = 0; i < 40; i++) {
+        await packets[pick(packets.length)]();
+        expect(clock.pending().length).toBeLessThanOrEqual(1);
+      }
+      if (count('setEvmTipReceive')) signedIn++;
+      if (count('requestEvmNonce') > 1) retried++;
+      // Given up: nothing left to fire, and a day later still nothing asked
+      const asked = count('requestEvmNonce');
+      clock.advance(24 * 3600_000);
+      if (!wallet.receiving && !clock.pending().length && count('requestEvmNonce') === asked && asked === 4) gaveUp++;
     }
+    // The sequences took wallets through signing in, asking again, and giving up
+    expect(signedIn).toBeGreaterThan(5);
+    expect(retried).toBeGreaterThan(5);
+    expect(gaveUp).toBeGreaterThan(0);
   });
 
   it('a timer that fires although it was replaced does nothing (a scheduler that cannot cancel)', async () => {

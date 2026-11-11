@@ -103,11 +103,8 @@ export class AgentLoader extends System {
     this.results = new Map();
     this.gltfLoader = createGltfLoader();
 
-    // --- Dummy Scene for Hooks ---
-    // Create one dummy object to act as the scene target for all avatar loads
     this.dummyScene = new THREE.Object3D();
     this.dummyScene.name = "AgentLoaderDummyScene";
-    // -----------------------------
   }
 
   // --- Dummy Preload Methods ---
@@ -264,7 +261,8 @@ export class AgentLoader extends System {
     await lease?.toWork(reservation.workBytes, this.stopped.signal);
     this.throwIfStopped();
     const puppeteerManager = PuppeteerManager.getInstance()
-    // The render page keeps the textures (and the whole avatar) and hands back a copy without them.
+    // The render page keeps the textures (and the whole avatar) and hands back a copy: a model's
+    // without the textures of the stripped slots, an avatar's with its textures.
     // That copy is parsed and converted here before the page is told the load is accepted: if any
     // of it fails, or the world goes away first, what the page kept is taken back (pageCall).
     const accept = async (stripped: Uint8Array) => {

@@ -2,7 +2,8 @@ import fs from 'fs/promises'
 import path from 'path'
 import { EMOTES_LIST, LOCOMOTION_EMOTES, TALK_EMOTE } from '../constants.js'
 import { Emotes } from '../hyperfy/src/core/extras/playerEmotes.js'
-import { getModuleDirectory, resolveUrl } from '../utils'
+import { bundledFile } from '../lib/asset-root'
+import { resolveUrl } from '../utils'
 import { AssetUploadError, assetServed, ensureAsset } from '../lib/asset-upload'
 import { worldNet } from '../lib/net-policy'
 import { describeUrl } from '../lib/log-url'
@@ -201,7 +202,9 @@ export class EmoteManager {
     if (!world) return { retry: true };
     let buffer: Buffer;
     try {
-      buffer = await fs.readFile(getModuleDirectory() + emote.path);
+      const file = bundledFile(emote.path);
+      if (!file) throw new Error(`${emote.path} is not a bundled file`);
+      buffer = await fs.readFile(file);
     } catch (err: any) {
       console.error(`${tag} Cannot read emote '${emote.name}': ${err.message}`);
       return { retry: false };
@@ -302,8 +305,8 @@ export class EmoteManager {
    * false when the bundled clip should be tried again.
    */
   private async ensureTalkEmote(world: any = this.session.world): Promise<boolean> {
-    const bundled = getModuleDirectory() + TALK_EMOTE.path;
-    const hasBundled = await fs.access(bundled).then(() => true, () => false);
+    const bundled = bundledFile(TALK_EMOTE.path);
+    const hasBundled = bundled !== null && (await fs.access(bundled).then(() => true, () => false));
     if (hasBundled) {
       const result = await this.uploadLocomotionEmote(world, TALK_EMOTE);
       if (result === 'ok') return true;

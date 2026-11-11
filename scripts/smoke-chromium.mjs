@@ -130,7 +130,7 @@ function processTree(root) {
   return [...tree];
 }
 
-/** Resident memory of a process tree right now, in bytes (what lib/render-watchdog.ts measures) */
+/** Resident memory of a process tree right now, in bytes (the tree part of what lib/render-watchdog.ts measures) */
 function treeMemory(root) {
   const rows = spawnSync('ps', ['-A', '-o', 'pid=,ppid=,rss='], { encoding: 'utf8' }).stdout.split('\n').map((line) => line.trim().split(/\s+/).map(Number)).filter((row) => row.length === 3 && row.every(Number.isFinite));
   const tree = new Set([root]);
@@ -297,7 +297,7 @@ async function main() {
     const emote = await manager.loadGlbBytes(file('emotes/emote-idle.glb'));
     const emoteGltf = await parseStrippedGlb(emote);
     check('emote-idle.glb: parsed from bytes and handed back as a GLB the agent can read', Buffer.from(emote.subarray(0, 4)).toString() === 'glTF' && !!emoteGltf.scene, `${emote.byteLength} bytes back`);
-    // As before this page existed in its present form: the export is of the scene only
+    // The export is of the scene only: how many animations the GLB handed back holds is reported, not checked
     console.log(`  info  the GLB handed back for the emote holds ${emoteGltf.animations.length} animation(s)`);
     const environmentSource = file('assets/base-environment.glb');
     const stripped = await manager.loadGlbBytes(environmentSource);
@@ -436,7 +436,7 @@ async function main() {
         const settings = (t) => [t.type, t.format, t.encoding, t.minFilter, t.magFilter, t.wrapS, t.wrapT, t.flipY, t.generateMipmaps, t.anisotropy, t.image.width, t.image.height, t.image.data.constructor.name, t.image.data.length].join(',');
         out.hdrSettings = settings(viaUrl) === settings(viaBytes) ? 'same' : `${settings(viaUrl)} != ${settings(viaBytes)}`;
         out.hdrPixels = viaUrl.image.data.every((value, i) => value === viaBytes.image.data[i]);
-        // Image: TextureLoader.load of the JPEG as a data: URL (what the page was given before) against registerTexture(bytes)
+        // Image: TextureLoader.load of the JPEG as a data: URL against registerTexture(bytes)
         const jpegViaUrl = await new Promise((resolve, reject) => window.TextureLoader.load(`data:image/jpeg;base64,${jpeg}`, resolve, undefined, reject));
         const id = await window.agentPage.registerTexture(jpeg, 'image/jpeg', 'smoke', 'data:image/jpeg;base64');
         const jpegViaBytes = window.texturesMap.get(`${id}:smoke`);

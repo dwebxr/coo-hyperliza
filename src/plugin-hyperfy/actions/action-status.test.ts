@@ -5,7 +5,7 @@ import { SHARE_ACTION, createOpenPayStorePlugin } from '../../openpay-store';
 import { hyperfyPlugin } from '../index';
 import { AgentActions } from '../systems/actions';
 import { AgentControls } from '../systems/controls';
-import { connectedService, createRuntime, run, runPlan } from '../test-support/core-runtime';
+import { connectedService, createRuntime, run, runPlan, uuid } from '../test-support/core-runtime';
 import { inAutonomousTurn, inChatTurn, worldWithBuilder } from '../test-support/turns';
 
 /*
@@ -89,6 +89,17 @@ describe('action status recorded by core for every Hyperfy action', () => {
     expect(recorded.callbacks).toEqual([expect.objectContaining({ thought: 't', text: 'Generated hi', actions: ['REPLY'] })]);
   });
 
+  it('REPLY and ambient speech make no model call and fail when core hands them no callback: there is nothing to say it through', async () => {
+    const { runtime, useModel } = createRuntime({ models: { [ModelType.OBJECT_LARGE]: { thought: 't', message: 'Generated hi' } } });
+    const message = { id: uuid(), entityId: uuid(), roomId: uuid(), content: { text: 'hi', source: 'hyperfy' } };
+    for (const name of ['REPLY', 'HYPERFY_AMBIENT_SPEECH']) {
+      const action = runtime.actions.find((registered) => registered.name === name)!;
+      // As core's processActions calls a handler when its own caller gave it no callback
+      await expect(action.handler(runtime, message, undefined, undefined, undefined, [])).resolves.toMatchObject({ success: false, data: { actionName: name } });
+    }
+    expect(useModel).not.toHaveBeenCalled();
+  });
+
   it.each([
     'HYPERFY_STOP_MOVING',
     'HYPERFY_TELEPORT_TO_USER',
@@ -104,7 +115,7 @@ describe('action status recorded by core for every Hyperfy action', () => {
     const stored = await inChatTurn(worldWithBuilder(), () => run(runtime, recorded, actionName));
     expect(stored.actionStatus).toBe('failed');
     expect(stored.actionResult).toMatchObject({ success: false, data: { actionName } });
-    expect(typeof stored.actionResult.error).toBe('string');
+    expect(stored.actionResult.error).toEqual(expect.stringMatching(/\S/));
   });
 
   it('records movement and item actions as completed when the real systems carry them out', async () => {
@@ -243,7 +254,10 @@ describe('action status recorded by core for every Hyperfy action', () => {
     const goto = await run(runtime, recorded, 'HYPERFY_GOTO_ENTITY');
     expect(goto.actionStatus).toBe('failed');
     expect(goto.actionResult.error).toBe('navigation failed: blocked');
-    expect((await run(runtime, recorded, 'HYPERFY_USE_ITEM')).actionStatus).toBe('failed');
+    const use = await run(runtime, recorded, 'HYPERFY_USE_ITEM');
+    expect(use.actionStatus).toBe('failed');
+    expect(use.actionResult.error).toBe('entity not found');
+    expect(world.actions.performAction).not.toHaveBeenCalled();
   });
 
   describe('a walk that did not arrive is reported as it ended', () => {
@@ -597,12 +611,14 @@ describe('action status recorded by core for every Hyperfy action', () => {
     expect(recorded.callbacks).toEqual([]);
   });
 
-  it('still refuses the OpenPay share action for a self-sent, empty message outside any turn (its own check)', async () => {
+  it('refuses the OpenPay share action for a self-sent, empty message outside any turn (its own check)', async () => {
     // The Store's listings API never answers here (and the real one is never asked)
     const shop = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'someone' }, { fetchImpl: (() => new Promise(() => {})) as typeof fetch })!;
     const { runtime, recorded } = createRuntime();
     runtime.registerAction(shop.actions![0]);
     const stored = await run(runtime, recorded, SHARE_ACTION, { message: { entityId: runtime.agentId, content: { text: '' } } });
+    expect(stored.actionStatus).toBe('failed');
     expect(stored.actionResult).toMatchObject({ success: false, error: 'links are only shared in a conversation' });
+    expect(recorded.callbacks).toEqual([]);
   });
 });

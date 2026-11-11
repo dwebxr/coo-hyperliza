@@ -129,14 +129,19 @@ export function stripFormatChars(value: string): string {
 }
 
 /**
- * Untrusted text as one line of at most `max` code points: control characters and line/paragraph
- * separators become spaces, so it cannot start a new line in a log or a new section in a prompt,
- * and format characters and variation selectors are removed except where they do their job
- * (stripFormatChars). Runs of ordinary spaces are kept.
+ * What oneLine and shownName keep of untrusted text: control characters (Cc) and line/paragraph
+ * separators (Zl, Zp) become spaces, so it cannot start a new line in a log or a new section in a
+ * prompt, and format characters (Cf) and variation selectors are removed except where they do
+ * their job (stripFormatChars).
  */
+function visibleText(value: string): string {
+  return stripFormatChars(value.replace(LINE_BREAKING_CHARS, ' '));
+}
+
+/** Untrusted text as one line of at most `max` code points (visibleText). Runs of ordinary spaces are kept. */
 export function oneLine(value: string, max: number): string {
   // A code point is at most two UTF-16 units: nothing beyond 2 x max units can survive the cut
-  return truncateCodePoints(stripFormatChars(head(value, max * 2).replace(LINE_BREAKING_CHARS, ' ')).trim(), max).trimEnd();
+  return truncateCodePoints(visibleText(head(value, max * 2)).trim(), max).trimEnd();
 }
 
 /** The first `units` UTF-16 units of `value`, never ending in half a surrogate pair. */
@@ -150,14 +155,13 @@ export const SHOWN_NAME_MAX = 32;
 
 /**
  * A name from the world (a player, an entity, an action label) as it is logged, prompted and
- * spoken: control, format and line/paragraph separator characters become spaces, whitespace is
- * collapsed, and it is cut to `max` code points (coo-world's shown() does the same to the names in
- * its tip announcements). Empty when nothing visible is left or the value is not a string.
+ * spoken: the same as a line of chat (visibleText), with whitespace collapsed, cut to `max` code
+ * points. Empty when nothing visible is left or the value is not a string.
  */
 export function shownName(value: unknown, max = SHOWN_NAME_MAX): string {
   if (typeof value !== 'string') return '';
   // Only the start can survive the cut: an over-long value is not scanned whole
-  return truncateCodePoints(stripInvisibleChars(head(value, max * 8), ' ').replace(/\s+/g, ' ').trim(), max).trimEnd();
+  return truncateCodePoints(visibleText(head(value, max * 8)).replace(/\s+/g, ' ').trim(), max).trimEnd();
 }
 
 /**

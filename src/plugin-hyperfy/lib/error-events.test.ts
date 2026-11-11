@@ -95,6 +95,9 @@ describe('guardErrorEvents, where the runtime delivers through emit() (Node)', (
     ]);
     expectHostValues(got, reason, scriptPromise);
     expect(calls).toEqual([]);
+    // The hook is live: printing the script's own reason calls it
+    inspect(reason);
+    expect(calls).toHaveLength(1);
   });
 
   it("guards multipleResolves, uncaughtException, uncaughtExceptionMonitor, rejectionHandled and the capture callback, and leaves other events' values alone", () => {
@@ -106,7 +109,11 @@ describe('guardErrorEvents, where the runtime delivers through emit() (Node)', (
     const guard = guardErrorEvents(target, { delivery: 'emit', ...quiet() });
     const got: unknown[][] = [];
     for (const event of ['uncaughtException', 'uncaughtExceptionMonitor', 'rejectionHandled', 'multipleResolves', 'exit']) {
-      target.on(event, (...args: unknown[]) => void got.push([event, ...args]));
+      target.on(event, (...args: unknown[]) => {
+        got.push([event, ...args]);
+        // A listener of a guarded event prints what it gets
+        if (event !== 'exit') for (const arg of args) inspect(arg);
+      });
     }
     const { reason, calls } = hookedReason();
     const scriptPromise = Promise.resolve();
@@ -118,7 +125,10 @@ describe('guardErrorEvents, where the runtime delivers through emit() (Node)', (
     target.emit('multipleResolves', 'resolve', scriptPromise, 42);
     target.emit('exit', reason);
     const seen: unknown[] = [];
-    target.setUncaughtExceptionCaptureCallback((error) => void seen.push(error));
+    target.setUncaughtExceptionCaptureCallback((error) => {
+      seen.push(error);
+      inspect(error);
+    });
     (captured[0] as (error: unknown) => void)(reason);
 
     expect(got[0]).toEqual(['uncaughtException', expect.any(Error), 'uncaughtException']);
@@ -372,6 +382,8 @@ describe('errorEventValue', () => {
 
     const made = reasons.map(errorEventValue);
 
+    // The first reason's trap is reached, and what it throws goes no further
+    expect(traps).toHaveBeenCalled();
     for (const value of made) expect(value).toBeInstanceOf(Error);
     expect(made.map((error) => error.message)).toEqual([
       'a value that is not an error',

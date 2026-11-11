@@ -12,9 +12,10 @@
  * - inside getProxy(): a member that hands a value derived from its arguments (a parameter, a rest
  *   parameter's element, `arguments`, a local alias, destructuring or a property of one) to
  *   add/insert/remove/attach, to `.children.push/unshift/splice` or an element of `.children`, to
- *   `.activate()` called on it, or to a function or method of this file that does one of these
- *   (followed to any depth); a spread or Object.assign() of another object (it reads the getters
- *   once, `_ref` included);
+ *   `.activate()` called on it, or to a function declaration or method of this file that does one
+ *   of these (followed to any depth; not an arrow function or function expression bound to a
+ *   name); a spread or Object.assign() of another object (it reads the getters once, `_ref`
+ *   included);
  * - in a constructor: a property of `this` (or of an alias of `this`) set from the data parameter,
  *   whatever it is called, as `data.x`, `data?.x`, `data['x']`, `data.x ?? d` (also || && ?:),
  *   through an alias or a destructuring of the data, and Object.assign(this, data) (reported with

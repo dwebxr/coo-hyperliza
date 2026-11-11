@@ -1,12 +1,10 @@
 import {
-    type Action,
-    composePromptFromState,
-    ModelType,
-    type HandlerCallback,
-    type IAgentRuntime,
-    type Memory,
-    type State,
-    logger,
+  type Action,
+  composePromptFromState,
+  ModelType,
+  type IAgentRuntime,
+  type State,
+  logger,
 } from '@elizaos/core';
 import { actingSession, connectedSession } from '../service';
 import { AiBudgetExceededError, forPurpose } from '../../usage-budget';
@@ -14,6 +12,7 @@ import { AnthropicRefusalError } from '../../anthropic-models';
 import { AgentControls, WORLD_COORDINATE_LIMIT } from '../systems/controls';
 import { notArrivedText } from '../lib/move-outcome';
 import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
+import { errorText } from '../lib/error-text';
 import { oneLine, shownName } from '../lib/text';
 import { TurnCancelled } from '../lib/turn-context';
 
@@ -85,14 +84,7 @@ export const hyperfyGotoEntityAction: Action = {
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
       return !!connectedSession(runtime)?.world?.controls;
     },
-    handler: async (
-      runtime: IAgentRuntime,
-      message: Memory,
-      _state: State,
-      _options: unknown,
-      callback: HandlerCallback,
-      responses,
-    ) => {
+    handler: async (runtime, message, _state, _options, callback, responses) => {
       const thoughtSnippets = oneLine(
         responses
           ?.map((res) => res.content?.thought)
@@ -127,7 +119,7 @@ export const hyperfyGotoEntityAction: Action = {
         // The turn's caller handles these (scripted or offline fallback, a fixed decline); a
         // cancelled turn does nothing more
         if (error instanceof AiBudgetExceededError || error instanceof AnthropicRefusalError || error instanceof TurnCancelled) throw error;
-        logger.error(`[GOTO Action] Error during navigation target extraction:`, error);
+        logger.error(`[GOTO Action] Error during navigation target extraction: ${errorText(error)}`);
         await tellFailure(callback, GOTO_ENTITY, 'Action failed: Could not determine a navigation target.', {
           thought: 'Failed to extract navigation target.',
           metadata: { error: 'extraction_failed' },
@@ -173,7 +165,7 @@ export const hyperfyGotoEntityAction: Action = {
               shownName(targetEntity?.blueprint?.name, ENTITY_NAME_MAX) ||
               `entity ${shownName(String(entityId), ENTITY_NAME_MAX)}`;
 
-            await callback({
+            await callback?.({
               text: `Arrived at ${entityName}.`,
               actions: [GOTO_ENTITY],
               source: 'hyperfy',
@@ -198,7 +190,7 @@ export const hyperfyGotoEntityAction: Action = {
               return actionFailed(GOTO_ENTITY, `did not arrive (${outcome})`, { navigationType, position: { x, z }, outcome });
             }
 
-            await callback({
+            await callback?.({
               text: `Reached position (${x}, ${z}).`,
               actions: [GOTO_ENTITY],
               source: 'hyperfy',
@@ -221,16 +213,16 @@ export const hyperfyGotoEntityAction: Action = {
      examples: [
       // Example assumes an entity "Bob" exists with ID "entity123"
       [
-        { name: '{{name1}}', content: { text: 'Go to Bob' } }, // LLM should infer/find ID or user provides via options
-        { name: '{{name2}}', content: { text: 'Navigating towards Bob...', actions: ['HYPERFY_GOTO_ENTITY'], source: 'hyperfy' } } // Removed metadata
+        { name: '{{name1}}', content: { text: 'Go to Bob' } },
+        { name: '{{name2}}', content: { text: 'Navigating towards Bob...', actions: ['HYPERFY_GOTO_ENTITY'], source: 'hyperfy' } }
       ],
        [
         { name: '{{name1}}', content: { text: 'Find entity abcdef' } }, // Assuming entity abcdef exists
-        { name: '{{name2}}', content: { text: 'Navigating towards entity abcdef...', actions: ['HYPERFY_GOTO_ENTITY'], source: 'hyperfy' } } // Removed metadata
+        { name: '{{name2}}', content: { text: 'Navigating towards entity abcdef...', actions: ['HYPERFY_GOTO_ENTITY'], source: 'hyperfy' } }
       ],
       // Example for failure (entity not found)
       [
-        { name: '{{name1}}', content: { text: 'Go to the missing chair' } }, // User might specify ID in options
+        { name: '{{name1}}', content: { text: 'Go to the missing chair' } },
         { name: '{{name2}}', content: { text: 'Error: Cannot navigate. Could not find location for entity chair999.' } } // Assuming ID was chair999
       ],
       [

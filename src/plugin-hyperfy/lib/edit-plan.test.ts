@@ -65,12 +65,12 @@ describe('the scene-edit plan schema', () => {
     expect(readPlanEntry(entry)).toEqual({ kind: 'invalid', problem });
   });
 
-  it('runs an operation that carries no success flag, a true one, or one that is not a boolean: only its shape counts', () => {
+  it('reads an entry that carries no success flag, a true one, or one that is not a boolean as an operation: only its shape counts', () => {
     const move = { operation: 'translate', target: 'box', parameters: { position: [0, 2, 0] } };
     for (const success of [undefined, true, 'false', 0, null, 'yes']) expect(kindOf({ ...move, success })).toBe('translate');
   });
 
-  it('never runs an entry the plan itself declined, however complete it is, and keeps its reason', () => {
+  it('reads an entry the plan itself declined as declined, however complete an operation it is, and keeps its reason', () => {
     expect(readPlanEntry({ success: false, operation: 'delete', target: 'box', reason: 'kept on purpose' })).toEqual({ kind: 'declined', reason: 'kept on purpose' });
     expect(readPlanEntry({ success: false, operation: 'translate', target: 'box', parameters: { position: [0, 2, 0] }, reason: { why: 'x' } })).toEqual({ kind: 'declined', reason: undefined });
     expect(readPlanEntry({ success: false })).toEqual({ kind: 'declined', reason: undefined });

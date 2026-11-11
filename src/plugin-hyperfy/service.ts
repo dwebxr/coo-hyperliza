@@ -207,7 +207,8 @@ export class HyperfyService extends Service {
     // The close reason also carries 'outdated', in case the kick packet itself was unreadable
     const kick = kickCode ?? findQueuedKick(session.world) ?? (reason?.reason === 'outdated' ? 'outdated' : null)
     if (kick === 'duplicate_user') {
-      // The server rejects the newer connection, so retrying never disturbs the other session;
+      // The server refuses the newer connection while the other one is alive (coo-world lets one
+      // that no longer answers a ping give way), so retrying does not disturb a live session;
       // it just lets us rejoin once that session leaves.
       console.warn('[Hyperfy Reconnect] Another session is using this auth token. Retrying at the maximum delay.')
       this.reconnectController.deferNextRetry()

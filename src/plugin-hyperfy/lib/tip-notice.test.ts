@@ -32,7 +32,7 @@ describe('parseTipNotice', () => {
 describe('parseTipNotice limits', () => {
   it('cuts the name to 32 code points and removes what cannot be seen, as coo-world writes names', () => {
     const tip = parseTipNotice(`A\u0000l\u202eice\u200b ${'x'.repeat(50)} tipped Coo 1 JPYC`, 'Coo')!;
-    expect(tip.fromName).toBe(`A l ice ${'x'.repeat(24)}`);
+    expect(tip.fromName).toBe(`A lice ${'x'.repeat(25)}`);
     expect(Array.from(tip.fromName)).toHaveLength(32);
     expect(parseTipNotice(`${'🛹'.repeat(40)} tipped Coo 1 JPYC`, 'Coo')!.fromName).toBe('🛹'.repeat(32));
     expect(parseTipNotice('\u200b\u202e tipped Coo 1 JPYC', 'Coo')!.fromName).toBe('Anonymous');

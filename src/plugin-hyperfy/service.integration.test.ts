@@ -121,7 +121,7 @@ describe('HyperfyService connection lifecycle (offline)', () => {
       }
     }
     vi.stubGlobal('WebSocket', FakeWebSocket);
-    vi.stubGlobal('self', globalThis.self);
+    vi.stubGlobal('self', (globalThis as { self?: unknown }).self);
     ({ service } = createRuntime());
     const controller = (service as any).reconnectController;
     const schedule = vi.spyOn(controller, 'schedule');
@@ -154,7 +154,7 @@ describe('HyperfyService connection lifecycle (offline)', () => {
     expect(service.isConnected()).toBe(false);
     expect(service.getWorld()).toBeNull();
     // the next session gets a fresh page (no stale textures)
-    expect(service.getPuppeteerManager().resetPage).toHaveBeenCalled();
+    expect(service.getPuppeteerManager()?.resetPage).toHaveBeenCalled();
     // the player never spawned, so the backoff keeps growing
     expect(controller.attemptCount).toBe(1);
   });
@@ -181,6 +181,8 @@ describe('HyperfyService connection lifecycle (offline)', () => {
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
     vi.spyOn(console, 'info').mockImplementation(() => {});
     vi.stubEnv('WS_URL', wsUrl);
+    // start() applies HYPERFY_WORLD_SCRIPTS: off here, whatever the environment the suite runs in says
+    vi.stubEnv('HYPERFY_WORLD_SCRIPTS', undefined);
     const WebSocketSpy = vi.fn();
     vi.stubGlobal('WebSocket', WebSocketSpy);
     const { runtime } = createRuntime();
@@ -207,6 +209,20 @@ describe('HyperfyService connection lifecycle (offline)', () => {
 
     expect(controller.isPending).toBe(false);
     expect(controller.schedule()).toBeNull();
+  });
+
+  it('disconnect() cancels a pending reconnect and leaves later retries possible', async () => {
+    ({ service } = createRuntime());
+    const controller = (service as any).reconnectController;
+
+    await connectIgnoringClose(service);
+    await vi.waitFor(() => expect(controller.isPending).toBe(true), { timeout: 15_000, interval: 50 });
+    await service.disconnect();
+
+    expect(controller.isPending).toBe(false);
+    expect(controller.isStopped).toBe(false);
+    // Unlike stop(): a retry can be scheduled again
+    expect(controller.schedule()).toEqual(expect.any(Number));
   });
 });
 
@@ -283,39 +299,64 @@ describe('which session code acts on', () => {
 });
 
 describe('HyperfyService kick policy', () => {
+  // Every service made here is stopped whatever its test did: a retry left pending would connect later
+  const made: HyperfyService[] = [];
+  const connectedHere: typeof connectedTo = (world, parts) => {
+    const connection = connectedTo(world, parts);
+    made.push(connection.service);
+    return connection;
+  };
+  afterEach(async () => {
+    for (const service of made.splice(0)) await service.stop();
+    vi.restoreAllMocks();
+  });
+
   it('ignores the disconnect of a session that is not the current one (already replaced or ended)', async () => {
-    const { service, runtime, session } = connectedTo({ network: { queue: [['onKick', 'duplicate_user']] }, livekit: null });
+    const { service, runtime, session } = connectedHere({ network: { queue: [['onKick', 'duplicate_user']] }, livekit: null });
     const stale = sessionFor({ network: { queue: [['onKick', 'duplicate_user']] } }, { runtime });
     await (service as any).onWorldDisconnect(stale, { code: 1000 }, null);
     expect(service.getSession()).toBe(session);
     expect(session.ended).toBe(false);
     expect((service as any).reconnectController.isPending).toBe(false);
     expect(runtime.emitEvent).not.toHaveBeenCalled();
-    await service.stop();
   });
 
-  // A kick that arrived right before the close is still in the unflushed network queue.
-  async function disconnectWithQueuedKick(code: string) {
-    const { service, session } = connectedTo({ network: { queue: [['onKick', code]] }, livekit: null });
+  /** A close of the current session's socket; `queue` is the network queue a tick has not flushed yet. Returns what the retry it scheduled waits. */
+  async function disconnectWith(queue: unknown[]) {
+    const { service, runtime, session } = connectedHere({ network: { queue }, livekit: null });
+    const controller = (service as any).reconnectController;
+    const schedule = vi.spyOn(controller, 'schedule');
     await (service as any).onWorldDisconnect(session, { code: 1000 }, null);
-    return { service, session, controller: (service as any).reconnectController };
+    return { service, runtime, session, controller, delays: schedule.mock.results.map((result) => result.value) };
   }
 
   it.each(['duplicate_user', 'player_limit', 'outdated'])('keeps retrying, at the maximum delay, after a %s kick', async (code) => {
-    const { service, session, controller } = await disconnectWithQueuedKick(code);
+    // The kick arrived right before the close: it is still in the unflushed network queue
+    const { service, session, controller, delays } = await disconnectWith([['onKick', code]]);
     // The session the socket belonged to has ended, and the service has none until it reconnects
     expect(session.ended).toBe(true);
     expect(service.getSession()).toBeNull();
     expect(controller.isStopped).toBe(false);
     expect(controller.isPending).toBe(true);
+    // The one retry it scheduled waits the maximum delay
+    expect(delays).toEqual([RECONNECT_MAX_DELAY_MS]);
     controller.cancelPending();
-    // the deferral was consumed by the retry onWorldDisconnect scheduled
+    // ...and only that one: the deferral was used up by it
     expect(controller.schedule()).not.toBe(RECONNECT_MAX_DELAY_MS);
-    await service.stop();
+  });
+
+  it('retries with the ordinary backoff, not the maximum delay, after a close without a kick (control)', async () => {
+    const { runtime, session, controller, delays } = await disconnectWith([['onSnapshot', {}]]);
+    expect(session.ended).toBe(true);
+    expect(controller.isPending).toBe(true);
+    expect(delays).toHaveLength(1);
+    expect(delays[0]).toBeGreaterThan(0);
+    expect(delays[0]).toBeLessThan(RECONNECT_MAX_DELAY_MS / 10);
+    expect(runtime.emitEvent).toHaveBeenCalledWith(hyperfyEventType.DISCONNECTED, expect.objectContaining({ reason: 1000 }));
   });
 
   it("treats a close with reason 'outdated' as that kick even when the kick packet was not read", async () => {
-    const { service, session } = connectedTo({ network: { queue: [] }, livekit: null });
+    const { service, session } = connectedHere({ network: { queue: [] }, livekit: null });
     const controller = (service as any).reconnectController;
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -323,19 +364,16 @@ describe('HyperfyService kick policy', () => {
     expect(controller.schedule()).toBe(RECONNECT_MAX_DELAY_MS);
     await handling;
     expect(String(error.mock.calls[0]?.[0])).toContain('newer protocol');
-    error.mockRestore();
-    await service.stop();
   });
 
   it.each(['duplicate_user', 'player_limit', 'outdated'])('applies the %s delay even when another path schedules first', async (code) => {
-    const { service, session } = connectedTo({ network: { queue: [['onKick', code]] }, livekit: null });
+    const { service, session } = connectedHere({ network: { queue: [['onKick', code]] }, livekit: null });
     const controller = (service as any).reconnectController;
 
     const handling = (service as any).onWorldDisconnect(session, { code: 1000 }, null);
     // e.g. a failed connect() racing with the disconnect handler
     expect(controller.schedule()).toBe(RECONNECT_MAX_DELAY_MS);
     await handling;
-    await service.stop();
   });
 });
 
@@ -413,9 +451,17 @@ const withTipWallet = (account: ReturnType<typeof privateKeyToAccount>) => (worl
   tipWallet: new TipWallet(world.network, account, { host: 'play.world.test', selfId: () => 'coo' }),
 });
 
+/** The tip wallet of a session made with withTipWallet */
+function walletOf(session: { tipWallet: TipWallet | null }): TipWallet {
+  if (!session.tipWallet) throw new Error('this session has no tip wallet');
+  return session.tipWallet;
+}
+
 const net = (id: string, fromId = `from-${id}`) => cooWorldChat(id, fromId, `Player ${fromId}`, id);
 
 describe('HyperfyService chat handling', () => {
+  afterEach(() => vi.restoreAllMocks());
+
   it('handles messages one at a time, in order, each exactly once; Coo posting a reply re-runs the listener but queues nothing', async () => {
     const { s, world, sent } = chatService();
     const handled: string[] = [];
@@ -447,6 +493,8 @@ describe('HyperfyService chat handling', () => {
 });
 
 describe('HyperfyService chat provenance', () => {
+  afterEach(() => vi.restoreAllMocks());
+
   it("never turns app scripts' chat into a turn or a tip thanks, whatever its fromId, and never sends it to the world", async () => {
     const { s, runtime, world, sent, fromScript } = chatService();
     const manager = s.messages;
@@ -464,6 +512,8 @@ describe('HyperfyService chat provenance', () => {
     await new Promise((r) => setTimeout(r, 20));
     await s.conversation.idle();
 
+    // None of them was even taken into the conversation queue
+    expect(s.conversation.stats()).toMatchObject({ queued: 0, handled: 0, duplicate: 0, rateLimited: 0 });
     expect(handleMessage).not.toHaveBeenCalled();
     expect(sent).toEqual([]);
     // Still shown in the local chat history
@@ -474,12 +524,12 @@ describe('HyperfyService chat provenance', () => {
     // The real tip wallet on this connection, signed in and shown as receiving by the world
     const account = privateKeyToAccount(generatePrivateKey());
     const { s, runtime, world, sent } = chatService(withTipWallet(account));
-    const { verify } = await signIn(s.tipWallet, world.network, sent, account);
+    const { verify } = await signIn(walletOf(s), world.network, sent, account);
     // As coo-world answers a verified signature
     world.network.onEvmWalletStatus({ verified: true, wallet: account.address, attempt: verify.attempt, reason: 'ok' });
     vi.spyOn(console, 'error').mockImplementation(() => {}); // the engine finds no 'coo' entity to modify
     world.network.onEntityModified({ id: 'coo', evmTips: true });
-    expect(s.tipWallet.receiving).toBe(true);
+    expect(walletOf(s).receiving).toBe(true);
     sent.length = 0;
 
     const manager = s.messages;
@@ -490,7 +540,7 @@ describe('HyperfyService chat provenance', () => {
     world.network.onChatAdded(net('m1', 'p1'));
     await vi.waitFor(() => expect(handleMessage).toHaveBeenCalledTimes(2));
     await s.conversation.idle();
-    s.tipWallet.stop();
+    walletOf(s).stop();
 
     expect(sent.filter(([name]) => name === 'chatAdded')).toEqual([['chatAdded', expect.objectContaining({ fromId: 'coo', body: expect.stringContaining('Aliceさん、100 JPYCの投げゼニ') })]]);
     // The player's message became a chat turn (MESSAGE_RECEIVED is emitted; its handling is not part of this test)
@@ -502,11 +552,11 @@ describe('HyperfyService chat provenance', () => {
     async function receivingTips() {
       const account = privateKeyToAccount(generatePrivateKey());
       const ctx = chatService(withTipWallet(account));
-      const { verify } = await signIn(ctx.s.tipWallet, ctx.world.network, ctx.sent, account);
+      const { verify } = await signIn(walletOf(ctx.s), ctx.world.network, ctx.sent, account);
       ctx.world.network.onEvmWalletStatus({ verified: true, wallet: account.address, attempt: verify.attempt, reason: 'ok' });
       // The engine finds no 'coo' entity to modify (console.error, silenced)
       ctx.world.network.onEntityModified({ id: 'coo', evmTips: true });
-      expect(ctx.s.tipWallet.receiving).toBe(true);
+      expect(walletOf(ctx.s).receiving).toBe(true);
       ctx.sent.length = 0;
       const manager = ctx.s.messages;
       const handleMessage = vi.spyOn(manager, 'handleMessage');
@@ -525,7 +575,7 @@ describe('HyperfyService chat provenance', () => {
         world.network.onChatAdded(worldNotice('n1', 'Alice tipped Coo 100 JPYC'));
         await vi.waitFor(() => expect(handleMessage).toHaveBeenCalledTimes(1));
         await s.conversation.idle();
-        s.tipWallet.stop();
+        walletOf(s).stop();
         expect(thanks()).toEqual([]);
       }
     });
@@ -549,7 +599,7 @@ describe('HyperfyService chat provenance', () => {
       world.network.onChatAdded(worldNotice('n1', cooWorldTipBodies('Alice', 'Coo', '100', 'JPYC').privateBody));
       await vi.waitFor(() => expect(handleMessage).toHaveBeenCalledTimes(1));
       await s.conversation.idle();
-      s.tipWallet.stop();
+      walletOf(s).stop();
       expect(thanks()).toHaveLength(1);
     });
 
@@ -562,7 +612,7 @@ describe('HyperfyService chat provenance', () => {
       world.network.onChatAdded(worldNotice('n1', body));
       await vi.waitFor(() => expect(handleMessage).toHaveBeenCalledTimes(1));
       await s.conversation.idle();
-      s.tipWallet.stop();
+      walletOf(s).stop();
       expect(thanks()).toEqual([]);
     });
 
@@ -576,7 +626,7 @@ describe('HyperfyService chat provenance', () => {
       world.network.onChatAdded(worldNotice('n2', cooWorldTipBodies('Bob', 'Coo', '5', 'JPYC').privateBody));
       await vi.waitFor(() => expect(handleMessage).toHaveBeenCalledTimes(2));
       await s.conversation.idle();
-      s.tipWallet.stop();
+      walletOf(s).stop();
       expect(thanks()).toEqual([]);
     });
 
@@ -587,7 +637,7 @@ describe('HyperfyService chat provenance', () => {
       world.network.onChatAdded(worldNotice('n1', `Alice tipped ${Array.from(`Coo the ${'o'.repeat(40)}`).slice(0, 32).join('')} 100 JPYC`));
       await vi.waitFor(() => expect(handleMessage).toHaveBeenCalledTimes(1));
       await s.conversation.idle();
-      s.tipWallet.stop();
+      walletOf(s).stop();
       expect(thanks()).toHaveLength(1);
     });
   });
@@ -595,13 +645,13 @@ describe('HyperfyService chat provenance', () => {
   it('still thanks for a tip confirmed after "Receive tips" was switched off again on the same connection', async () => {
     const account = privateKeyToAccount(generatePrivateKey());
     const { s, runtime, world, sent } = chatService(withTipWallet(account));
-    const { verify } = await signIn(s.tipWallet, world.network, sent, account);
+    const { verify } = await signIn(walletOf(s), world.network, sent, account);
     // As coo-world answers a verified signature
     world.network.onEvmWalletStatus({ verified: true, wallet: account.address, attempt: verify.attempt, reason: 'ok' });
     vi.spyOn(console, 'error').mockImplementation(() => {});
     world.network.onEntityModified({ id: 'coo', evmTips: true });
     world.network.onEntityModified({ id: 'coo', evmTips: false });
-    expect(s.tipWallet.receiving).toBe(false);
+    expect(walletOf(s).receiving).toBe(false);
     sent.length = 0;
     const manager = s.messages;
     const handleMessage = vi.spyOn(manager, 'handleMessage');
@@ -610,8 +660,8 @@ describe('HyperfyService chat provenance', () => {
     world.network.onChatAdded(worldNotice('n1', 'Alice tipped Coo 100 JPYC'));
     await vi.waitFor(() => expect(handleMessage).toHaveBeenCalledTimes(1));
     await s.conversation.idle();
-    s.tipWallet.stop();
-    expect(sent.filter(([name]) => name === 'chatAdded')).toHaveLength(1);
+    walletOf(s).stop();
+    expect(sent.filter(([name]) => name === 'chatAdded')).toEqual([['chatAdded', expect.objectContaining({ fromId: 'coo', body: expect.stringContaining('Aliceさん、100 JPYCの投げゼニ') })]]);
   });
 
   it('does not thank for a tip announcement on a connection where the agent is not receiving tips', async () => {
@@ -659,6 +709,7 @@ describe('HyperfyService chat provenance', () => {
 
 describe('HyperfyService chat intake (the path from a chatAdded packet to a turn)', () => {
   const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  afterEach(() => vi.restoreAllMocks());
 
   /** `realManager`: the session's own message manager; otherwise one that only records what it is handed */
   function chatSetup({ realManager = false } = {}) {
@@ -821,8 +872,6 @@ describe('HyperfyService chat intake (the path from a chatAdded packet to a turn
     vi.useFakeTimers();
     try {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      // An earlier test's spy on console.warn may still hold its calls
-      warn.mockClear();
       const { world } = chatSetup();
       for (let i = 0; i < 500; i++) world.network.onChatAdded({ id: i, body: 'numeric id' });
       world.network.onSnapshot({ ...cooWorldSnapshot({ chat: Array.from({ length: 50 }, () => ({ body: 'no id' })) }), entities: [] });
@@ -866,10 +915,10 @@ describe('HyperfyService chat intake (the path from a chatAdded packet to a turn
     const expected = `a${'🛹'.repeat(499)}`;
     expect(world.chat.msgs[0].body).toBe(expected);
     expect(world.chat.msgs[0].body).not.toMatch(LONE_SURROGATE);
-    expect(world.chat.msgs[0].from).toBe(`Al ice${'x'.repeat(26)}`);
+    expect(world.chat.msgs[0].from).toBe(`Alice${'x'.repeat(27)}`);
     const memory = runtime.emitEvent.mock.calls.find(([event]: any[]) => event === hyperfyEventType.MESSAGE_RECEIVED)[1].message;
     expect(memory.content.text).toBe(expected);
-    expect(memory.content.metadata.hyperfyFromName).toBe(`Al ice${'x'.repeat(26)}`);
+    expect(memory.content.metadata.hyperfyFromName).toBe(`Alice${'x'.repeat(27)}`);
     const logged = logs.flatMap((log) => log.mock.calls.flat()).map(String).join('\n');
     expect(logged).not.toContain('🛹'.repeat(500));
     expect(logged).not.toContain('forged log line');
@@ -918,13 +967,20 @@ describe('HyperfyService chat intake (the path from a chatAdded packet to a turn
     expect(order).toEqual(['slow', ...Array.from({ length: 20 }, (_, i) => `w${i}`)]);
   });
 
-  it('handles nothing before the agent has a player of its own', async () => {
+  it('handles nothing before the agent has a player of its own, and what comes once it has one', async () => {
     const { s, world, send, ids } = chatSetup();
+    const player = world.entities.player;
     world.entities.player = null;
     s.start();
     send('early');
     await s.conversation.idle();
+    // Its turn came and went (it was not dropped on the way): nothing was handed to the message manager
+    expect(s.conversation.stats()).toMatchObject({ queued: 1, handled: 1 });
     expect(ids()).toEqual([]);
+    world.entities.player = player;
+    send('later');
+    await s.conversation.idle();
+    expect(ids()).toEqual(['later']);
   });
 });
 
@@ -1010,6 +1066,29 @@ describe('HyperfyService: "stop" does not wait its turn', () => {
     expect(stopAllActions.mock.calls.filter(([why]: any[]) => why === 'asked to stop')).toEqual([]);
   });
 
+  it('stops nothing on arrival for a stop the queue dropped while its room state was read: it gets no turn, and a later walk is not its to end', async () => {
+    vi.useFakeTimers();
+    const { s, world, runtime, stopAllActions } = walking();
+    world.entities.items.set('p1', { data: { id: 'p1', type: 'player', name: 'Alice' } });
+    const reads: ((state: string | null) => void)[] = [];
+    runtime.getParticipantUserState = vi.fn(() => new Promise((resolve) => reads.push(resolve)));
+    world.network.onChatAdded(cooWorldChat('walk', 'p1', 'Alice', 'Coo, go to the tree'));
+    await vi.advanceTimersByTimeAsync(0);
+    // A bare stop from the only other player: its room state is read before it acts
+    world.network.onChatAdded(cooWorldChat('bare', 'p1', 'Alice', 'stop'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reads).toHaveLength(1);
+    // Alice's later lines push it out of the queue (her oldest waiting goes past her cap)
+    for (let i = 0; i < 6; i++) world.network.onChatAdded(cooWorldChat(`chat${i}`, 'p1', 'Alice', `line ${i}`));
+    await vi.advanceTimersByTimeAsync(8_000);
+    for (let i = 6; i < 8; i++) world.network.onChatAdded(cooWorldChat(`chat${i}`, 'p1', 'Alice', `line ${i}`));
+    expect(s.conversation.stats().senderWaiting).toBe(1);
+    // The read finishes: not muted, and the stop is gone
+    reads.shift()!(null);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stopAllActions.mock.calls.filter(([why]: any[]) => why === 'asked to stop')).toEqual([]);
+  });
+
   it("keeps a stop's mark on its own queued message, however many other stops arrive while it waits", async () => {
     vi.useFakeTimers();
     const { s, world, received } = walking();
@@ -1030,7 +1109,7 @@ describe('HyperfyService: "stop" does not wait its turn', () => {
 
   it('stops nothing for a stop the queue does not admit (its sender is over the rate limit), nor for one not addressed to the agent', async () => {
     vi.useFakeTimers();
-    const { world, stopAllActions } = walking();
+    const { s, world, stopAllActions } = walking();
     // Someone else is present: a bare "stop" is not addressed to the agent
     world.entities.items.set('p2', { data: { id: 'p2', type: 'player', name: 'Bob' } });
     world.entities.items.set('p3', { data: { id: 'p3', type: 'player', name: 'Cid' } });
@@ -1039,8 +1118,13 @@ describe('HyperfyService: "stop" does not wait its turn', () => {
     expect(stopAllActions).not.toHaveBeenCalled();
     for (let i = 1; i < 8; i++) world.network.onChatAdded(cooWorldChat(`m${i}`, 'p1', 'Alice', `line ${i}`));
     // Alice's ninth message within the same moment is over her limit
+    expect(s.conversation.stats().rateLimited).toBe(0);
     world.network.onChatAdded(cooWorldChat('halt', 'p1', 'Alice', 'Coo, stop!'));
+    expect(s.conversation.stats().rateLimited).toBe(1);
     expect(stopAllActions).not.toHaveBeenCalled();
+    // The same words from someone under their limit do stop: it was the limit that turned Alice's away
+    world.network.onChatAdded(cooWorldChat('halt-2', 'p3', 'Cid', 'Coo, stop!'));
+    expect(stopAllActions).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1049,6 +1133,7 @@ describe('HyperfyService tip wallet key', () => {
     forgetTipWalletAccount();
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it('keeps TIP_WALLET_PRIVATE_KEY out of process.env across the server re-reading .env, and signs in with it on a connection and after a reconnect', async () => {
@@ -1061,6 +1146,7 @@ describe('HyperfyService tip wallet key', () => {
     // The elizaOS server re-reads .env (without overriding) after loading the project
     process.env.TIP_WALLET_PRIVATE_KEY = key;
     vi.stubEnv('WS_URL', '   '); // start() then connects nowhere by itself
+    vi.stubEnv('HYPERFY_WORLD_SCRIPTS', undefined); // ...and applies the scripts mode: off here
     for (const method of ['log', 'warn', 'error', 'info', 'debug'] as const) vi.spyOn(console, method).mockImplementation(() => {});
     const { runtime } = createRuntime();
     const service = await HyperfyService.start(runtime);
@@ -1215,6 +1301,47 @@ describe('HyperfyService and the session of each connection', () => {
     await service.disconnect();
     expect([service.getSession(), service.getWorld(), service.currentWorldId, service.isConnected()]).toEqual([null, null, null, false]);
     expect([session.ended, session.connected]).toEqual([true, false]);
+  });
+
+  it("resets the reconnect backoff when the agent's player spawns on the current connection, and not for a connection that was replaced", async () => {
+    const created = createRuntime();
+    service = created.service;
+    const controller = (service as any).reconnectController;
+    // Two failed attempts behind it, as after two closes without a spawn
+    controller.schedule();
+    controller.cancelPending();
+    controller.schedule();
+    controller.stop();
+    expect(controller.attemptCount).toBe(2);
+
+    await service.connect(HERE);
+    const first = service.getSession()!;
+    // Connected is not established: the backoff stands until the world spawns the agent's player
+    expect(controller.attemptCount).toBe(2);
+    first.world.emit('player', {});
+    expect(controller.attemptCount).toBe(0);
+
+    controller.resume();
+    controller.schedule();
+    controller.stop();
+    expect(controller.attemptCount).toBe(1);
+    await service.connect(HERE);
+    // The replaced connection's world says its player spawned: that says nothing about the current one
+    first.world.emit('player', {});
+    expect(controller.attemptCount).toBe(1);
+    service.getSession()!.world.emit('player', {});
+    expect(controller.attemptCount).toBe(0);
+  });
+
+  it('a connect supersedes a retry that was waiting to fire', async () => {
+    const created = createRuntime();
+    service = created.service;
+    const controller = (service as any).reconnectController;
+    expect(controller.schedule()).toEqual(expect.any(Number));
+    expect(controller.isPending).toBe(true);
+    await service.connect(HERE);
+    expect(controller.isPending).toBe(false);
+    expect(sockets).toHaveLength(1);
   });
 
   it('gives every connection a session of its own, and ends the one it replaces', async () => {

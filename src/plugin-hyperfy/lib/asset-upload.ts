@@ -7,11 +7,12 @@ import { type NetPolicy, onWorldOrigin, SafeFetchError, toResponse, worldNet } f
  *
  * The world only accepts uploads from a connected session: both requests carry the session's
  * bearer token, and posting a file needs builder rank (or, for a .vrm, custom avatars turned on
- * in the world settings). The engine's ClientNetwork.upload predates this: it sends no token and
+ * in the world settings). The engine's ClientNetwork.upload does neither: it sends no token and
  * ignores the response, so session/create-agent-world.ts installs uploadAsset in its place.
  *
- * The token goes to the world's own origin only (the one WS_URL names): the API URL arrives from
- * the world, and one on any other origin is refused before anything is sent. A redirect is not
+ * The token goes to the world's own origin only (the one WS_URL names; for a loopback world, any
+ * loopback spelling of it: net-policy.ts onWorldOrigin): the API URL arrives from the world, and
+ * one on any other origin is refused before anything is sent. A redirect is not
  * followed either, wherever it points. Like every request for a world, these go through the
  * network policy (lib/net-policy.ts) and so never through an HTTP(S)_PROXY, which the runtime's
  * own fetch would use. The world's assets URL gets no token: looking a file up there is an
@@ -152,8 +153,9 @@ export interface UploadOptions {
 }
 
 /**
- * The one function that sends the session token: each call checks its own URL against the world's
- * origin (apiUrlProblem) before anything is sent, then calls `check`, and never follows a redirect.
+ * The one function that sends the session token over HTTP (the socket carries it in its own URL,
+ * lib/world-protocol.ts): each call checks its own URL against the world's origin (apiUrlProblem)
+ * before anything is sent, then calls `check`, and never follows a redirect.
  * Throws AssetUploadError, or whatever `check` throws.
  */
 export function worldApiSender(
@@ -234,8 +236,8 @@ export async function uploadAsset(
 }
 
 /**
- * Whether `url` is served: true, false (4xx), or null when that could not be checked (cause
- * logged). Throws AssetUploadError when the network policy does not allow asking at all.
+ * Whether `url` is served: true, false (any other status below 500), or null when that could not
+ * be checked (cause logged). Throws AssetUploadError when the network policy does not allow asking at all.
  */
 export async function assetServed(url: string, net: NetPolicy): Promise<boolean | null> {
   try {
@@ -255,7 +257,7 @@ export async function assetServed(url: string, net: NetPolicy): Promise<boolean 
 
 export type EnsureAssetResult =
   | { ok: true; fileName: string; url: string; uploaded: boolean }
-  /** retryable: the cause may pass (network, server error, not verified yet); false when the world refused. */
+  /** retryable: the cause may pass (network, server error, not verified yet); false when the world refused, the agent's policy refuses the assets URL, or the file is not there and was not to be uploaded. */
   | { ok: false; fileName: string; error: Error; retryable: boolean };
 
 /**

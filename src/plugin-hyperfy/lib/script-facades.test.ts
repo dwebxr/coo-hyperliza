@@ -49,6 +49,12 @@ describe('script console', () => {
     scriptConsole.timeEnd('never started');
     expect(out.log).toHaveBeenCalledTimes(1);
     expect(out.log.mock.calls[0][0]).toMatch(/^\[script\] load: [\d.]+ms$/);
+    // A label that is not text: rendered, never handed on as an object
+    scriptConsole.time({ a: 1 });
+    scriptConsole.timeEnd({ a: 1 });
+    expect(out.log).toHaveBeenCalledTimes(2);
+    expect(out.log.mock.calls[1]).toHaveLength(1);
+    expect(out.log.mock.calls[1][0]).toMatch(/^\[script\] \{ a: 1 \}: [\d.]+ms$/);
   });
 });
 
@@ -108,6 +114,9 @@ describe('script fetch', () => {
     expect(blob).not.toBeInstanceOf(Blob);
     expect(Object.getPrototypeOf(blob)).toBe(Object.prototype);
     expect(Object.isFrozen(blob)).toBe(true);
+    // A size, a type and three functions: no property holds the bytes
+    expect(Reflect.ownKeys(blob).sort()).toEqual(['arrayBuffer', 'size', 'slice', 'text', 'type']);
+    expect(Object.values(blob).map((value) => typeof value).sort()).toEqual(['function', 'function', 'function', 'number', 'string']);
     expect(blob.size).toBe(11);
     expect(blob.type).toBe('image/png');
     expect(await blob.text()).toBe('hello world');

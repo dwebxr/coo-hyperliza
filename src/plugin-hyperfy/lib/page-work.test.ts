@@ -15,14 +15,15 @@ describe('PageWork', () => {
     const run = vi.fn(async () => 'never');
     await expect(work.run('model/a', 'the model a', run)).rejects.toThrow('Not handing the model a to the render page again');
     expect(run).not.toHaveBeenCalled();
+    // Another asset's work still runs
+    const other = vi.fn(async () => 'ran');
+    await expect(work.run('model/d', 'the model d', other)).resolves.toBe('ran');
     expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0]).toContain('the model a got the render page killed while it was the only page call');
   });
 
   it('runs page work one call at a time from the first kill on', async () => {
     const work = new PageWork({ log: () => {} });
-    expect(work.serial).toBe(false);
-    await work.run('model/a', 'a', async () => Promise.reject(killed(3))).catch(() => {});
-    expect(work.serial).toBe(true);
     let running = 0;
     let most = 0;
     const job = async () => {
@@ -30,6 +31,14 @@ describe('PageWork', () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
       running--;
     };
+    // Before any kill: side by side
+    expect(work.serial).toBe(false);
+    await Promise.all([work.run('x', 'x', job), work.run('z', 'z', job)]);
+    expect(most).toBe(2);
+
+    await work.run('model/a', 'a', async () => Promise.reject(killed(3))).catch(() => {});
+    expect(work.serial).toBe(true);
+    most = 0;
     await Promise.all([work.run('x', 'x', job), work.run('y', 'y', async () => Promise.reject(new Error('fails on its own'))).catch(() => {}), work.run('z', 'z', job)]);
     expect(most).toBe(1);
   });

@@ -181,16 +181,24 @@ async function setup({ handler = scriptServer, limits, scripts }: { handler?: Ha
 const paths = (server: TestServer) => server.hits.map((hit) => hit.url);
 
 describe('AgentLoader', () => {
-  it('loads a script from the world and keeps it unevaluated when scripts are off', async () => {
-    const { loader, assets } = await setup();
+  it('loads a script from the world and keeps it unevaluated when scripts are off: neither the load nor its exec() runs the code', async () => {
+    // Code that would leave a mark on the process, and throw, if anything evaluated it
+    const code = "globalThis.__cooLoaderTestEvaluated = true; throw new Error('evaluated');";
+    const { loader, assets } = await setup({ handler: (_request, response) => response.end(code) });
+    try {
+      const script = await loader.load('script', 'asset://app.js');
 
-    const script = await loader.load('script', 'asset://app.js');
-
-    expect(script.code).toBe('// /assets/app.js');
-    expect(typeof script.exec).toBe('function');
-    expect(loader.get('script', 'asset://app.js')).toBe(script);
-    expect(loader.has('script', 'asset://app.js')).toBe(true);
-    expect(paths(assets)).toEqual(['/assets/app.js']);
+      expect(script.code).toBe(code);
+      expect(typeof script.exec).toBe('function');
+      // What the engine calls to run an app's script (entities/App.js): nothing happens
+      expect(script.exec({}, {}, {}, {}, {})).toBeUndefined();
+      expect('__cooLoaderTestEvaluated' in globalThis).toBe(false);
+      expect(loader.get('script', 'asset://app.js')).toBe(script);
+      expect(loader.has('script', 'asset://app.js')).toBe(true);
+      expect(paths(assets)).toEqual(['/assets/app.js']);
+    } finally {
+      delete (globalThis as { __cooLoaderTestEvaluated?: boolean }).__cooLoaderTestEvaluated;
+    }
   });
 
   it('hands a script to the sandbox runtime when there is one', async () => {
@@ -203,8 +211,8 @@ describe('AgentLoader', () => {
   it('downloads an asset once when it is asked for twice at the same moment', async () => {
     const { loader, assets } = await setup();
 
-    // Before the fix, the second call arrived while the first was still resolving the URL, found
-    // nothing registered, and downloaded the file again
+    // The second call arrives while the first is still resolving the URL: it finds the first one
+    // registered and gets its promise, instead of downloading the file again
     const first = loader.load('script', 'asset://app.js');
     const second = loader.load('script', 'asset://app.js');
 
@@ -224,7 +232,7 @@ describe('AgentLoader', () => {
     expect(a).toBe(b);
     expect(a.gltf.scene.children[0].name).toBe('Root');
     expect(typeof a.toNodes).toBe('function');
-    // One request in all: the agent no longer asks first and lets Chromium download it again
+    // One request in all: the agent downloads it and the render page is given the bytes (it downloads nothing)
     expect(paths(assets)).toEqual(['/assets/thing.glb']);
     expect(page.glb).toEqual([glb.byteLength]);
   });
@@ -237,23 +245,30 @@ describe('AgentLoader', () => {
   });
 
   it.each([
-    ['another port on loopback', (internal: TestServer) => `http://127.0.0.1:${internal.port}/internal.glb`],
-    ['the same machine by name', (internal: TestServer) => `http://localhost:${internal.port}/internal.glb`],
-    ['a private address', () => 'https://10.0.0.8/internal.glb'],
-    ['the metadata address', () => 'http://169.254.169.254/latest/meta-data/'],
-    ['a URL with credentials', (_internal: TestServer, origin: string) => origin.replace('http://', 'http://user:pw@') + '/assets/app.js'],
-    ['a file URL', () => 'file:///etc/hosts'],
-    ['a path outside the module directory', () => '../../../../../etc/hosts'],
-    ['a blob URL', () => 'blob:nodedata:1234'],
-  ])('loads nothing from %s, whoever named it, and asks no server', async (_name, url) => {
-    const { loader, assets, internal, origin } = await setup();
+    ['another port on loopback', (internal: TestServer) => `http://127.0.0.1:${internal.port}/internal.glb`, "http:// is only allowed on the world's own origin"],
+    ['the same machine by name', (internal: TestServer) => `http://localhost:${internal.port}/internal.glb`, "http:// is only allowed on the world's own origin"],
+    ['a private address', () => 'https://10.0.0.8/internal.glb', '10.0.0.8 is a private address'],
+    ['the metadata address', () => 'http://169.254.169.254/latest/meta-data/', "http:// is only allowed on the world's own origin"],
+    ['a URL with credentials', (_internal: TestServer, origin: string) => origin.replace('http://', 'http://user:pw@') + '/assets/app.js', 'user name or password'],
+    ['a file URL', () => 'file:///etc/hosts', 'could not resolve file:///etc/hosts'],
+    ['a path outside the bundled files', () => '../../../../../etc/hosts', 'could not resolve ../../../../../etc/hosts'],
+    ['a blob URL', () => 'blob:nodedata:1234', 'blob: URLs cannot be loaded by the agent'],
+  ])('loads nothing from %s, as any kind of asset, and asks no server', async (_name, url, why) => {
+    const evaluate = vi.fn((code: string) => ({ exec() {}, code }));
+    const { loader, assets, internal, origin } = await setup({ scripts: { evaluate } });
 
     for (const type of ['model', 'script', 'avatar', 'emote']) {
-      await expect(loader.load(type, url(internal, origin))).rejects.toThrow();
+      // Refused for what it is, not failed for another reason
+      await expect(loader.load(type, url(internal, origin))).rejects.toThrow(why);
       expect(loader.has(type, url(internal, origin))).toBe(false);
     }
     expect(internal.connections + assets.connections).toBe(0);
-    expect(page.glb).toEqual([]);
+    expect([page.glb, page.vrm]).toEqual([[], []]);
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(loader.results.size).toBe(0);
+    // The same loader does load from the world itself (control)
+    await expect(loader.load('script', 'asset://app.js')).resolves.toMatchObject({ code: '// /assets/app.js' });
+    expect(assets.connections).toBe(1);
   });
 
   it('follows a redirect inside the world and refuses one that leaves it', async () => {
@@ -462,7 +477,7 @@ describe('AgentLoader', () => {
     expect(page.glb).toHaveLength(1);
   });
 
-  it("gives the page, for a large model, a ceiling lowered so that the reservation fits the pool, and refuses one whose estimated export cannot fit", () => {
+  it("modelReservation lowers a large model's ceiling so that the reservation fits the pool, refuses one whose estimated export cannot fit, and gives an avatar room for 8 x its download", () => {
     const MiB = 1024 * 1024;
     // 50 MB: 6 x 50 MB sent, the rest of 768 MiB over 7 per returned byte
     const fitted = modelReservation('model', 50 * 1000 * 1000, MiB, modelBudget('model').exportBytes) as { exportBytes: number; workBytes: number };
@@ -616,8 +631,9 @@ describe('AgentLoader', () => {
 
   it('lists every emote for one full play of its clip, as the agent parses the bundled file (constants.ts EMOTES_LIST)', async () => {
     const { loader } = await setup();
+    expect(EMOTES_LIST.length).toBeGreaterThan(0);
     for (const emote of EMOTES_LIST) {
-      const parsed = await loader.load('emote', `public${emote.path}`);
+      const parsed = await loader.load('emote', emote.path);
       const clip = parsed.toClip({ rootToHips: 1, version: '1', getBoneName: (name: string) => name });
       expect(emote.duration, emote.name).toBeCloseTo(clip.duration, 2);
     }
@@ -726,7 +742,7 @@ describe('AgentLoader emotes', () => {
     const calls = parse.mock.calls.length;
     const { loader: other } = await setup({ handler: (_request, response) => response.end(Buffer.from(glbOfChunks([jsonChunk({ asset: { version: '2.0' } }), jsonChunk({ asset: { version: '2.0' } })]))) });
     const otherParse = vi.spyOn(other.gltfLoader, 'parse');
-    await expect(other.load('emote', 'asset://two-json.glb')).rejects.toThrow();
+    await expect(other.load('emote', 'asset://two-json.glb')).rejects.toThrow('the GLB has a second chunk that is not BIN');
     expect(otherParse).not.toHaveBeenCalled();
     expect(parse.mock.calls.length).toBe(calls);
   });

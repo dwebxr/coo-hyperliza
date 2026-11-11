@@ -135,7 +135,8 @@ export class AgentEnvironment extends System {
   /**
    * Downloads `url` and hands it to the render page with `pageCall`, under the world's page work
    * (a kill blames it only when it was alone; lib/page-work.ts) and the agent's memory reservation
-   * (lib/asset-memory.ts), held until the page call is over. Null when `signal` fired meanwhile.
+   * (lib/asset-memory.ts), held until the page call is over. Null when `signal` fired, or the
+   * system was destroyed, between its steps (a wait or download the signal stops throws instead).
    */
   private async toPage<T>(url: string, kind: 'image' | 'hdr', signal: AbortSignal, pageCall: (asset: AssetBytes) => Promise<T>): Promise<{ asset: AssetBytes; result: T } | null> {
     const work: PageWork = this.world.loader?.pageWork ?? this.ownPageWork

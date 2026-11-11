@@ -78,12 +78,16 @@ describe('HYPERFY_EDIT_ENTITY', () => {
     ]);
   });
 
-  it('answers a refusal in Japanese to a Japanese request, by voice too', async () => {
-    const { world, runtime, recorded } = editSetup();
-    await inTurn({ origin: 'voice', world, requesterId: 'visitor-1' }, () =>
-      run(runtime, recorded, 'HYPERFY_EDIT_ENTITY', { message: { content: { text: '箱を動かして', source: 'hyperfy' } } })
-    );
-    expect(recorded.callbacks[0].text).toMatch(/^ごめんなさい/);
+  it('answers a refusal in Japanese to a Japanese request, in chat and by voice', async () => {
+    for (const origin of ['chat', 'voice'] as const) {
+      const { world, buildManager, runtime, recorded } = editSetup();
+      const stored = await inTurn({ origin, world, requesterId: 'visitor-1' }, () =>
+        run(runtime, recorded, 'HYPERFY_EDIT_ENTITY', { message: { content: { text: '箱を動かして', source: 'hyperfy' } } })
+      );
+      expect(stored.actionResult.error, origin).toBe('the requester is not a builder in this world');
+      expect(buildManager.translate, origin).not.toHaveBeenCalled();
+      expect(recorded.callbacks.map((c) => c.text), origin).toEqual([expect.stringMatching(/^ごめんなさい/)]);
+    }
   });
 
   it('on an upstream world, runs only for HYPERFY_OPERATOR_IDS', async () => {
@@ -161,21 +165,28 @@ describe('the action allow-list on autonomous turns', () => {
     expect(plain.useModel).not.toHaveBeenCalled();
   });
 
-  it('refuses every registered action outside the autonomy list, and lets the listed ones run', async () => {
+  it('refuses every registered action outside the autonomy list, and none that is on it', async () => {
     // The Store's listings API never answers here (and the real one is never asked)
     const shop = createOpenPayStorePlugin({ OPENPAY_STORE_HANDLES: 'someone' }, { fetchImpl: (() => new Promise(() => {})) as typeof fetch })!;
     const actions = [...hyperfyPlugin.actions!, ...shop.actions!];
     const { runtime, recorded } = createRuntime({ actions, models: {} });
     const world = coo();
+    // The list itself, written out: an action added to it is a change to this test as well
+    const allowed = ['HYPERFY_GOTO_ENTITY', 'HYPERFY_WALK_RANDOMLY', 'HYPERFY_USE_ITEM', 'HYPERFY_UNUSE_ITEM', 'HYPERFY_AMBIENT_SPEECH', 'HYPERFY_TELEPORT_TO_USER', 'REPLY', 'IGNORE'];
+    expect([...AUTONOMY_ACTIONS].sort()).toEqual([...allowed].sort());
+    const refused: string[] = [];
     for (const action of actions) {
       // Planned text, so REPLY and ambient speech need no model call of their own
       const stored = await inAutonomousTurn(world, () =>
         run(runtime, recorded, action.name, { content: { text: 'Hello' }, message: { entityId: runtime.agentId, content: { text: '' } } })
       );
       const refusedByList = stored.actionResult.error === `${action.name} is not allowed on an autonomous turn`;
-      expect(refusedByList, action.name).toBe(!AUTONOMY_ACTIONS.includes(action.name));
+      expect(refusedByList, action.name).toBe(!allowed.includes(action.name));
+      if (refusedByList) refused.push(action.name);
     }
-    expect(actions.map((a) => a.name)).toContain(SHARE_ACTION);
+    // Both kinds were among the registered actions: every listed one, and the ones that must be refused
+    expect(actions.map((a) => a.name)).toEqual(expect.arrayContaining(allowed));
+    expect(refused.sort()).toEqual(['HYPERFY_EDIT_ENTITY', 'HYPERFY_SCENE_PERCEPTION', 'HYPERFY_STOP_MOVING', SHARE_ACTION].sort());
   });
 });
 
@@ -508,7 +519,7 @@ describe('a scene edit that loses its authorization while it runs', () => {
     ['an entity operation given a URL', 'delete', ' https://cdn.example/a.glb?token=signed-secret'],
     ['an entity operation given a path with a query', 'translate', 'models/a.glb?token=signed-secret'],
     ['an operation this action does not know', 'download', ' https://cdn.example/a.glb?token=signed-secret'],
-    ['an operation that is not text', { toString: () => 'import' }, ' https://cdn.example/a.glb?token=signed-secret'],
+    ['an operation that is not text', { toString: (): string => 'import' }, ' https://cdn.example/a.glb?token=signed-secret'],
   ])('logs, summarises and records nothing of the signed query or credentials of %s', async (_what, operation, target) => {
     const ctx = liveEdit([{ success: true, operation, target, parameters: { position: [0, 1, 0] }, description: 'Did it' }, { success: false, operation, target, reason: 'not possible' }], {});
     const lines: string[] = [];
@@ -718,17 +729,16 @@ describe('failures the requester is told about', () => {
   const noService = () => createRuntime({ service: null });
 
   it.each([
-    ['navigation target extraction failing', 'HYPERFY_GOTO_ENTITY', () => ({ world: { controls: { goto: vi.fn() } }, models: { [ModelType.OBJECT_LARGE]: () => { throw new Error('bad json'); } } })],
-    ['navigation failing', 'HYPERFY_GOTO_ENTITY', () => ({ world: { controls: { goto: vi.fn().mockRejectedValue(new Error('blocked')) } }, models: { [ModelType.OBJECT_LARGE]: { navigationType: 'position', parameter: { position: { x: 1, z: 1 } } } } })],
-    ['a missing item', 'HYPERFY_USE_ITEM', () => ({ world: { controls: {}, actions: {}, entities: { items: new Map() } }, models: { [ModelType.OBJECT_SMALL]: { entityId: 'gone' } } })],
-    ['no action system', 'HYPERFY_UNUSE_ITEM', () => ({ world: {}, models: {} })],
-    ['no controls', 'HYPERFY_WALK_RANDOMLY', () => ({ world: {}, models: {} })],
-  ])('%s is told in a chat turn and kept quiet on an autonomous one', async (_what, name, make) => {
+    ['navigation target extraction failing', 'HYPERFY_GOTO_ENTITY', 'Action failed: Could not determine a navigation target.', () => ({ world: { controls: { goto: vi.fn() } }, models: { [ModelType.OBJECT_LARGE]: () => { throw new Error('bad json'); } } })],
+    ['navigation failing', 'HYPERFY_GOTO_ENTITY', 'Navigation failed: blocked', () => ({ world: { controls: { goto: vi.fn().mockRejectedValue(new Error('blocked')) } }, models: { [ModelType.OBJECT_LARGE]: { navigationType: 'position', parameter: { position: { x: 1, z: 1 } } } } })],
+    ['a missing item', 'HYPERFY_USE_ITEM', 'Could not locate entity gone.', () => ({ world: { controls: {}, actions: {}, entities: { items: new Map() } }, models: { [ModelType.OBJECT_SMALL]: { entityId: 'gone' } } })],
+    ['no action system', 'HYPERFY_UNUSE_ITEM', 'Error: Cannot unuse item. Required systems are unavailable.', () => ({ world: {}, models: {} })],
+    ['no controls', 'HYPERFY_WALK_RANDOMLY', 'Error: Cannot wander. Hyperfy connection/controls unavailable.', () => ({ world: {}, models: {} })],
+  ])('%s is told in a chat turn and kept quiet on an autonomous one', async (_what, name, text, make) => {
     const chat = make();
     const inChat = createRuntime({ service: connectedService(chat.world), models: chat.models });
-    await inChatTurn(chat.world, () => run(inChat.runtime, inChat.recorded, name));
-    expect(inChat.recorded.callbacks).toHaveLength(1);
-    expect(inChat.recorded.callbacks[0].text).toBeTruthy();
+    expect((await inChatTurn(chat.world, () => run(inChat.runtime, inChat.recorded, name))).actionStatus).toBe('failed');
+    expect(inChat.recorded.callbacks.map((c) => c.text)).toEqual([text]);
     const auto = make();
     const inAuto = createRuntime({ service: connectedService(auto.world), models: auto.models });
     expect((await inAutonomousTurn(auto.world, () => run(inAuto.runtime, inAuto.recorded, name))).actionStatus).toBe('failed');

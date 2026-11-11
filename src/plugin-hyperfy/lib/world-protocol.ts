@@ -3,7 +3,7 @@ import { WORLD_URL_PROTOCOLS, sessionTokenProblem } from './world-url';
 import { describeUrl } from './log-url';
 import { readChatMessage } from './chat-intake';
 import { RateLimitedLog } from './rate-limited-log';
-import { PacketOverLimit, decodeServerFrame } from './packet-decode';
+import { PacketOverLimit, PacketRefused, decodeServerFrame } from './packet-decode';
 
 /**
  * The network protocol of coo-world (github.com/dwebxr/coo-world, src/core/packets.js as of
@@ -80,15 +80,263 @@ const clientPackr = new Packr({ useRecords: false, structuredClone: false, moreT
 const idByName = new Map<string, number>(PACKET_NAMES.map((name, id) => [name, id]));
 const methodOf = (name: string) => `on${name.charAt(0).toUpperCase()}${name.slice(1)}`; // 'kick' -> 'onKick'
 
+// The world's inboundPolicy.js also scans every packet (strictDecode.js) and drops one with more
+// values than these, nested deeper than INBOUND_MAX_DEPTH, or holding anything but plain msgpack
+const INBOUND_NODE_LIMITS: Record<string, number> = {
+  entityEvent: 8192,
+  blueprintAdded: 8192,
+  blueprintModified: 8192,
+  ai: 1024,
+};
+const INBOUND_DEFAULT_NODE_LIMIT = 4096;
+const INBOUND_MAX_DEPTH = 32;
+
 /**
- * Why the world would drop packet `name` with `data` unread (its inbound byte limit), or null.
- * network.send does not send such a packet (adaptToWorldProtocol); a caller that must know whether
- * its change reaches the world (managers/build-manager.ts) asks first.
+ * Why the world would drop packet `name` with `data` unread, or null: over its byte limit, over
+ * its node or depth limit, or holding a value its scan refuses (coo-world src/core/extras/
+ * inboundPolicy.js and strictDecode.js). network.send does not send a packet over the byte limit
+ * (adaptToWorldProtocol); a caller that must know whether its change reaches the world
+ * (managers/build-manager.ts) asks first.
+ *
+ * `data` is walked as clientPackr writes it before it is packed, and the walk stops at the first
+ * limit it passes: clientPackr writes a value held twice in full each time, so a small value can
+ * pack into far more than the world takes.
  */
 export function outgoingPacketProblem(name: string, data: unknown): string | null {
-  const bytes = writeClientPacket(name, data).byteLength;
-  const limit = INBOUND_BYTE_LIMITS[name] ?? INBOUND_DEFAULT_BYTE_LIMIT;
-  return bytes > limit ? `the ${name} packet would be ${bytes} bytes, more than the ${limit} the world accepts` : null;
+  if (!idByName.has(name)) throw new Error(`outgoingPacketProblem: ${name} is not in the world's protocol`);
+  const byteLimit = INBOUND_BYTE_LIMITS[name] ?? INBOUND_DEFAULT_BYTE_LIMIT;
+  const nodeLimit = INBOUND_NODE_LIMITS[name] ?? INBOUND_DEFAULT_NODE_LIMIT;
+  const tooMany = `the ${name} packet holds more than the ${nodeLimit} values the world accepts`;
+  const tooDeep = `the ${name} packet nests deeper than the ${INBOUND_MAX_DEPTH} levels the world accepts`;
+  let walked: ReturnType<typeof walkAsPacked>;
+  try {
+    walked = walkAsPacked(data, nodeLimit, byteLimit);
+  } catch (error: any) {
+    // (what makes clientPackr throw too: a getter or toJSON that throws, an object posing as a Map)
+    return `the ${name} packet holds a value that cannot be written as msgpack (${error?.name || 'Error'})`;
+  }
+  if (walked === 'values') return tooMany;
+  if (walked === 'depth') return tooDeep;
+  if (typeof walked === 'number') return `the ${name} packet would be at least ${walked} bytes, more than the ${byteLimit} the world accepts`;
+  let packet: Uint8Array;
+  try {
+    packet = writeClientPacket(name, data);
+  } catch (error: any) {
+    return `the ${name} packet holds a value that cannot be written as msgpack (${error?.name || 'Error'})`;
+  }
+  if (packet.byteLength > byteLimit) return `the ${name} packet would be ${packet.byteLength} bytes, more than the ${byteLimit} the world accepts`;
+  const scanned = inboundScanProblem(packet, nodeLimit);
+  if (scanned === 'node budget exceeded') return tooMany;
+  if (scanned === 'too deep') return tooDeep;
+  return scanned ? `the ${name} packet holds a value the world does not accept (${scanned})` : null;
+}
+
+/**
+ * Walks `data` as the packet [id, data] that clientPackr writes (useRecords, structuredClone and
+ * moreTypes off: an object or a Map is a map, a Set, an Error and a RegExp an array, a typed
+ * array or an ArrayBuffer a bin (a DataView an empty one), a function undefined, an object with
+ * toJSON what that returns), counting values and depth as the world's scan does (strictDecode.js:
+ * the packet array and its two elements are three values; each further element one, each map
+ * entry two, each bin four; a value more than INBOUND_MAX_DEPTH levels down is refused) and bytes
+ * from below (one for each value, a string's UTF-16 length, a bin's length). Stops at the first
+ * limit passed: 'values', 'depth', or the bytes counted when they passed the byte limit; null
+ * within all three.
+ */
+function walkAsPacked(data: unknown, nodeLimit: number, byteLimit: number): 'values' | 'depth' | number | null {
+  let nodes = 3;
+  let bytes = 2;
+  const over = (): 'values' | number | null => (nodes > nodeLimit ? 'values' : bytes > byteLimit ? bytes : null);
+  const list = (items: ArrayLike<unknown> | Iterable<unknown>, count: number, depth: number) => {
+    nodes += count;
+    bytes += 1;
+    const stop = over();
+    if (stop !== null) return stop;
+    if (Array.isArray(items) || !(Symbol.iterator in Object(items))) {
+      const indexed = items as ArrayLike<unknown>;
+      for (let i = 0; i < count; i++) {
+        const inner = walk(indexed[i], depth + 1);
+        if (inner !== null) return inner;
+      }
+      return null;
+    }
+    for (const item of items as Iterable<unknown>) {
+      const inner = walk(item, depth + 1);
+      if (inner !== null) return inner;
+    }
+    return null;
+  };
+  const entry = (key: unknown, value: unknown, depth: number) => {
+    nodes += 2;
+    return over() ?? walk(key, depth + 1) ?? walk(value, depth + 1);
+  };
+  const walk = (value: unknown, depth: number): 'values' | 'depth' | number | null => {
+    if (depth > INBOUND_MAX_DEPTH) return 'depth';
+    if (typeof value === 'string') bytes += 1 + value.length;
+    else if ((typeof value !== 'object' && typeof value !== 'function') || value === null) bytes += 1;
+    else {
+      // In clientPackr's order (msgpackr pack.js)
+      const object = value as any;
+      const constructor = object.constructor;
+      if (constructor === Object) return members(object, depth);
+      if (constructor === Array) return list(object, object.length, depth);
+      if (constructor === Map) {
+        bytes += 1;
+        for (const [key, inner] of object as Map<unknown, unknown>) {
+          const stop = entry(key, inner, depth);
+          if (stop !== null) return stop;
+        }
+        return over();
+      }
+      if (object instanceof Date) bytes += 1;
+      else if (object instanceof Set) return list(object, object.size, depth);
+      else if (object instanceof Error) return list([object.name, object.message, object.cause], 3, depth);
+      else if (object instanceof RegExp) return list([object.source, object.flags], 2, depth);
+      else if (object instanceof DataView) {
+        // (written as an empty bin)
+        nodes += 3;
+        bytes += 1;
+      } else if (object instanceof ArrayBuffer || ArrayBuffer.isView(object)) {
+        nodes += 3;
+        bytes += 1 + object.byteLength;
+      } else if (Array.isArray(object)) return list(object, object.length, depth);
+      else {
+        if (object.toJSON) {
+          const json = object.toJSON();
+          if (json !== object) return walk(json, depth);
+        }
+        // A function is written as undefined
+        if (typeof object === 'function') bytes += 1;
+        else return members(object, depth);
+      }
+    }
+    return over();
+  };
+  // A plain object as clientPackr writes one: the keys for..in finds that are its own
+  const members = (object: any, depth: number) => {
+    bytes += 1;
+    for (const key in object) {
+      if (typeof object.hasOwnProperty === 'function' && !object.hasOwnProperty(key)) continue;
+      const stop = entry(key, object[key], depth);
+      if (stop !== null) return stop;
+    }
+    return over();
+  };
+  return walk(data, 2);
+}
+
+/**
+ * Why coo-world's inbound scan (strictDecode.js with build off) refuses `packet`, in its words, or
+ * null: the same counting and depth, and only nil, booleans, integers, floats, strings, bin, arrays,
+ * maps whose keys are strings, and undefined (fixext 1 of type 0).
+ */
+function inboundScanProblem(packet: Uint8Array, maxNodes: number): string | null {
+  const length = packet.length;
+  const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
+  let position = 0;
+  let nodes = 1;
+  class Refused extends Error {}
+  const fail = (reason: string): never => {
+    throw new Refused(reason);
+  };
+  const need = (count: number) => {
+    if (position + count > length) fail('truncated');
+  };
+  const charge = (count: number) => {
+    nodes += count;
+    if (nodes > maxNodes) fail('node budget exceeded');
+  };
+  const skip = (count: number) => {
+    need(count);
+    position += count;
+  };
+  const read = (depth: number, key = false): void => {
+    if (depth > INBOUND_MAX_DEPTH) fail('too deep');
+    need(1);
+    const b = packet[position];
+    const string = (b >= 0xa0 && b <= 0xbf) || b === 0xd9 || b === 0xda || b === 0xdb;
+    if (key && !string) fail('map key is not a string');
+    if (b === 0xc1 || (b >= 0xc7 && b <= 0xc9) || (b >= 0xd5 && b <= 0xd8)) fail(`byte 0x${b.toString(16)} refused`);
+    position++;
+    if (b <= 0x7f || b >= 0xe0 || b === 0xc0 || b === 0xc2 || b === 0xc3) return;
+    if (b >= 0xa0 && b <= 0xbf) return skip(b & 0x1f);
+    if (b >= 0x90 && b <= 0x9f) return items(b & 0x0f, depth);
+    if (b >= 0x80 && b <= 0x8f) return entries(b & 0x0f, depth);
+    switch (b) {
+      case 0xc4:
+        need(1);
+        return bin(packet[position++]);
+      case 0xc5:
+        need(2);
+        return bin(view.getUint16((position += 2) - 2));
+      case 0xc6:
+        need(4);
+        return bin(view.getUint32((position += 4) - 4));
+      case 0xca:
+      case 0xce:
+      case 0xd2:
+        return skip(4);
+      case 0xcb:
+      case 0xcf:
+      case 0xd3:
+        return skip(8);
+      case 0xcc:
+      case 0xd0:
+        return skip(1);
+      case 0xcd:
+      case 0xd1:
+        return skip(2);
+      case 0xd4:
+        need(1);
+        if (packet[position] !== 0x00) fail(`ext type 0x${packet[position].toString(16)} refused`);
+        return skip(2);
+      case 0xd9:
+        need(1);
+        return skip(packet[position++]);
+      case 0xda:
+        need(2);
+        return skip(view.getUint16((position += 2) - 2));
+      case 0xdb:
+        need(4);
+        return skip(view.getUint32((position += 4) - 4));
+      case 0xdc:
+        need(2);
+        return items(view.getUint16((position += 2) - 2), depth);
+      case 0xdd:
+        need(4);
+        return items(view.getUint32((position += 4) - 4), depth);
+      case 0xde:
+        need(2);
+        return entries(view.getUint16((position += 2) - 2), depth);
+      case 0xdf:
+        need(4);
+        return entries(view.getUint32((position += 4) - 4), depth);
+    }
+  };
+  const bin = (count: number) => {
+    charge(3);
+    skip(count);
+  };
+  const items = (count: number, depth: number) => {
+    charge(count);
+    if (count > length - position) fail('declared length exceeds remaining bytes');
+    for (let i = 0; i < count; i++) read(depth + 1);
+  };
+  const entries = (count: number, depth: number) => {
+    charge(count * 2);
+    if (count * 2 > length - position) fail('declared length exceeds remaining bytes');
+    for (let i = 0; i < count; i++) {
+      read(depth + 1, true);
+      read(depth + 1);
+    }
+  };
+  try {
+    read(1);
+    if (position !== length) fail('trailing bytes');
+    return null;
+  } catch (error) {
+    if (error instanceof Refused) return error.message;
+    throw error;
+  }
 }
 
 export function writeClientPacket(name: string, data: unknown): Uint8Array {
@@ -102,9 +350,9 @@ export function writeClientPacket(name: string, data: unknown): Uint8Array {
  * blueprint and the chat history) is a few megabytes at most. What this bounds: the decode work
  * and the input of the decoder for one frame. What it does not bound: receipt (the WebSocket
  * implementation has buffered the whole frame before this code sees it). What a frame may decode
- * into is bounded separately: at most PACKET_LIMITS.maxNodes values, nested at most
- * PACKET_LIMITS.maxDepth deep (lib/packet-decode.ts); a frame over either is dropped like one that
- * is too large.
+ * into is bounded separately: at most PACKET_LIMITS.maxNodes values and PACKET_LIMITS.maxBytes
+ * bytes of strings and binary data, nested at most PACKET_LIMITS.maxDepth deep
+ * (lib/packet-decode.ts); a frame over any of these is dropped like one that is too large.
  */
 export const MAX_SERVER_FRAME_BYTES = 8 * 1024 * 1024;
 // Unknown packet ids are each reported once; after this many different ones, no more
@@ -134,8 +382,9 @@ const reportedIds = new Set<string>();
 let undecodable = undecodableLog();
 
 function undecodableLog(): RateLimitedLog {
-  // Decoder messages can quote the payload, which may hold credentials: only the size is said
-  return new RateLimitedLog((count, size) => `[Hyperfy] Could not read ${count} packet(s) from the world (the latest ${size} bytes)`, {
+  // Only the size and the decoder's fixed word for the rule (PacketRefused.kind): its messages, or
+  // another decoder's, could quote the payload, which may hold credentials
+  return new RateLimitedLog((count, latest) => `[Hyperfy] Could not read ${count} packet(s) from the world (the latest ${latest})`, {
     intervalMs: FRAME_LOG_INTERVAL_MS,
     log: (line) => console.error(line),
   });
@@ -149,7 +398,8 @@ export function resetReportedPacketIds(): void {
 
 /**
  * [handler method, data, the number of values the packet decoded into], or [] when the packet
- * cannot be read (logged at most once per FRAME_LOG_INTERVAL_MS with the count; once per unknown
+ * cannot be read (logged at most once per FRAME_LOG_INTERVAL_MS with the count, and for the latest
+ * one its size and the decoder's word for why: PacketRefused.kind; once per unknown
  * id, for the first MAX_REPORTED_PACKET_IDS different ones). A packet that would decode into more
  * than the limits allow (lib/packet-decode.ts) is not read either: `overLimit`, when given, is
  * told why.
@@ -164,7 +414,7 @@ export function readServerPacket(packet: ArrayBuffer | Uint8Array, overLimit?: (
     nodes = decoded.nodes;
   } catch (error) {
     if (error instanceof PacketOverLimit && overLimit) overLimit(error.message);
-    else undecodable.note(String(packet.byteLength));
+    else undecodable.note(`${packet.byteLength} bytes, refused: ${error instanceof PacketRefused ? error.kind : error instanceof PacketOverLimit ? 'over the limits' : 'unreadable'}`);
     return [];
   }
   const name = typeof id === 'number' ? PACKET_NAMES[id] : undefined;

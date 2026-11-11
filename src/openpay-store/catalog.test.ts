@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { logger } from '@elizaos/core';
-import { StoreCatalog, parseHandles, parseLocale, purchaseUrlProblem, sanitizeText, toStoreProduct } from './catalog';
+import { MAX_URL_LENGTH, StoreCatalog, parseHandles, parseLocale, purchaseUrlProblem, sanitizeText, toStoreProduct } from './catalog';
 import { createOpenPayStorePlugin } from './index';
 
 const API = 'https://open-pay.jp/api/store/listings';
@@ -123,6 +123,11 @@ describe('toStoreProduct', () => {
     const good = `${ORIGIN}/ja/@alice?product=h_1&from=agent`;
     expect(toStoreProduct(item('h_1', 'alice', { url: good }), ORIGIN)?.url).toBe(good);
     expect(toStoreProduct(item('h_1', 'alice', { url: `${ORIGIN}/en/@alice/items?product=h_1&note=%E3%83%9B%E3%83%90%E3%83%BC` }), ORIGIN)).not.toBeNull();
+    // 325 characters are accepted; the row below is one more
+    expect(MAX_URL_LENGTH).toBe(325);
+    const longest = `${good}&pad=${'a'.repeat(325 - good.length - 5)}`;
+    expect(longest).toHaveLength(325);
+    expect(toStoreProduct(item('h_1', 'alice', { url: longest }), ORIGIN)?.url).toBe(longest);
     for (const [why, url] of [
       ['a newline in it', `${ORIGIN}/ja/@alice?product=h_1\nhttps://evil.test/pay`],
       ['a trailing newline', `${good}\n`],
@@ -165,6 +170,7 @@ describe('toStoreProduct', () => {
     expect(check('http://open-pay.jp/ja/@alice', 'http://open-pay.jp')).toBe('not https');
     expect(check('not a url')).toBe('contains whitespace or an invisible character');
     expect(check('nourl')).toBe('not a URL');
+    expect(check(42)).toBe('not text');
   });
 
   it("accepts a purchase URL only when its path names the item's own seller", () => {
@@ -204,7 +210,11 @@ describe('toStoreProduct', () => {
     expect(toStoreProduct(item('h_1', 'alice', { title: '  ' }), ORIGIN)).toBeNull();
     expect(toStoreProduct(item('h_1', 'alice', { title: '\u200b\u202e' }), ORIGIN)).toBeNull();
     expect(toStoreProduct(item('bad id!', 'alice'), ORIGIN)).toBeNull();
+    // A handle of 64 characters is one; 65 are not
+    expect(toStoreProduct(item('h_1', 'a'.repeat(64)), ORIGIN)).not.toBeNull();
+    expect(toStoreProduct(item('h_1', 'a'.repeat(65)), ORIGIN)).toBeNull();
     expect(toStoreProduct(null, ORIGIN)).toBeNull();
+    expect(toStoreProduct('h_1', ORIGIN)).toBeNull();
   });
 
   it('rejects an amount longer than 15 digits or 18 decimals instead of showing it', () => {
@@ -230,6 +240,7 @@ describe('StoreCatalog', () => {
     await catalog.refresh();
 
     expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fetchImpl.mock.calls.map(([url]) => url.searchParams.get('handle'))).toEqual(['alice', 'bob']);
     for (const [url] of fetchImpl.mock.calls) {
       expect([...url.searchParams.keys()].sort()).toEqual(['handle', 'limit', 'locale']);
       expect(url.searchParams.get('limit')).toBe('100');
@@ -242,6 +253,7 @@ describe('StoreCatalog', () => {
     const fetchImpl = vi.fn(async (_url: URL) => ok([item('x', 'anyone')]));
     const catalog = new StoreCatalog({ apiUrl: API, handles: '*', locale: 'ja' }, { fetchImpl: fetchImpl as any });
     await catalog.refresh();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
     const url = fetchImpl.mock.calls[0][0] as URL;
     expect(url.searchParams.has('handle')).toBe(false);
     expect(catalog.list()).toHaveLength(1);
@@ -297,19 +309,27 @@ describe('StoreCatalog', () => {
     expect(catalog.list().map((p) => p.id)).toEqual(['b_newest', 'a_new', 'a_old']);
   });
 
-  it('backs off after a failure instead of retrying on every list()', async () => {
+  it('backs off after a failure instead of retrying on every list(): 30 s, then 60 s', async () => {
     let now = 0;
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ ok: false, error: 'storage_unavailable' }), { status: 503 }));
     const catalog = new StoreCatalog({ apiUrl: API, handles: ['alice'], locale: 'ja' }, { fetchImpl: fetchImpl as any, now: () => now });
     await catalog.refresh();
     for (let i = 0; i < 4; i++) catalog.list();
+    now = 29_999;
+    catalog.list();
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     now = 30_000;
     catalog.list();
-    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
-    now = 30_000 + 59_999; // second failure: 60 s backoff
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    // The refresh list() started has failed too (refresh() hands back the one in flight): 60 s from here
+    await catalog.refresh();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    now = 30_000 + 59_999;
     catalog.list();
     expect(fetchImpl).toHaveBeenCalledTimes(2);
+    now = 30_000 + 60_000;
+    catalog.list();
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
   });
 
   it('stays in flight until every seller has answered, even if one fails fast', async () => {
@@ -342,11 +362,27 @@ describe('StoreCatalog', () => {
     expect(catalog.list().map((p) => p.id)).toEqual(['a1']);
   });
 
-  it('treats 404 (store off) and 400 as nothing to sell', async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ ok: false, error: 'not_found' }), { status: 404 }));
-    const catalog = new StoreCatalog({ apiUrl: API, handles: ['alice'], locale: 'ja' }, { fetchImpl: fetchImpl as any });
+  it.each([
+    [404, 'not_found'],
+    [400, 'invalid_query'],
+  ])('takes %i (%s) as nothing to sell: the list it had is emptied, and the next request waits a whole TTL, not a retry delay', async (status, error) => {
+    let now = 0;
+    const fetchImpl = vi.fn().mockResolvedValueOnce(ok([item('a1', 'alice')]));
+    const catalog = new StoreCatalog({ apiUrl: API, handles: ['alice'], locale: 'ja' }, { fetchImpl: fetchImpl as any, now: () => now, ttlMs: 100_000 });
     await catalog.refresh();
+    expect(catalog.list().map((p) => p.id)).toEqual(['a1']);
+
+    fetchImpl.mockResolvedValue(new Response(JSON.stringify({ ok: false, error }), { status }));
+    await catalog.refresh();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    // Unlike a 503, which keeps the last good list (above)
     expect(catalog.list()).toEqual([]);
+    now = 99_999;
+    catalog.list();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    now = 100_000;
+    catalog.list();
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
   });
 });
 
@@ -404,7 +440,7 @@ describe('the synthetic listings fixture (not a recorded response)', () => {
   it.each([
     ['the handles of .env.example', ['coo', 'cipherweb'] as string[] | '*'],
     ['every seller', '*' as string[] | '*'],
-  ])('still yields every product of the fixture, unchanged, for %s', async (_what, handles) => {
+  ])('yields every product of the fixture, unchanged, for %s', async (_what, handles) => {
     const catalog = new StoreCatalog({ apiUrl: API, handles, locale: 'ja' }, { fetchImpl: listingsApi as any });
     await catalog.refresh();
     const products = catalog.list();

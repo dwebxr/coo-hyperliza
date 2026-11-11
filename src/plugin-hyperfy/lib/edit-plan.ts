@@ -3,12 +3,13 @@ import { z } from 'zod';
 /**
  * What the scene-edit planner (a model) may ask for, as data: each entry of its plan is read here
  * before anything is done with it. An entry is an operation only when it has that operation's
- * shape; what the plan says about itself (`success`, `description`) decides nothing about that.
+ * shape; what the plan says about itself never makes an entry an operation (`"success": false`
+ * only declines it; `description` decides nothing).
  * The build manager checks the values again against what the world accepts
  * (managers/build-manager.ts acceptedTransform), and every effect against the requester's right.
  */
 
-/** How many entries of one plan are run; the rest are reported as not run. */
+/** How many operations of one plan are run or tried (declined and invalid entries do not count); the rest are reported as not run. */
 export const MAX_OPERATIONS_PER_REQUEST = 20;
 
 /** A name a plan gives a copy it makes (`as`), for later entries of the same plan (`targetRef`). */

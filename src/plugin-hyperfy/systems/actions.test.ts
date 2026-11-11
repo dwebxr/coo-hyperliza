@@ -81,10 +81,11 @@ describe("an action node's duration is in seconds, as the engine counts it", () 
     expect(node._onTrigger).not.toHaveBeenCalled();
   });
 
-  it('triggers at once for a duration of zero or less, as the engine does', () => {
+  it.each([0, -5])('triggers at once for a duration of zero or less (%d), as the engine does', (duration) => {
     const w = world();
-    const node = item(w, 'seat', { _duration: -5 });
+    const node = item(w, 'seat', { _duration: duration });
     expect(w.actions.performAction('seat')).toBe('started');
+    expect(node._onTrigger).not.toHaveBeenCalled();
     vi.advanceTimersByTime(0);
     expect(node._onTrigger).toHaveBeenCalledTimes(1);
   });
@@ -157,9 +158,11 @@ describe('one interaction at a time, reserved from the moment the hold starts', 
 
   it('a cancel handler that throws while the hold is called off is contained', () => {
     const w = world();
-    item(w, 'seat', { _duration: 2, _onCancel: () => { throw new Error('script error'); } });
+    const onCancel = vi.fn(() => { throw new Error('script error'); });
+    item(w, 'seat', { _duration: 2, _onCancel: onCancel });
     w.actions.performAction('seat');
     expect(() => w.actions.releaseAction()).not.toThrow();
+    expect(onCancel.mock.results.map((result) => result.type)).toEqual(['throw']);
     expect(w.controls.keyE.down).toBe(false);
     expect(w.actions.performAction('seat')).toBe('started');
   });
@@ -253,10 +256,14 @@ describe('timers and callbacks', () => {
     item(w, 'seat', { _duration: 0 });
     w.actions.performAction('seat');
     vi.advanceTimersByTime(0);
-    w.controls.keyX.onPress = () => { throw new Error('press handler'); };
-    w.controls.keyX.onRelease = () => { throw new Error('release handler'); };
+    const onPress = vi.fn(() => { throw new Error('press handler'); });
+    const onRelease = vi.fn(() => { throw new Error('release handler'); });
+    w.controls.keyX.onPress = onPress;
+    w.controls.keyX.onRelease = onRelease;
     expect(w.actions.releaseAction()).toBe(true);
     expect(() => vi.advanceTimersByTime(500)).not.toThrow();
+    // Both were called, and threw
+    expect([onPress.mock.results.map((result) => result.type), onRelease.mock.results.map((result) => result.type)]).toEqual([['throw'], ['throw']]);
     expect(w.controls.keyX.down).toBe(false);
     expect(w.actions.releaseAction()).toBe(false);
     expect(w.actions.performAction('seat')).toBe('started');
@@ -305,10 +312,11 @@ describe('getNearby', () => {
 
   it('uses the nearest node when no entity is named', () => {
     const w = world();
-    item(w, 'farther', { meters: 9, _duration: 0 });
+    const farther = item(w, 'farther', { meters: 9, _duration: 0 });
     const nearest = item(w, 'nearest', { meters: 1, _duration: 0 });
     expect(w.actions.performAction()).toBe('started');
     vi.advanceTimersByTime(0);
     expect(nearest._onTrigger).toHaveBeenCalledTimes(1);
+    expect(farther._onTrigger).not.toHaveBeenCalled();
   });
 });

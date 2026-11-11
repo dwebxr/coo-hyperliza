@@ -11,6 +11,7 @@ vi.mock('@livekit/rtc-node', () => {
   class Room {
     connected = false;
     resolveConnect!: () => void;
+    rejectConnect!: (error: Error) => void;
     disconnect = vi.fn(async () => {
       // like the SDK: a no-op while the join is still pending
       this.connected = false;
@@ -27,17 +28,21 @@ vi.mock('@livekit/rtc-node', () => {
     }
     connect(...args: unknown[]) {
       this.connectedTo = args;
-      return new Promise<void>((resolve) => {
+      return new Promise<void>((resolve, reject) => {
         this.resolveConnect = () => {
           this.connected = true;
           resolve();
         };
+        this.rejectConnect = reject;
       });
     }
   }
   return {
     Room,
-    AudioFrame: class {},
+    // Keeps what it was made of, for the tests that look at what went out
+    AudioFrame: class {
+      constructor(readonly data: Int16Array, readonly sampleRate: number, readonly channels: number, readonly samplesPerChannel: number) {}
+    },
     AudioSource: class {
       captureFrame = vi.fn(async () => {});
       close = vi.fn(async () => void released.push('source closed'));
@@ -53,9 +58,15 @@ vi.mock('@livekit/rtc-node', () => {
     },
     TrackPublishOptions: class {},
     TrackSource: { SOURCE_MICROPHONE: 1 },
-    RoomEvent: {},
-    TrackKind: { KIND_AUDIO: 1 },
-    AudioStream: class {},
+    RoomEvent: { ParticipantConnected: 'participantConnected', Disconnected: 'disconnected', TrackPublished: 'trackPublished', TrackSubscribed: 'trackSubscribed' },
+    TrackKind: { KIND_AUDIO: 1, KIND_VIDEO: 2 },
+    // The frames of a remote track: whatever the test's track yields
+    AudioStream: class {
+      constructor(readonly track: { frames(): AsyncIterator<unknown> }) {}
+      [Symbol.asyncIterator]() {
+        return this.track.frames();
+      }
+    },
   };
 });
 
@@ -87,7 +98,7 @@ describe('AgentLiveKit room lifecycle', () => {
     expect(rooms[0].on).not.toHaveBeenCalled();
   });
 
-  it('a second deserialize replaces the first room without double-wiring events', async () => {
+  it('a second deserialize replaces the first room: the first is left with no event wired, the second has each room event wired once', async () => {
     rooms.length = 0;
     const livekit = new AgentLiveKit(worldOnLk());
     const first = livekit.deserialize(opts);
@@ -100,9 +111,11 @@ describe('AgentLiveKit room lifecycle', () => {
     await Promise.all([first, second]);
 
     expect(rooms[0].connected).toBe(false);
+    expect(rooms[0].disconnect).toHaveBeenCalled();
     expect(rooms[0].on).not.toHaveBeenCalled();
     expect(rooms[1].connected).toBe(true);
-    expect(rooms[1].on).toHaveBeenCalled();
+    expect(rooms[1].disconnect).not.toHaveBeenCalled();
+    expect(rooms[1].on.mock.calls.map(([event]: [string]) => event).sort()).toEqual(['disconnected', 'participantConnected', 'trackPublished', 'trackSubscribed']);
   });
 
   it('a join superseded (or torn down) during the voice server check creates no room', async () => {
@@ -120,11 +133,36 @@ describe('AgentLiveKit room lifecycle', () => {
   });
 });
 
+describe('AgentLiveKit joins that come to nothing', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  // The engine's ClientNetwork calls deserialize without awaiting it
+  it('never rejects: without options nothing is joined, and a join that fails leaves no room and no event wired', async () => {
+    rooms.length = 0;
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const livekit = new AgentLiveKit(worldOnLk());
+    await expect(livekit.deserialize(undefined as never)).resolves.toBeUndefined();
+    expect(rooms).toHaveLength(0);
+
+    const joining = livekit.deserialize(opts);
+    await vi.waitFor(() => expect(rooms).toHaveLength(1));
+    rooms[0].rejectConnect(new Error('could not establish signal connection'));
+    await expect(joining).resolves.toBeUndefined();
+    expect(error.mock.calls.map((call) => call.join(' '))).toEqual(['[LiveKit] Failed to connect to room: could not establish signal connection']);
+    expect(rooms[0].on).not.toHaveBeenCalled();
+    // The room that could not be joined is not kept: there is nothing to play into
+    await expect(livekit.publishAudioStream(Buffer.from([0xff, 0xfb, 0x90, 0x00, 0, 0]))).resolves.toEqual({ played: 'none', reason: 'not connected to a voice room' });
+  });
+});
+
 describe('AgentLiveKit and the voice server the world names', () => {
   const quiet = () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     return vi.spyOn(console, 'warn').mockImplementation(() => {});
   };
+  afterEach(() => vi.restoreAllMocks());
 
   it.each([
     ['a private address', 'wss://10.0.0.7', '10.0.0.7 is a private address'],
@@ -139,16 +177,19 @@ describe('AgentLiveKit and the voice server the world names', () => {
     const warn = quiet();
     const world = {};
     installWorldNet(world, new NetPolicy({ worldOrigin: 'https://world.example', resolve: async (host) => [{ address: host === 'lk.internal' ? '10.0.0.9' : PUBLIC_ADDRESS, family: 4 }] }));
-    await new AgentLiveKit(world).deserialize({ wsUrl, token: 'secret-livekit-token' });
+    const joining = new AgentLiveKit(world).deserialize({ wsUrl, token: 'secret-livekit-token' });
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(1));
+    // No room is made after the refusal (a join would wait on it: checked before the join is awaited)
+    expect(rooms).toHaveLength(0);
+    await joining;
     expect(rooms).toHaveLength(0);
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0].join(' ')).toContain('Voice chat off');
     expect(warn.mock.calls[0].join(' ')).toContain(why);
     expect(warn.mock.calls[0].join(' ')).not.toContain('secret-livekit-token');
-    vi.restoreAllMocks();
   });
 
-  it("connects to the world's own host (any scheme and port) and to wss: on a public host", async () => {
+  it("connects to the world's own host (by ws: on another port) and to wss: on a public host", async () => {
     quiet();
     for (const [origin, wsUrl] of [['http://127.0.0.1:3000', 'ws://localhost:7880'], ['https://world.example', 'wss://lk.example']]) {
       rooms.length = 0;
@@ -160,7 +201,6 @@ describe('AgentLiveKit and the voice server the world names', () => {
       await joining;
       expect(rooms[0].connectedTo.slice(0, 2)).toEqual([wsUrl, 't']);
     }
-    vi.restoreAllMocks();
   });
 });
 
@@ -175,7 +215,8 @@ describe('AgentLiveKit playback outcome', () => {
   let dir = '';
   beforeAll(() => {
     dir = mkdtempSync(path.join(tmpdir(), 'coo-ffmpeg-'));
-    writeFileSync(path.join(dir, 'ffmpeg'), '#!/bin/sh\ntail -c +5\n');
+    // ...and writes down the input format it was told (`-f <format>`)
+    writeFileSync(path.join(dir, 'ffmpeg'), `#!/bin/sh\necho "$2" >> '${path.join(dir, 'formats')}'\ntail -c +5\n`);
     chmodSync(path.join(dir, 'ffmpeg'), 0o755);
   });
   afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -205,9 +246,19 @@ describe('AgentLiveKit playback outcome', () => {
     await expect(new AgentLiveKit({}).publishAudioStream(mp3())).resolves.toEqual({ played: 'none', reason: 'not connected to a voice room' });
   });
 
-  it('reports played once audio went out to the room', async () => {
+  it('reports played once audio went out to the room: one track published, the lead-in silence and the decoded frame captured', async () => {
     const livekit = await joined();
-    await expect(livekit.publishAudioStream(mp3())).resolves.toEqual({ played: 'all' });
+    const audio = Buffer.concat([Buffer.from([0xff, 0xfb, 0x90, 0x00]), Buffer.alloc(FRAME_BYTES, 3)]);
+    await expect(livekit.publishAudioStream(audio)).resolves.toEqual({ played: 'all' });
+    expect(tracks).toHaveLength(1);
+    expect(rooms[0].localParticipant.publishTrack).toHaveBeenCalledTimes(1);
+    expect(rooms[0].localParticipant.publishTrack.mock.calls[0][0]).toBe(tracks[0]);
+    const frames = tracks[0].source.captureFrame.mock.calls.map(([frame]: [{ data: Int16Array; sampleRate: number; channels: number }]) => frame);
+    expect(frames.map((frame: { sampleRate: number; channels: number }) => [frame.sampleRate, frame.channels])).toEqual([[48000, 1], [48000, 1]]);
+    // 100 ms of silence, then the 100 ms the stand-in ffmpeg decoded (every byte 3)
+    expect(Array.from(new Set(frames[0].data))).toEqual([0]);
+    expect(frames[1].data).toHaveLength(4800);
+    expect(Array.from(new Set(frames[1].data))).toEqual([0x0303]);
   });
 
   it.each([
@@ -228,11 +279,13 @@ describe('AgentLiveKit playback outcome', () => {
     expect(capture.mock.calls.length).toBe(before);
   });
 
-  it('takes MP3 (frame sync or ID3 tag) and WAV by their first bytes', async () => {
+  it('takes MP3 (frame sync or ID3 tag) and WAV by their first bytes, and tells ffmpeg which it is', async () => {
     const livekit = await joined();
+    writeFileSync(path.join(dir, 'formats'), '');
     for (const header of [[0xff, 0xfb, 0x90, 0x00], [0x49, 0x44, 0x33, 0x04], [0x52, 0x49, 0x46, 0x46]]) {
       await expect(livekit.publishAudioStream(Buffer.concat([Buffer.from(header), Buffer.alloc(FRAME_BYTES)]))).resolves.toEqual({ played: 'all' });
     }
+    expect(readFileSync(path.join(dir, 'formats'), 'utf8').trim().split('\n')).toEqual(['mp3', 'mp3', 'wav']);
   });
 
   it('reports nothing played when stopped before the first frame, or when the room went away while the track was published', async () => {
@@ -340,6 +393,27 @@ describe('AgentLiveKit playback outcome', () => {
     });
   });
 
+  it('reports nothing played, without rejecting, when ffmpeg fails or is not there: no track is published', async () => {
+    const livekit = await joined();
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const failing = mkdtempSync(path.join(tmpdir(), 'coo-ffmpeg-failing-'));
+    const empty = mkdtempSync(path.join(tmpdir(), 'coo-ffmpeg-none-'));
+    try {
+      writeFileSync(path.join(failing, 'ffmpeg'), '#!/bin/sh\ncat > /dev/null\nexit 3\n');
+      chmodSync(path.join(failing, 'ffmpeg'), 0o755);
+      // /bin for the stand-in's `cat`
+      vi.stubEnv('PATH', `${failing}${path.delimiter}/bin`);
+      await expect(livekit.publishAudioStream(mp3())).resolves.toEqual({ played: 'none', error: 'ffmpeg failed (code 3)' });
+      vi.stubEnv('PATH', empty);
+      await expect(livekit.publishAudioStream(mp3())).resolves.toEqual({ played: 'none', error: expect.stringContaining('ENOENT') });
+      expect(tracks).toEqual([]);
+      expect(rooms[0].localParticipant.publishTrack).not.toHaveBeenCalled();
+    } finally {
+      rmSync(failing, { recursive: true, force: true });
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+
   it('reports nothing played for audio that decodes to nothing', async () => {
     const livekit = await joined();
     await expect(livekit.publishAudioStream(mp3(0))).resolves.toEqual({ played: 'none', reason: 'no audio was decoded' });
@@ -424,6 +498,57 @@ describe('AgentLiveKit playback outcome', () => {
       // Nothing of the old room is used again
       await expect(livekit.publishAudioStream(mp3())).resolves.toEqual({ played: 'none', reason: 'not connected to a voice room' });
     });
+  });
+});
+
+/*
+ * What the room's other participants say: the frames of a subscribed audio track, handed on as
+ * 'audio' events (the voice manager listens for them).
+ */
+describe('AgentLiveKit and the audio of other participants', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  /** A joined AgentLiveKit, what it emitted as 'audio', and the handler it wired for subscribed tracks */
+  async function listening() {
+    rooms.length = 0;
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const livekit = new AgentLiveKit(worldOnLk());
+    const joining = livekit.deserialize(opts);
+    await vi.waitFor(() => expect(rooms).toHaveLength(1));
+    rooms[0].resolveConnect();
+    await joining;
+    const heard: { participant: string; buffer: Buffer }[] = [];
+    (livekit as any).on('audio', (data: { participant: string; buffer: Buffer }) => heard.push(data));
+    const subscribed: (track: unknown, publication: unknown, participant: { identity: string }) => Promise<void> = rooms[0].on.mock.calls.find(([event]: [string]) => event === 'trackSubscribed')[1];
+    return { livekit, heard, subscribed };
+  }
+
+  it("emits each frame of a subscribed audio track with its participant's identity, and nothing for a video track", async () => {
+    const { heard, subscribed } = await listening();
+    const first = new Int16Array([1, -2, 3]);
+    const second = new Int16Array([4, 5]);
+    await subscribed({ kind: 1, sid: 'TR_alice', async *frames() { yield { data: first }; yield { data: second }; } }, {}, { identity: 'alice' });
+    expect(heard).toEqual([
+      { participant: 'alice', buffer: Buffer.from(first.buffer) },
+      { participant: 'alice', buffer: Buffer.from(second.buffer) },
+    ]);
+    const video = vi.fn();
+    await subscribed({ kind: 2, sid: 'TR_video', frames: video }, {}, { identity: 'bob' });
+    expect(video).not.toHaveBeenCalled();
+    expect(heard).toHaveLength(2);
+  });
+
+  it('emits no frame of a room that was left, also when its track goes on yielding', async () => {
+    const { livekit, heard, subscribed } = await listening();
+    let more!: () => void;
+    const held = new Promise<void>((resolve) => (more = resolve));
+    const frame = { data: new Int16Array([7, 8]) };
+    const done = subscribed({ kind: 1, sid: 'TR_alice', async *frames() { yield frame; await held; yield frame; yield frame; } }, {}, { identity: 'alice' });
+    await vi.waitFor(() => expect(heard).toHaveLength(1));
+    await livekit.disconnectRoom();
+    more();
+    await done;
+    expect(heard).toHaveLength(1);
   });
 });
 

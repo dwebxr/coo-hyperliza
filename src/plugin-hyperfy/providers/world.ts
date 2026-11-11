@@ -15,8 +15,15 @@ import { SHOWN_NAME_MAX, oneLine, shownName, shownNames } from '../lib/text'
 import { CHAT_BODY_MAX_CODE_POINTS } from '../lib/chat-intake'
 import { HISTORY_TEXT_MAX_CODE_POINTS, PROMPT_ACTIONS_MAX, PROMPT_ACTION_NAME_MAX } from '../managers/message-manager'
 
-// Per entity type, how many of the nearest entities get a full line. The rest are listed
-// compactly (name + id) so actions can still target them without flooding the prompt.
+/** What this provider reads of an interactable node (systems/actions.ts getNearby) */
+interface ShownAction {
+  _label?: unknown;
+  ctx?: { entity?: { root?: { position?: { x: number; y: number; z: number } }; data?: { id?: unknown }; blueprint?: { name?: unknown } } };
+}
+
+// Per entity type other than players (every player gets a full line), how many of the nearest
+// entities get a full line. The rest are listed compactly (name + id) so actions can still target
+// them without flooding the prompt.
 const MAX_DETAILED_ENTITIES_PER_TYPE = 40;
 // Names and labels come from the world (players, builders, app scripts): each enters the prompt as
 // one short line without control or format characters. Players' names are cut like chat senders'.
@@ -121,7 +128,7 @@ export const hyperfyProvider: Provider = {
         }
 
         const actionsSystem = world?.actions;
-        const nearbyActions = actionsSystem?.getNearby(50) || [];
+        const nearbyActions: ShownAction[] = actionsSystem?.getNearby(50) || [];
         const currentAction = actionsSystem?.currentNode;
 
         const actionLines = nearbyActions.map(action => {
@@ -193,7 +200,7 @@ export const hyperfyProvider: Provider = {
           ? `### Your Last Response\n${lastResponse}\n\n_Do not repeat this unless someone asks again._\n\n### Your Last Action\n${lastActionText}`
           : `### Your Last Response\nNo recent message.\n\n### Your Last Action\n${lastActionText}`;
 
-        // Emphasize nearby players for social interaction
+        // Every other player in the world, emphasized for social interaction
         const playerSummary = nearbyPlayers.length > 0
           ? `## 🎮 Other Players in World (${nearbyPlayers.length})\n**There ${nearbyPlayers.length === 1 ? 'is' : 'are'} ${nearbyPlayers.length} other player${nearbyPlayers.length === 1 ? '' : 's'} nearby!** Be lively and dynamic — walk around, explore, interact with objects, greet players, or show expressions. Create an engaging presence through varied actions.\n${nearbyPlayers.join('\n')}`
           : `## 🎮 Other Players in World (0)\nYou are currently alone in the world. No need for autonomous behavior right now.`;

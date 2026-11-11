@@ -21,9 +21,10 @@ describe('isDirectlyAddressed', () => {
     expect(isDirectlyAddressed('クーちゃん、案内して', names)).toBe(true);
   });
 
-  it('handles empty input and names', () => {
+  it('is false for empty or missing text, and for names that are blank', () => {
     expect(isDirectlyAddressed('', names)).toBe(false);
     expect(isDirectlyAddressed(undefined, names)).toBe(false);
+    expect(isDirectlyAddressed(null, names)).toBe(false);
     expect(isDirectlyAddressed('hello', ['', '  '])).toBe(false);
   });
 

@@ -12,7 +12,7 @@ const settled = async (promise: Promise<unknown>) => {
 };
 
 describe('AssetMemory', () => {
-  it('holds twice a download, shrinks to what is known, exchanges it for work, and gives everything back', async () => {
+  it('holds twice a download, shrinks to what is known (and never grows by it), exchanges it for work, and gives everything back', async () => {
     const memory = new AssetMemory({ downloadBytes: 1000, workBytes: 3000 });
     const lease = await memory.download(400);
     expect(memory.held).toEqual({ downloads: 800, work: 0 });
@@ -21,6 +21,10 @@ describe('AssetMemory', () => {
     await lease.toWork(1500);
     expect([memory.held, lease.phase]).toEqual([{ downloads: 0, work: 1500 }, 'work']);
     lease.shrink(500);
+    expect([lease.bytes, memory.held]).toEqual([500, { downloads: 0, work: 500 }]);
+    // More than it holds: nothing changes
+    lease.shrink(2000);
+    expect([lease.bytes, memory.held]).toEqual([500, { downloads: 0, work: 500 }]);
     lease.release();
     lease.release();
     expect(memory.held).toEqual({ downloads: 0, work: 0 });

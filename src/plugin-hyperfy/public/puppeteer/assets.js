@@ -91,7 +91,8 @@ function base64Of(buffer) {
   return btoa(binary);
 }
 
-// From memory: with no base path, a URI inside the file that points outside it resolves to nothing
+// From memory, with no base path: a URI inside the file that points outside it is used as written
+// (a relative one has only about:blank to resolve against), and the page refuses every request
 const parseGltf = (loader, bytes) => new Promise((resolve, reject) => loader.parse(bytes.buffer, '', resolve, reject));
 
 const exportGlb = (scene) => new Promise((done) => new window.GLTFExporter().parse(scene, done, { binary: true, embedImages: true }));
@@ -235,7 +236,8 @@ async function registerTexture(base64, contentType, slot, sourceUrl, op) {
 /**
  * An .hdr file as the texture RGBELoader.load() would give for it. That method only takes a URL,
  * so this is what it (and DataTextureLoader.load under it) does with the bytes once they arrive,
- * step for step, in three.js 0.132.2.
+ * step for step, in three.js 0.132.2, except for bytes RGBELoader cannot parse: there load() never
+ * calls back, and this throws.
  */
 function hdrTexture(buffer) {
   const THREE = window.THREE;

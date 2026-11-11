@@ -50,11 +50,10 @@ const ELIZA_RUNTIME_SETTINGS: ReadonlySet<string> = new Set([
 const NEVER_STORED = [TIP_WALLET_ENV, 'ELIZA_SERVER_AUTH_TOKEN', 'SERVER_API_KEY', 'SECRET_SALT'];
 
 /**
- * The character's secrets. The .env file is no longer copied in. Every key earlier versions
- * copied from it (each key of the .env file) gets null, which deletes the copy stored by an
- * earlier run, except:
+ * The character's secrets. The .env file is not copied in. Every key of the .env file gets
+ * null, which deletes a stored copy of it, except:
  * - settings elizaOS reads through runtime.getSetting keep their current value from the
- *   environment, as before;
+ *   environment;
  * - keys elizaOS copies from the environment into the secrets on its own (`coreCopies`: the
  *   CLI's allow-list, core's getAllowedEnvVars(); null = it copies the whole environment) are
  *   left out while the environment has them: a null here would replace the live value it copies.
@@ -85,9 +84,10 @@ export function characterSecrets(
 }
 
 /**
- * Stored secret keys nothing needs any more: neither a setting elizaOS reads through getSetting
- * nor one elizaOS copies from the environment itself (those are rewritten on every start). This
- * catches what earlier versions stored for keys that are no longer in .env.
+ * Stored secret keys nothing needs: neither a setting elizaOS reads through getSetting nor a name
+ * elizaOS copies from the environment itself (those are rewritten on every start that has them;
+ * one on the allow-list that the environment lacks is kept). This catches stored keys that are
+ * not in .env, whatever stored them.
  */
 export function staleSecretKeys(storedKeys: Iterable<string>, { env, coreCopies }: { env: Env; coreCopies: ReadonlySet<string> | null }): string[] {
   return [...storedKeys].filter(

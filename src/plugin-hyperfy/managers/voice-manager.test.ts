@@ -144,7 +144,7 @@ describe('VoiceManager.speak and the turn it speaks for', () => {
     await vi.waitFor(() => expect(livekit.publishAudioStream).toHaveBeenCalledTimes(1));
     // The second turn's reply is synthesized and waits for the first to finish playing
     const second = session.runTurn({ origin: 'chat', requesterId: 'p2', cancel: slot.signal }, () => manager.speak('Second reply'));
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await vi.waitFor(() => expect((manager as any).pendingPlaybacks).toBe(2));
     slot.abort();
     finishFirst();
     expect(await first).toBe('all');
@@ -164,6 +164,21 @@ describe('VoiceManager.speak and the turn it speaks for', () => {
     const { manager, session, livekit } = setup(async () => PLAYED);
     expect(await session.runTurn({ origin: 'voice', requesterId: 'p1', cancel: slot.signal }, () => manager.speak('Too late'))).toBe('none');
     expect(livekit.publishAudioStream).not.toHaveBeenCalled();
+  });
+
+  it('asks for no synthesis for a turn that was cancelled before it speaks', async () => {
+    const utils = await import('../utils');
+    const synthesize = vi.spyOn(utils, 'generateSpeech').mockImplementation(async (text: string) => Buffer.from(text));
+    const { manager, session, livekit } = setup(async () => PLAYED);
+    const slot = new AbortController();
+    const spoken = await session.runTurn({ origin: 'chat', requesterId: 'p1', cancel: slot.signal }, async () => {
+      const whileLive = await manager.speak('While live');
+      slot.abort();
+      return [whileLive, await manager.speak('Too late')];
+    });
+    expect(spoken).toEqual(['all', 'none']);
+    expect(synthesize.mock.calls).toEqual([['While live']]);
+    expect(livekit.publishAudioStream.mock.calls.map(([buf]) => buf.toString())).toEqual(['While live']);
   });
 });
 
@@ -287,21 +302,29 @@ describe('a voice reply through the real delivery and voice', () => {
 });
 
 describe('VoiceManager.speak', () => {
-  it('discards speech synthesized after stop()', async () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('discards speech whose synthesis finishes after stop(); the same speech is played when nothing stops it', async () => {
     const utils = await import('../utils');
     let finishTts!: (buf: Buffer) => void;
     const tts = vi.spyOn(utils, 'generateSpeech').mockImplementation(
       () => new Promise((resolve) => (finishTts = resolve))
     );
-    const { manager, livekit } = setup(() => Promise.resolve());
+    const { manager, livekit } = setup(async () => PLAYED);
 
     const speaking = manager.speak('hello');
+    await vi.waitFor(() => expect(tts).toHaveBeenCalledTimes(1));
     manager.stop();
     finishTts(audio('late'));
-    await speaking;
-
+    await expect(speaking).resolves.toBe('none');
     expect(livekit.publishAudioStream).not.toHaveBeenCalled();
-    tts.mockRestore();
+
+    const other = setup(async () => PLAYED);
+    const played = other.manager.speak('hello');
+    await vi.waitFor(() => expect(tts).toHaveBeenCalledTimes(2));
+    finishTts(audio('in time'));
+    await expect(played).resolves.toBe('all');
+    expect(other.livekit.publishAudioStream.mock.calls.map(([buf]) => buf.toString())).toEqual(['in time']);
   });
 });
 
@@ -765,7 +788,7 @@ describe('VoiceManager voice input', () => {
     ['a frame longer than a second', { participant: 'p1', buffer: loud(1001) }],
     ['a single byte', { participant: 'p1', buffer: Buffer.alloc(1, 0x7f) }],
     ['no participant', { buffer: loud(100) }],
-    ['a participant that is not text', { participant: { toString: () => 'p1' }, buffer: loud(100) }],
+    ['a participant that is not text', { participant: { toString: (): string => 'p1' }, buffer: loud(100) }],
     ['a participant id of 65 characters', { participant: 'p'.repeat(65), buffer: loud(100) }],
   ])('ignores a frame with %s without throwing or keeping anything', (_what, data) => {
     const { emit, state } = listening();
@@ -847,16 +870,19 @@ describe('VoiceManager voice input', () => {
 });
 
 describe('VoiceManager.speak and links', () => {
-  it('never reads URLs aloud and skips text that is only a link', async () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('asks for speech without the http(s) URLs of the text, wherever they stand, and for none when the text is only a link', async () => {
     const utils = await import('../utils');
     const tts = vi.spyOn(utils, 'generateSpeech').mockResolvedValue(null);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
     const manager = sessionFor({}).voice;
     await manager.speak('Here you go https://open-pay.jp/ja/@a?product=x');
-    expect(tts).toHaveBeenCalledWith('Here you go');
+    await manager.speak('See https://a.test/x?y=1#z and http://b.test/y, then tell me');
+    expect(tts.mock.calls).toEqual([['Here you go'], ['See  and  then tell me']]);
     tts.mockClear();
-    await manager.speak('https://open-pay.jp/ja/@a?product=x');
+    await expect(manager.speak('https://open-pay.jp/ja/@a?product=x')).resolves.toBe('none');
     expect(tts).not.toHaveBeenCalled();
-    tts.mockRestore();
   });
 });
 
@@ -914,9 +940,9 @@ describe('VoiceManager voice limits', () => {
     resetUsageBudget(budget);
     const { manager } = setup(async () => PLAYED);
     const both = [manager.speak('Hello there!'), manager.speak('Hello again!')];
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(fetch).toHaveBeenCalledTimes(1);
-    expect(budget.snapshot(60_000)).toMatchObject({ ttsChars: 12, skipped: { tts: 1 } });
+    // Both were decided while the first request is still unanswered: one counted and sent, one skipped
+    await vi.waitFor(() => expect(budget.snapshot(60_000)).toMatchObject({ ttsChars: 12, skipped: { tts: 1 } }));
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
     answer(new Response(Buffer.from('audio'), { status: 200 }));
     expect(await Promise.all(both)).toEqual(['all', 'none']);
   });
@@ -959,9 +985,20 @@ describe('VoiceManager voice limits', () => {
     expect(japanese).toEqual({ text: `${'あ'.repeat(400)}。`, cut: true });
   });
 
-  it('reports that nothing was spoken for empty text', async () => {
-    const { manager } = setup(async () => {});
-    await expect(manager.speak('https://only.a/link')).resolves.toBe('none');
+  it.each([
+    ['empty text', ''],
+    ['only whitespace', ' \n\t'],
+    ['only a link', 'https://only.a/link'],
+  ])('reports that nothing was spoken, and asks for no speech, for %s', async (_what, text) => {
+    const fetch = vi.fn();
+    globalThis.fetch = fetch as never;
+    const budget = new UsageBudget(noLimits);
+    resetUsageBudget(budget);
+    const { manager, livekit } = setup(async () => PLAYED);
+    await expect(manager.speak(text)).resolves.toBe('none');
+    expect(fetch).not.toHaveBeenCalled();
+    expect(budget.snapshot(60_000).ttsChars).toBe(0);
+    expect(livekit.publishAudioStream).not.toHaveBeenCalled();
   });
 });
 
@@ -1011,11 +1048,16 @@ describe('VoiceManager delivery', () => {
 
 it('does not count an utterance that could not be played because the world has no voice room', async () => {
   const utils = await import('../utils');
-  vi.spyOn(utils, 'generateSpeech').mockResolvedValue(Buffer.from('audio'));
-  const session = sessionFor({ entities: {} });
-  const result = await session.runTurn({ origin: 'voice', requesterId: 'p1' }, async () => [await session.voice.speak('Hello there'), turnDelivered(currentTurn())]);
-  expect(result).toEqual(['none', false]);
-  vi.restoreAllMocks();
+  const tts = vi.spyOn(utils, 'generateSpeech').mockResolvedValue(Buffer.from('audio'));
+  try {
+    const session = sessionFor({ entities: {} });
+    const result = await session.runTurn({ origin: 'voice', requesterId: 'p1' }, async () => [await session.voice.speak('Hello there'), turnDelivered(currentTurn())]);
+    expect(result).toEqual(['none', false]);
+    // It got as far as having audio to play
+    expect(tts).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.restoreAllMocks();
+  }
 });
 
 describe('VoiceManager voice replies (a voice turn answered through the one delivery path)', () => {

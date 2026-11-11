@@ -5,9 +5,10 @@ import { findAddresses } from '../../openpay-store/addresses';
 import { IDLE_EMOTES } from './idle-behavior';
 
 /**
- * What the agent says when the Claude budget is used up, so it never just goes silent:
- * a purchase link when the message names a product on the shelf, otherwise a short notice
- * (at most once per player per NOTICE_INTERVAL_MS) that says how to still get a link.
+ * What the agent says when the Claude budget is used up, instead of going silent: a purchase link
+ * when the message names a product on the shelf, otherwise a short notice (when sent up front, at
+ * most once per player and room per OFFLINE_NOTICE_INTERVAL_MS: handlers/messageReceivedHandler.ts)
+ * that says how to still get a link when there is a product to name.
  */
 
 export const OFFLINE_NOTICE_INTERVAL_MS = 5 * 60_000;
@@ -61,7 +62,7 @@ export function composeOfflineReply({
   };
 }
 
-// Players whose last notice is remembered, more than a world's player limit. The least recently
+// Players whose last notice is remembered (more than a world usually holds). The least recently
 // noticed is forgotten first, and a forgotten one can get a notice again at once.
 export const OFFLINE_NOTICE_TRACKED_KEYS = 256;
 

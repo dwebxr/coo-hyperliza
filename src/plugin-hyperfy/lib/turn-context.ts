@@ -46,9 +46,10 @@ export interface TurnContext {
   readonly world: object;
   readonly generation: number;
   /**
-   * Fires when the turn is cancelled while it runs: its session ended, its slot ran out, or
-   * cancelTurn. What the turn started and awaits (a walk, a wait for a lock) stops with it. It
-   * does not fire for a turn that completed, so a walk such a turn left running goes on.
+   * Fires when the turn is cancelled: its session ended or its slot ran out while it ran, or
+   * cancelTurn. What the turn started and awaits (a walk, a wait for a lock) stops with it. A
+   * completed turn's signal does not follow its session or slot, so a walk such a turn left
+   * running goes on.
    */
   readonly signal: AbortSignal;
   /** False once the turn may no longer act; also after it completed, once its session has ended. */
@@ -112,7 +113,7 @@ export function runTurn<T>(init: TurnInit, fn: () => Promise<T>): Promise<T> {
       listeners.push([signal, abort]);
     }
   }
-  // Only while it runs: a completed turn's signal stays as it is (see TurnContext.signal)
+  // Only while it runs: a completed turn's signal does not follow its session or slot (see TurnContext.signal)
   const unlink = () => {
     for (const [signal, abort] of listeners) signal.removeEventListener('abort', abort);
   };

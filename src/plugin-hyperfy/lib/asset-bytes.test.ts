@@ -42,14 +42,23 @@ describe('fetchAssetBytes', () => {
     expect(cdn.hits[0].url).toBe('/world-assets/a.glb');
   });
 
-  it('loads nothing from anywhere else inside the network, and asks no server', async () => {
+  it('loads nothing from anywhere else inside the network, nor a local path outside the bundle, and asks no server', async () => {
     const { world, server, internal } = await localWorld();
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    for (const url of [`http://127.0.0.1:${internal.port}/a.glb`, `http://localhost:${internal.port}/a.glb`, 'https://192.168.0.1/a.glb', 'https://[::1]/a.glb', 'blob:nodedata:1', '/etc/hosts', '../../../.env', 42, null]) {
-      await expect(fetchAssetBytes(world, url, 'model')).rejects.toThrow();
-    }
+    const refused: [unknown, string][] = [
+      [`http://127.0.0.1:${internal.port}/a.glb`, "http:// is only allowed on the world's own origin"],
+      [`http://localhost:${internal.port}/a.glb`, "http:// is only allowed on the world's own origin"],
+      ['https://192.168.0.1/a.glb', '192.168.0.1 is a private address'],
+      ['https://[::1]/a.glb', '::1 is a loopback address'],
+      ['blob:nodedata:1', 'blob: URLs cannot be loaded by the agent'],
+      ['/etc/hosts', 'could not resolve /etc/hosts'],
+      ['../../../.env', 'could not resolve ../../../.env'],
+      [42, 'could not resolve 42'],
+      [null, 'could not resolve null'],
+    ];
+    for (const [url, why] of refused) await expect(fetchAssetBytes(world, url, 'model'), String(url)).rejects.toThrow(why);
     expect(server.connections + internal.connections).toBe(0);
   });
 
@@ -62,8 +71,8 @@ describe('fetchAssetBytes', () => {
   it('reads a bundled file and an inline data: URL without any request', async () => {
     const { world, server } = await localWorld();
 
-    const bundled = await fetchAssetBytes(world, 'constants.ts', 'script');
-    expect(text(bundled.bytes)).toContain('export');
+    const bundled = await fetchAssetBytes(world, 'assets/day2.hdr', 'image');
+    expect(text(bundled.bytes.subarray(0, 10))).toBe('#?RADIANCE');
     const inline = await fetchAssetBytes(world, 'data:model/gltf-binary;base64,Z2xURg==', 'model');
     expect([text(inline.bytes), inline.contentType]).toEqual(['glTF', 'model/gltf-binary']);
     expect(server.connections).toBe(0);
@@ -143,6 +152,19 @@ describe('decodeDataUrl', () => {
     expect(() => decodeDataUrl(`data:text/plain,${'a'.repeat(301)}`, 300)).toThrow('holds more than 300 bytes');
     expect(() => decodeDataUrl('https://x.test/', 100)).toThrow('not a valid data: URL');
     expect(() => decodeDataUrl('data:text/plain;base64', 100)).toThrow('not a valid data: URL');
+  });
+
+  it('refuses a payload that cannot fit the cap before decoding any of it', () => {
+    const big = `data:application/octet-stream;base64,${Buffer.alloc(300).toString('base64')}`;
+    const tooMuchBase64 = `data:application/octet-stream;base64,${'A'.repeat(4000)}`;
+    const tooMuchText = `data:text/plain,${'a'.repeat(4000)}`;
+    const decode = vi.spyOn(Buffer, 'from');
+    expect(() => decodeDataUrl(tooMuchBase64, 299)).toThrow('holds more than 299 bytes');
+    expect(() => decodeDataUrl(tooMuchText, 299)).toThrow('holds more than 299 bytes');
+    expect(decode).not.toHaveBeenCalled();
+    // The same spy sees the decoding of a payload that may fit
+    expect(decodeDataUrl(big, 300).bytes.byteLength).toBe(300);
+    expect(decode).toHaveBeenCalledTimes(1);
   });
 });
 

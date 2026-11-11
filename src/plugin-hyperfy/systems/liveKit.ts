@@ -25,7 +25,8 @@ export interface PublishAudioOptions {
   signal?: AbortSignal;
   /**
    * Asked right before the first frame of the audio, once it is decoded and its track published
-   * (a reply that reports a privileged action: session/deliver-reply.ts). No: nothing is played.
+   * (a reply that reports a privileged action: session/deliver-reply.ts). No: none of the audio is
+   * played (one frame of silence has gone out).
    */
   admit?: () => boolean;
   /** Counts the frames of the audio the room took as they go out, so it holds also when the stream fails or hangs */

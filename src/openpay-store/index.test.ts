@@ -64,6 +64,15 @@ describe('formatShelf', () => {
     expect(text.match(/^- \[/gm)).toHaveLength(12);
     expect(text).toContain('(+8 more not listed)');
     expect(formatShelf([], { autonomous: false })).toBe('');
+    // Fewer than 12 when their lines are long: at most 1500 characters of product lines
+    const long = Array.from({ length: 12 }, (_, i) => product(`h_l${i}`, `Item ${i} ${'t'.repeat(100)}`, { desc: 'd'.repeat(80) }));
+    const shelf = formatShelf(long, { autonomous: false });
+    const lines = shelf.split('\n').filter((line) => line.startsWith('- ['));
+    expect(lines.length).toBeGreaterThan(1);
+    expect(lines.length).toBeLessThan(12);
+    expect(lines.join('').length).toBeLessThanOrEqual(1500);
+    expect(lines.join('').length + lines[0].length).toBeGreaterThan(1500);
+    expect(shelf).toContain(`(+${12 - lines.length} more not listed)`);
   });
 });
 
@@ -110,9 +119,16 @@ describe('resolveProduct', () => {
     expect(MIN_TITLE_MATCH_CODE_POINTS).toBe(4);
   });
 
-  it('never matches a title inside another word, and never guesses', () => {
+  it('matches no Latin title inside another word, and does not guess among several products or from nothing', () => {
     const ai = product('h_ai', 'AI');
     expect(resolveProduct([ai, board], { messageText: 'Can I get details?' })).toBeNull();
+    // A title long enough to be looked for, inside longer words
+    const rain = product('h_rain', 'Rain');
+    for (const text of ['Training is fun', 'a rainbow please', 'brains']) {
+      expect(resolveProduct([rain, board], { messageText: text }), text).toBeNull();
+      expect(resolveProduct([rain, board], { replyText: text }), text).toBeNull();
+    }
+    expect(resolveProduct([rain, board], { messageText: 'Is the rain, er, for sale?' })).toBe(rain);
     expect(resolveProduct([board], {})).toBeNull();
     expect(resolveProduct(products, { replyText: 'Both HoverBoard and Bio Dome are nice' })).toBeNull();
   });
@@ -288,10 +304,14 @@ describe('createOpenPayStorePlugin', () => {
     expect(toStoreProduct({ ...listing, url: `${longest}a` }, 'https://open-pay.jp')).toBeNull();
   });
 
-  it('never shares on autonomous turns or for an unresolvable product (the player is told it posted no link)', async () => {
+  it('shares nothing for a message from the agent itself, for one without text, or for an unresolvable product (the player is told it posted no link)', async () => {
     const { action } = await loadedPlugin();
     const callback = vi.fn();
+    // Either mark of an autonomous run is enough: the agent's own id as the sender, or no text
+    const fromSelf = await action.handler(runtime(), { entityId: 'agent', content: { text: 'HoverBoard link please', source: 'hyperfy' } } as any, undefined, {}, callback, reply('h_board'));
+    const noText = await action.handler(runtime(), { entityId: 'player', content: { text: '  ', source: 'hyperfy' } } as any, undefined, {}, callback, reply('h_board'));
     const autonomous = await action.handler(runtime(), { entityId: 'agent', content: { text: '' } } as any, undefined, {}, callback, reply('h_board'));
+    for (const refused of [fromSelf, noText, autonomous]) expect(refused).toEqual({ success: false, error: 'links are only shared in a conversation', data: { actionName: SHARE_ACTION } });
     expect(callback).not.toHaveBeenCalled();
     const unknown = await action.handler(runtime(), userMessage('hyperfy', { text: 'それのリンクちょうだい' }), undefined, {}, callback, reply('h_unknown'));
     expect(callback.mock.calls.map(([content]) => content.text)).toEqual(["Sorry, I couldn't tell which product you mean, so I didn't post a link."]);

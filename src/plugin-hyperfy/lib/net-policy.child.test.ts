@@ -60,6 +60,8 @@ interface Run {
   servers: Record<'gate' | 'v4' | 'tls' | 'bodies' | 'api' | 'elsewhere', TestServer> & { v6: TestServer | null };
   /** First lines of whatever was sent to the proxy the child's environment names */
   proxied: string[];
+  /** What the proxy recorded of a request made to it from here, before the child ran */
+  proxyProbe: string[];
 }
 
 async function run(runtime: string): Promise<Run> {
@@ -100,7 +102,16 @@ async function run(runtime: string): Promise<Run> {
     socket.on('error', () => {});
   });
   await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
-  const proxyUrl = `http://127.0.0.1:${(proxy.address() as net.AddressInfo).port}`;
+  const proxyPort = (proxy.address() as net.AddressInfo).port;
+  const proxyUrl = `http://127.0.0.1:${proxyPort}`;
+  // The recorder records: one request to it from here, taken out again before the child runs
+  await new Promise<void>((resolve, reject) => {
+    const probe = net.connect(proxyPort, '127.0.0.1', () => probe.write('GET http://probe.test/ HTTP/1.1\r\nHost: probe.test\r\n\r\n'));
+    probe.on('error', reject);
+    probe.on('close', () => resolve());
+    probe.resume();
+  });
+  const proxyProbe = proxied.splice(0);
 
   const scenario: NetChildScenario = {
     ca: testCertificate().cert,
@@ -125,7 +136,7 @@ async function run(runtime: string): Promise<Run> {
     if (!existsSync(reportFile)) throw new Error(`The network child (${runtime}) ended with status ${status} and no report.\n${output.slice(-3000)}`);
     const report = JSON.parse(readFileSync(reportFile, 'utf8')) as NetChildReport;
     if (report.fatal) throw new Error(`The network child (${runtime}) failed: ${report.fatal}`);
-    return { report, servers, proxied };
+    return { report, servers, proxied, proxyProbe };
   } finally {
     proxy.close();
   }
@@ -224,7 +235,8 @@ describe.each(runtimes)('the network policy in a %s process', (runtime, availabl
     expect(servers.elsewhere.connections).toBe(0);
   });
 
-  test('nothing went through the proxy the environment names', () => {
+  test('nothing went through the proxy the environment names (which records what is sent to it)', () => {
+    expect(result.proxyProbe).toEqual(['GET http://probe.test/ HTTP/1.1']);
     expect(result.proxied).toEqual([]);
   });
 });

@@ -222,16 +222,24 @@ describe('npm run tip-wallet (the script itself, on a temporary file)', () => {
 
   it('removes its temporary file and leaves the old file when the new one cannot be moved into place', () => {
     const { dir, file } = envFile('OTHER=1\n');
+    const text = `OTHER=1\n${KEY}=${key}\n`;
     // The move itself fails (as across file systems), after the temporary file was written
-    const rename = vi.spyOn(fs, 'renameSync').mockImplementation(() => {
+    const atMove: { names: string[]; content?: string; mode?: number } = { names: [] };
+    const rename = vi.spyOn(fs, 'renameSync').mockImplementation((from) => {
+      atMove.names = readdirSync(dir).sort();
+      atMove.content = readFileSync(String(from), 'utf8');
+      atMove.mode = statSync(String(from)).mode & 0o777;
       throw Object.assign(new Error('EXDEV: cross-device link not permitted'), { code: 'EXDEV' });
     });
     try {
-      expect(() => writeAtomically(file, `OTHER=1\n${KEY}=${key}\n`)).toThrow('EXDEV');
+      expect(() => writeAtomically(file, text)).toThrow('EXDEV');
       expect(rename).toHaveBeenCalledTimes(1);
     } finally {
       rename.mockRestore();
     }
+    // The temporary file was there, next to the old one, complete and readable by its owner only
+    expect(atMove.names).toHaveLength(2);
+    expect(atMove).toMatchObject({ content: text, mode: 0o600 });
     expect(readdirSync(dir)).toEqual(['.env']);
     expect(readFileSync(file, 'utf8')).toBe('OTHER=1\n');
   });

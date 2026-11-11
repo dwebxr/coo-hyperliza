@@ -134,7 +134,7 @@ export class WorldChat {
 
   /**
    * Calls `listener` with the ids of the snapshot's chat history: at once with the last snapshot's
-   * (when one was received), then with every later one. Returns the unsubscribe.
+   * (when it had any), then with every later one. Returns the unsubscribe.
    */
   onHistory(listener: (ids: readonly string[]) => void): () => void {
     this.#historyListeners.add(listener);
@@ -160,7 +160,7 @@ export class WorldChat {
     chat.msgs = [...chat.msgs, msg];
     if (chat.msgs.length > MAX_MSGS) chat.msgs.shift();
     for (const callback of chat.listeners) callback(chat.msgs);
-    // The engine's own add also shows a chat bubble over the sender; that is skipped, as before
+    // The engine's own add also shows a chat bubble over the sender; this one does not
     this.#world.events.emit('chat', Object.freeze({ ...(msg as object) }));
   }
 }

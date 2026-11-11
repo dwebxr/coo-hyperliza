@@ -26,8 +26,8 @@ const UNREACHABLE = { wsUrl: 'ws://127.0.0.1:9/ws', worldId: '00000000-0000-0000
 /** start() with a WS_URL it refuses, so it returns right after applying the script policy */
 async function start(worldScripts: string | undefined) {
   vi.stubEnv('WS_URL', 'ftp://not-a-world');
-  if (worldScripts === undefined) delete process.env.HYPERFY_WORLD_SCRIPTS;
-  else vi.stubEnv('HYPERFY_WORLD_SCRIPTS', worldScripts);
+  // Unset for `undefined`; either way what the suite's environment had comes back with unstubAllEnvs
+  vi.stubEnv('HYPERFY_WORLD_SCRIPTS', worldScripts);
   const logs = { info: vi.spyOn(console, 'info').mockImplementation(() => {}), error: vi.spyOn(console, 'error').mockImplementation(() => {}) };
   const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
     throw new Error(`process.exit(${code})`);
@@ -85,15 +85,25 @@ describe('HyperfyService and HYPERFY_WORLD_SCRIPTS', () => {
   });
 
   it('hands the loader a script runtime only when scripts are sandboxed', async () => {
+    /** Connects, and returns the script runtime the loader of that connection's world was given */
+    const loaderScriptsOf = async (service: any) => {
+      const connecting = service.connect(UNREACHABLE).catch(() => {});
+      // The session, and with it the world and its systems, exists from the start of the attempt
+      const loader = service.getWorld().loader;
+      await connecting;
+      await service.stop();
+      return loader.scripts;
+    };
     const off = await start(undefined);
-    await off.service.connect(UNREACHABLE).catch(() => {});
-    await off.service.stop();
+    expect(await loaderScriptsOf(off.service)).toBeNull();
     expect(created).not.toHaveBeenCalled();
 
     const sandboxed = await start('sandboxed');
-    await sandboxed.service.connect(UNREACHABLE).catch(() => {});
-    await sandboxed.service.stop();
+    const scripts = await loaderScriptsOf(sandboxed.service);
     expect(created).toHaveBeenCalledTimes(1);
+    // The loader evaluates app scripts with exactly the runtime that was made for this world
+    expect(scripts).toBe(created.mock.results[0].value);
+    expect(typeof scripts.evaluate).toBe('function');
   });
 
   it('exits the process when the sandbox cannot be activated, before any world is created', async () => {

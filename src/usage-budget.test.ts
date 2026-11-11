@@ -136,9 +136,30 @@ describe('usageLimitProblems', () => {
 
 describe('purposes', () => {
   it('caps each purpose, with AI_MAX_TOKENS_<PURPOSE> overrides', () => {
+    // Every purpose and the variable that overrides its cap, written out
+    const overrides: Record<keyof typeof AI_PURPOSE_MAX_TOKENS, string> = {
+      'should-respond': 'AI_MAX_TOKENS_SHOULD_RESPOND',
+      chat: 'AI_MAX_TOKENS_CHAT',
+      autonomous: 'AI_MAX_TOKENS_AUTONOMOUS',
+      navigation: 'AI_MAX_TOKENS_NAVIGATION',
+      'use-item': 'AI_MAX_TOKENS_USE_ITEM',
+      vision: 'AI_MAX_TOKENS_VISION',
+      reply: 'AI_MAX_TOKENS_REPLY',
+      ambient: 'AI_MAX_TOKENS_AMBIENT',
+      build: 'AI_MAX_TOKENS_BUILD',
+    };
+    expect(Object.keys(overrides).sort()).toEqual(Object.keys(AI_PURPOSE_MAX_TOKENS).sort());
+    for (const [purpose, key] of Object.entries(overrides) as [keyof typeof AI_PURPOSE_MAX_TOKENS, string][]) {
+      expect(AI_PURPOSE_MAX_TOKENS[purpose], purpose).toBeGreaterThan(0);
+      expect(maxTokensFor(purpose, {}), purpose).toBe(AI_PURPOSE_MAX_TOKENS[purpose]);
+      expect(maxTokensFor(purpose, { [key]: '700' }), purpose).toBe(700);
+      // Another purpose's override is not this one's
+      expect(maxTokensFor(purpose, { [`${key}_X`]: '700' }), purpose).toBe(AI_PURPOSE_MAX_TOKENS[purpose]);
+    }
     expect(maxTokensFor('chat', {})).toBe(AI_PURPOSE_MAX_TOKENS.chat);
     expect(maxTokensFor('should-respond', { AI_MAX_TOKENS_SHOULD_RESPOND: '700' })).toBe(700);
     expect(maxTokensFor('chat', { AI_MAX_TOKENS_CHAT: 'x' })).toBe(AI_PURPOSE_MAX_TOKENS.chat);
+    expect(maxTokensFor('chat', { AI_MAX_TOKENS_CHAT: '0' })).toBe(AI_PURPOSE_MAX_TOKENS.chat);
     expect(maxTokensFor('unknown', {})).toBeUndefined();
     expect(maxTokensFor(undefined, {})).toBeUndefined();
   });
@@ -174,10 +195,12 @@ describe('UsageBudget', () => {
   it('counts every kind of token toward the daily token limit', () => {
     const c = clock();
     const budget = new UsageBudget({ ...noLimits, aiTokensPerDay: 1000 }, c.now);
-    made(budget, { ...call('chat', 500, 100), cacheReadTokens: 300 } as ReturnType<typeof call>, 900);
+    // 900 in four kinds, then 100 more: leaving any one kind out would stay under the limit
+    made(budget, { ...call('chat', 400, 100), cacheReadTokens: 300, cacheWriteTokens: 100 } as ReturnType<typeof call>, 900);
     expect(budget.aiAvailable()).toBe(true);
     made(budget, call('chat', 50, 50));
     expect(budget.aiBlockedReason()).toBe('AI_MAX_TOKENS_PER_DAY=1000');
+    expect(budget.snapshot(DAY).ai).toMatchObject({ inputTokens: 450, outputTokens: 150, cacheReadTokens: 300, cacheWriteTokens: 100 });
     c.advance(DAY);
     expect(budget.aiAvailable()).toBe(true);
   });

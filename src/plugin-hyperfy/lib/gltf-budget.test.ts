@@ -146,7 +146,7 @@ describe('gltfStorageProblem: what the page would allocate', () => {
     ['a fractional count', accessor(1.5), 'no usable count'],
     ['no count', { type: 'VEC3', componentType: 5126 }, 'no usable count'],
     ['a buffer view that does not exist', accessor(1, 'VEC3', 5126, { bufferView: 7 }), 'names no buffer view'],
-    ['a sparse part with an inherited index type', accessor(1, 'VEC3', 5126, { sparse: { count: 1, indices: { bufferView: 0, componentType: 'valueOf' }, values: { bufferView: 0 } } }), 'sparse part'],
+    ['a sparse part with an inherited index type', accessor(1, 'VEC3', 5126, { sparse: { count: 1, indices: { bufferView: 0, componentType: 'valueOf' }, values: { bufferView: 0 } } }), 'sparse part with no usable count or index type'],
   ])('refuses an accessor with %s', (_name, entry, why) => {
     expect(problem(glb({ accessors: [entry] }))).toContain(why);
   });
@@ -294,20 +294,35 @@ describe('gltfStorageProblem: what the page would allocate', () => {
 
   it('refuses JSON nested deeper than MODEL_LIMITS.jsonDepth, before parsing it, and passes the depth just under it', () => {
     const nested = (depth: number) => `{"asset":{"version":"2.0"},"extras":${'['.repeat(depth - 1)}${']'.repeat(depth - 1)}}`;
+    const tooDeep = glbOf([[JSON_TYPE, jsonBytes(nested(MODEL_LIMITS.jsonDepth + 1))]]);
+    const deepest = glbOf([[JSON_TYPE, jsonBytes(nested(MODEL_LIMITS.jsonDepth))]]);
     const parse = vi.spyOn(JSON, 'parse');
-    expect(problem(glbOf([[JSON_TYPE, jsonBytes(nested(MODEL_LIMITS.jsonDepth + 1))]]))).toBe(`the glTF JSON nests deeper than ${MODEL_LIMITS.jsonDepth}`);
-    expect(parse).not.toHaveBeenCalled();
-    parse.mockRestore();
-    expect(problem(glbOf([[JSON_TYPE, jsonBytes(nested(MODEL_LIMITS.jsonDepth))]]))).toBeNull();
+    try {
+      expect(problem(tooDeep)).toBe(`the glTF JSON nests deeper than ${MODEL_LIMITS.jsonDepth}`);
+      expect(parse).not.toHaveBeenCalled();
+      // The same spy sees the parse of the one that passes
+      expect(problem(deepest)).toBeNull();
+      expect(parse).toHaveBeenCalledTimes(1);
+    } finally {
+      parse.mockRestore();
+    }
     // Brackets inside strings are text
     expect(problem(glb({ extras: '['.repeat(1000) }))).toBeNull();
   });
 
   it('refuses JSON larger than MODEL_LIMITS.jsonBytes without its data: URIs, before parsing it', () => {
+    const tooLarge = glb({ extras: 'x'.repeat(MODEL_LIMITS.jsonBytes) });
+    // The same amount inside a data: URI is not counted
+    const inDataUri = glb({ images: [{ uri: `data:image/png;base64,${'A'.repeat(MODEL_LIMITS.jsonBytes)}` }] });
     const parse = vi.spyOn(JSON, 'parse');
-    expect(problem(glb({ extras: 'x'.repeat(MODEL_LIMITS.jsonBytes) }))).toBe(`the glTF JSON is larger than ${MODEL_LIMITS.jsonBytes} bytes (without its data: URIs)`);
-    expect(parse).not.toHaveBeenCalled();
-    parse.mockRestore();
+    try {
+      expect(problem(tooLarge)).toBe(`the glTF JSON is larger than ${MODEL_LIMITS.jsonBytes} bytes (without its data: URIs)`);
+      expect(parse).not.toHaveBeenCalled();
+      expect(problem(inDataUri, modelBudget('model'))).toBeNull();
+      expect(parse).toHaveBeenCalledTimes(1);
+    } finally {
+      parse.mockRestore();
+    }
   });
 
   it('refuses extras and unknown-extension payloads that, with the copies made of them, come to more than MODEL_LIMITS.metadataBytes', () => {
@@ -360,9 +375,22 @@ describe('gltfStorageProblem: what the page would allocate', () => {
       meshes: [{ primitives: [{ attributes: Object.fromEntries(Array.from({ length: attributes }, (_, i) => [`_A${i}`, i])) }] }],
     });
     const budget = { singleBytes: 1000, totalBytes: 1_000_000, exportBytes: 7000 };
-    expect(gltfCharge(glb(json(10), bin), budget)).toMatchObject({ charge: { exportBytes: expect.any(Number) } });
-    expect(problem(glb(json(10), bin), budget)).toBeNull();
-    expect(problem(glb(json(12), bin), budget)).toMatch(/^the model's export would be about \d+ bytes, more than 7000$/);
+    // The JSON chunk's length, as the GLB header of its chunk says it (all ASCII here)
+    const jsonLength = (file: Uint8Array) => new DataView(file.buffer, file.byteOffset).getUint32(12, true);
+    const ten = glb(json(10), bin);
+    expect(gltfCharge(ten, budget)).toMatchObject({ charge: { exportBytes: 10 * 600 + jsonLength(ten) } });
+    expect(problem(ten, budget)).toBeNull();
+    const twelve = glb(json(12), bin);
+    expect(problem(twelve, budget)).toBe(`the model's export would be about ${12 * 600 + jsonLength(twelve)} bytes, more than 7000`);
+    // A morph target (120 bytes as floats) and a skin of two joints (64 bytes each) are written too
+    const rigged = glb({
+      accessors: [accessor(10), accessor(10)],
+      meshes: [{ primitives: [{ attributes: { POSITION: 0 }, targets: [{ POSITION: 1 }] }] }],
+      skins: [{ joints: [1, 2] }],
+      nodes: [{ mesh: 0, skin: 0 }, {}, {}],
+      scenes: [{ nodes: [0] }],
+    });
+    expect(gltfCharge(rigged, budget)).toMatchObject({ charge: { exportBytes: 120 + 120 + 2 * 64 + jsonLength(rigged) } });
   });
 
   it.each([
@@ -485,6 +513,10 @@ describe('the bundled models load under their budgets', () => {
       .filter((name) => name.endsWith('.glb'))
       .map((name): [string, 'emote'] => [`emotes/${name}`, 'emote']),
   ];
+
+  it('finds the bundled emotes next to the avatar and the base environment', () => {
+    expect(bundled.filter(([, kind]) => kind === 'emote').length).toBeGreaterThan(0);
+  });
 
   it.each(bundled)('%s (as %s) is charged well under its limits', (file, kind) => {
     const budget = modelBudget(kind);

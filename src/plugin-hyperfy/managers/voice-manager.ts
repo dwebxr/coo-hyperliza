@@ -34,8 +34,7 @@ export const MAX_UTTERANCE_BYTES = 30 * PCM_BYTES_PER_SECOND;
 /**
  * An utterance with less speech than this (100 ms above the loudness threshold: ten LiveKit frames)
  * is not sent to speech-to-text: every request costs, and audio this short holds no word (a click,
- * a breath, a cough's onset). 0.1 s is also the shortest audio OpenAI's transcription API accepts
- * (it refuses shorter files). A spoken word, the shortest ones included ("hi", "no", "stop"), has
+ * a breath, a cough's onset). A spoken word, the shortest ones included ("hi", "no", "stop"), has
  * more voiced sound than this.
  */
 export const MIN_UTTERANCE_BYTES = PCM_BYTES_PER_SECOND / 10;
@@ -76,7 +75,7 @@ function isLoudEnough(pcm: Buffer, threshold = 1000): boolean {
   return samples > 0 && sum / samples > threshold;
 }
 
-/** `text` for speech: whole when short enough, else up to the last sentence end within the cap. */
+/** `text` for speech: whole when short enough, else up to the last sentence end in the second half of the cap, else the cap itself. */
 export function spokenPart(text: string): { text: string; cut: boolean } {
   if (Array.from(text).length <= MAX_SPOKEN_CODE_POINTS) return { text, cut: false };
   const head = truncateCodePoints(text, MAX_SPOKEN_CODE_POINTS);
@@ -85,13 +84,13 @@ export function spokenPart(text: string): { text: string; cut: boolean } {
   return { text: end > head.length / 2 ? head.slice(0, end + 1).trimEnd() : head, cut: true };
 }
 
+/** Something said: at least one letter or digit, in any script */
+const WORD = /[\p{L}\p{N}]/u;
+
 /**
  * The voice of one connection: what players say (LiveKit audio, transcribed, then queued as a
  * turn of the connection's conversation, lib/chat-intake.ts) and what the agent says (speak).
  */
-/** Something said: at least one letter or digit, in any script */
-const WORD = /[\p{L}\p{N}]/u;
-
 export class VoiceManager {
   private runtime: IAgentRuntime;
   private session: ConnectionSession;
@@ -161,7 +160,9 @@ export class VoiceManager {
   }
 
   /**
-   * Detaches from LiveKit, cancels pending transcription and drops queued playback.
+   * Detaches from LiveKit, drops what speakers said that was not yet handed to speech-to-text (a
+   * request in flight is not cancelled; its transcript is ignored), drops queued playback and cuts
+   * the one playing.
    */
   stop() {
     if (this.audioSource && this.audioListener) {
@@ -238,8 +239,8 @@ export class VoiceManager {
     if (now - this.ingressGate.checkedAt < INGRESS_GATE_RECHECK_MS) return this.ingressGate.open;
     this.ingressGate.checkedAt = now;
     this.ingressGate.open = false;
-    // ElevenLabs (src/elevenlabs-speech.ts) when configured, otherwise e.g. OpenAI. Without any,
-    // voice input is simply unavailable (start() said so)
+    // ElevenLabs (src/elevenlabs-speech.ts) when ELEVENLABS_XI_API_KEY is set; this project
+    // registers no other. Without it voice input is unavailable (start() said so)
     if (!this.runtime.getModel(ModelType.TRANSCRIPTION)) return false;
     const budget = getUsageBudget();
     if (!budget.sttAvailable()) {
@@ -561,7 +562,8 @@ export class VoiceManager {
   }
 
   /**
-   * Queues audio so overlapping replies play one after another instead of being dropped.
+   * Queues audio so overlapping replies play one after another (at most MAX_PENDING_PLAYBACKS
+   * playing or waiting; more is dropped).
    * A failed or hung playback never blocks the ones after it. Resolves to how much of it went out
    * to the room (AgentLiveKit.publishAudioStream counts the frames as they go): 'partial' also when
    * the playback failed or timed out after some of it had played.

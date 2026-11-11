@@ -63,4 +63,20 @@ describe('NoticeThrottle', () => {
     expect(throttle.allow(`player-${10 * OFFLINE_NOTICE_TRACKED_KEYS - 1}`)).toBe(false);
     expect(throttle.allow('player-0')).toBe(true);
   });
+
+  it('forgets by when a key was last noticed, not by when it was first seen', () => {
+    let t = 0;
+    const throttle = new NoticeThrottle(1000, () => t);
+    expect(throttle.allow('first-seen')).toBe(true);
+    t = 999;
+    expect(throttle.allow('second-seen')).toBe(true);
+    // Noticed again: 'second-seen' is the least recently noticed of the two from here on
+    t = 1000;
+    expect(throttle.allow('first-seen')).toBe(true);
+    for (let i = 0; i < OFFLINE_NOTICE_TRACKED_KEYS - 1; i++) expect(throttle.allow(`other-${i}`)).toBe(true);
+    expect(throttle.trackedKeys).toBe(OFFLINE_NOTICE_TRACKED_KEYS);
+    // One over: 'second-seen' is forgotten (it gets a notice again inside its interval), 'first-seen' is still throttled
+    expect(throttle.allow('first-seen')).toBe(false);
+    expect(throttle.allow('second-seen')).toBe(true);
+  });
 });

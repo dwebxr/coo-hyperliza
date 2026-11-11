@@ -17,7 +17,8 @@ import type { TurnContext } from '../lib/turn-context';
  *     gets the action's neutral line instead. It is checked once more right before such a reply is
  *     played (after its synthesis) and right before its text fallback; one who lost the right by
  *     then gets the neutral line instead, by the same path, once, and the report's audio is
- *     discarded.
+ *     discarded (on a voice turn; on a chat turn the report is already posted by then, and only
+ *     its audio is discarded).
  *  3. Emote, when the reply names one (a voice reply with words shows TALK otherwise). A name that
  *     is no emote, or an emote that fails, never stops the reply.
  *  4. Words. A chat turn, an autonomous tick and a tip thanks are posted to chat and then spoken. A

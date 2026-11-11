@@ -12,7 +12,8 @@ import { adaptToWorldProtocol } from '../lib/world-protocol';
  * wired the way session/create-agent-world.ts installs it as world.network.upload) against a fake world API whose
  * answers the test releases one by one. The guard's authorization and connection can be
  * withdrawn at any point; nothing may reach the world after that, whichever await it happened
- * during, except taking back what the edit itself added.
+ * during (an import announces nothing before its uploads are done, so it has nothing to take back:
+ * `rolledBack` in effects() stays empty).
  *
  * Imports are downloaded through the real network policy (lib/net-policy.ts): cdn.test is a public
  * host that a server on loopback stands in for (test-support/net.ts).
@@ -129,6 +130,24 @@ describe('BuildManager stops when the authorization is withdrawn', () => {
     expect(entity.root.scale.toArray()).toEqual([1, 1, 1]);
   });
 
+  it.each([
+    ['translate', (m: BuildManager, g: EditGuard) => m.translate(g, 'box', [0, 2, 0])],
+    ['rotate', (m: BuildManager, g: EditGuard) => m.rotate(g, 'box', [0, 0, 0, 1])],
+    ['scale', (m: BuildManager, g: EditGuard) => m.scale(g, 'box', [2, 2, 2])],
+    ['duplicate', (m: BuildManager, g: EditGuard) => m.duplicate(g, 'box')],
+    ['delete', (m: BuildManager, g: EditGuard) => m.delete(g, 'box')],
+  ])('%s: changes nothing for a request that may not edit in a world without controls, where nothing is walked', async (_name, run) => {
+    const { auth, guard, world, entity, effects, manager } = setup();
+    world.controls = undefined;
+    auth.allowed = false;
+    await expect(run(manager, guard)).rejects.toBeInstanceOf(SceneEditStopped);
+    expect(effects()).toEqual(none);
+    expect([entity.root.position.toArray(), entity.root.scale.toArray()]).toEqual([[1, 0, 1], [1, 1, 1]]);
+    // Allowed, the same operation in that world is applied
+    auth.allowed = true;
+    await expect(run(manager, guard)).resolves.toMatchObject({ outcome: 'applied' });
+  });
+
   it('does not even walk for an edit that is no longer allowed', async () => {
     const { auth, guard, world, manager } = setup();
     auth.allowed = false;
@@ -150,6 +169,8 @@ describe('BuildManager reports what each operation did', () => {
     expect(added.id).toMatch(/^[A-Za-z0-9_-]{6,}$/);
     expect(added.id).not.toBe('box');
     await expect(manager.delete(guard, 'box')).resolves.toEqual({ outcome: 'applied' });
+    // Destroyed with the flag that announces it to the world
+    expect(entity.destroy.mock.calls).toEqual([[true]]);
   });
 
   it.each([
@@ -622,12 +643,27 @@ describe('BuildManager and packets the world would drop', () => {
     const { manager, guard, entity, world, frames } = announcing();
     Object.assign(entity.blueprint, { unique: true, name: 'Big', model: 'asset://box.glb', props: { notes: 'x'.repeat(70 * 1024) } });
     const result = await manager.duplicate(guard, 'box');
-    expect(result).toEqual({ outcome: 'failed', reason: expect.stringMatching(/^the blueprintAdded packet would be \d+ bytes, more than the 65536 the world accepts$/) });
+    expect(result).toEqual({ outcome: 'failed', reason: expect.stringMatching(/^the blueprintAdded packet would be at least \d+ bytes, more than the 65536 the world accepts$/) });
     expect([world.blueprints.add.mock.calls.length, world.entities.add.mock.calls.length, frames.length]).toEqual([0, 0, 0]);
     // A copy that fits is announced: its blueprint and its entity
     (entity.blueprint as Record<string, unknown>).props = { notes: 'short' };
     await expect(manager.duplicate(guard, 'box')).resolves.toMatchObject({ outcome: 'applied' });
     expect(frames).toHaveLength(2);
+  });
+
+  it("fails a duplicate whose blueprint the world's scan would refuse (nested too deep, or too many values once shared ones are written out), and changes nothing", async () => {
+    const { manager, guard, entity, world, frames } = announcing();
+    // The review's props: 33 nested objects, a 229-byte packet
+    let deep: unknown = null;
+    for (let i = 0; i < 33; i++) deep = { a: deep };
+    Object.assign(entity.blueprint, { unique: true, name: 'Deep', model: 'asset://box.glb', props: deep });
+    await expect(manager.duplicate(guard, 'box')).resolves.toEqual({ outcome: 'failed', reason: 'the blueprintAdded packet nests deeper than the 32 levels the world accepts' });
+    // One list held at both places of each level: a million values once the packer writes it out
+    let shared: unknown = [0];
+    for (let i = 0; i < 20; i++) shared = [shared, shared];
+    (entity.blueprint as Record<string, unknown>).props = { shared };
+    await expect(manager.duplicate(guard, 'box')).resolves.toEqual({ outcome: 'failed', reason: 'the blueprintAdded packet holds more than the 8192 values the world accepts' });
+    expect([world.blueprints.add.mock.calls.length, world.entities.add.mock.calls.length, frames.length]).toEqual([0, 0, 0]);
   });
   it('fails the import of a .hyp whose blueprint is over what the world takes in one packet, and adds nothing', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});

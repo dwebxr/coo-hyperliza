@@ -118,27 +118,58 @@ describe('the no-network guard of the test process', () => {
     expect(takeNetworkAttempts()).toHaveLength(13);
   });
 
-  it('refuses UDP to a name whose socket lookup answers with an address that is not loopback', async () => {
+  it('refuses UDP to a name whose socket lookup answers with an address that is not loopback, and to a name the socket would ask DNS for', async () => {
     // Addresses (the socket's own bind to 0.0.0.0) answer as themselves, names with `address`
     const answering = (address: string) => (name: string, _options: unknown, callback: (error: Error | null, address: string, family: number) => void) => callback(null, net.isIP(name) ? name : address, 4);
     const remote = dgram.createSocket({ type: 'udp4', lookup: answering('192.0.2.1') as never });
     const local = dgram.createSocket({ type: 'udp4', lookup: answering('127.0.0.1') as never });
+    // No lookup of its own: the name would go to DNS
+    const plain = dgram.createSocket('udp4');
     try {
       expect(await new Promise((resolve) => remote.send('x', 53, 'udp-target.invalid', (error) => resolve(error?.message)))).toContain('UDP to udp-target.invalid (192.0.2.1)');
       const failed = new Promise((resolve) => remote.once('error', (error) => resolve(error.message)));
       remote.connect(53, 'udp-target.invalid');
       expect(await failed).toContain('UDP to udp-target.invalid (192.0.2.1)');
       expect(await new Promise((resolve) => local.send('x', 9, 'udp-target.invalid', (error) => resolve(error?.message ?? 'sent')))).toBe('sent');
+      expect(await new Promise((resolve) => plain.send('x', 53, 'udp-target.invalid', (error) => resolve(error?.message ?? 'sent')))).toContain('DNS lookup of udp-target.invalid');
     } finally {
       remote.close();
       local.close();
+      plain.close();
     }
-    expect(takeNetworkAttempts()).toHaveLength(2);
+    expect(takeNetworkAttempts()).toEqual(['UDP to udp-target.invalid (192.0.2.1)', 'UDP to udp-target.invalid (192.0.2.1)', 'DNS lookup of udp-target.invalid']);
   });
 
   it('refuses to start a worker thread, which would run without the guard', () => {
     expect(() => new Worker('console.log(1)', { eval: true })).toThrow('A test tried to leave this machine: a worker thread');
     expect(takeNetworkAttempts()).toHaveLength(1);
+  });
+
+  it('refuses a WebSocket to an address or a name that is not this machine, and lets one to loopback through', async () => {
+    const outcomeOf = (url: string) =>
+      new Promise<string>((resolve) => {
+        const socket = new WebSocket(url);
+        socket.addEventListener('open', () => resolve('open'));
+        socket.addEventListener('error', () => resolve('failed'));
+      });
+    expect(await outcomeOf('ws://192.0.2.1/ws')).toBe('failed');
+    expect(await outcomeOf('wss://guard-test.invalid/ws')).toBe('failed');
+    expect(takeNetworkAttempts()).toEqual(['connection to 192.0.2.1:80', 'connection to guard-test.invalid:443']);
+    // Loopback is reached (the server there speaks no WebSocket, so the handshake fails after the connection)
+    const server = await startServer((_request, response) => response.end('here'));
+    expect(await outcomeOf(`ws://127.0.0.1:${server.port}/ws`)).toBe('failed');
+    expect(server.connections).toBe(1);
+    expect(takeNetworkAttempts()).toEqual([]);
+  });
+
+  // Expected to fail: its body passes, and the guard's own afterEach (no-network.ts) is what fails
+  // it. Were that hook gone, this test would pass and so be reported as failing.
+  it.fails('fails a test that tried to leave this machine, also when the code under test swallowed the refusal', () => {
+    try {
+      new Worker('0', { eval: true });
+    } catch {
+      // swallowed, as code under test might
+    }
   });
 
   it('refuses a UDP datagram or connection to an address that is not loopback, and lets loopback through', async () => {

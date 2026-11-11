@@ -46,7 +46,7 @@ describe('HYPERFY_WORLD_SCRIPTS', () => {
   });
 });
 
-// The probes added with the species, reference, receiver and error fixes (P1a2 review S-01..S-06)
+// The probes of the membrane's species, reference, receiver and error handling (P1a2 review S-01..S-06)
 const MEMBRANE_PROBES = [
   "a promise's species constructor is handed a host value (promise passed to the host)",
   "a promise's species constructor is handed a host value (promise returned by a callback)",
@@ -82,10 +82,13 @@ describe('escape probes', () => {
     expect(failed).toContain('no host function was written to through `this`');
     expect(failed).toContain('a host function never comes back to the host as itself');
     expect(failed).toContain('a host error reaches a script with its stack, cause or file paths');
+    // Every probe of the membrane fails without one (the species probes: the host kept the
+    // script's own promise, so its species constructor never ran)
+    for (const name of MEMBRANE_PROBES) expect(failed, name).toContain(name);
     expect(failed).not.toContain('the self-test can evaluate a script');
   });
 
-  it('report a membrane that lets host objects through even when the language probes pass', async () => {
+  it('report host objects that cross where there is no membrane, and none with the real one (in a realm that is not locked down)', async () => {
     const results = await runEscapeProbes({ ...leakyTools, toScript: (value) => value });
     const membrane = createScriptMembrane();
     const withMembrane = names(await runEscapeProbes({ ...leakyTools, toScript: membrane.toScript }));
@@ -155,19 +158,35 @@ describe('activating the sandbox', () => {
     expect(() => createSelfTestCompartment({})).toThrow('only while the sandbox self-test runs');
   });
 
-  it('refuses when the self-test itself cannot run, or runs no checks', async () => {
+  it('refuses when the self-test itself cannot run', async () => {
+    const out = log();
     const failing = await activateScriptSandbox({ guardErrorEvents: () => null,
       lockdown: () => {},
       selfTest: async () => {
         throw new Error('no Compartment');
       },
-      log: log(),
+      log: out,
     });
-    const empty = await activateScriptSandbox({ guardErrorEvents: () => null, lockdown: () => {}, selfTest: () => [], log: log() });
 
     expect(failing).toBe(false);
+    expect(isScriptSandboxActive()).toBe(false);
+    expect(out.error.mock.calls.map((call) => call[0])).toEqual(['[Hyperfy] World scripts: the sandbox self-test could not run: no Compartment']);
+    expect(() => createScriptCompartment({})).toThrow('after the sandbox has been activated');
+  });
+
+  // (A test of its own: an activation asked for in the same turn in which the one before it ended
+  // is handed that one's result, and its own self-test does not run)
+  it('refuses when the self-test runs no checks', async () => {
+    const out = log();
+    const selfTest = vi.fn(() => []);
+    const empty = await activateScriptSandbox({ guardErrorEvents: () => null, lockdown: () => {}, selfTest, log: out });
+
+    expect(selfTest).toHaveBeenCalledTimes(1);
     expect(empty).toBe(false);
     expect(isScriptSandboxActive()).toBe(false);
+    expect(out.error.mock.calls.map((call) => call[0])).toEqual(['[Hyperfy] World scripts: the sandbox self-test ran no checks']);
+    expect(out.info).not.toHaveBeenCalled();
+    expect(() => createScriptCompartment({})).toThrow('after the sandbox has been activated');
   });
 
   it('allows only self-test compartments while the self-test runs, and hands a second caller the same activation', async () => {
@@ -221,12 +240,24 @@ describe('activating the sandbox', () => {
   });
 
   it('passes the documented options to lockdown', async () => {
-    const lock = vi.fn(() => {
+    const lock = vi.fn((_options: unknown) => {
       throw new Error('stop here');
     });
     await activateScriptSandbox({ guardErrorEvents: () => null, lockdown: lock, selfTest: () => [], log: log() });
-    expect(lock).toHaveBeenCalledWith(LOCKDOWN_OPTIONS);
-    expect(LOCKDOWN_OPTIONS).toMatchObject({ localeTaming: 'unsafe', overrideTaming: 'severe', errorTrapping: 'none' });
+    expect(lock).toHaveBeenCalledTimes(1);
+    expect(lock.mock.calls[0]).toEqual([
+      {
+        errorTaming: 'unsafe',
+        consoleTaming: 'unsafe',
+        overrideTaming: 'severe',
+        domainTaming: 'unsafe',
+        stackFiltering: 'verbose',
+        errorTrapping: 'none',
+        unhandledRejectionTrapping: 'none',
+        localeTaming: 'unsafe',
+      },
+    ]);
+    expect(lock.mock.calls[0][0]).toBe(LOCKDOWN_OPTIONS);
   });
 });
 

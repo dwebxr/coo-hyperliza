@@ -17,7 +17,7 @@ const q2 = new THREE.Quaternion()
 const CONTROLS_TICK_INTERVAL = 100; // ms
 const NAVIGATION_STOP_DISTANCE = 0.5; // meters
 const FOLLOW_STOP_DISTANCE = 2.5; // meters
-const RANDOM_WALK_DEFAULT_INTERVAL = 5000; // ms <-- SET TO 5 SECONDS
+const RANDOM_WALK_DEFAULT_INTERVAL = 5000; // ms
 const RANDOM_WALK_DEFAULT_MAX_DISTANCE = 7; // meters
 /**
  * How long one walk (goto, followEntity) may take before it ends as 'timed-out'. Under the 180 s a
@@ -194,7 +194,6 @@ export class AgentControls extends System {
         control[name].released = false;
       }
     }
-    // We don't run navigationTick here, it runs on its own interval
   }
 
   // --- Walks: one at a time. Every routine below checks, after each of its awaits, that its walk
@@ -228,7 +227,7 @@ export class AgentControls extends System {
     for (const key of ['keyW', 'keyA', 'keyS', 'keyD', 'space', 'shiftLeft']) this.setKey(key, false);
   }
 
-  /** Makes `token`'s walk the one in progress, in place of whatever was. */
+  /** Starts a walk in place of whatever was in progress, and returns its token. */
   private begin(reason: string): ControlsToken {
     this.endWalk('replaced', reason);
     const token = new ControlsToken();

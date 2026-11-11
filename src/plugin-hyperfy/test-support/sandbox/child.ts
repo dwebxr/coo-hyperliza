@@ -5,7 +5,8 @@
  * It runs in a process of its own
  * because `sandboxed` locks the whole realm down, which a test runner's worker must never be.
  *
- * Not initialised, as in service.integration.test.ts: no socket, no physics, no tick loop.
+ * Not initialised, as in service.integration.test.ts: no socket, no Physics system, no tick loop
+ * (a scenario with physxModule loads PhysX itself).
  *
  * The world's assets are served by a server in this process on loopback, which is the world's own
  * origin for the agent's real network policy (lib/net-policy.ts). A second loopback server stands

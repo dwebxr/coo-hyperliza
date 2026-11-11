@@ -89,11 +89,19 @@ const text = (bytes: Uint8Array) => Buffer.from(bytes).toString();
 
 describe('PuppeteerManager', () => {
   afterEach(async () => {
+    // Whatever a test set, also one that failed half-way: the stand-in answers plainly again
+    failNextLaunch = false;
+    launchGate = null;
+    hangNewPage = false;
+    newPageGate = null;
+    launchPid = undefined;
     await (PuppeteerManager as any).instance?.close();
     launched.length = 0;
     launchOptions.length = 0;
     writes.length = 0;
     vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+    delete (globalThis as { window?: unknown }).window;
   });
 
   it('reuses one browser across sessions and gives each session a fresh page', async () => {
@@ -126,7 +134,6 @@ describe('PuppeteerManager', () => {
     await (manager as any).init();
     expect(launched[0].pages).toHaveLength(3);
     expect(manager.pageEpoch).toBe(3);
-    vi.restoreAllMocks();
   });
 
   it('close() closes the browser and allows a new manager', async () => {
@@ -152,7 +159,7 @@ describe('PuppeteerManager', () => {
     expect(() => new PuppeteerManager()).toThrow('already been instantiated');
   });
 
-  it("starts Chromium without the agent's environment, without a way to the network, and without slowMo", async () => {
+  it("launches Chromium with the reduced child environment (nothing of the agent's own), the offline flags, and no slowMo", async () => {
     const agentOnly = {
       ANTHROPIC_API_KEY: 'value-of-the-anthropic-key',
       ELIZA_SERVER_AUTH_TOKEN: 'value-of-the-api-token',
@@ -177,7 +184,7 @@ describe('PuppeteerManager', () => {
     expect(Object.keys(options.env).filter((name) => /KEY|TOKEN|SECRET|PASSWORD|POSTGRES|PROXY/i.test(name))).toEqual([]);
   });
 
-  it('writes the page into an empty tab, adds its code inline, and refuses every request the page makes', async () => {
+  it('writes the page into an empty tab without navigating, adds its code inline, turns request interception on before any content, and aborts a request the page makes', async () => {
     await (PuppeteerManager.getOrCreate() as any).init();
     const [page] = launched[0].pages;
 
@@ -191,7 +198,7 @@ describe('PuppeteerManager', () => {
 
     const request = { abort: vi.fn().mockResolvedValue(undefined), continue: vi.fn(), respond: vi.fn() };
     page.emit('request', request);
-    expect(request.abort).toHaveBeenCalledTimes(1);
+    expect(request.abort.mock.calls).toEqual([['blockedbyclient']]);
     expect(request.continue).not.toHaveBeenCalled();
     expect(request.respond).not.toHaveBeenCalled();
   });
@@ -209,7 +216,6 @@ describe('PuppeteerManager', () => {
     expect(launched).toHaveLength(1);
     expect(launched[0].pages).toHaveLength(2);
     expect(await manager.init()).toBe(second);
-    vi.restoreAllMocks();
   });
 
   it('passes asset bytes to the page as base64 and returns bytes', async () => {
@@ -250,7 +256,6 @@ describe('PuppeteerManager', () => {
     expect(results.map((result) => result.status === 'rejected' && (result.reason as Error).name)).toEqual(['AbortError', 'AbortError', 'AbortError', 'AbortError']);
     expect(results.every((result) => result.status === 'rejected' && result.reason instanceof PageOperationCancelled)).toBe(true);
     expect(page.evaluate.mock.calls.length).toBe(calls);
-    vi.restoreAllMocks();
   });
 
   it('settles a page call whose signal fired while it ran as taken back, under the id it passed (the page side is checked by smoke-chromium)', async () => {
@@ -268,7 +273,7 @@ describe('PuppeteerManager', () => {
     const op = loadCall.at(-1);
     expect(op).toMatch(/^op-\d+$/);
     expect(settleCall.slice(1)).toEqual([op, 'rollback']);
-    // The settle call runs agentPage.settle with that id
+    // The settle call runs agentPage.settle with that id (the page's window stands in here; afterEach removes it)
     const settled: unknown[][] = [];
     (globalThis as any).window = { agentPage: { settle: (...args: unknown[]) => settled.push(args) } };
     settleCall[0](op, 'rollback');
@@ -314,6 +319,26 @@ describe('PuppeteerManager', () => {
     // Accepted: what accept made of it is returned, and the record is dropped
     await expect(manager.loadGlbBytes(new Uint8Array([1]), { signal, accept: (bytes: Uint8Array) => `parsed ${text(bytes)}` })).resolves.toBe('parsed glb');
     expect(steps).toEqual(['rollback', 'rollback', 'forget']);
+  });
+
+  it("does not start the caller's work on a result whose signal fired while the page call ran, and takes the result back", async () => {
+    const manager = PuppeteerManager.getOrCreate() as any;
+    const page = await manager.init();
+    const steps: string[] = [];
+    const stop = new AbortController();
+    page.evaluate.mockImplementation(async (_fn: unknown, ...args: any[]) => {
+      if (['rollback', 'forget'].includes(args.at(-1))) steps.push(args.at(-1));
+      else stop.abort();
+      return Buffer.from('glb').toString('base64');
+    });
+    const accept = vi.fn((bytes: Uint8Array) => text(bytes));
+    await expect(manager.loadGlbBytes(new Uint8Array([1]), { signal: stop.signal, accept })).rejects.toBeInstanceOf(PageOperationCancelled);
+    expect(accept).not.toHaveBeenCalled();
+    expect(steps).toEqual(['rollback']);
+    // The same call with a signal that does not fire reaches the caller's work
+    page.evaluate.mockImplementation(async () => Buffer.from('glb').toString('base64'));
+    await expect(manager.loadGlbBytes(new Uint8Array([1]), { signal: new AbortController().signal, accept })).resolves.toBe('glb');
+    expect(accept).toHaveBeenCalledTimes(1);
   });
 
   it('takes back what a page call kept when its accept step throws or rejects, also when the call has no signal', async () => {
@@ -373,7 +398,6 @@ describe('PuppeteerManager', () => {
     expect(error).toBeInstanceOf(RenderPageKilled);
     expect(error).toMatchObject({ reason: 'deadline', callsInFlight: 1, initInFlight: false });
     expect(work.refusal('image/a.png')).toBe((error as Error).message);
-    vi.restoreAllMocks();
   });
 
   it('fails a cancelled page call with the error of its take-back when that fails', async () => {
@@ -416,6 +440,18 @@ describe('PuppeteerManager', () => {
     await expect(manager.capture(scene(), { kind: 'around' })).rejects.toBeInstanceOf(RenderPageUnavailable);
   });
 
+  it('launches no browser for a call made while the render page is down for a cooldown', async () => {
+    const breaker = new RenderBreaker({ log: { warn: () => {} } });
+    const manager = new PuppeteerManager({ watchdog: { breaker, table: async () => [] } }) as any;
+    await manager.init();
+    // What a teardown does: the browser is gone, and the next use would launch another
+    manager.dropGeneration(manager.generation);
+    for (let i = 0; i < 3; i++) breaker.recordKill();
+    await expect(manager.registerTexture({ bytes: new Uint8Array([1]), contentType: 'image/png', url: 'https://world.test/a.png' }, 'map')).rejects.toBeInstanceOf(RenderPageUnavailable);
+    await expect(manager.capture(scene(), { kind: 'around' })).rejects.toBeInstanceOf(RenderPageUnavailable);
+    expect(launchOptions).toHaveLength(1);
+  });
+
   it('builds no page and runs no page work when a launch it waited for completes after the render page went down for a cooldown', async () => {
     let launch!: () => void;
     launchGate = new Promise<void>((resolve) => (launch = resolve));
@@ -430,7 +466,6 @@ describe('PuppeteerManager', () => {
     launch();
     expect(await call).toBeInstanceOf(RenderPageUnavailable);
     expect(launched[0].pages).toEqual([]);
-    vi.restoreAllMocks();
   });
 
   it('runs no page work for a call whose page finished building after the render page went down for a cooldown', async () => {
@@ -446,7 +481,6 @@ describe('PuppeteerManager', () => {
     built();
     expect(await call).toBeInstanceOf(RenderPageUnavailable);
     expect(launched[0].pages[0].evaluate).not.toHaveBeenCalled();
-    vi.restoreAllMocks();
   });
 
   it('runs page calls under its watchdog: a call past the deadline fails with RenderPageKilled, and the next use starts a new browser', async () => {
@@ -462,7 +496,6 @@ describe('PuppeteerManager', () => {
     const next = await manager.init();
     expect(next).not.toBe(page);
     expect(launched).toHaveLength(2);
-    vi.restoreAllMocks();
   });
 
   it('gives building the page a deadline of its own: a page that never gets built fails the wait, and the next use starts again', async () => {
@@ -476,7 +509,6 @@ describe('PuppeteerManager', () => {
     const page = await manager.init();
     expect(launched).toHaveLength(2);
     expect(launched[1].pages).toEqual([page]);
-    vi.restoreAllMocks();
   });
 
   it("does not let the old browser's late disconnect drop the browser that replaced it", async () => {
@@ -491,7 +523,6 @@ describe('PuppeteerManager', () => {
     disconnected();
     expect(await manager.init()).toBe(second);
     expect([launched.length, manager.watchdog.isLive(1), manager.watchdog.isLive(2)]).toEqual([2, false, true]);
-    vi.restoreAllMocks();
   });
 
   it("kills a torn-down browser's process group and every process it was seen to own (process.kill stubbed: nothing is signalled)", async () => {
@@ -513,7 +544,6 @@ describe('PuppeteerManager', () => {
     // Once from what it knew, once more from a fresh table
     await vi.waitFor(() => expect(kill.mock.calls.length).toBe(6));
     expect(kill.mock.calls.slice(0, 3)).toEqual([[-4_000_000, 'SIGKILL'], [4_000_000, 'SIGKILL'], [4_000_001, 'SIGKILL']]);
-    vi.restoreAllMocks();
   });
 
   it('kills and closes a browser whose launch finishes after its generation was given up, and builds no page on it', async () => {
@@ -532,7 +562,6 @@ describe('PuppeteerManager', () => {
     expect([late.close.mock.calls.length > 0, late.child.kill.mock.calls, late.pages.length, manager.watchdog.isLive(1)]).toEqual([true, [['SIGKILL']], 0, false]);
     await manager.init();
     expect(launched).toHaveLength(2);
-    vi.restoreAllMocks();
   });
 
   it('closes a page that finishes building after its browser was given up, and fails that build', async () => {
@@ -549,7 +578,6 @@ describe('PuppeteerManager', () => {
     await expect(warmUp).rejects.toThrow('given up');
     expect(launched[0].pages[0].close).toHaveBeenCalled();
     expect(manager.page).toBeNull();
-    vi.restoreAllMocks();
   });
 
   it('a reset while the first page is being built closes that page without calling it a failure; the next use builds another', async () => {
@@ -567,7 +595,6 @@ describe('PuppeteerManager', () => {
     expect(error).not.toHaveBeenCalled();
     const next = await manager.init();
     expect([launched.length, launched[0].pages.length, launched[0].pages[1]]).toEqual([1, 2, next]);
-    vi.restoreAllMocks();
   });
 
   it('returns the page\'s bytes in memory of their own, exactly as long (not a view into the buffer pool)', async () => {

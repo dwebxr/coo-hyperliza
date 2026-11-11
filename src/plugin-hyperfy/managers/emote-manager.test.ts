@@ -11,6 +11,7 @@ import { Emotes } from '../hyperfy/src/core/extras/playerEmotes.js';
 import { AssetUploadError } from '../lib/asset-upload';
 import { installWorldNet } from '../lib/net-policy';
 import { PUBLIC_ADDRESS, type TestServer, closeServers, startServer, testNet } from '../test-support/net';
+import { LOCOMOTION_EMOTES } from '../constants.js';
 import { EmoteManager } from './emote-manager';
 
 const DEFAULT_TALK = 'asset://emote-talk.glb';
@@ -52,7 +53,7 @@ function installed<T extends object>(world: T): T {
   return world;
 }
 
-describe('EmoteManager talking gesture', () => {
+describe('EmoteManager and the clips a world serves (talking gesture, locomotion, custom emotes)', () => {
   beforeEach(() => {
     readFile.mockResolvedValue(Buffer.from('custom-talk-clip'));
   });
@@ -88,8 +89,9 @@ describe('EmoteManager talking gesture', () => {
     access.mockResolvedValue(undefined);
     await serveAssets((file) => file === 'emote-talk.glb'); // upload "succeeded", hash is 404
     const warn = vi.spyOn(logger, 'warn');
-    const { manager } = newManager();
+    const { manager, upload } = newManager();
     await (manager as any).ensureTalkEmote();
+    expect(upload).toHaveBeenCalledTimes(1);
     expect((Emotes as any).TALK).toBe(DEFAULT_TALK);
     expect(warn).not.toHaveBeenCalled();
   });
@@ -139,12 +141,16 @@ describe('EmoteManager talking gesture', () => {
     expect((Emotes as any).TALK).toBe(DEFAULT_TALK);
   });
 
-  it('never points a locomotion emote at an upload that could not be verified', async () => {
+  it('points no locomotion emote at an upload that resolved but could not be verified', async () => {
     access.mockRejectedValue(new Error('ENOENT'));
     await serveAssets((file) => file === 'emote-talk.glb'); // every uploaded hash is 404
-    await (newManager().manager as any).uploadLocomotionEmotes();
-    expect((Emotes as any).WALK).toBe(original.WALK);
-    expect((Emotes as any).RUN).toBe(original.RUN);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const { manager, upload } = newManager();
+    await (manager as any).uploadLocomotionEmotes();
+    // Every locomotion clip was uploaded, and none of the uploads is in use
+    expect(upload).toHaveBeenCalledTimes(LOCOMOTION_EMOTES.length);
+    expect(LOCOMOTION_EMOTES.map(({ name }) => (Emotes as any)[name])).toEqual(LOCOMOTION_EMOTES.map(({ name }) => original[name]));
   });
 
   it('stops uploading once the world refuses, and keeps the defaults', async () => {
@@ -211,6 +217,22 @@ describe('EmoteManager talking gesture', () => {
     });
     expect(await manager.uploadEmotes()).toBe(false);
     expect((Emotes as any).WALK).toBe(original.WALK);
+  });
+
+  it('asks the world nothing, and uploads nothing, for a connection that has already ended', async () => {
+    access.mockRejectedValue(new Error('ENOENT'));
+    const server = await serveAssets(() => false);
+    for (const method of ['info', 'warn'] as const) vi.spyOn(console, method).mockImplementation(() => {});
+    const ended = newManager();
+    ended.connection.ended = true;
+    expect(await ended.manager.uploadEmotes()).toBe(false);
+    expect(server.hits).toEqual([]);
+    expect(ended.upload).not.toHaveBeenCalled();
+    // The same world is asked, and uploaded to, on a connection that has not ended
+    const live = newManager();
+    await live.manager.uploadEmotes();
+    expect(server.hits.length).toBeGreaterThan(0);
+    expect(live.upload).toHaveBeenCalled();
   });
 
   it('gives up on clips that keep failing after a few rounds', async () => {
@@ -348,6 +370,7 @@ describe('EmoteManager.playEmote (the name comes from a model: any text)', () =>
     for (const method of ['info', 'warn'] as const) vi.spyOn(console, method).mockImplementation(() => {});
     const { manager, player, connection } = playing();
     manager.playEmote('TALK');
+    expect(vi.getTimerCount()).toBe(2);
     manager.stop();
     expect(vi.getTimerCount()).toBe(0);
     player.data.effect = undefined;

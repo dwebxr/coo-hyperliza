@@ -6,11 +6,14 @@ interface ActionNode extends THREE.Object3D {
   [key: string]: any;
 }
 
-/** What performAction did: 'started' when it began an interaction, otherwise why it did nothing. */
+/**
+ * What performAction did: 'started' when it began an interaction, otherwise why it did nothing
+ * ('entity-has-no-action-node' also when the node's duration is not one the agent holds E for).
+ */
 export type PerformActionOutcome = 'started' | 'busy' | 'no-action-nodes' | 'entity-has-no-action-node';
 
 /**
- * How long E is held on a node whose script gives no usable duration. An action node's `_duration`
+ * How long E is held on a node that has no `_duration` at all. An action node's `_duration`
  * is in seconds: the engine's own client adds each frame's delta (seconds) to the node's progress
  * until it reaches it, and its default is 0.5 (hyperfy/src/core/nodes/Action.js,
  * systems/ClientActions.js).
@@ -114,7 +117,8 @@ export class AgentActions extends System {
     const control = this.world.controls;
     control.setKey('keyE', true);
 
-    // Reserved before the timer is set: a second performAction meanwhile is 'busy'
+    // Reserved in this same synchronous step (below), before the timer can fire: a second
+    // performAction meanwhile is 'busy'
     const timer = setTimeout(() => {
       if (this.pending?.timer !== timer) return;
       this.pending = null;

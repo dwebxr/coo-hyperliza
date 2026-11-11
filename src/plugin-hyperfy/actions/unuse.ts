@@ -1,11 +1,8 @@
 import {
-    type Action,
-    type HandlerCallback,
-    type IAgentRuntime,
-    type Memory,
-    type State,
-    logger
-  } from '@elizaos/core';
+  type Action,
+  type IAgentRuntime,
+  logger,
+} from '@elizaos/core';
   import { actingSession, connectedSession } from '../service';
   import { AgentActions } from '../systems/actions';
   import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
@@ -19,13 +16,7 @@ import {
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
       return !!connectedSession(runtime)?.world?.actions;
     },
-    handler: async (
-      runtime: IAgentRuntime,
-      _message: Memory,
-      _state: State,
-      _options: {},
-      callback: HandlerCallback
-    ) => {
+    handler: async (runtime, _message, _state, _options, callback) => {
       // The turn's own connection (never a newer one); throws when the turn may no longer act
       const session = actingSession(runtime);
       const world = session?.world;
@@ -52,7 +43,7 @@ import {
         return actionFailed(UNUSE_ITEM, 'not holding or using anything');
       }
 
-      await callback({
+      await callback?.({
         text: 'Item released.',
         actions: [UNUSE_ITEM],
         source: 'hyperfy',

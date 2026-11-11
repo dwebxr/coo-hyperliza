@@ -1,9 +1,6 @@
 import {
     Action,
-    HandlerCallback,
     IAgentRuntime,
-    Memory,
-    State,
     logger,
 } from "@elizaos/core";
 import { actingSession, connectedSession } from "../service";
@@ -19,13 +16,7 @@ export const teleportToUserAction: Action = {
     validate: async (runtime: IAgentRuntime) => {
         return !!connectedSession(runtime);
     },
-    handler: async (
-        runtime: IAgentRuntime,
-        message: Memory,
-        state: State,
-        options: any,
-        callback: HandlerCallback
-    ) => {
+    handler: async (runtime, message, _state, _options, callback) => {
         logger.info("[Teleport Action] Handler triggered.");
         // The turn's own connection (never a newer one); throws when the turn may no longer act
         const session = actingSession(runtime);

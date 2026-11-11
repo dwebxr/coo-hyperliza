@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 
 // The real PuppeteerManager methods, over a stand-in page whose agentPage records what it keeps.
-// `ready` holds the page's init(); `gate` holds registerTexture inside the page; `acknowledge`
-// holds the answer to a settlement step while set.
+// `ready` holds the page's init() (`inits` counts the calls waiting on it or past it); `gate` holds
+// registerTexture inside the page; `acknowledge` holds the answer to a settlement step while set;
+// `onHdr` runs as the page takes an HDR.
 const page = vi.hoisted(() => ({
   calls: [] as string[],
   textures: new Map<string, string>(),
@@ -11,6 +12,8 @@ const page = vi.hoisted(() => ({
   undone: [] as string[],
   committed: [] as string[],
   ready: null as Promise<void> | null,
+  inits: 0,
+  onHdr: null as (() => void) | null,
   gate: null as Promise<void> | null,
   /** What registerTexture fails with, while set */
   fail: null as Error | null,
@@ -32,6 +35,7 @@ vi.mock('../managers/puppeteer-manager.js', async (importOriginal) => {
     },
     loadEnvironmentHDR(base64: string, op?: string) {
       page.calls.push('loadEnvironmentHDR');
+      page.onHdr?.();
       page.environment = base64;
       if (op) page.undo.set(op, () => (page.environment = null));
     },
@@ -67,6 +71,7 @@ vi.mock('../managers/puppeteer-manager.js', async (importOriginal) => {
   manager.watchdog = new RenderWatchdog({ kill: () => {}, table: async () => [] });
   manager.page = fakePage;
   manager.init = async () => {
+    page.inits++;
     await page.ready;
     return fakePage;
   };
@@ -81,6 +86,11 @@ import { assetMemory } from '../lib/asset-memory';
 import { RenderPageKilled } from '../lib/render-watchdog';
 
 const prototype = AgentEnvironment.prototype as any;
+
+// The stand-in page's evaluate() puts its `window` on globalThis
+afterAll(() => {
+  delete (globalThis as { window?: unknown }).window;
+});
 
 function refreshSky(error: Error) {
   const environment = {
@@ -139,6 +149,8 @@ describe('AgentEnvironment sky updates', () => {
     page.undone.length = 0;
     page.committed.length = 0;
     page.ready = null;
+    page.inits = 0;
+    page.onHdr = null;
     page.gate = null;
     page.fail = null;
     page.acknowledge = null;
@@ -199,14 +211,19 @@ describe('AgentEnvironment sky updates', () => {
     let ready!: () => void;
     page.ready = new Promise<void>((resolve) => (ready = resolve));
     env.addSky(sky('asset://a.jpg', 'asset://a.hdr'));
-    await expect.poll(() => assets.hits.length).toBe(1);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    // The image is downloaded and its page call waits for the page: its memory is reserved meanwhile
+    await expect.poll(() => page.inits).toBe(1);
+    expect(assets.hits).toHaveLength(1);
+    expect(assetMemory.held.work).toBeGreaterThan(0);
 
     env.destroy();
     ready();
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    // The page call is over (its reservation is given back)
+    await expect.poll(() => assetMemory.held).toEqual({ downloads: 0, work: 0 });
+    await new Promise((resolve) => setImmediate(resolve));
 
     expect(page.calls).toEqual([]);
+    expect(assets.hits).toHaveLength(1);
     expect([page.textures.size, page.environment, env.sky.material.userData.materialId, env.sky.visible, world.stage.scene.fog]).toEqual([0, null, undefined, false, 'untouched']);
   });
 
@@ -309,6 +326,31 @@ describe('AgentEnvironment sky updates', () => {
     expect([...page.textures.values()]).toEqual([`${origin}/assets/second.jpg`]);
     expect(`${shown}:map`).toBe([...page.textures.keys()][0]);
     expect(env.csm.lightDirection).toBe('direction of asset://second.jpg');
+  });
+
+  it('a sky update that was replaced while the page acknowledged its HDR does not put its sun and fog over those of the newer sky', async () => {
+    const { env, world } = await environment();
+    let acknowledge!: () => void;
+    // Held from the HDR on: the image before it is settled as usual
+    page.onHdr = () => {
+      page.onHdr = null;
+      page.acknowledge = new Promise<void>((resolve) => (acknowledge = resolve));
+    };
+    env.addSky({ ...sky('asset://day.jpg', 'asset://day.hdr'), _fogNear: 1, _fogFar: 2, _fogColor: '#ff0000' });
+    // The page has the HDR and has dropped its record of it (forget); its answer is held back
+    await expect.poll(() => page.committed.length).toBe(2);
+    page.acknowledge = null;
+    env.addSky({ ...sky('asset://day.jpg', 'asset://dusk.hdr'), _sunDirection: 'evening' });
+    // The newer sky is fully in place, without fog, while the first update still waits for the page
+    await expect.poll(() => env.csm.lightDirection).toBe('evening');
+    expect([env.skyInfo.hdrUrl, world.stage.scene.fog]).toEqual(['asset://dusk.hdr', null]);
+    expect(assetMemory.held.work).toBeGreaterThan(0);
+
+    acknowledge();
+    // The first update has heard from the page and is over
+    await expect.poll(() => assetMemory.held).toEqual({ downloads: 0, work: 0 });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect([env.csm.lightDirection, env.skyInfo.sunDirection, env.skyInfo.hdrUrl, world.stage.scene.fog]).toEqual(['evening', 'evening', 'asset://dusk.hdr', null]);
   });
 
   it("holds the agent's memory reservation for a sky image while it is on its way, and gives it back", async () => {

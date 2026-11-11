@@ -43,6 +43,7 @@ const ENV_FILE = {
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
   setAllowedEnvVars(null);
 });
 
@@ -58,7 +59,7 @@ describe('characterSecrets', () => {
       WS_URL: null,
       TIP_WALLET_PRIVATE_KEY: null,
       SERVER_API_KEY: null,
-      // Read by plugin-sql / core through runtime.getSetting: kept live, as before
+      // Read by plugin-sql / core through runtime.getSetting: kept live
       POSTGRES_URL: 'postgres://live/eliza',
       USE_MULTI_STEP: 'false',
       // SERVER_PORT is left out: the CLI copies it from the environment, and a null would replace that
@@ -77,7 +78,9 @@ describe('characterSecrets', () => {
   });
 
   it('shadows nothing elizaOS needs when it copies the whole environment (no allow-list), and never stores the tip key, API token or salt', () => {
-    expect(characterSecrets(Object.keys(ENV_FILE), { env: ENV_FILE, coreCopies: null })).toEqual({
+    // The tip key and the Socket.IO key are in the environment too (set in the shell, not in .env)
+    const env = { ...ENV_FILE, TIP_WALLET_PRIVATE_KEY: '0xlive', SERVER_API_KEY: 'socket-live' };
+    expect(characterSecrets(Object.keys(ENV_FILE), { env, coreCopies: null })).toEqual({
       POSTGRES_URL: 'postgres://live/eliza',
       USE_MULTI_STEP: 'false',
       TIP_WALLET_PRIVATE_KEY: null,
@@ -89,8 +92,20 @@ describe('characterSecrets', () => {
 });
 
 describe('staleSecretKeys', () => {
-  it("keeps every per-model-type setting core's getModelSettings reads (e.g. OBJECT_SMALL_TEMPERATURE)", () => {
-    const tuning = ['OBJECT_SMALL_TEMPERATURE', 'TEXT_LARGE_TOP_P', 'IMAGE_DESCRIPTION_MAX_TOKENS', 'TRANSCRIPTION_SEED', 'DEFAULT_MIN_P', 'MODEL_FREQ_PENALTY'];
+  it("keeps every setting core's getModelSettings reads, for every model type (e.g. OBJECT_SMALL_TEMPERATURE)", () => {
+    // The keys the installed core asks getSetting for: with nothing set it goes through every fallback
+    const core = new AgentRuntime({ character: { name: 'probe', bio: [] }, plugins: [] });
+    const asked = new Set<string>();
+    vi.spyOn(core, 'getSetting').mockImplementation((key: string) => {
+      asked.add(key);
+      return null;
+    });
+    const modelTypes = [...new Set(Object.values(ModelType))];
+    for (const type of modelTypes) (core as unknown as { getModelSettings(type: string): unknown }).getModelSettings(type);
+    const tuning = [...asked];
+    expect(tuning).toEqual(expect.arrayContaining(['OBJECT_SMALL_TEMPERATURE', 'TEXT_LARGE_TOP_P', 'IMAGE_DESCRIPTION_MAX_TOKENS', 'TRANSCRIPTION_SEED', 'DEFAULT_MIN_P', 'MODEL_FREQ_PENALTY']));
+    // At least one key of its own for every model type
+    expect(tuning.length).toBeGreaterThan(modelTypes.length);
     expect(staleSecretKeys(tuning, { env: {}, coreCopies: CLI_ALLOWED })).toEqual([]);
     const env = Object.fromEntries(tuning.map((key) => [key, '0.5']));
     expect(characterSecrets(tuning, { env, coreCopies: CLI_ALLOWED })).toMatchObject(env);
@@ -194,23 +209,27 @@ describe('character secrets against the real elizaOS store (core 1.7.2 + plugin-
     expect(runtime.getSetting('POSTGRES_URL')).toBe('postgres://live/eliza');
   });
 
-  it('claims nothing, and leaves this run alone, when the database refuses the cleanup', async () => {
+  it.each([
+    // plugin-sql's update returns false when its transaction fails
+    ['refuses the cleanup', false],
+    ['reports the cleanup as done while the key is still stored', true],
+  ])('claims nothing, and leaves this run alone, when the database %s', async (_what, answer) => {
     const now = { ANTHROPIC_API_KEY: 'sk-live', POSTGRES_URL: 'postgres://live/eliza' };
     for (const [key, value] of Object.entries(now)) vi.stubEnv(key, value);
     setAllowedEnvVars(CLI_ALLOWED);
     const adapter = await store();
     await boot(adapter, { ...now, OPENAI_API_KEY: 'oa-old' });
     const secrets = characterSecrets(Object.keys(now), { env: process.env, coreCopies: CLI_ALLOWED });
-    vi.spyOn(logger, 'error').mockImplementation(() => {});
-    const errors = vi.spyOn(logger, 'error');
+    const errors = vi.spyOn(logger, 'error').mockImplementation(() => {});
     let deleted: string[] = ['not called'];
+    let update: ReturnType<typeof vi.spyOn> | undefined;
     const runtime = await boot(adapter, secrets, async (rt) => {
-      // plugin-sql's update returns false when its transaction fails
-      vi.spyOn(adapter, 'updateAgent').mockResolvedValue(false);
+      update = vi.spyOn(adapter, 'updateAgent').mockResolvedValue(answer);
       deleted = await removeStaleStoredSecrets(rt, { env: process.env, coreCopies: CLI_ALLOWED });
     });
+    expect(update).toHaveBeenCalledTimes(1);
     expect(deleted).toEqual([]);
-    expect(String(errors.mock.calls.at(-1)?.[0])).toContain('Could not delete 1 stored secret(s)');
+    expect(String(errors.mock.calls.at(-1)?.[0])).toContain('Could not delete 1 stored secret(s) no longer in use from the agent record (OPENAI_API_KEY); they are still stored');
     expect(runtime.getSetting('OPENAI_API_KEY')).toBe('oa-old');
     expect(Object.keys((await adapter.getAgent(agentId))!.settings!.secrets as object)).toContain('OPENAI_API_KEY');
   });
@@ -250,6 +269,15 @@ describe('secureServerDefaults', () => {
     expect(warning).toContain('listens on 0.0.0.0, protected only by ELIZA_SERVER_AUTH_TOKEN');
     expect(warning).toContain('/api/system/env/local');
     expect(wide.ELIZA_SERVER_AUTH_TOKEN).toBe('mine');
+    // Every way to name this machine is local; a name or address that only looks like one is not
+    for (const host of ['localhost', '::1', '[::1]', '127.0.0.1', '127.8.9.10']) {
+      expect(secureServerDefaults({ SERVER_HOST: host, ELIZA_SERVER_AUTH_TOKEN: 'mine' }, token), host).toEqual([]);
+    }
+    for (const host of ['192.168.1.5', '::', '127.0.0.1.evil.test', '127.evil.test', 'localhost.evil.test', '10.127.0.0.1']) {
+      const lines = secureServerDefaults({ SERVER_HOST: host, ELIZA_SERVER_AUTH_TOKEN: 'mine' }, token);
+      expect(lines, host).toHaveLength(1);
+      expect(lines[0], host).toContain(`listens on ${host}, protected only by ELIZA_SERVER_AUTH_TOKEN`);
+    }
   });
 
   it('locks the API with a fresh random token by default', () => {

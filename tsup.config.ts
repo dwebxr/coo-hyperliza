@@ -6,7 +6,9 @@ export default defineConfig({
   tsconfig: './tsconfig.build.json',
   platform: 'node',
   sourcemap: true,
-  clean: true,
+  // dist/ is cleaned by scripts/build-assets.mjs, which runs next: tsup's own clean deletes files
+  // and leaves their directories behind
+  clean: false,
   format: ['esm'],
   dts: false,
   external: [
@@ -23,5 +25,4 @@ export default defineConfig({
     'stream',
     'util'
   ],
-  banner: {},
 });

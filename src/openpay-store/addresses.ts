@@ -11,20 +11,23 @@
  *   (`http` `https` `ws` `wss` `ftp` `file`) with any number of slashes or backslashes, none
  *   included (`https:evil%2ecom`), and `mailto` `javascript` `vbscript` `data` `tel` `sms` `intent`
  *   `blob` `about` `view-source` `chrome` `bitcoin` `ethereum` `lightning` `upi` `geo` `magnet`,
- *   also right after other text (`pay-https:…`, `送金先https:…`);
+ *   also right after other text that does not end in a Latin letter or digit (`pay-https:…`,
+ *   `送金先https:…`; not `xhttps:`);
  * - wallet addresses (walletPass): `0x` and exactly 40 hex digits, wherever they stand;
- * - IPv4 addresses (ipv4Pass): four numbers up to 255, wherever they stand, except right after
- *   a Latin letter with no path or port after them (`v1.2.3.4`); and, with a path, port, query or
- *   fragment after them, the other numeric forms a browser reads as one that do not occur in
- *   ordinary text (numericHostPass: a `0x` part, or 2 or 3 parts with the last above 255);
+ * - IPv4 addresses (ipv4Pass): four numbers up to 255 that are not part of a longer dotted number,
+ *   wherever they stand, except right after a Latin letter with no path or port after them
+ *   (`v1.2.3.4`); and, with a path, port, query or fragment after them, the other numeric forms a
+ *   browser reads as one (numericHostPass: a `0x` part, or 2 or 3 parts with the last above 255; a
+ *   decimal such as `1.500/kg` is removed with them);
  * - bracketed IPv6 addresses (ipv6Pass), `[…]` with `::` or seven colons;
  * - host names (hostPass): labels of letters, digits and marks in any script (IDN), punycode, or
  *   percent-encoded (`%61`, and UTF-8 `%E3%82%B3…` for IDN), joined by the separators below, when
- *   - its last label is a listed top-level domain (TLDS), or
+ *   - a label after the first is a listed top-level domain (TLDS): the address ends at the last
+ *     such label (`shop.com.js` gives `shop.com`), or
  *   - its last label could be one (2 to 63 Latin letters, punycode, or a listed one) and a `/`,
  *     `:port`, `?…` or `#…` follows (also percent-encoded), or it comes after `@` (`name@host`,
  *     an e-mail address) or after `//`, or
- *   - its first label is `www`;
+ *   - its first label is `www` (or `www` and up to three digits);
  *   together with a `name@` or `//` right before it (back to the space).
  *
  * Separators between labels, by character:
@@ -33,12 +36,13 @@
  * - `。` `｡` (browsers read them as a dot) and `・` `･` (a person does) only between two labels in
  *   Latin letters and digits: they are also the full stop and the middle dot of ordinary Japanese
  *   text, after which the next word may be English (`おいしいです。It is good`, `コーヒー・カップ`);
- * - de-fangs: `[.]` `(.)` `{.}` with any of the dots above inside, `[dot]` `(dot)` `{dot}`, and the
- *   word `dot` between spaces (`evil dot com`), each with up to three spaces around it.
+ * - de-fangs: `[.]` `(.)` `{.}` with any of the dot characters above inside (not `%2e`), `[dot]`
+ *   `(dot)` `{dot}`, and the word `dot` between spaces (`evil dot com`), each with up to three
+ *   spaces around it.
  *
- * Not addresses: a host whose last label is not listed and has nothing after it (`Node.js`,
- * `photo.jpg`, `Mt.Fuji`; also `evil.test`), a last label with a digit (`v1.2`, `1.5kg`) or of one
- * letter (`e.g.`), and a word, a colon and a space (`Note: see below`).
+ * Not addresses: a host none of whose labels after the first is listed and that has nothing after
+ * it (`Node.js`, `photo.jpg`, `Mt.Fuji`; also `evil.test`), a last label with a digit (`v1.2`,
+ * `1.5kg`) or of one letter (`e.g.`), and a word, a colon and a space (`Note: see below`).
  *
  * Each pass is linear in the length of the text, with bounded look-ahead and look-back: every
  * character is looked at a bounded number of times (the optional ScanSteps counts them).
@@ -54,7 +58,7 @@ export interface ScanSteps {
   count: number;
 }
 
-// Every country code, the generic top-level domains in common use, and some in other scripts
+// The country codes in use, the generic top-level domains in common use, and some in other scripts
 const COUNTRY_TLDS =
   'ac ad ae af ag ai al am ao aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bm bn bo br bs bt bw by bz ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg er es et eu fi fj fk fm fo fr ga gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il im in io iq ir is it je jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md me mg mh mk ml mm mn mo mp mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro rs ru rw sa sb sc sd se sg sh si sk sl sm sn so sr ss st su sv sx sy sz tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug uk us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw';
 const GENERIC_TLDS =
@@ -158,7 +162,7 @@ function addSpan(spans: AddressSpan[], start: number, end: number): void {
   spans.push({ start, end });
 }
 
-/** `scheme://…` for any scheme, and a listed scheme (also at the end of other text) followed by `:` and no space */
+/** `scheme://…` for any scheme, and a listed scheme (also after other text that does not end in a Latin letter or digit) followed by `:` and no space */
 function schemePass(scan: Scan): AddressSpan[] {
   const spans: AddressSpan[] = [];
   for (let i = 0; i < scan.n; i++) {

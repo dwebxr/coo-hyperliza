@@ -3,8 +3,8 @@ import { Buffer } from 'buffer';
 
 import dotenv from 'dotenv';
 
-// The keys of the .env file: earlier versions copied them into the character secrets, which
-// elizaOS stores in its database (see characterSecrets below)
+// The keys of the .env file: characterSecrets (below) gives each its value in the character
+// secrets, or the null that deletes a stored copy
 const envFileKeys = Object.keys(dotenv.config().parsed ?? {});
 import {
   getAllowedEnvVars,
@@ -24,7 +24,9 @@ import { characterSecrets, errorReportingDefaults, removeStaleStoredSecrets, sec
 import { takeTipWalletAccount } from './plugin-hyperfy/lib/tip-wallet';
 import { guardErrorEventsForWorldScripts } from './plugin-hyperfy/lib/script-sandbox';
 
-// The tip wallet's key moves into memory and out of process.env before elizaOS copies anything
+// The tip wallet's key moves into memory and out of process.env (the server's later re-read of
+// .env puts it back until the service takes it again; characterSecrets keeps it out of the stored
+// secrets either way)
 takeTipWalletAccount();
 // HYPERFY_WORLD_SCRIPTS=sandboxed: the process's error events are guarded from here on, before
 // elizaOS's server and the plugins register their listeners (src/plugin-hyperfy/lib/error-events.ts)
@@ -52,19 +54,14 @@ try {
   process.exit(1);
 }
 
-/**
- * Represents the default character (Eliza) with her specific attributes and behaviors.
- * Eliza responds to messages relevant to the community manager, offers help when asked, and stays focused on her job.
- * She interacts with users in a concise, direct, and helpful manner, using humor and silence effectively.
- * Eliza's responses are geared towards resolving issues, offering guidance, and maintaining a positive community environment.
- */
+/** Coo's character: name, system prompt, topics, examples and style. */
 export const character: Character = {
   name: 'Coo',
   plugins: modelPlan.packages,
   settings: {
     // Not the .env file: elizaOS stores these in the agent's database record and its API returns
-    // them. Nulls delete what earlier versions stored there (an old, revoked API key stored there
-    // made every model call fail with 401; src/anthropic-models.ts reads process.env first anyway).
+    // them. A null deletes the stored copy of that key (src/agent-secrets.ts);
+    // src/anthropic-models.ts reads process.env first.
     secrets: characterSecrets(envFileKeys, { env: process.env, coreCopies: getAllowedEnvVars() }),
     avatar: 'https://dwebxr.xyz/images/coo.jpg',
     voice: {
@@ -247,7 +244,7 @@ export const character: Character = {
 const initCharacter = async ({ runtime }: { runtime: IAgentRuntime }) => {
   logger.info('Initializing character');
   logger.info('Name: ', character.name);
-  // What earlier versions stored for keys that are no longer in .env (characterSecrets covers the rest)
+  // Stored secrets nothing reads and that are not keys of .env (characterSecrets covers those that are)
   await removeStaleStoredSecrets(runtime, { env: process.env, coreCopies: getAllowedEnvVars() }).catch((error) =>
     logger.warn(`[Secrets] Could not clean up stored secrets: ${error instanceof Error ? error.message : String(error)}`)
   );
@@ -263,7 +260,8 @@ export const projectAgent: ProjectAgent = {
   plugins: [
     // Claude gets a higher priority than any other plugin that registers text models
     anthropicModelsPlugin,
-    // Speech-to-text and text-to-speech models (used by Hyperfy voice chat)
+    // Speech-to-text and text-to-speech as runtime models (Hyperfy voice input uses the first; its
+    // speech output calls utils.ts generateSpeech directly)
     ...(process.env.ELEVENLABS_XI_API_KEY ? [elevenLabsSpeechPlugin] : []),
     // Shop clerk for OpenPay Store when OPENPAY_STORE_HANDLES is set
     ...(openPayStorePlugin ? [openPayStorePlugin] : []),

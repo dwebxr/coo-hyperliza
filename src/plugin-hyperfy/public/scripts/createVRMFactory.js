@@ -4,10 +4,10 @@ window.createVRMFactory = function(glb, setupMaterial) {
     const v2 = new THREE.Vector3()
 
     const DIST_CHECK_RATE = 1 // once every second
-    const DIST_MIN_RATE = 1 / 5 // 3 times per second
+    const DIST_MIN_RATE = 1 / 5 // 5 times per second
     const DIST_MAX_RATE = 1 / 25 // 25 times per second
-    const DIST_MIN = 30 // <= 15m = min rate
-    const DIST_MAX = 60 // >= 30m = max rate
+    const DIST_MIN = 30 // <= 30m = max rate
+    const DIST_MAX = 60 // >= 60m = min rate
     const DEG2RAD = THREE.MathUtils.DEG2RAD
     // we'll update matrix ourselves
     glb.scene.matrixAutoUpdate = false
@@ -67,8 +67,8 @@ window.createVRMFactory = function(glb, setupMaterial) {
     glb.userData.vrm.humanoid.update(0)
     skeleton.update()
   
-    // get height
-    let height = 1 // minimum
+    // height
+    let height = 1 // fixed at 1: the measurement below is commented out
     // for (const mesh of skinnedMeshes) {
     //   if (!mesh.boundingBox) mesh.computeBoundingBox()
     //   if (height < mesh.boundingBox.max.y) {

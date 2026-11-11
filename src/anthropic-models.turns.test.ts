@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { ModelType } from '@elizaos/core';
+import { ModelType, logger } from '@elizaos/core';
 import { closeServers, startServer, type TestServer } from './plugin-hyperfy/test-support/net';
 import { anthropicModelsPlugin, tokenReserve } from './anthropic-models';
 import { UsageBudget, type UsageLimits, resetUsageBudget } from './usage-budget';
@@ -85,20 +85,25 @@ describe('Claude requests of a turn', () => {
     expect(ctx.budget.snapshot(60_000).skipped['ai-call'] ?? 0).toBe(0);
   });
 
-  it('does not try again after an overloaded answer once the turn was cancelled during the wait', async () => {
+  it('does not try again after an overloaded answer once the turn was cancelled during the wait: no second request, and no second reservation', async () => {
     const ctx = setup();
     statuses = [529];
-    const outcome = await ctx.inTurn(async () => {
-      const pending = ctx.call().then(
+    // The handler logs this line when the overloaded answer has arrived, right before it starts to wait
+    vi.spyOn(logger, 'warn').mockImplementation(((line: unknown) => {
+      if (String(line).includes('trying once more')) ctx.slot.abort();
+    }) as never);
+    const outcome = await ctx.inTurn(() =>
+      ctx.call().then(
         () => 'answered',
         (error: unknown) => error
-      );
-      await vi.waitFor(() => expect(api.hits).toHaveLength(1));
-      ctx.slot.abort();
-      return pending;
-    });
+      )
+    );
+    // Cancelled at the start of the wait, not while the first request was in flight
+    expect(ctx.slot.signal.aborted).toBe(true);
     expect(outcome).toBeInstanceOf(TurnCancelled);
     expect(api.hits).toHaveLength(1);
+    // The answered request stays counted; nothing was reserved for a second one
+    expect(ctx.budget.snapshot(60_000).ai).toMatchObject({ calls: 1, reservedTokens: tokenReserve('You are Coo.', 'x', 2048) });
   });
 
   it.each([

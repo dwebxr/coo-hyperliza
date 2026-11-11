@@ -44,8 +44,17 @@ describe('elevenLabsSpeechPlugin', () => {
     expect(transcribeWithElevenLabs.mock.calls.map((c) => [...c[0]])).toEqual([[1, 2], [3], [...Buffer.from('xyz')]]);
   });
 
-  it('outranks a text provider that also offers speech (e.g. plugin-openai at 100)', () => {
-    expect((elevenLabsSpeechPlugin as any).priority).toBeGreaterThan(100);
+  it('is the speech provider core picks over a text provider that also offers speech at priority 100 (e.g. plugin-openai), whichever is registered first', async () => {
+    const { AgentRuntime } = await import('@elizaos/core');
+    const rival = { name: 'rival', description: '', priority: 100, models: { [ModelType.TEXT_TO_SPEECH]: async () => 'rival', [ModelType.TRANSCRIPTION]: async () => 'rival' } };
+    for (const plugins of [[rival, elevenLabsSpeechPlugin], [elevenLabsSpeechPlugin, rival]]) {
+      const core = new AgentRuntime({ character: { name: 'probe', bio: [], plugins: [] } as any, plugins: plugins as any });
+      // registers the plugins, then stops for lack of a database adapter
+      await core.initialize().catch(() => {});
+      for (const type of [ModelType.TEXT_TO_SPEECH, ModelType.TRANSCRIPTION]) {
+        expect((core as any).models.get(type).map((model: any) => model.provider)).toEqual(['elevenlabs-speech', 'rival']);
+      }
+    }
   });
 
   it('downloads audio given as a URL or { audioUrl } from a public https host', async () => {
@@ -60,12 +69,17 @@ describe('elevenLabsSpeechPlugin', () => {
     }
   });
 
-  it('names a failed download without its query, credentials or fragment (the error can reach chat)', async () => {
+  it('names a failed download without its query values or fragment, and refuses a URL with credentials without naming it (the error can reach chat)', async () => {
     const server = await startServer((_request, response) => response.writeHead(403).end(), { tls: true });
     const { policy } = testNet({ hosts: { 'cdn.test': PUBLIC_ADDRESS }, routes: { 'cdn.test:443': { port: server.port, direct: true } } });
     try {
       const error = await toAudioBuffer('https://cdn.test/a.mp3?X-Amz-Signature=sig-value&token=token-value#frag-value', policy).catch((e: Error) => e);
       expect((error as Error).message).toBe('[ElevenLabs] Failed to fetch audio from https://cdn.test/a.mp3?X-Amz-Signature=…&token=…: 403');
+      const withCredentials = await toAudioBuffer('https://user-value:pass-value@cdn.test/a.mp3?token=token-value', policy).catch((e: Error) => e);
+      expect(withCredentials).toBeInstanceOf(SafeFetchError);
+      expect((withCredentials as Error).message).not.toMatch(/user-value|pass-value|token-value/);
+      // Only the first URL was asked for
+      expect(server.hits.map((hit) => hit.url)).toEqual(['/a.mp3?X-Amz-Signature=sig-value&token=token-value']);
     } finally {
       await closeServers();
     }
@@ -109,6 +123,9 @@ describe('elevenLabsSpeechPlugin', () => {
     elevenLabsSpeech.mockResolvedValue({ audio: null, mayBeBilled: true });
     await expect(models[ModelType.TEXT_TO_SPEECH](runtime, 'hi')).rejects.toThrow('synthesis failed');
     await expect(models[ModelType.TEXT_TO_SPEECH](runtime, '  ')).rejects.toThrow('needs text');
+    await expect(models[ModelType.TEXT_TO_SPEECH](runtime, { text: '' })).rejects.toThrow('needs text');
+    // No request for nothing to say
+    expect(elevenLabsSpeech.mock.calls).toEqual([['hi']]);
   });
 });
 
@@ -160,7 +177,7 @@ describe('elevenLabsSpeechPlugin through the real runtime', () => {
 });
 
 describe('core string-param bug the init shim works around', () => {
-  it('still breaks useModel(TEXT_TO_SPEECH, "text") without the shim (remove the shim once this fails)', async () => {
+  it('breaks useModel(TEXT_TO_SPEECH, "text") without the shim (remove the shim once this fails)', async () => {
     const { AgentRuntime } = await import('@elizaos/core');
     const { init: _shim, ...withoutShim } = elevenLabsSpeechPlugin;
     const runtime = new AgentRuntime({ character: { name: 'probe', bio: [], plugins: [] } as any, plugins: [withoutShim as any] });

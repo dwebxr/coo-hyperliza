@@ -2,21 +2,14 @@ import {
   type Action,
   type Content,
   composePromptFromState,
-  type HandlerCallback,
   type IAgentRuntime,
-  type Memory,
   ModelType,
-  type State,
 } from '@elizaos/core';
 import { forPurpose } from '../../usage-budget';
-import { actionSucceeded } from '../lib/action-result';
+import { actionFailed, actionSucceeded } from '../lib/action-result';
 import { plannedContent, readString } from '../lib/model-output';
 
-/**
- * Template for generating dialog and actions for a character.
- *
- * @type {string}
- */
+/** Template for the character's next message. */
 const replyTemplate = `# Task: Generate dialog for the character {{agentName}}.
 {{providers}}
 # Instructions: Write the next message for {{agentName}}.
@@ -53,14 +46,9 @@ export const replyAction: Action = {
   validate: async (_runtime: IAgentRuntime) => {
     return true;
   },
-  handler: async (
-    runtime: IAgentRuntime,
-    message: Memory,
-    state: State,
-    _options: any,
-    callback: HandlerCallback,
-    responses?: Memory[]
-  ) => {
+  handler: async (runtime, message, state, _options, callback, responses) => {
+    // Its whole effect is what the callback posts: without one, no model call is made for it
+    if (!callback) return actionFailed('REPLY', 'no callback to reply through');
     const existingReplies =
       responses
         ?.map((r) => plannedContent(r, 'REPLY'))

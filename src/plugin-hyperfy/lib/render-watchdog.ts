@@ -6,7 +6,8 @@
  * Each browser the manager launches is one generation. For as long as it exists, the resident
  * memory of the processes it owns is sampled: the next sample starts RENDER_SAMPLE_INTERVAL_MS
  * after the previous one finished while a page call runs, RENDER_IDLE_SAMPLE_INTERVAL_MS after it
- * otherwise (timers that do not keep the process up), so the time `ps` takes adds to the gap.
+ * otherwise (timers that do not keep the process up), so the time `ps` takes adds to the gap; a
+ * page call that starts triggers a sample at once (unless one is being read).
  * It owns the browser, its descendants by parent pid, every process in its process group (puppeteer
  * starts Chromium detached, so the browser leads a group of its own, which a helper keeps when its
  * parent exits), and every process seen in an earlier sample whose group has not changed since.
@@ -16,7 +17,7 @@
  * marked dead, every call in flight fails with RenderPageKilled, every later call on it fails the
  * same way (with callsInFlight 0: it was not in flight, so it is not blamed), the owner is told
  * (and starts the next browser on next use), and its group and its processes are killed
- * (SIGKILL), once from the latest sample and again from a fresh one.
+ * (SIGKILL), from the latest sample and, when the process table can be read, again from a fresh one.
  *
  * Kills are counted process-wide (renderBreaker): after RENDER_KILLS_PER_WINDOW within
  * RENDER_KILL_WINDOW_MS the render page stays down for RENDER_COOLDOWN_MS, and page calls fail at
@@ -215,7 +216,8 @@ export const renderBreaker = new RenderBreaker();
 export interface RenderWatchdogOptions {
   /**
    * Kills a torn-down generation's processes (SIGKILL): its process group when it has one (`group`),
-   * and `pids`. Called once from the latest sample and once more from a fresh one.
+   * and `pids`. Called from the latest sample, again from a fresh one when the table can be read,
+   * and for a browser that comes up on a generation already over.
    */
   kill: (pids: number[], group: number | null) => void;
   /** Told, synchronously, that a generation was torn down: drop its handles if they are still the current ones */
@@ -260,7 +262,7 @@ export class RenderWatchdog {
   readonly intervalMs: number;
   readonly idleIntervalMs: number;
   readonly breaker: RenderBreaker;
-  /** The owned processes' resident memory in the latest sample (null before the first, or without `ps`) */
+  /** The owned processes' resident memory in the latest sample that could be read (null before the first) */
   lastSampleBytes: number | null = null;
   /** The largest sample so far, and the longest page call that finished (for scripts/smoke-chromium.mjs, which reports them) */
   peakSampleBytes = 0;
@@ -283,7 +285,7 @@ export class RenderWatchdog {
     this.#log = options.log ?? console;
   }
 
-  /** Page calls in flight, over every live generation */
+  /** Page calls in flight, over every generation still kept */
   get inFlight(): number {
     let count = 0;
     for (const generation of this.#generations.values()) count += generation.calls.size;
@@ -353,7 +355,8 @@ export class RenderWatchdog {
   async watch<T>(generation: number, work: () => Promise<T>, { deadlineMs = this.deadlineMs, init = false }: { deadlineMs?: number; init?: boolean } = {}): Promise<T> {
     let state = this.#generations.get(generation);
     if (!state) {
-      // A browser whose launch did not report its pid; watched by the deadline (and sampled from now on)
+      // A generation the watchdog was not told about (or one it has dropped, #prune): watched by the
+      // deadline; sampling owns no process until started() names its pid
       this.started(generation, null);
       state = this.#generations.get(generation) as Generation;
     }
@@ -466,7 +469,7 @@ export class RenderWatchdog {
     this.#log.warn(error.message);
     this.breaker.recordKill();
     this.#options.onTornDown?.(state.id);
-    // From what the latest sample showed, then again from a fresh one (helpers started since)
+    // From what the latest sample showed, then again from a fresh one when it can be read (helpers started since)
     const pidsOf = (table: readonly ProcessRow[] | null | undefined) => (table ? this.#owned(state, table).map((row) => row.pid) : [...state.owned.keys()]);
     this.#options.kill(pidsOf(rows), state.group);
     void this.#table()

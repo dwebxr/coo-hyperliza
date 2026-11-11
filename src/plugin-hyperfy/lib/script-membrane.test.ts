@@ -43,12 +43,32 @@ describe('host values shown to a script', () => {
     }
   });
 
-  it('never shows globalThis, process or process.env, whatever their shape', () => {
+  it('does not show globalThis, process or process.env', () => {
     const seen = script({ g: globalThis, p: process, env: process.env });
     expect(Reflect.ownKeys(seen.g)).toEqual([]);
     expect(Reflect.ownKeys(seen.p)).toEqual([]);
     expect(Reflect.ownKeys(seen.env)).toEqual([]);
+    expect(process.env.PATH).toEqual(expect.any(String));
     expect(seen.env.PATH).toBeUndefined();
+    for (const value of [seen.g, seen.p, seen.env]) expect(Object.isFrozen(value)).toBe(true);
+  });
+
+  it('does not show process.env where it has the shape of a plain object, which any other object of that shape is shown as', () => {
+    const real = process.env;
+    // In this test runner process.env is no plain object; in other runtimes it is one
+    const plain = { PATH: '/usr/bin', SECRET_KEY: 'a secret' };
+    process.env = plain;
+    try {
+      const m = membrane();
+      const seen = m.toScript({ env: process.env, other: { ...plain } }) as any;
+      expect(seen.other.SECRET_KEY).toBe('a secret');
+      expect(seen.env.SECRET_KEY).toBeUndefined();
+      expect(Reflect.ownKeys(seen.env)).toEqual([]);
+      expect(Object.isFrozen(seen.env)).toBe(true);
+    } finally {
+      process.env = real;
+    }
+    expect(process.env).toBe(real);
   });
 
   it('does not turn a token back into the object it stands for', () => {
@@ -340,6 +360,14 @@ describe('script values given to the host', () => {
     expect(() => m.toHost(deep)).toThrow('too large or too deeply nested');
   });
 
+  it('refuses a value of more objects than it copies (100,000), and copies one just within that', () => {
+    const m = membrane();
+    const wide = (count: number) => Array.from({ length: count }, () => ({}));
+    // The array itself is one of them
+    expect(m.toHost(wide(99_999))).toHaveLength(99_999);
+    expect(() => m.toHost(wide(100_000))).toThrow('too large or too deeply nested');
+  });
+
   it('copies cyclic values without looping', () => {
     const m = membrane();
     const a: any = { name: 'a' };
@@ -400,7 +428,7 @@ describe('call guards and dynamic facades', () => {
   });
 });
 
-// ---- the P1a2 review fixes (S-01 ... S-07): no built-in on a script's value may choose what runs ----
+// ---- No built-in on a script's value may choose what runs (the P1a2 review's S-01 ... S-07) ----
 
 /** Lets every promise job that has been queued run */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -434,9 +462,10 @@ describe('promises a script passes to the host (S-01)', () => {
     // The host got a promise of its own that resolves to the host object
     expect(received).toBeInstanceOf(Promise);
     expect(await received).toBe(secret);
-    // ...and the script's resolve function was handed nothing (before the fix: the raw host object)
+    // ...and the species constructor, which did run, had its resolve function handed nothing:
+    // then() called on the script's promise hands it the raw host object
     expect(handed.includes(secret)).toBe(false);
-    expect(handed.every((value) => value === undefined)).toBe(true);
+    expect(handed).toEqual([undefined]);
   });
 
   it('are followed without calling then() on them when a callback returns one', async () => {
@@ -451,6 +480,8 @@ describe('promises a script passes to the host (S-01)', () => {
 
     expect(await result).toBe(secret);
     expect(handed.includes(secret)).toBe(false);
+    // The species constructor did run
+    expect(handed).toEqual([undefined]);
   });
 
   it('reject with an Error the host made, never the script\'s own value, when copying their result throws', async () => {

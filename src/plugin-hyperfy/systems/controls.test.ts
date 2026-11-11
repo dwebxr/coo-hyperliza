@@ -59,7 +59,11 @@ describe('AgentControls.bind', () => {
   it('gives every caller without PLAYER priority the inert control, whatever it passes', () => {
     const w = world();
     for (const options of [undefined, {}, { priority: 99 }, { priority: '0' }, { priority: null }]) {
-      expect(w.controls.bind(options)).not.toBe(w.controls);
+      const control = w.controls.bind(options);
+      expect(control).not.toBe(w.controls);
+      // Inert: frozen, and nothing in it leads to the controls system or the world
+      const graph = reachable(control);
+      expect([Object.isFrozen(control), graph.has(w.controls), graph.has(w), control.setKey, control.goto]).toEqual([true, false, false, undefined, undefined]);
     }
   });
 
@@ -107,18 +111,14 @@ describe('AgentControls.bind', () => {
     vi.useFakeTimers();
     try {
       const w = world();
-      const control = w.controls.bind({
-        priority: ControlPriorities.APP,
-        onRelease: () => {
-          throw new Error('onRelease');
-        },
-      });
-      control.keyX.onPress = () => {
-        throw new Error('onPress');
-      };
-      control.keyX.onRelease = () => {
-        throw new Error('onRelease');
-      };
+      const thrower = (what: string) =>
+        vi.fn(() => {
+          throw new Error(what);
+        });
+      const handlers = { release: thrower('onRelease'), keyPress: thrower('onPress'), keyRelease: thrower('onRelease') };
+      const control = w.controls.bind({ priority: ControlPriorities.APP, onRelease: handlers.release });
+      control.keyX.onPress = handlers.keyPress;
+      control.keyX.onRelease = handlers.keyRelease;
       (w.actions as any).currentNode = { _onCancel: vi.fn() };
 
       expect(w.actions.releaseAction()).toBe(true);
@@ -126,6 +126,8 @@ describe('AgentControls.bind', () => {
       expect((w.actions as any).currentNode).toBeNull();
       // The engine calls release() while it tears the app down
       expect(() => control.release()).not.toThrow();
+      // Each handler was called, and threw
+      for (const handler of Object.values(handlers)) expect(handler.mock.results.map((result) => result.type)).toEqual(['throw']);
     } finally {
       vi.useRealTimers();
     }
@@ -162,18 +164,20 @@ describe('AgentControls.bind', () => {
     vi.useFakeTimers();
     try {
       const w = world();
+      const onTrigger = vi.fn(() => {
+        throw new Error('onTrigger');
+      });
       const node: any = {
         // Seconds, as the engine counts an action's duration
         _duration: 0.01,
-        _onTrigger: () => {
-          throw new Error('onTrigger');
-        },
+        _onTrigger: onTrigger,
         ctx: { entity: { data: { id: 'seat' }, root: { position: { distanceTo: () => 0 } } } },
       };
       w.actions.register(node);
 
       expect(w.actions.performAction('seat')).toBe('started');
       expect(() => vi.advanceTimersByTime(10)).not.toThrow();
+      expect(onTrigger.mock.results.map((result) => result.type)).toEqual(['throw']);
       expect((w.actions as any).currentNode).toBe(node);
     } finally {
       vi.useRealTimers();
@@ -233,16 +237,22 @@ describe('AgentControls navigation and the signal of what it is for', () => {
     expect(player.base.position.x).toBe(reached);
   });
 
-  it('starts nothing for a signal that has fired already', async () => {
-    const { controls, walking } = walkable();
+  it('starts nothing for a signal that has fired already: no walk, no wandering, no turn', async () => {
+    const { controls, player, walking } = walkable();
     const fired = new AbortController();
     fired.abort();
     await controls.goto(10_000, 0, { signal: fired.signal });
     await controls.followEntity('tower', undefined, { signal: fired.signal });
     await controls.startRandomWalk(1000, 5, 30_000, { signal: fired.signal });
     await controls.rotateTo('left', 500, { signal: fired.signal });
+    await controls.faceEntity('tower', 500, { signal: fired.signal });
     await vi.advanceTimersByTimeAsync(1_000);
     expect([controls.getIsNavigating(), controls.getIsWalkingRandomly(), walking()]).toEqual([false, false, false]);
+    expect([player.base.position.toArray(), player.base.quaternion.toArray()]).toEqual([[0, 0, 0], [0, 0, 0, 1]]);
+    // The same calls without a fired signal do turn the player (control)
+    void controls.rotateTo('left', 500);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(player.base.quaternion.toArray()).not.toEqual([0, 0, 0, 1]);
   });
 
   it('goes on walking while the signal never fires: a walk a completed turn left running', async () => {
@@ -347,10 +357,10 @@ describe('AgentControls walks: outcomes, and no key left down', () => {
   });
 
   it.each([
-    ['stopped', (c: AgentControls) => c.stopAllActions('asked to stop')],
-    ['stopped', (c: AgentControls) => c.stopNavigation()],
-    ['replaced', (c: AgentControls) => void c.followEntity('tower')],
-    ['replaced', (c: AgentControls) => void c.teleportTo(new THREE.Vector3(1, 2, 3))],
+    ['stopped', (c: AgentControls): void => c.stopAllActions('asked to stop')],
+    ['stopped', (c: AgentControls): void => c.stopNavigation()],
+    ['replaced', (c: AgentControls): void => void c.followEntity('tower')],
+    ['replaced', (c: AgentControls): void => void c.teleportTo(new THREE.Vector3(1, 2, 3))],
   ] as const)('a walk ends as %s when that is what ended it, not as arrived', async (outcome, end) => {
     for (const start of [(c: AgentControls) => c.goto(10_000, 0), (c: AgentControls) => c.followEntity('tower')]) {
       const { controls } = ground();
@@ -596,7 +606,7 @@ describe('AgentControls walks: outcomes, and no key left down', () => {
     expect(controls.teleportToEntity('tower')).toBe('arrived');
   });
 
-  it('does not turn to face an entity whose position is not a number', async () => {
+  it('turns to face an entity, and does not turn to face one whose position is not a number', async () => {
     const { controls, player, items } = ground();
     items.set('nowhere', { data: { id: 'nowhere' }, base: { position: new THREE.Vector3(Number.NaN, 0, 1) } });
     const before = player.base.quaternion.clone();
@@ -604,5 +614,9 @@ describe('AgentControls walks: outcomes, and no key left down', () => {
     await vi.advanceTimersByTimeAsync(1_000);
     expect(player.base.quaternion.equals(before)).toBe(true);
     expect(Number.isFinite(player.base.quaternion.w)).toBe(true);
+    // The tower is at +x: facing it is a turn (control)
+    void controls.faceEntity('tower');
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(new THREE.Vector3(0, 0, -1).applyQuaternion(player.base.quaternion).x).toBeCloseTo(1);
   });
 });

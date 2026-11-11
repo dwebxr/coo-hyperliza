@@ -5,10 +5,7 @@ import {
 } from '@elizaos/core'
 import { EMOTES_LIST } from '../constants'
   
-/**
- * A provider that lists all available emotes with descriptions.
- * @type {Provider}
- */
+/** Lists the agent's emotes (constants.ts EMOTES_LIST) with descriptions, whether or not this world serves their clips. */
 export const hyperfyEmoteProvider: Provider = {
     name: 'HYPERFY_EMOTE_LIST',
     description: 'Lists all available emotes and their descriptions',

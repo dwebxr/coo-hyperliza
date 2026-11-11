@@ -3,9 +3,9 @@ import fs from 'fs/promises'
 import path from 'path'
 import { type AssetUploadError, ensureAsset } from '../lib/asset-upload'
 import { describeUrl } from '../lib/log-url'
-import { getModuleDirectory } from '../utils'
+import { ASSET_LAYOUT } from '../lib/asset-root'
 
-const LOCAL_AVATAR_PATH = `${getModuleDirectory()}/avatars/avatar.vrm`
+const LOCAL_AVATAR_PATH = path.join(ASSET_LAYOUT.root, 'avatars', 'avatar.vrm')
 
 export const APPEARANCE_POLL_INTERVAL_MS = 30000
 
@@ -40,7 +40,7 @@ export class Appearance {
     return this.interval !== null
   }
 
-  /** Whether name and avatar are both settled for this connection. */
+  /** Whether the name, the avatar and the emotes are settled for this connection. */
   get settled(): boolean {
     return this.nameSet && this.avatarSet
   }
@@ -185,13 +185,13 @@ export class Appearance {
 
   private async applyAvatar(): Promise<AvatarResult> {
     const world = this.host.world
-    const localAvatarPath = path.resolve(LOCAL_AVATAR_PATH)
+    const localAvatarPath = LOCAL_AVATAR_PATH
     const fileName = path.basename(localAvatarPath)
     let buffer: Buffer
     try {
       buffer = await fs.readFile(localAvatarPath)
     } catch (error: any) {
-      console.error(`[Appearance] Cannot read the avatar file at ${localAvatarPath} (CWD: ${process.cwd()}): ${error.message}`)
+      console.error(`[Appearance] Cannot read the avatar file at ${localAvatarPath}: ${error.message}`)
       return { outcome: 'gave-up', error: error.message }
     }
     if (this.host.ended) return { outcome: 'retry', error: 'the connection ended' }

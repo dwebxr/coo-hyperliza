@@ -17,8 +17,8 @@ import { uuid } from '../hyperfy/src/core/utils';
 
 export type { ChatTurn };
 
-// One message of the history in a prompt: what a stored memory holds was bounded when it was
-// received, but rows stored by earlier versions were not
+// One message of the history in a prompt: a stored memory is bounded when it is received, but the
+// database can hold older rows that are not
 export const HISTORY_TEXT_MAX_CODE_POINTS = 1000;
 // The action names of one stored reply in a prompt: a reply names a few; each is one short line
 export const PROMPT_ACTIONS_MAX = 8;
@@ -226,8 +226,9 @@ export class MessageManager {
 
     const selfId = world.entities.player?.data?.id
     for (const [id, entity] of world.entities.items?.entries?.() ?? []) {
-      // The announcement names the tipper as coo-world's shown() writes names
-      if (id !== selfId && entity?.data?.type === 'player' && shownName(entity.data.name) === tip.fromName) {
+      // The announcement names the tipper as coo-world's shown() writes names (announcedName), and
+      // parseTipNotice reads that as shownName does
+      if (id !== selfId && entity?.data?.type === 'player' && shownName(announcedName(entity.data.name)) === tip.fromName) {
         world.controls?.faceEntity?.(id, undefined, { signal: currentTurn()?.signal })?.catch?.(() => {})
         break
       }

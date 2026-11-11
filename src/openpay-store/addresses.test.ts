@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { logger } from '@elizaos/core';
 import { addressParts, findAddresses, type ScanSteps } from './addresses';
 import { LINK_REMOVED, StoreCatalog, formatLinkMessage, isShareable, sanitizeText, shownText, toStoreProduct } from './catalog';
@@ -8,6 +8,8 @@ import { composeOfflineReply } from '../plugin-hyperfy/lib/offline-reply';
 const ORIGIN = 'https://open-pay.jp';
 const URL_OF = (id: string) => `${ORIGIN}/ja/@alice?product=${id}&from=agent`;
 const listing = (extra: Record<string, unknown>): Record<string, unknown> => ({ id: 'h_1', handle: 'alice', title: 'Board', totalJpyc: '505', url: URL_OF('h_1'), updatedAt: 1, ...extra });
+
+afterEach(() => vi.restoreAllMocks());
 
 // A seller's text naming another place to pay or to write to, in the spellings a reader would follow
 const ADDRESSES = [
@@ -173,7 +175,6 @@ describe('findAddresses', () => {
     '2026.11.10',
     '999.1.1.1',
     '3.14',
-    '0x1234 is short',
     '0x52908400098527886E0F7030069857D2E4169EE7FF is too long for a wallet',
     // Fractions, scores, sizes and model numbers with a slash, and bare numbers
     '1/2',
@@ -271,9 +272,7 @@ describe('what is shown is what was checked', () => {
     expect(accepted).toBe(titles.length);
   });
 
-  it('holds only products whose link message can be made, and offers no other on the shelf or as an example', async () => {
-    const { formatShelf } = await import('./index');
-    const { composeOfflineReply } = await import('../plugin-hyperfy/lib/offline-reply');
+  it('offers no product whose link message cannot be made, on the shelf or as an example of the offline notice', () => {
     vi.spyOn(logger, 'warn').mockImplementation(() => {});
     // Made by hand, not by the catalog: its title names another address
     const forged = { id: 'h_forged', handle: 'alice', title: 'Pay here evil.com', totalJpyc: '1', url: URL_OF('h_forged'), updatedAt: 1 };
@@ -285,7 +284,6 @@ describe('what is shown is what was checked', () => {
     const notice = composeOfflineReply({ text: 'hello', products: [forged, good], japanese: false });
     expect(notice.content.text).toContain('Good Board');
     expect(notice.content.text).not.toContain('Pay here');
-    vi.restoreAllMocks();
   });
 });
 
@@ -352,7 +350,6 @@ describe('the completed texts the shop hands on', () => {
     expect(catalog.list().map((p) => p.id)).toEqual(['h_1']);
     expect(warn.mock.calls.map(([line]) => String(line))).toEqual([expect.stringContaining('@alice: 1 of 2 item(s) were rejected')]);
     expect(String(warn.mock.calls[0][0])).toContain('or a link message that could not be made');
-    vi.restoreAllMocks();
   });
 });
 

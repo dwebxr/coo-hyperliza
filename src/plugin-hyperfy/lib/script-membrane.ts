@@ -13,7 +13,7 @@
  *     whose traps convert every value read from or written to the host object
  *   - instances of the classes listed in `classes` (exact prototype match) become facades too,
  *     limited to properties whose name does not start with "_" and to assignments that replace
- *     an existing non-function value
+ *     an existing own non-function value or go through a setter
  *   - functions become frozen callables that convert `this`, the arguments, the result and any
  *     exception; a function is refused as `this`
  *   - promises are followed by a promise made here, dates and binary data are copied, errors are
@@ -25,11 +25,12 @@
  *   - primitives pass; facades unwrap to the host object they stand for
  *   - functions (a script's own, and the callables and classes of this membrane too) become host
  *     callables that convert the arguments (so a callback the engine invokes with a raw object
- *     sees a facade or a token), drop `this`, and rethrow anything the script throws as a fresh
- *     Error carrying strings only. A raw host function never goes back to host code.
+ *     sees a facade or a token), drop `this`, and rethrow an object the script throws as a fresh
+ *     Error carrying strings only (a thrown primitive crosses as it is). A raw host function never
+ *     goes back to host code.
  *   - promises are followed by a promise made here; binary data is copied byte for byte. Following
-     a script's promise calls its `then` (the script's own, or the language's) with the two
-     resolving functions of the promise made here, and nothing else of the host
+ *     a script's promise calls its `then` (the script's own, or the language's) with the two
+ *     resolving functions of the promise made here, and nothing else of the host
  *   - everything else is copied: own enumerable string-keyed properties, each read once, into a
  *     new plain object or array. The engine never holds a script's own object, so a script
  *     cannot answer differently on a second read, and no getter of its runs later inside host code.
@@ -84,7 +85,7 @@ export interface ScriptMembrane {
   exposeDynamic(host: object, allows: (prop: string) => boolean): object;
   /** The script-facing constructor for a class in `classes` */
   scriptClass(name: string): unknown;
-  /** A fresh Error for the host from whatever a script threw */
+  /** A fresh Error for the host from an object a script threw; a primitive as it is */
   toHostError(thrown: unknown): unknown;
   /**
    * Whether `value` is a host object this membrane has shown to a script as a facade. By
@@ -213,10 +214,15 @@ function readString(value: unknown, key: string): string | null {
   }
 }
 
-// An absolute file path or file: URL, after the start of the text, a space, a quote, a bracket or "="
+// An absolute file path or file: URL with a "/" after its first segment, after the start of the
+// text, whitespace, a quote, an opening bracket, "=" or ","; it ends at whitespace, a quote or a bracket
 const PATH_PATTERN = /(^|[\s'"`([{=,])((?:file:\/\/)?\/(?:[^/\s'"`()<>[\]{}]+\/)+[^/\s'"`()<>[\]{}]*)/g;
 
-/** The text with every absolute file path in it replaced by `<path>` */
+/**
+ * The text with every absolute file path PATH_PATTERN finds replaced by `<path>` (not a path of one
+ * segment such as /tmp, not one that follows another character, and of a path with a space in it
+ * only the part before the space)
+ */
 export function redactPaths(text: string): string {
   return text.replace(PATH_PATTERN, '$1<path>');
 }

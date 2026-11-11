@@ -189,14 +189,15 @@ describe('readServerPacket', () => {
     expect(warn).toHaveBeenCalledTimes(1);
   });
 
-  it('skips an unreadable packet without throwing or quoting it', () => {
+  it('skips an unreadable packet without throwing, and says only its size', () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
-    expect(readServerPacket(new Uint8Array([0xc1]))).toEqual([]);
-    // a complete frame followed by junk: the decoder's own message would quote the frame
+    // A complete frame followed by junk, the first unreadable one (so it is the one the line is about)
     const frame = serverPackr.pack([2, { body: TOKEN }]);
     const withTrailer = new Uint8Array([...frame, 0xc1, 0xc1]);
-    readServerPacket(withTrailer);
-    expect(error).toHaveBeenCalled();
+    expect(Buffer.from(withTrailer).toString('latin1')).toContain(TOKEN);
+    expect(readServerPacket(withTrailer)).toEqual([]);
+    expect(error.mock.calls).toEqual([[`[Hyperfy] Could not read 1 packet(s) from the world (the latest ${withTrailer.byteLength} bytes, refused: trailing bytes)`]]);
+    expect(readServerPacket(new Uint8Array([0xc1]))).toEqual([]);
     expect(JSON.stringify(error.mock.calls)).not.toContain(TOKEN);
   });
 
@@ -205,10 +206,10 @@ describe('readServerPacket', () => {
     try {
       const error = vi.spyOn(console, 'error').mockImplementation(() => {});
       for (let i = 0; i < 500; i++) readServerPacket(new Uint8Array([0xc1]));
-      expect(error.mock.calls.map(([line]) => line)).toEqual(['[Hyperfy] Could not read 1 packet(s) from the world (the latest 1 bytes)']);
+      expect(error.mock.calls.map(([line]) => line)).toEqual(['[Hyperfy] Could not read 1 packet(s) from the world (the latest 1 bytes, refused: reserved byte)']);
       vi.advanceTimersByTime(10_000);
       readServerPacket(new Uint8Array([0xc1, 0xc1]));
-      expect(error.mock.calls.map(([line]) => line).at(-1)).toBe('[Hyperfy] Could not read 500 packet(s) from the world (the latest 2 bytes)');
+      expect(error.mock.calls.map(([line]) => line).at(-1)).toBe('[Hyperfy] Could not read 500 packet(s) from the world (the latest 2 bytes, refused: reserved byte)');
       expect(error).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
@@ -218,6 +219,9 @@ describe('readServerPacket', () => {
   it('does not echo a non-numeric id', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     expect(readServerPacket(serverPackr.pack([TOKEN, {}]))).toEqual([]);
+    // It is reported, by its type alone
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain('The world sent packet a non-numeric id (string), which is not in this agent\'s protocol table');
     expect(JSON.stringify(warn.mock.calls)).not.toContain(TOKEN);
   });
 });
@@ -653,9 +657,11 @@ describe('sessionTokenProblem', () => {
 });
 
 describe('outgoingPacketProblem', () => {
+  afterEach(() => vi.restoreAllMocks());
+
   it('says why the world would drop a packet over its limit, and the adapter does not send it', () => {
     expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: { a: 'x'.repeat(100) } })).toBeNull();
-    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: { a: 'x'.repeat(70 * 1024) } })).toMatch(/^the blueprintAdded packet would be \d+ bytes, more than the 65536 the world accepts$/);
+    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: { a: 'x'.repeat(70 * 1024) } })).toMatch(/^the blueprintAdded packet would be at least \d+ bytes, more than the 65536 the world accepts$/);
     expect(outgoingPacketProblem('entityAdded', { id: 'e', state: { a: 'x'.repeat(33 * 1024) } })).toMatch(/more than the 32768/);
     const frames: unknown[] = [];
     const network: any = { queue: [], onClose: () => {}, flush: () => {}, ws: { send: (frame: unknown) => void frames.push(frame) } };
@@ -664,5 +670,50 @@ describe('outgoingPacketProblem', () => {
     expect(network.send('entityAdded', { id: 'e', state: { a: 'x'.repeat(33 * 1024) } })).toBe(false);
     expect(network.send('entityAdded', { id: 'e' })).toBe(true);
     expect(frames).toHaveLength(1);
+  });
+
+  // What coo-world's inbound scan (src/core/extras/strictDecode.js, inboundPolicy.js) gives at each limit
+  const nested = (levels: number): unknown => (levels === 0 ? null : { a: nested(levels - 1) });
+
+  it("refuses nesting the world's scan refuses (deeper than 32 levels): the review's 33 nested objects, and one level past the limit", () => {
+    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: nested(33) })).toBe('the blueprintAdded packet nests deeper than the 32 levels the world accepts');
+    // [id, {id, props: ...}]: the props' 29 objects and their innermost value come to level 32
+    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: nested(29) })).toBeNull();
+    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: nested(30) })).toBe('the blueprintAdded packet nests deeper than the 32 levels the world accepts');
+    // A value that holds itself: refused at the depth limit, never packed (the packer would recurse until the stack overflows)
+    const loop: Record<string, unknown> = { id: 'loop' };
+    loop.self = loop;
+    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: loop })).toBe('the blueprintAdded packet nests deeper than the 32 levels the world accepts');
+  });
+
+  it('refuses more values than the world takes for that packet (8,192 for a blueprint, 4,096 for an entity), counted as its scan counts them', () => {
+    // The packet array and its two elements, the two entries of the object (two each), then the list
+    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: new Array(8185).fill(0) })).toBeNull();
+    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: new Array(8186).fill(0) })).toBe('the blueprintAdded packet holds more than the 8192 values the world accepts');
+    expect(outgoingPacketProblem('entityAdded', { id: 'e', state: new Array(4089).fill(0) })).toBeNull();
+    expect(outgoingPacketProblem('entityAdded', { id: 'e', state: new Array(4090).fill(0) })).toBe('the entityAdded packet holds more than the 4096 values the world accepts');
+    // A bin is four
+    expect(outgoingPacketProblem('entityAdded', { id: 'e', state: Array.from({ length: 1022 }, () => new Uint8Array(1)) })).toBeNull();
+    expect(outgoingPacketProblem('entityAdded', { id: 'e', state: Array.from({ length: 1023 }, () => new Uint8Array(1)) })).toMatch(/more than the 4096 values/);
+  });
+
+  it('refuses what the world scan does not take: a date (an extension), a map key that is not a string; and what cannot be written at all', () => {
+    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: { at: new Date(0) } })).toBe('the blueprintAdded packet holds a value the world does not accept (byte 0xd6 refused)');
+    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: new Map([[1, 'x']]) })).toBe('the blueprintAdded packet holds a value the world does not accept (map key is not a string)');
+    expect(outgoingPacketProblem('entityAdded', { id: 'e', state: { n: 2n ** 70n } })).toBe('the entityAdded packet holds a value that cannot be written as msgpack (RangeError)');
+    // undefined is fixext 1 of type 0, which the world takes
+    expect(outgoingPacketProblem('entityAdded', { id: 'e', state: { n: undefined } })).toBeNull();
+  });
+
+  it('stops at the limit before packing a value the packer would write out in full at every reference to it', () => {
+    // 2^20 values to the packer, in a few objects
+    let chain: unknown = [0];
+    for (let i = 0; i < 20; i++) chain = [chain, chain];
+    const started = performance.now();
+    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: chain })).toBe('the blueprintAdded packet holds more than the 8192 values the world accepts');
+    // One 60 KB string 5,000 times: 300 MB to the packer
+    const text = 'z'.repeat(60_000);
+    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: new Array(5000).fill(text) })).toMatch(/^the blueprintAdded packet would be at least \d+ bytes, more than the 65536 the world accepts$/);
+    expect(performance.now() - started).toBeLessThan(100);
   });
 });

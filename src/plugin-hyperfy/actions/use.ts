@@ -1,12 +1,10 @@
 import {
   type Action,
-  type HandlerCallback,
   type IAgentRuntime,
-  type Memory,
   type State,
   logger,
   composePromptFromState,
-  ModelType
+  ModelType,
 } from '@elizaos/core';
 import { actingSession, connectedSession } from '../service';
 import { TurnCancelled } from '../lib/turn-context';
@@ -15,6 +13,7 @@ import { AnthropicRefusalError } from '../../anthropic-models';
 import { AgentActions, type PerformActionOutcome } from '../systems/actions';
 import { AgentControls } from '../systems/controls';
 import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
+import { errorText } from '../lib/error-text';
 import { shownName } from '../lib/text';
 import { notArrivedText } from '../lib/move-outcome';
 import type { MoveOutcome } from '../systems/controls';
@@ -57,13 +56,7 @@ export const hyperfyUseItemAction: Action = {
     const world = connectedSession(runtime)?.world;
     return !!world?.controls && !!world?.actions;
   },
-  handler: async (
-    runtime: IAgentRuntime,
-    message: Memory,
-    _state: State,
-    _options: unknown,
-    callback: HandlerCallback
-  ) => {
+  handler: async (runtime, message, _state, _options, callback) => {
     // The turn's own connection (never a newer one); throws when the turn may no longer act
     const session = actingSession(runtime);
     const world = session?.world;
@@ -92,7 +85,7 @@ export const hyperfyUseItemAction: Action = {
     } catch (err) {
       // The turn's caller handles these (scripted or offline fallback, a fixed decline)
       if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError) throw err;
-      logger.error('[USE ITEM] Extraction failed:', err);
+      logger.error(`[USE ITEM] Extraction failed: ${errorText(err)}`);
     }
 
     if (!targetEntityId) {
@@ -139,7 +132,7 @@ export const hyperfyUseItemAction: Action = {
       return actionFailed(USE_ITEM, `nothing was used (${outcome})`, { targetEntityId, outcome });
     }
 
-    await callback({
+    await callback?.({
       text: `Using item: ${shownName(String(targetEntityId), ENTITY_ID_MAX)}`,
       actions: [USE_ITEM],
       source: 'hyperfy',

@@ -1,13 +1,9 @@
 import {
-    logger,
-    type Action,
-    type HandlerCallback,
-    type IAgentRuntime,
-    type Memory,
-    type State
+  logger,
+  type Action,
+  type IAgentRuntime,
 } from '@elizaos/core';
-// No longer need THREE here
-import { AgentControls } from '../systems/controls'; // Still need type for casting
+import { AgentControls } from '../systems/controls'; // type only
 import { actingSession, connectedSession } from '../service';
 import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
 
@@ -18,19 +14,13 @@ const RANDOM_WALK_MAX_DISTANCE = 30; // meters
 
 export const hyperfyWalkRandomlyAction: Action = {
     name: WALK_RANDOMLY,
-    similes: ['WANDER', 'PACE_AROUND', 'WALK_AROUND', 'MOVE_RANDOMLY'], // Reverted similes/desc
+    similes: ['WANDER', 'PACE_AROUND', 'WALK_AROUND', 'MOVE_RANDOMLY'],
     description: 'Makes your character wander to random points nearby; use for idle behavior or ambient movement.',
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
       return !!connectedSession(runtime)?.world?.controls;
     },
-    handler: async (
-      runtime: IAgentRuntime,
-      _message: Memory,
-      _state: State,
-      // elizaOS core passes its own bookkeeping here (actionContext, actionPlan), nothing of this action's
-      _options: unknown,
-      callback: HandlerCallback,
-    ) => {
+    // elizaOS core passes its own bookkeeping as options (actionContext, actionPlan), nothing of this action's
+    handler: async (runtime, _message, _state, _options, callback) => {
       // The turn's own connection (never a newer one); throws when the turn may no longer act
       const session = actingSession(runtime);
       const world = session?.world;
@@ -55,7 +45,7 @@ export const hyperfyWalkRandomlyAction: Action = {
         controls.startRandomWalk(RANDOM_WALK_INTERVAL_MS, RANDOM_WALK_MAX_DISTANCE, undefined, { signal });
       });
 
-      await callback({
+      await callback?.({
         text: ``,
         actions: [WALK_RANDOMLY],
         source: 'hyperfy',

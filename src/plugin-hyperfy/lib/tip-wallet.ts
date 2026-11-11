@@ -22,7 +22,7 @@ export const SIGN_IN_STATEMENT = 'Verify wallet ownership for this world. This d
 const MAX_VALIDITY_MS = 10 * 60_000;
 const ANSWER_TIMEOUT_MS = 20_000;
 const RETRY_BASE_MS = 30_000;
-// The longest wait before the next request that the world can ask for
+// The longest wait the world can make the agent take before the next request (coo-world's own cooldown is 5 s)
 const MAX_COOLDOWN_MS = 60_000;
 const MAX_FAILURES = 3;
 const RECEIVE_CHECK_MS = 3_000;
@@ -134,8 +134,10 @@ export interface TipWalletOptions {
  *  - 'verified': the world said this wallet is signed in;
  *  - 'waiting': an attempt failed (or the world asked to wait); the next one is scheduled;
  *  - 'stopped': over for this connection (stop(), a message it refused to sign, too many failures).
- * Nothing the world sends changes anything unless it answers the attempt in progress in the phase
- * that waits for it: that is checked before any state is touched.
+ * Of what the world sends, only the answer to the attempt in progress, in the phase that waits for
+ * it, moves the sign-in on: that is checked before any state is touched. Besides that, a sign-out
+ * notice (no attempt, verified false) while 'verified' counts as a failure, and the evmTips flag of
+ * the agent's own player is recorded in any phase.
  */
 type Phase = 'idle' | 'awaiting-nonce' | 'answering' | 'verified' | 'waiting' | 'stopped';
 
@@ -288,7 +290,8 @@ export class TipWallet {
 
   /**
    * The attempt in progress failed. The next one is made after `retryInMs` (by default longer
-   * after each failure); after MAX_FAILURES failures in a row there is none on this connection.
+   * after each failure); after MAX_FAILURES retries have failed too (MAX_FAILURES + 1 failures in
+   * a row) there is none on this connection.
    */
   private failed(what: string, retryInMs?: number): void {
     if (this.phase === 'stopped') return;

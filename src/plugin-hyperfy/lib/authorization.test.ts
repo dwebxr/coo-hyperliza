@@ -187,7 +187,9 @@ describe('what a turn may do', () => {
 
   it('checks the builder in the world the turn belongs to', () => {
     const otherWorld = worldFromSnapshot(cooWorldSnapshot({ players: [{ id: 'builder-1', name: 'Bob', rank: Ranks.VISITOR }] }));
-    expect(sceneEditRefusal(turn({ world: otherWorld, requesterId: 'builder-1' }), builders)).not.toBeNull();
+    // The same player id is a builder in one world and a visitor in the other
+    expect(sceneEditRefusal(turn({ world: builderWorld, requesterId: 'builder-1' }), builders)).toBeNull();
+    expect(sceneEditRefusal(turn({ world: otherWorld, requesterId: 'builder-1' }), builders)).toBe('the requester is not a builder in this world');
   });
 
   it('stops an authorized edit once the requester may no longer build', async () => {
@@ -224,9 +226,10 @@ describe('what a turn may do', () => {
   });
 
   it('lets an autonomous turn run only the autonomy actions, and privileged actions never run outside a turn', () => {
-    for (const name of AUTONOMY_ACTIONS) expect(actionRefusal(name, turn({ origin: 'autonomy' }))).toBeNull();
+    expect(AUTONOMY_ACTIONS).toEqual(['HYPERFY_GOTO_ENTITY', 'HYPERFY_WALK_RANDOMLY', 'HYPERFY_USE_ITEM', 'HYPERFY_UNUSE_ITEM', 'HYPERFY_AMBIENT_SPEECH', 'HYPERFY_TELEPORT_TO_USER', 'REPLY', 'IGNORE']);
+    for (const name of AUTONOMY_ACTIONS) expect(actionRefusal(name, turn({ origin: 'autonomy' })), name).toBeNull();
     expect(actionRefusal('HYPERFY_EDIT_ENTITY', turn({ origin: 'autonomy' }))).toBe('HYPERFY_EDIT_ENTITY is not allowed on an autonomous turn');
-    expect(actionRefusal('HYPERFY_SCENE_PERCEPTION', turn({ origin: 'autonomy' }))).not.toBeNull();
+    expect(actionRefusal('HYPERFY_SCENE_PERCEPTION', turn({ origin: 'autonomy' }))).toBe('HYPERFY_SCENE_PERCEPTION is not allowed on an autonomous turn');
     expect(actionRefusal('HYPERFY_EDIT_ENTITY', turn({ requesterId: 'visitor-1' }))).toBeNull();
     expect(actionRefusal('HYPERFY_EDIT_ENTITY', undefined)).toBe('HYPERFY_EDIT_ENTITY runs only inside a chat or voice turn');
     expect(actionRefusal('HYPERFY_GOTO_ENTITY', undefined)).toBeNull();

@@ -98,8 +98,11 @@ export class ConnectionSession {
   private readonly abort = new AbortController()
   private readonly subscriptions: Array<() => void> = []
   private ending: Promise<void> | null = null
-  /** Stop commands, by the queued message itself: taken on arrival, or claimed by their turn (no eviction) */
-  private readonly stops = new WeakMap<object, 'stopped' | 'claimed'>()
+  /**
+   * Stop commands, by the queued message itself: taken on arrival, claimed by their turn, or
+   * dropped by the queue before their turn ('discarded': no longer live, nothing acts for it)
+   */
+  private readonly stops = new WeakMap<object, 'stopped' | 'claimed' | 'discarded'>()
   private started = false
   private init: ((authToken?: string) => Promise<void>) | null = null
 
@@ -120,6 +123,7 @@ export class ConnectionSession {
     this.conversation = new ChatIntake({
       signal: this.signal,
       admitted: (msg) => this.stopOnArrival(msg),
+      discarded: (msg) => this.stops.set(msg, 'discarded'),
       handle: async (msg, turn) => {
         // Before the agent's own player exists there is nobody to answer as
         if (!this.world.entities?.player) return
@@ -273,9 +277,12 @@ export class ConnectionSession {
     )
   }
 
-  /** Stops on arrival of `msg`, unless the session ended or the message's own turn has begun meanwhile (claimStop). */
+  /**
+   * Stops on arrival of `msg`, unless the session ended, the message's own turn has begun meanwhile
+   * (claimStop), or the queue dropped the message (it gets no turn: a later walk is not its to stop).
+   */
   private takeStop(msg: object): void {
-    if (this.ended || this.stops.get(msg) === 'claimed') return
+    if (this.ended || this.stops.has(msg)) return
     this.world.controls.stopAllActions('asked to stop')
     this.stops.set(msg, 'stopped')
     console.info('[Hyperfy] Stopped on arrival of a stop command; its turn will acknowledge it')

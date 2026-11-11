@@ -3,7 +3,7 @@ import fs from 'fs'
 import { promises as fsPromises } from 'fs';
 import puppeteer, { type Browser, type Page } from 'puppeteer'
 import { resolveUrl } from '../utils.js';
-import { getModuleDirectory } from '../utils.js';
+import { ASSET_LAYOUT } from '../lib/asset-root';
 import { childEnv } from '../lib/child-env';
 import { modelBudget } from '../lib/gltf-budget';
 import { RenderWatchdog, type RenderWatchdogOptions } from '../lib/render-watchdog';
@@ -97,7 +97,7 @@ const PAGE_HTML = `<!DOCTYPE html>
  * Chromium has no way out. Everything the browser itself would send (it contacts update and
  * safe-browsing services on its own when started plainly) goes to a proxy address where nothing
  * listens, loopback included, and no host name resolves. The page's own requests are refused
- * one by one as well (see init). Neither covers WebRTC/UDP, which nothing in the page uses.
+ * one by one as well (see buildPage). Neither covers WebRTC/UDP, which nothing in the page uses.
  */
 export const OFFLINE_CHROMIUM_ARGS = [
   '--proxy-server=http://127.0.0.1:9',
@@ -154,7 +154,7 @@ export class PageOperationCancelled extends Error {
 }
 
 export interface PuppeteerManagerOptions {
-  /** The built render page, when it is not next to this module (the smoke script). */
+  /** The built render page, when it is not where lib/asset-root.ts expects it (the smoke script). */
   pageBundlePath?: string
   /** FOR TESTS: a shorter deadline or another process table. */
   watchdog?: Pick<RenderWatchdogOptions, 'deadlineMs' | 'initDeadlineMs' | 'limitBytes' | 'table' | 'intervalMs' | 'idleIntervalMs' | 'breaker'>
@@ -218,7 +218,7 @@ export class PuppeteerManager {
       // Synchronously, at the teardown: the next use starts a new browser without waiting for puppeteer to notice
       onTornDown: (generation) => this.dropGeneration(generation),
     })
-    this.pageBundlePath = pageBundlePath ?? path.join(getModuleDirectory(), 'puppeteer', 'page.js')
+    this.pageBundlePath = pageBundlePath ?? ASSET_LAYOUT.renderPageBundle
     PuppeteerManager.instance = this
     // Warm up Chromium in the background; callers await init() themselves.
     this.init().catch(error => {
@@ -579,7 +579,9 @@ export class PuppeteerManager {
 
   /** Drops a texture registerTexture kept (by its id and slot), for a caller that accepted it and then had no use for it. */
   async releaseTexture(id: string, slot: string): Promise<void> {
-    // A page built since holds none of the old one's textures: nothing to release then
+    // No page right now: nothing to release. A page built since holds none of the old one's
+    // textures either, and the call reaches it with the old id: systems/environment.ts compares
+    // pageEpoch before it releases a texture it kept
     const page = this.page
     if (!page) return
     await this.watched(page, () => page.evaluate((id, slot) => { window.agentPage!.releaseTexture(id, slot) }, id, slot))

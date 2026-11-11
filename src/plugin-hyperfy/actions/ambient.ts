@@ -2,14 +2,11 @@ import {
   type Action,
   type Content,
   composePromptFromState,
-  type HandlerCallback,
   type IAgentRuntime,
-  type Memory,
   ModelType,
-  type State,
 } from '@elizaos/core';
 import { forPurpose } from '../../usage-budget';
-import { actionSucceeded } from '../lib/action-result';
+import { actionFailed, actionSucceeded } from '../lib/action-result';
 import { plannedContent, readString } from '../lib/model-output';
 
 const AMBIENT_SPEECH = 'HYPERFY_AMBIENT_SPEECH';
@@ -35,14 +32,9 @@ export const hyperfyAmbientSpeechAction: Action = {
   similes: ['MONOLOGUE', 'OBSERVE', 'SELF_TALK', 'ENVIRONMENTAL_REMARK'],
   description: 'Says something aloud without addressing anyone; use for idle thoughts, atmosphere, or commentary when not in conversation.',
   validate: async (_runtime: IAgentRuntime) => true,
-  handler: async (
-    runtime: IAgentRuntime,
-    message: Memory,
-    state: State,
-    _options: any,
-    callback: HandlerCallback,
-    responses?: Memory[]
-  ) => {
+  handler: async (runtime, message, state, _options, callback, responses) => {
+    // Its whole effect is what the callback posts: without one, no model call is made for it
+    if (!callback) return actionFailed(AMBIENT_SPEECH, 'no callback to say it through');
     const existing =
       responses
         ?.map((r) => plannedContent(r, AMBIENT_SPEECH))

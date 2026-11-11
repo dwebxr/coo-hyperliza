@@ -23,7 +23,8 @@ const repo = path.resolve(here, '../../..');
 const engineStorage = realpathSync(path.join(repo, 'src/plugin-hyperfy/hyperfy/src/core/storage.js'));
 // PGLite as @elizaos/plugin-sql (a dependency of this project) resolves it
 const pglite = createRequire(fileURLToPath(import.meta.resolve('@elizaos/plugin-sql'))).resolve('@electric-sql/pglite');
-const hasBun = spawnSync('bun', ['--version'], { encoding: 'utf8' }).status === 0;
+// Asked outside the repository and without the suite's environment: only whether the runtime is there
+const hasBun = spawnSync('bun', ['--version'], { encoding: 'utf8', cwd: tmpdir(), env: { PATH: process.env.PATH, HOME: process.env.HOME } }).status === 0;
 const withoutBun = process.env.SANDBOX_TESTS_WITHOUT_BUN === '1';
 
 let dir = '';
@@ -75,7 +76,7 @@ describe.each(['bun', 'node'])('the agent process under %s', (runtime) => {
     if (runtime === 'bun' && !hasBun) throw new Error('`bun` is not on PATH (set SANDBOX_TESTS_WITHOUT_BUN=1 to skip the Bun run)');
     const reportFile = path.join(dir, `report-${runtime}.json`);
     // No environment beyond what the runtime needs to start
-    const result = spawnSync(runtime, [bundle, path.join(repo, 'src/plugin-hyperfy/public'), path.join(repo, 'src/plugin-hyperfy/physx/loadPhysX.js'), pglite, reportFile], {
+    const result = spawnSync(runtime, [bundle, path.join(repo, 'src/plugin-hyperfy/public'), path.join(repo, 'src/plugin-hyperfy/hyperfy/src/core/loadPhysX.js'), pglite, reportFile], {
       cwd: dir,
       encoding: 'utf8',
       timeout: 60_000,

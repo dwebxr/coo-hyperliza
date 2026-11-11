@@ -1,7 +1,8 @@
 /**
- * An admission filter for models (GLB or glTF JSON) before they reach the render page: strict
- * checks of the container and the structure, simple charges for the allocations that are cheap to
- * cause and easy to tell from the file, and plain ceilings on counts. Where the page's loader or
+ * An admission filter for models (GLB or glTF JSON) before they reach the render page, and for
+ * emotes before the agent's own parser: strict checks of the container and the structure, simple
+ * charges for the allocations that are cheap to cause and easy to tell from the file, and plain
+ * ceilings on counts. Where the page's loader or
  * exporter (node_modules/page-three/examples/jsm/{loaders/GLTFLoader,exporters/GLTFExporter}.js,
  * three 0.132.2) does something intricate, the feature is refused or its count capped instead of
  * modelled. This is not the limit on what the page may use: that is the run-time watchdog on the
@@ -19,13 +20,15 @@
  * Checked before parsing: a GLB is read the way the page's loader reads it (magic "glTF", version
  * 2, a declared length equal to the file's, chunks within bounds and multiples of 4 bytes, one JSON
  * chunk first, at most one BIN chunk after it, nothing else); the JSON's nesting depth and its size
- * in UTF-8 bytes without data: URIs (MODEL_LIMITS.jsonDepth, .jsonBytes) by one linear scan.
+ * in UTF-8 bytes without the contents of strings that start with `data:` (MODEL_LIMITS.jsonDepth,
+ * .jsonBytes) by one linear scan.
  *
  * Checked after parsing: asset.version 2.x; the references between buffers, buffer views,
  * accessors (sparse indices and values included), images, samplers, textures (also those a
  * material names where glTF or a supported extension defines one: MATERIAL_TEXTURES), materials,
  * meshes, nodes, skins, cameras, lights, scenes and animations name something that exists (extras
- * and other extensions are not read as references); buffer views lie within their buffers, and
+ * and other extensions are not read as references, and an animation sampler no channel uses is not
+ * checked); buffer views lie within their buffers, and
  * accessors and their sparse parts within their views (byteStride included); the node graph is a
  * forest; primitives the loader would share one geometry for (same indices, attributes and mode)
  * declare the same morph targets (compared by content, not by the order of their members).
@@ -46,7 +49,8 @@
  * fit `exportBytes`: buffers of that whole size exist while the page assembles it, so the
  * single-allocation ceiling applies to source arrays, not to the assembled file.
  *
- * Capped (MODEL_LIMITS): every collection's length; mesh instances the scenes expand to; animation
+ * Capped (MODEL_LIMITS): every top-level collection's length (and primitives, morph targets, joints
+ * and channels in all); mesh instances the scenes expand to; animation
  * tracks generated; the work of walking the node tree, binding skins and fanning out "weights"
  * tracks; and the size of extras and unknown-extension payloads times the copies made of them.
  *
@@ -80,7 +84,7 @@ export interface ModelBudget {
   singleBytes: number;
   /** All charged allocations together */
   totalBytes: number;
-  /** What the render page hands back (assets.js refuses to return more), and the export estimate */
+  /** The most the render page may hand back (lib/asset-memory.ts modelReservation can lower it for a load), and the limit on the export estimate */
   exportBytes: number;
 }
 
@@ -151,7 +155,8 @@ const HANDLED_REQUIRED = new Set([
   'KHR_materials_specular', 'KHR_lights_punctual', 'EXT_texture_webp',
   'VRM', 'VRMC_vrm', 'VRMC_springBone', 'VRMC_springBone_extended_collider', 'VRMC_materials_mtoon', 'VRMC_node_constraint', 'VRMC_materials_hdr_emissiveMultiplier',
 ]);
-// Extensions the base loader handles itself: not copied into userData
+// Extensions the base loader handles itself: not copied into userData (four of them only when the
+// file lists them in extensionsUsed)
 const KNOWN_TO_LOADER = new Set([...HANDLED_REQUIRED].filter((name) => !name.startsWith('VRM')));
 const NO_DECODER: Readonly<Record<string, string>> = {
   KHR_draco_mesh_compression: 'Draco-compressed meshes cannot be decoded in the render page (it has no Draco decoder)',
@@ -209,7 +214,7 @@ function container(bytes: Uint8Array): { text: string; bin: number | null } {
   return { text: decode(bytes.subarray(start, start + jsonLength)), bin };
 }
 
-/** The UTF-8 length of the UTF-16 code unit at `i` of `text` (a surrogate pair counts 4 on its first half) */
+/** The UTF-8 length of the UTF-16 code unit `code` (a surrogate pair counts 4 on its first half) */
 function utf8Bytes(code: number): number {
   if (code < 0x80) return 1;
   if (code < 0x800) return 2;
@@ -220,7 +225,8 @@ function utf8Bytes(code: number): number {
 
 /**
  * One pass over the JSON text before it is parsed: its nesting depth, and its size in UTF-8 bytes
- * without the contents of string literals that start with "data: (embedded buffers and images).
+ * without the contents of string literals that start with "data: (meant for embedded buffers and
+ * images; any other string that starts so is left out too).
  */
 function scanJson(text: string): number {
   let depth = 0;
@@ -661,8 +667,8 @@ function charge(bytes: Uint8Array, budget: ModelBudget): ModelCharge {
 }
 
 /**
- * Why a glTF that is parsed in the agent (Node: an emote, or the copy the render page hands back)
- * would load a file by URL, or null: a buffer or an image whose URI is not a data: URI. The filter
+ * Why a glTF that is parsed in the agent's own process (an emote, or the copy the render page hands
+ * back) would load a file by URL, or null: a buffer or an image whose URI is not a data: URI. The filter
  * above lets such URIs through because the render page cannot fetch them; the agent's engine could.
  */
 export function externalUriProblem(bytes: Uint8Array): string | null {

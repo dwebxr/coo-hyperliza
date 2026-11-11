@@ -11,7 +11,7 @@ describe('planModelPlugins', () => {
     });
   });
 
-  it('defaults to Claude without LLM_PROVIDER, and ignores keys of providers it no longer loads', () => {
+  it("defaults to Claude without LLM_PROVIDER, and loads nothing for other providers' keys", () => {
     expect(planModelPlugins({ ANTHROPIC_API_KEY: 'k', OPENAI_API_KEY: 'o', GROQ_API_KEY: 'g', OLLAMA_API_ENDPOINT: 'http://x' })).toEqual({
       packages: [SQL],
       textProvider: 'anthropic',
@@ -22,9 +22,10 @@ describe('planModelPlugins', () => {
     expect(planModelPlugins({ LLM_PROVIDER: ' Anthropic ', ANTHROPIC_API_KEY: 'k' }).textProvider).toBe('anthropic');
   });
 
-  it('rejects providers that are no longer supported', () => {
-    for (const provider of ['openai', 'ollama', 'groq', 'gemini']) {
-      expect(() => planModelPlugins({ LLM_PROVIDER: provider, ANTHROPIC_API_KEY: 'k' })).toThrow('Unsupported LLM_PROVIDER');
+  it('rejects every other provider (openai, ollama, groq, gemini, a made-up one), naming it and the supported one', () => {
+    for (const provider of ['openai', 'ollama', 'groq', 'gemini', 'made-up']) {
+      // Also with that provider's own key set
+      expect(() => planModelPlugins({ LLM_PROVIDER: provider, ANTHROPIC_API_KEY: 'k', OPENAI_API_KEY: 'o' })).toThrow(`Unsupported LLM_PROVIDER "${provider}". Use one of: anthropic.`);
     }
   });
 

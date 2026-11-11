@@ -80,7 +80,7 @@ describe('readChatMessage', () => {
 
   it('cuts the name to 32 code points and removes control, bidi and zero-width characters', () => {
     const msg = readChatMessage({ id: 'm1', body: 'x', fromId: 'p1', from: `Al‮ice\n​System${'🛹'.repeat(40)}` })!;
-    expect(msg.from).toBe(`Al ice System${'🛹'.repeat(19)}`);
+    expect(msg.from).toBe(`Alice System${'🛹'.repeat(20)}`);
     expect(Array.from(msg.from!)).toHaveLength(32);
     expect(msg.from).not.toMatch(LONE_SURROGATE);
     expect(readChatMessage({ id: 'm1', body: 'x', fromId: 'p1', from: '​‮ \n' })!.from).toBeNull();
@@ -93,11 +93,16 @@ function intake() {
   const clock = { now: 0 };
   const handled: string[] = [];
   const lines: string[] = [];
+  /** The clock's time at each line */
+  const lineTimes: number[] = [];
   const gates: (() => void)[] = [];
   let hold = false;
   const chat = new ChatIntake({
     now: () => clock.now,
-    log: (line) => lines.push(line),
+    log: (line) => {
+      lines.push(line);
+      lineTimes.push(clock.now);
+    },
     handle: async (msg) => {
       handled.push(msg.id);
       if (hold) await new Promise<void>((resolve) => gates.push(resolve));
@@ -108,6 +113,7 @@ function intake() {
     clock,
     handled,
     lines,
+    lineTimes,
     /** From now on every turn waits until release() */
     holdTurns: () => void (hold = true),
     release: () => gates.shift()?.(),
@@ -319,7 +325,7 @@ describe('ChatIntake', () => {
   });
 
   it('logs at most one rate-limit line per 10 s for a sender who keeps sending two whenever one token refills, also as each fast turn empties the queue', async () => {
-    const { chat, clock, lines } = intake();
+    const { chat, clock, lines, lineTimes } = intake();
     for (let i = 0; i < CHAT_SENDER_BURST; i++) chat.accept(message(`a${i}`, 'alice'));
     await chat.idle();
     for (let round = 0; round < 15; round++) {
@@ -328,12 +334,14 @@ describe('ChatIntake', () => {
       chat.accept(message(`r${round}-2`, 'alice'));
       await chat.idle();
     }
-    // 60 s: the first drop at once, then one line per 10 s at most
-    const rateLines = lines.filter((line) => line.includes('rate limit'));
-    expect(rateLines.length).toBeLessThanOrEqual(1 + (15 * CHAT_SENDER_REFILL_MS) / CHAT_DROP_LOG_INTERVAL_MS);
     expect(chat.stats().rateLimited).toBe(15);
-    const counted = rateLines.map((line) => Number(line.match(/Dropped (\d+)/)![1])).reduce((a, b) => a + b, 0);
-    expect(counted).toBeLessThanOrEqual(15);
+    // 60 s, a drop every 4 s: the first is said at once, then every third (12 s, the first past 10 s);
+    // the last two are counted and not said yet
+    const over = 'from senders over their rate limit';
+    expect(lines).toEqual([`[Chat] Dropped 1 message ${over}`, ...Array(4).fill(`[Chat] Dropped 3 messages ${over}`)]);
+    const gaps = lineTimes.slice(1).map((time, i) => time - lineTimes[i]);
+    expect(gaps).toEqual([12_000, 12_000, 12_000, 12_000]);
+    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(CHAT_DROP_LOG_INTERVAL_MS);
   });
 
   it('reports a long burst of drops once per interval, with the count', () => {
@@ -344,8 +352,12 @@ describe('ChatIntake', () => {
       clock.now += 1000;
     }
     const rateLines = lines.filter((line) => line.includes('rate limit'));
-    expect(rateLines.length).toBeLessThanOrEqual(1 + (30_000 / CHAT_DROP_LOG_INTERVAL_MS));
-    expect(rateLines.length).toBeGreaterThan(1);
+    // 100 a second against 8 at once and one every 4 s: the first drop is said at once, and what
+    // was dropped since (the line's own drop included) with the first drop 10 s and 20 s later
+    const over = 'from senders over their rate limit';
+    expect(rateLines).toEqual([`[Chat] Dropped 1 message ${over}`, `[Chat] Dropped 990 messages ${over}`, `[Chat] Dropped 998 messages ${over}`]);
+    // Every message but those let through (8, then one every 4 s for 28 s) was counted
+    expect(chat.stats().rateLimited).toBe(30 * 100 - (CHAT_SENDER_BURST + 7));
     chat.stop();
   });
 
@@ -364,6 +376,47 @@ describe('ChatIntake', () => {
     await chat.idle();
     expect(chat.stats().stale).toBe(1);
     expect(lines).toEqual(['[Chat] Dropped 1 message after waiting longer than 120 s for a turn']);
+  });
+
+  it('tells `discarded` of each queued message that gets no turn (dropped for a newer one of its sender, for a full queue, as stale, or as the intake stops), and of no other', async () => {
+    const clock = { now: 0 };
+    const handled: string[] = [];
+    const discarded: string[] = [];
+    const gates: (() => void)[] = [];
+    const chat = new ChatIntake({
+      now: () => clock.now,
+      log: () => {},
+      discarded: (msg) => void discarded.push(msg.id),
+      handle: async (msg) => {
+        handled.push(msg.id);
+        await new Promise<void>((resolve) => gates.push(resolve));
+      },
+    });
+    chat.accept(message('turn', 'someone'));
+    await vi.waitFor(() => expect(handled).toEqual(['turn']));
+    // Over its sender's waiting cap: that sender's oldest
+    for (let i = 0; i < CHAT_SENDER_BURST; i++) chat.accept(message(`a${i}`, 'alice'));
+    clock.now += CHAT_SENDER_REFILL_MS;
+    expect(chat.accept(message('a8', 'alice'))).toBe('queued');
+    expect(discarded).toEqual(['a0']);
+    // A full queue: the oldest of whoever has the most waiting
+    const others = Array.from({ length: CHAT_QUEUE_MAX - CHAT_SENDER_WAITING_MAX + 1 }, (_, i) => `o${i}`);
+    for (const id of others) chat.accept(message(id));
+    expect(discarded).toEqual(['a0', 'a1']);
+    expect(chat.waiting).toBe(CHAT_QUEUE_MAX);
+    // Stale: all that waited past 120 s once the turn ends
+    clock.now += CHAT_TURN_MAX_AGE_MS + 1;
+    gates.shift()!();
+    await vi.waitFor(() => expect(chat.waiting).toBe(0));
+    const stale = [...Array.from({ length: 7 }, (_, i) => `a${i + 2}`), ...others];
+    expect(discarded).toEqual(['a0', 'a1', ...stale]);
+    // At stop: what still waits, not the turn in progress
+    chat.accept(message('next', 'bob'));
+    await vi.waitFor(() => expect(handled).toEqual(['turn', 'next']));
+    chat.accept(message('q1', 'carol'));
+    chat.accept(message('q2', 'dave'));
+    chat.stop();
+    expect(discarded).toEqual(['a0', 'a1', ...stale, 'q1', 'q2']);
   });
 
   it('cancels a turn that outlives its 180 s slot and moves on; a failing turn does not stop the next', async () => {

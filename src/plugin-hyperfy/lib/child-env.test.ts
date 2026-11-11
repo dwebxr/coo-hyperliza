@@ -31,8 +31,11 @@ describe('childEnv', () => {
 
   it('reads the process environment by default, and never returns a variable that is not set', () => {
     const env = childEnv();
+    expect(typeof process.env.PATH).toBe('string');
     expect(env.PATH).toBe(process.env.PATH);
     expect(Object.values(env).every((value) => typeof value === 'string')).toBe(true);
-    expect(childEnv({})).toEqual({});
+    // A name on the list that is not set is left out, not passed on as undefined
+    expect(Object.keys(childEnv({ PATH: undefined, HOME: '/home/agent', TZ: undefined }))).toEqual(['HOME']);
+    expect(Object.keys(childEnv({}))).toEqual([]);
   });
 });

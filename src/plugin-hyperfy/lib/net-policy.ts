@@ -24,12 +24,13 @@
  *     credentials. If WS_URL points at a host that also serves something private, that is reachable.
  *   - Requests to public hosts stay possible and are not rate limited here: the agent can be made
  *     to fetch from, and so reveal its address to, any public https host.
- *   - It does not go through HTTP(S)_PROXY (node:http ignores those variables in Node and Bun, and
- *     net-policy.child.test.ts checks that). Where the only way out is a proxy, these requests
- *     fail; and if one were ever routed through a proxy, the proxy would resolve the name and the
- *     address check here would mean nothing.
- *   - Address classes follow the IANA special-purpose registries as of this writing. A private
- *     network that uses public address space is not recognised.
+ *   - It does not go through HTTP(S)_PROXY: a request made with `agent: false` takes no proxy
+ *     settings in Node (whose default agent does under NODE_USE_ENV_PROXY=1) or in Bun, and
+ *     net-policy.child.test.ts checks that with those variables set. Where the only way out is a
+ *     proxy, these requests fail; and if one were ever routed through a proxy, the proxy would
+ *     resolve the name and the address check here would mean nothing.
+ *   - Address classes follow the IANA special-purpose registries. A private network that uses
+ *     public address space is not recognised.
  */
 
 import dns from 'node:dns';
@@ -39,7 +40,7 @@ import net from 'node:net';
 
 const MB = 1024 * 1024;
 
-// ---- operator byte caps ----
+// ---- byte caps ----
 
 /** Models (.glb) and avatars (.vrm): world assets, and files the agent is asked to import. */
 export const MAX_MODEL_BYTES = 50 * MB;
@@ -208,7 +209,11 @@ export interface SafeFetchOptions {
   /** One deadline for the whole exchange, redirects and body included. */
   timeoutMs?: number;
   method?: string;
-  /** Sent as given, except the ones this module sets itself (host, connection, lengths, encodings). */
+  /**
+   * Sent as given (names in lower case), except the ones this module sets itself (OWN_HEADERS), any
+   * with characters a header may not hold, `authorization` once a redirect leaves the origin, and
+   * `content-type` once a redirect turns the request into a GET.
+   */
   headers?: Record<string, string>;
   body?: string | Uint8Array;
   signal?: AbortSignal;
@@ -365,7 +370,7 @@ export class NetPolicy {
           body = undefined;
           delete headers['content-type'];
         }
-        // A caller's credentials are for the host it named
+        // A caller's Authorization is for the origin it named (other headers go along)
         if (next.origin !== url.origin) delete headers.authorization;
         url = next;
       }

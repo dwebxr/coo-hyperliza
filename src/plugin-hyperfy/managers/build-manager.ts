@@ -46,9 +46,10 @@ const applied: EditResult = { outcome: 'applied' };
 
 /**
  * Why announcing a new app (its blueprint, when it has one of its own, and its entity) would not
- * reach the world, or null: the world drops a packet over its size limit unread, and the agent's
- * network does not send it (lib/world-protocol.ts). Asked before anything is added locally, so an
- * edit that cannot reach the world changes nothing here either.
+ * reach the world, or null: the world drops a packet unread that is over its size, value or depth
+ * limit or holds a value its scan refuses (lib/world-protocol.ts outgoingPacketProblem). Asked
+ * before anything is added locally, so an edit that cannot reach the world changes nothing here
+ * either.
  */
 function announcementProblem(blueprint: unknown, entity: unknown): string | null {
   return (blueprint ? outgoingPacketProblem('blueprintAdded', blueprint) : null) ?? outgoingPacketProblem('entityAdded', entity);

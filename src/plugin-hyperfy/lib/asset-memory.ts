@@ -9,16 +9,20 @@
  *     asks (the chunks and the one copy they are joined into), 2 × the declared Content-Length once
  *     the answer says it is smaller, and 2 × the actual size once the bytes are in;
  *   - work (ASSET_WORK_POOL_BYTES): the download is then exchanged, once, for what the rest costs
- *     (workBytes). For a model, avatar or emote that is sized from the ceiling the render page is
- *     held to for this load (modelReservation), which the page is passed as its maxExportBytes and
- *     refuses to exceed, not from an estimate. Holders of work never wait on anything else.
+ *     (workBytes). For a model or avatar that is sized from the ceiling the render page is held to
+ *     for this load (modelReservation), which the page is passed as its maxExportBytes and refuses
+ *     to exceed, not from an estimate; an emote is parsed in this process and reserves its download
+ *     plus what the glTF filter charged for it (systems/loader.ts parseEmote). Holders of work
+ *     never wait for memory again (they may wait for the render page, lib/page-work.ts, whose
+ *     holder has its memory already).
  * After the exchange a reservation only shrinks; one that does not fit its pool is refused, never
  * cut (a model's ceiling is lowered to fit first, and the model refused when even its estimated
  * export would not fit). So what the pools hold is never less than what these copies take, and the
  * agent's memory for assets on their way stays within the two pools, 1 GiB. Not counted: three.js
  * objects and the scene graph the engine builds from a parsed model, the transient buffers of a
- * single step beyond the copies above, and the loader's cache of finished loads (bounded by
- * itself, systems/loader.ts LOADER_LIMITS).
+ * single step beyond the copies above, the text of a data: URL an asset is named by (as long as
+ * its base64, and for an avatar sent to the page as its key), and the loader's cache of finished
+ * loads (bounded by itself, systems/loader.ts LOADER_LIMITS).
  */
 
 const MiB = 1024 * 1024;
@@ -54,9 +58,9 @@ export function workBytes(kind: AssetWorkKind, bytes: number, exportBytes = 0): 
 }
 
 /**
- * How much a model, avatar or emote of `downloadBytes` may get back from the render page, and what
+ * How much a model or avatar of `downloadBytes` may get back from the render page, and what
  * that reserves. The ceiling is twice the filter's export estimate, or the download times the
- * room re-encoded textures need (an avatar keeps its textures in the export: 8 ×; a model or emote,
+ * room re-encoded textures need (an avatar keeps its textures in the export: 8 ×; a model,
  * whose texture slots are stripped, 2 ×), at least 1 MiB, and at most `exportCap` (the kind's
  * export budget, lib/gltf-budget.ts). It is lowered until the reservation fits `pool`; when even
  * the estimate does not fit, the load is refused.
@@ -214,7 +218,7 @@ export class AssetMemory {
     return new AssetLease(this, this.downloads, held);
   }
 
-  /** What is held now (for tests and reports) */
+  /** What is held now (for tests) */
   get held(): { downloads: number; work: number } {
     return { downloads: this.downloads.used, work: this.work.used };
   }

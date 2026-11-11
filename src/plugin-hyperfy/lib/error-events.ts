@@ -8,7 +8,8 @@
  * A listener that prints the reason (elizaOS's Sentry integration calls console.error with it)
  * would run the script's custom-inspect hook with the runtime's own `inspect` and its options.
  * Once the guard is installed, a listener gets an Error made here from the original's name,
- * message, stack and code strings, and a promise made here, instead of the originals:
+ * message, stack and code (strings; code also a number), and a promise made here, instead of the
+ * originals (a multipleResolves value that is not an object stays as it is):
  *
  * - Node delivers these events through `process.emit`, and the guard replaces it: every listener
  *   is covered, however and whenever it was registered. Registration is left to Node.

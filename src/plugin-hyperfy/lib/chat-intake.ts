@@ -137,6 +137,12 @@ export interface ChatIntakeOptions {
    * "stop": session/connection-session.ts). Its failure is logged and changes nothing here.
    */
   admitted?: (msg: ReceivedChatMessage) => void;
+  /**
+   * Told, synchronously, of each queued message that is dropped before its turn (for a newer one
+   * of its sender or a full queue, as stale, or as the intake stops): what `admitted` began for it
+   * must not act any more. Its failure is logged and changes nothing here.
+   */
+  discarded?: (msg: ReceivedChatMessage) => void;
   /** Fires when the connection this intake serves ends: the intake stops (see stop). */
   signal?: AbortSignal;
   now?: () => number;
@@ -178,6 +184,7 @@ const DROP_TEXT: Record<DropKind, string> = {
 export class ChatIntake {
   readonly #handle: ChatHandler;
   readonly #admitted?: (msg: ReceivedChatMessage) => void;
+  readonly #discarded?: (msg: ReceivedChatMessage) => void;
   /** The turn in progress */
   #current: AbortController | null = null;
   readonly #now: () => number;
@@ -194,9 +201,10 @@ export class ChatIntake {
   readonly #stats: ChatIntakeStats = { queued: 0, handled: 0, duplicate: 0, rateLimited: 0, senderWaiting: 0, queueFull: 0, stale: 0 };
   readonly #reports: Record<DropKind, RateLimitedLog>;
 
-  constructor({ handle, admitted, signal, now = Date.now, log = (line) => console.warn(line) }: ChatIntakeOptions) {
+  constructor({ handle, admitted, discarded, signal, now = Date.now, log = (line) => console.warn(line) }: ChatIntakeOptions) {
     this.#handle = handle;
     this.#admitted = admitted;
+    this.#discarded = discarded;
     if (signal?.aborted) this.#stopped = true;
     else signal?.addEventListener('abort', () => this.stop(), { once: true });
     this.#now = now;
@@ -242,6 +250,7 @@ export class ChatIntake {
       this.#reports['queue-full'].note();
     }
     if (dropped?.msg === msg) return 'queue-full';
+    if (dropped) this.#discard(dropped.msg);
     try {
       this.#admitted?.(msg);
     } catch (error) {
@@ -290,6 +299,15 @@ export class ChatIntake {
     return index === -1 ? undefined : this.#unqueue(index);
   }
 
+  /** Tells `discarded` that `msg`, which was queued, gets no turn. */
+  #discard(msg: ReceivedChatMessage): void {
+    try {
+      this.#discarded?.(msg);
+    } catch (error) {
+      this.#log(`[Chat] Acting on dropped message ${msg.id} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   /** Removes the message at `index` from the queue and returns it. */
   #unqueue(index: number): Waiting {
     const [entry] = this.#queue.splice(index, 1);
@@ -315,8 +333,9 @@ export class ChatIntake {
   /** Drops what is waiting, accepts nothing more, and cancels the turn in progress (its slot ends now). */
   stop(): void {
     this.#stopped = true;
-    this.#queue.length = 0;
+    const dropped = this.#queue.splice(0);
     this.#waiting.clear();
+    for (const { msg } of dropped) this.#discard(msg);
     this.#current?.abort(new TurnCancelled('the conversation it belongs to ended'));
   }
 
@@ -361,6 +380,7 @@ export class ChatIntake {
       if (this.#now() - at > CHAT_TURN_MAX_AGE_MS) {
         this.#stats.stale++;
         this.#reports.stale.note();
+        this.#discard(msg);
         continue;
       }
       await this.#withinSlot(msg, handle ?? this.#handle);

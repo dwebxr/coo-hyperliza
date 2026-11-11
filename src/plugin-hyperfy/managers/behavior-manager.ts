@@ -46,9 +46,7 @@ export class BehaviorManager {
     this.config = config;
   }
 
-  /**
-   * Starts the behavior loop if not already running and prerequisites are met.
-   */
+  /** Starts the behavior loop unless it is already running. */
   public start(): void {
     if (this.isRunning) {
       logger.warn("[BehaviorManager] Already running");
@@ -145,8 +143,6 @@ export class BehaviorManager {
       return false;
     }
 
-    // TODO: There may be slow post-processing in the bootstrap plugin's message handler.
-    // Investigate long tail after message handling, especially in emitEvent or runtime methods.
     if (agentActivityLock.isActive()) {
       logger.info("[BehaviorManager] Skipping behavior — message activity in progress");
       return hasOtherPlayers;

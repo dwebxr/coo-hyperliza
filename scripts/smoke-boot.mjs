@@ -8,17 +8,19 @@
  * or `bun run start` in the repository for that: the CLI loads the repository's .env (live world,
  * real database, real keys).
  *
- *   bun run build && node scripts/smoke-boot.mjs --dir <empty scratch directory> [--modes off,sandboxed] [--no-locked] [--no-bad-limit] [--keep]
+ *   bun run build && node scripts/smoke-boot.mjs --dir <empty scratch directory> [--modes off,sandboxed] [--no-locked] [--no-bad-limit] [--no-pglite] [--keep]
  *
  * The scratch directory must have no .env in it or in any directory above it.
  *
  * Each mode runs with SERVER_HOST=127.0.0.1 and an ELIZA_SERVER_AUTH_TOKEN the smoke chooses, and
  * the API is called with it. One more run (`off-locked`, skipped with --no-locked) sets neither: the
  * agent must then listen on loopback only and keep its API locked (401 without a token) while it
- * still boots, which is checked from its log. A last run (`off-bad-limit`, skipped with
+ * still boots, which is checked from its log. Another run (`off-bad-limit`, skipped with
  * --no-bad-limit) sets AI_MAX_CALLS_PER_HOUR to something that is not a number and
  * AI_MAX_TOKENS_CHAT to 0: the agent must say which variables it refuses and exit by itself,
- * without connecting to a world.
+ * without connecting to a world. One more (`off-pglite`, skipped with --no-pglite) gives the agent
+ * no POSTGRES_URL but a PGLITE_DATA_DIR inside its run directory: it must boot on elizaOS's embedded
+ * PGLite database exactly as the `off` run boots on PostgreSQL, and leave its database there.
  *
  * Per run, in <dir>/run-<mode>/ (created, and removed afterwards unless --keep):
  *   package.json   the repository's, with `scripts` replaced (see below)
@@ -29,6 +31,7 @@
  *   node_modules   a symlink to the repository's (package auto-install is switched off, so nothing
  *                  is written through it)
  *   pg/            a throwaway Postgres cluster (TCP on 127.0.0.1 only), stopped and deleted afterwards
+ *                  (not in the PGLite run, which has pglite/ instead: the embedded database's files)
  *   home/          an empty HOME, so no user-level configuration is found
  *
  * The agent's environment is exactly the `agentEnv` object below: nothing is inherited but PATH.
@@ -206,15 +209,15 @@ function sampleSockets(pid, remotes, listeners, chromium = new Set()) {
   }
 }
 
-async function smoke(mode, { locked = false, badLimit = false } = {}) {
+async function smoke(mode, { locked = false, badLimit = false, pglite = false } = {}) {
   const checks = [];
   const check = (name, ok, detail = '') => {
     checks.push({ name, ok: !!ok, detail });
     console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`);
   };
-  const runDir = path.join(baseDir, `run-${mode}${locked ? '-locked' : ''}${badLimit ? '-bad-limit' : ''}`);
+  const runDir = path.join(baseDir, `run-${mode}${locked ? '-locked' : ''}${badLimit ? '-bad-limit' : ''}${pglite ? '-pglite' : ''}`);
   if (existsSync(runDir)) throw new Error(`${runDir} already exists; remove it or use another --dir`);
-  console.log(`\n== HYPERFY_WORLD_SCRIPTS=${mode}${locked ? ', no SERVER_HOST and no ELIZA_SERVER_AUTH_TOKEN' : ', SERVER_HOST=127.0.0.1 and a token'}${badLimit ? `, AI_MAX_CALLS_PER_HOUR=${BAD_LIMIT}` : ''} in ${runDir}`);
+  console.log(`\n== HYPERFY_WORLD_SCRIPTS=${mode}${locked ? ', no SERVER_HOST and no ELIZA_SERVER_AUTH_TOKEN' : ', SERVER_HOST=127.0.0.1 and a token'}${badLimit ? `, AI_MAX_CALLS_PER_HOUR=${BAD_LIMIT}` : ''}${pglite ? ', PGLITE_DATA_DIR and no POSTGRES_URL' : ''} in ${runDir}`);
 
   const repoStorage = path.join(repo, 'localstorage.json');
   const submoduleStorage = path.join(repo, 'src/plugin-hyperfy/hyperfy/src/localstorage.json');
@@ -226,6 +229,7 @@ async function smoke(mode, { locked = false, badLimit = false } = {}) {
   let sampler = null;
   const log = [];
   const pgData = path.join(runDir, 'pg');
+  const pgliteData = path.join(runDir, 'pglite');
   try {
     // ---- the run directory ----
     mkdirSync(path.join(runDir, 'home'), { recursive: true });
@@ -246,12 +250,14 @@ async function smoke(mode, { locked = false, badLimit = false } = {}) {
     check('no .env in the run directory or any directory above it', envFiles.length === 0, envFiles.join(', '));
     if (envFiles.length) throw new Error('Refusing to start the agent below a .env file');
 
-    // ---- throwaway Postgres ----
+    // ---- throwaway Postgres (none in the PGLite run) ----
     const pgPort = await freePort();
-    run(path.join(PG_BIN, 'initdb'), ['-D', pgData, '-U', 'smoke', '--auth=trust', '-E', 'UTF8', '--no-locale']);
-    // TCP on loopback only: the run directory's path is too long for a unix socket
-    run(path.join(PG_BIN, 'pg_ctl'), ['-D', pgData, '-l', path.join(runDir, 'pg.log'), '-w', '-o', `-p ${pgPort} -c listen_addresses=127.0.0.1 -c unix_socket_directories=''`, 'start']);
-    pgStarted = true;
+    if (!pglite) {
+      run(path.join(PG_BIN, 'initdb'), ['-D', pgData, '-U', 'smoke', '--auth=trust', '-E', 'UTF8', '--no-locale']);
+      // TCP on loopback only: the run directory's path is too long for a unix socket
+      run(path.join(PG_BIN, 'pg_ctl'), ['-D', pgData, '-l', path.join(runDir, 'pg.log'), '-w', '-o', `-p ${pgPort} -c listen_addresses=127.0.0.1 -c unix_socket_directories=''`, 'start']);
+      pgStarted = true;
+    }
 
     // ---- the agent ----
     const serverPort = await freePort();
@@ -269,7 +275,7 @@ async function smoke(mode, { locked = false, badLimit = false } = {}) {
     const agentEnv = {
       PATH: process.env.PATH,
       HOME: path.join(runDir, 'home'),
-      POSTGRES_URL: `postgresql://smoke@127.0.0.1:${pgPort}/postgres`,
+      ...(pglite ? { PGLITE_DATA_DIR: pgliteData } : { POSTGRES_URL: `postgresql://smoke@127.0.0.1:${pgPort}/postgres` }),
       WS_URL: 'ws://127.0.0.1:9',
       ...(locked ? {} : { SERVER_HOST: '127.0.0.1', ELIZA_SERVER_AUTH_TOKEN: apiToken }),
       SERVER_PORT: String(serverPort),
@@ -405,6 +411,14 @@ async function smoke(mode, { locked = false, badLimit = false } = {}) {
     if (mode === 'sandboxed') check('the service says scripts run sandboxed', /World scripts run sandboxed/.test(logText()));
     check('the Hyperfy connect attempt is logged', logText().includes('Attempting automatic connection to default Hyperfy URL: ws://127.0.0.1:9'));
     check('the reconnect schedule is logged', /\[Hyperfy Reconnect\] Next attempt in \d+s/.test(logText()), (logText().match(/\[Hyperfy Reconnect\] Next attempt in \d+s/) ?? [''])[0]);
+    // world.init() resolves only once the engine's physics started: PhysX, whose .wasm the engine's
+    // glue code (bundled into dist/index.js) reads from next to it. Without the file the connection
+    // attempt fails after 30 s instead, and the reconnect line above comes all the same.
+    check(
+      'the engine started from the built files: world.init() completed, PhysX included',
+      logText().includes('Hyperfy world initialized.') && !logText().includes('(PhysX) did not start'),
+      (logText().match(/[^\n]*\(PhysX\) did not start[^\n]*/) ?? [''])[0].slice(0, 200)
+    );
     check('the scene-edit setting is logged at connect (off by default)', logText().includes('[Hyperfy] Scene edits by request: off'));
 
     // ---- Chromium: started by the agent for its render page, with no secrets and no way out ----
@@ -510,7 +524,7 @@ async function smoke(mode, { locked = false, badLimit = false } = {}) {
     check('every sampled connection of the agent and of what it started (Chromium included) went to 127.0.0.1', external.length === 0, `remote ends seen: ${JSON.stringify([...remotes].map((remote) => remote.replace(/:\d+$/, '')).filter((v, i, a) => a.indexOf(v) === i))}${external.length ? `, EXTERNAL: ${external.join(', ')}` : ''}`);
     // Its DevTools connection to the agent is a socket too: seeing it shows Chromium was among the sampled
     check("Chromium's own sockets were among those sampled, all to 127.0.0.1", chromiumRemotes.size > 0 && [...chromiumRemotes].every((remote) => isLoopback(remote.replace(/:\d+$/, ''))), `Chromium's remote ends: ${JSON.stringify([...chromiumRemotes])}`);
-    // With SERVER_HOST=127.0.0.1. Unset, elizaOS listens on every interface (*:port).
+    // With SERVER_HOST=127.0.0.1 (in the locked run the agent sets it itself; elizaOS alone would listen on every interface)
     console.log(`  info  the agent listens on: ${JSON.stringify([...listeners])} (SERVER_HOST=${agentEnv.SERVER_HOST}, SERVER_PORT=${serverPort})`);
 
     // ---- SIGTERM ----
@@ -538,6 +552,12 @@ async function smoke(mode, { locked = false, badLimit = false } = {}) {
       );
     }
 
+    if (pglite) {
+      // The embedded database: its files are where PGLITE_DATA_DIR says, and no PostgreSQL was there to use
+      const files = existsSync(pgliteData) ? readdirSync(pgliteData) : [];
+      check('the agent kept its database in PGLITE_DATA_DIR (PGLite files are there, no PostgreSQL was started)', files.includes('PG_VERSION') && !existsSync(pgData), `${files.length} entries in pglite/${files.includes('PG_VERSION') ? ', PG_VERSION among them' : ''}`);
+      check('no .env was written into the run directory', !existsSync(path.join(runDir, '.env')));
+    }
     storageChecks();
     console.log(`  info  storage file in the run directory: ${fingerprint(path.join(runDir, 'localstorage.json'))}`);
     console.log(`  info  files in the run directory: ${readdirSync(runDir).join(' ')}`);
@@ -561,7 +581,7 @@ async function smoke(mode, { locked = false, badLimit = false } = {}) {
 }
 
 if (!baseDir) {
-  console.error('Usage: node scripts/smoke-boot.mjs --dir <empty scratch directory> [--modes off,sandboxed] [--no-locked] [--no-bad-limit] [--keep]');
+  console.error('Usage: node scripts/smoke-boot.mjs --dir <empty scratch directory> [--modes off,sandboxed] [--no-locked] [--no-bad-limit] [--no-pglite] [--keep]');
   process.exit(2);
 }
 if (baseDir === repo || baseDir.startsWith(repo + path.sep)) {
@@ -579,6 +599,7 @@ const results = [];
 for (const mode of modes) results.push(...(await smoke(mode)).map((entry) => ({ mode, ...entry })));
 if (!args.includes('--no-locked')) results.push(...(await smoke('off', { locked: true })).map((entry) => ({ mode: 'off-locked', ...entry })));
 if (!args.includes('--no-bad-limit')) results.push(...(await smoke('off', { badLimit: true })).map((entry) => ({ mode: 'off-bad-limit', ...entry })));
+if (!args.includes('--no-pglite')) results.push(...(await smoke('off', { pglite: true })).map((entry) => ({ mode: 'off-pglite', ...entry })));
 const failed = results.filter((entry) => !entry.ok);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed${failed.length ? `; FAILED: ${failed.map((entry) => `[${entry.mode}] ${entry.name}`).join('; ')}` : ''}`);
 process.exit(failed.length ? 1 : 0);

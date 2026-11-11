@@ -186,7 +186,7 @@ describe('RenderWatchdog', () => {
     expect(tornDown).toEqual([1]);
   });
 
-  it("never takes the agent's own process group for the browser's, whatever the table says", async () => {
+  it("does not take the agent's own process group for the browser's when the table shows the browser leading it", async () => {
     // A table in which the browser seems to lead the group this process is in
     const table = vi.fn<Table>(async () => [
       { pid: own, ppid: 1, pgid: 400, rssBytes: MiB },
@@ -197,6 +197,24 @@ describe('RenderWatchdog', () => {
     watchdog.started(1, 400);
     await vi.advanceTimersByTimeAsync(10);
     expect(watchdog.ownership(1)).toEqual({ pids: [400], group: null });
+  });
+
+  it('does not own this process even when the table puts it under the browser: its memory is not counted, and it is not among what is killed', async () => {
+    let browserMiB = 100;
+    const table = vi.fn<Table>(async () => [
+      { pid: own, ppid: 100, pgid: own, rssBytes: 450 * MiB },
+      { pid: 100, ppid: 1, pgid: 100, rssBytes: browserMiB * MiB },
+      { pid: 101, ppid: 100, pgid: 100, rssBytes: 100 * MiB },
+    ]);
+    const { watchdog, kills, tornDown } = setup({ table });
+    watchdog.started(1, 100);
+    await vi.advanceTimersByTimeAsync(10);
+    // 200 MiB of 500: with this process counted it would be 650
+    expect([watchdog.lastSampleBytes, watchdog.ownership(1).pids, tornDown]).toEqual([200 * MiB, [100, 101], []]);
+    browserMiB = 600;
+    await vi.advanceTimersByTimeAsync(RENDER_IDLE_SAMPLE_INTERVAL_MS + 10);
+    expect(tornDown).toEqual([1]);
+    expect(kills).toEqual([[[100, 101], 100], [[100, 101], 100]]);
   });
 
   it('keeps owning a process it saw while its group stays the same, also once its parent is gone (a browser without a group of its own)', async () => {
@@ -238,7 +256,35 @@ describe('RenderWatchdog', () => {
     expect([tornDown, watchdog.isLive(1)]).toEqual([[], true]);
   });
 
-  it('has a limit, a deadline and intervals chosen from the measurements in the module header', () => {
+  it('holds a page initialisation to the deadline it is given, and says whether one was among the calls in flight', async () => {
+    const { watchdog, pending } = setup({ deadlineMs: 10_000 });
+    watchdog.started(1, 100);
+    const init = watchdog.watch(1, () => pending().promise, { deadlineMs: 500, init: true }).catch((error: unknown) => error);
+    const call = watchdog.watch(1, () => pending().promise).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(499);
+    expect(watchdog.isLive(1)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await init).toMatchObject({ name: 'RenderPageKilled', reason: 'deadline', callsInFlight: 2, initInFlight: true, message: expect.stringContaining('ran longer than 500 ms') });
+    expect(await call).toBe(await init);
+    // No initialisation among them: not flagged
+    watchdog.started(2, 100);
+    const plain = watchdog.watch(2, () => pending().promise, { deadlineMs: 500 }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(await plain).toMatchObject({ reason: 'deadline', generation: 2, callsInFlight: 1, initInFlight: false });
+  });
+
+  it('fails a call on a browser that is gone at once, without starting its work', async () => {
+    const { watchdog, tornDown } = setup();
+    watchdog.started(1, 100);
+    await expect(watchdog.watch(1, async () => 'while it is up')).resolves.toBe('while it is up');
+    watchdog.ended(1);
+    const work = vi.fn(async () => 'too late');
+    await expect(watchdog.watch(1, work)).rejects.toThrow('[RenderWatchdog] The browser of generation 1 is gone');
+    expect(work).not.toHaveBeenCalled();
+    expect([watchdog.isLive(1), watchdog.inFlight, tornDown]).toEqual([false, 0, []]);
+  });
+
+  it('has a limit of 3 GiB, a call deadline of 60 s, and samples every 250 ms during a call and every 2 s otherwise', () => {
     expect([RENDER_MEMORY_LIMIT_BYTES, RENDER_CALL_DEADLINE_MS, RENDER_SAMPLE_INTERVAL_MS, RENDER_IDLE_SAMPLE_INTERVAL_MS]).toEqual([3072 * MiB, 60_000, 250, 2000]);
   });
 });

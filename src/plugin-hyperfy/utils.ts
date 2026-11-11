@@ -1,8 +1,7 @@
 import { promises as fsPromises } from 'fs';
 import type { Action, IAgentRuntime, Memory, State } from '@elizaos/core';
-import { fileURLToPath } from 'url';
-import { dirname } from 'path';
 import path from 'path';
+import { bundledFile } from './lib/asset-root';
 import { describeUrl } from './lib/log-url';
 import { getUsageBudget } from '../usage-budget';
 import { assertTurnLive } from './lib/turn-context';
@@ -15,12 +14,6 @@ export async function hashFileBuffer(buffer: Buffer): Promise<string> {
     .map(b => b.toString(16).padStart(2, '0'))
     .join('')
   return hash
-}
-
-export function getModuleDirectory(): string {
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = dirname(__filename);
-  return __dirname
 }
 
 const mimeTypes: Record<string, string> = {
@@ -72,12 +65,10 @@ export const resolveUrl = async (
     return null;
   }
 
-  // Local files are only read from inside the module directory (bundled assets),
-  // never from arbitrary paths supplied by world content.
-  const moduleDir = path.resolve(getModuleDirectory());
-  const fullPath = path.resolve(moduleDir, url);
-  if (path.isAbsolute(url) || (fullPath !== moduleDir && !fullPath.startsWith(moduleDir + path.sep))) {
-    console.warn(`[resolveUrl] Refusing to read "${describeUrl(url)}" outside the module directory.`);
+  // The only local files read are the bundled ones (lib/asset-root.ts): assets/, avatars/, emotes/
+  const fullPath = bundledFile(url);
+  if (!fullPath) {
+    console.warn(`[resolveUrl] Refusing to read "${describeUrl(url)}": not a bundled file.`);
     return null;
   }
 
@@ -139,11 +130,7 @@ export async function getHyperfyActions(
   return validated.filter(Boolean) as Action[];
 }
 
-/**
- * Formats the provided actions into a detailed string listing each action's name and description, separated by commas and newlines.
- * @param actions - An array of `Action` objects to format.
- * @returns A detailed string of actions, including names and descriptions.
- */
+/** The actions as `- **NAME**: description` lines in random order, separated by blank lines. Reorders the given array in place. */
 export function formatActions(actions: Action[]) {
   return actions
     .sort(() => 0.5 - Math.random())
@@ -319,9 +306,7 @@ export function elevenLabsSpeech(text: string): Promise<SpeechAttempt> {
   );
 }
 
-/**
- * Direct OpenAI TTS API call - bypasses the @elizaos/plugin-openai which has issues reading the API key
- */
+/** One OpenAI text-to-speech request, made directly (this project loads no OpenAI plugin). */
 function openAISpeech(text: string): Promise<SpeechAttempt> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -350,19 +335,6 @@ function openAISpeech(text: string): Promise<SpeechAttempt> {
       }),
     })
   );
-}
-
-/**
- * ElevenLabs text-to-speech (one request, nothing reserved here).
- * @returns the audio (MP3 by default), or null when ElevenLabs isn't configured or the call fails
- */
-export async function generateElevenLabsTTS(text: string): Promise<Buffer | null> {
-  return (await elevenLabsSpeech(text)).audio;
-}
-
-/** OpenAI text-to-speech (one request, nothing reserved here). The audio, or null. */
-export async function generateOpenAITTS(text: string): Promise<Buffer | null> {
-  return (await openAISpeech(text)).audio;
 }
 
 /**
@@ -419,7 +391,8 @@ const SPEECH_PROVIDERS = [
 /**
  * Speech audio for `text`: ElevenLabs, then OpenAI when that gave none. Each request is reserved
  * against VOICE_TTS_MAX_CHARS_PER_DAY on its own, before it is sent. A request the provider refused
- * (a 4xx answer) is given back; any other failed one stays counted, as it may have been billed. A
+ * (a 4xx answer other than 408 and 409) is given back; any other failed one stays counted, as it may
+ * have been billed. A
  * fallback the limit does not admit is not made, and neither is one for a turn that may no longer
  * act (lib/turn-context.ts: TurnCancelled is thrown, the requests already sent stay counted).
  * Resolves to null when no provider gave audio; throws TtsLimitReached when the limit admits not

@@ -1,10 +1,11 @@
 /**
  * The one way a URL is written into a log line or an error message (which can reach chat): scheme,
- * host and path, with no user name or password, no query values (the names stay), no fragment, and
- * at most MAX_LOGGED_URL characters in all (a note of the full length included when it is cut). A
+ * host and path, with no user name or password, no query values (the names stay; a query part
+ * without "=" counts as a name and is written), no fragment, and at most MAX_LOGGED_URL characters in all (a note of the full length included when it is cut). A
  * data: URL keeps its media type only. Text that does not parse but has a scheme, a user part or an
  * authority, a URL of any other scheme, and a blob: inside a blob:, keep only their length. Signed
- * URLs carry their signature in the query and credentials in the user part; neither is ever written.
+ * URLs carry their signature in the query and credentials in the user part: the user part is never
+ * written, a signature only when it stands in the query without a name.
  */
 
 export const MAX_LOGGED_URL = 200;

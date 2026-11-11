@@ -210,7 +210,7 @@ describe('BehaviorManager autonomous turns', () => {
     session = withParts(sessionFor(world, { runtime }), { emotes, build: buildManager, messages: { sendMessage: vi.fn() }, voice: { speak: vi.fn(), stop: vi.fn() } });
     const manager = new BehaviorManager(runtime, session, AUTONOMY);
     const tick = () => (manager as any).executeBehavior() as Promise<boolean>;
-    return { runtime, recorded, useModel, buildManager, emotes, controls, tick };
+    return { runtime, recorded, useModel, buildManager, emotes, controls, tick, session };
   }
 
   it('edits nothing when the plan names the scene edit by name, substring or simile, and drops an empty name', async () => {
@@ -240,5 +240,23 @@ describe('BehaviorManager autonomous turns', () => {
     expect(budget.snapshot(60_000).autonomy).toEqual({ aiTicks: 1, scriptedTicks: 1 });
     // The scripted step: greeting the newcomer
     expect(emotes.playEmote).toHaveBeenCalledWith('waving both hands');
+  });
+
+  it('runs no scripted step when its connection ended while the tick ran out of Claude budget', async () => {
+    const budget = new UsageBudget(noLimits);
+    resetUsageBudget(budget);
+    // As the fallback test above, but the connection ends during the model call that hits the limit
+    const harness: ReturnType<typeof realRuntime> = realRuntime('<response><thought>t</thought><actions>HYPERFY_USE_ITEM</actions></response>', {
+      [ModelType.OBJECT_SMALL]: () => {
+        void harness.session.end();
+        throw new AiBudgetExceededError('AI_MAX_CALLS_PER_HOUR=1');
+      },
+    });
+    await expect(harness.tick()).resolves.toBe(true);
+    expect(harness.useModel.mock.calls.map(([type]) => type)).toEqual([ModelType.TEXT_LARGE, ModelType.OBJECT_SMALL]);
+    expect(budget.snapshot(60_000).autonomy).toEqual({ aiTicks: 1, scriptedTicks: 0 });
+    expect(harness.emotes.playEmote).not.toHaveBeenCalled();
+    expect(harness.controls.followEntity).not.toHaveBeenCalled();
+    expect(harness.controls.faceEntity).not.toHaveBeenCalled();
   });
 });

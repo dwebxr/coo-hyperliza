@@ -5,7 +5,7 @@ import { Ranks, worldIdentity } from './world-identity';
 
 /**
  * Who may make the agent do what. Principle: the agent never does for someone what the world
- * would not let them do themselves.
+ * would not let them do themselves, except for the ids the operator lists in HYPERFY_OPERATOR_IDS.
  */
 
 type Env = Record<string, string | undefined>;
@@ -18,8 +18,9 @@ export type SceneEditsMode = 'off' | 'builders';
 
 /**
  * HYPERFY_SCENE_EDITS: `off` (the default) or `builders`. Who asks for an edit is the sender id of
- * a chat message, which only a server that sets it itself (coo-world) makes trustworthy; stock
- * Hyperfy passes on whatever id the sending client wrote. An unknown value counts as off.
+ * a chat message (or the voice room's participant id of a speaker), which only a server that sets
+ * it itself (coo-world) makes trustworthy; stock Hyperfy passes on whatever id the sending client
+ * wrote. An unknown value counts as off.
  */
 export function readSceneEditsMode(env: Env = process.env): { mode: SceneEditsMode; problem?: string } {
   const raw = env[SCENE_EDITS_ENV]?.trim().toLowerCase();
