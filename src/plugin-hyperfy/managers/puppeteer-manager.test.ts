@@ -619,18 +619,20 @@ describe('PuppeteerManager', () => {
     }
   });
 
-  it('names another player\'s inline (data:) avatar for drawing by the key it was put into the page under, never by the URL itself', async () => {
-    const { dataUrlName } = await import('../lib/asset-bytes');
+  it('names another player\'s inline (data:) avatar for drawing by the name the loader\'s download gives it (the key it registers the avatar under), never by the URL itself', async () => {
+    const { fetchAssetBytes } = await import('../lib/asset-bytes');
     const manager = PuppeteerManager.getOrCreate() as any;
     const page = await manager.init();
     const world = scene();
     const inline = `data:model/gltf-binary;base64,${'QUJD'.repeat(50)}`;
     world.entities.players.get('p1')!.avatarUrl = inline;
+    // What systems/loader.ts hands to loadVRMBytes as the avatar's key (its own test covers that hand-over)
+    const registered = (await fetchAssetBytes(world, inline, 'avatar')).url;
     page.evaluate.mockClear();
     await manager.capture(world, { kind: 'around' });
     const players = page.evaluate.mock.calls[0][3];
-    expect(players).toEqual([expect.objectContaining({ id: 'p1', avatarUrl: dataUrlName(inline) })]);
-    expect(players[0].avatarUrl).toMatch(/^data:model\/gltf-binary;sha256=[0-9a-f]{64}$/);
+    expect(players).toEqual([expect.objectContaining({ id: 'p1', avatarUrl: registered })]);
+    expect(registered).toMatch(/^data:model\/gltf-binary;sha256=[0-9a-f]{64}$/);
   });
 
   it('takes one snapshot at a time, in the order they were asked for, and a caller whose signal fires stops waiting without a page call', async () => {
