@@ -9,6 +9,7 @@ import { childEnv } from '../lib/child-env';
 import { modelBudget } from '../lib/gltf-budget';
 import { RenderWatchdog, type RenderWatchdogOptions } from '../lib/render-watchdog';
 import { ScopedLock } from '../lib/scoped-lock';
+import { oneLine } from '../lib/text';
 
 // This module loads without the service and the engine behind it (scripts/smoke-chromium.mjs runs
 // it that way): what it draws of a world is handed to it (capture), never looked up.
@@ -57,6 +58,7 @@ interface RenderPageWindow {
     registerTexture(base64: string, contentType: string, slot: string, source: string, op?: string): Promise<string>
     loadEnvironmentHDR(base64: string, op?: string): Promise<void>
     rehydrate(sceneJson: unknown, stripSlots: readonly string[], players: unknown[]): unknown
+    sceneReport(): Record<string, unknown>
     settle(op: string, step: 'rollback' | 'forget'): unknown
     releaseTexture(id: string, slot: string): unknown
   }
@@ -66,6 +68,32 @@ declare const window: RenderPageWindow
 
 const debugSnapshotFile = (view: CaptureView) =>
   view.kind === 'around' ? 'scene_equirectangular.jpeg' : view.kind === 'facing' ? `scene_facing_${view.direction}.jpeg` : 'scene_view_to_target.jpeg'
+
+/** HYPERFY_DEBUG_SNAPSHOTS=true: snapshots are also written to disk, and what went into them is logged */
+const debugSnapshots = () => process.env.HYPERFY_DEBUG_SNAPSHOTS === 'true'
+/** At most this many lines of a render page's own console are passed on to the log (diagnostics) */
+const PAGE_LOG_LINES = 40
+
+/** What a scene in three's JSON format holds, in numbers (diagnostics: nothing of the world's own text) */
+export function sceneJsonSummary(sceneJson: unknown): string {
+  const count = { objects: 0, meshes: 0, instanced: 0, instances: 0, hidden: 0, lights: 0 }
+  const walk = (object: any, depth: number) => {
+    if (!object || typeof object !== 'object' || depth > 64) return
+    count.objects++
+    if (object.visible === false) count.hidden++
+    if (object.type === 'InstancedMesh') {
+      count.instanced++
+      count.instances += Number.isFinite(object.count) ? object.count : 0
+    } else if (typeof object.type === 'string' && object.type.endsWith('Mesh')) count.meshes++
+    else if (typeof object.type === 'string' && object.type.endsWith('Light')) count.lights++
+    if (Array.isArray(object.children)) for (const child of object.children) walk(child, depth + 1)
+  }
+  const json = sceneJson as any
+  walk(json?.object, 0)
+  const sizeOf = (list: unknown) => (Array.isArray(list) ? list.length : 0)
+  return `${count.objects} objects (${count.meshes} meshes, ${count.instanced} instanced meshes with ${count.instances} instances, ${count.lights} lights, ${count.hidden} hidden), ` +
+    `${sizeOf(json?.geometries)} geometries, ${sizeOf(json?.materials)} materials, fog ${json?.object?.fog ? 'on' : 'off'}`
+}
 
 const STRIP_SLOTS: readonly string[] = [
   'map', 'aoMap', 'alphaMap',
@@ -377,6 +405,23 @@ export class PuppeteerManager {
       lost()
       page.close().catch(() => { })
     })
+    // Diagnostics only: three's complaints about a shader or a scene it cannot read go to the
+    // page's console and nowhere else. World content can be in them: one line each, cut short,
+    // and no more than PAGE_LOG_LINES different ones per page (three repeats some with every draw).
+    if (debugSnapshots()) {
+      const said = new Set<string>()
+      const say = (kind: string, text: string) => {
+        const line = `[RenderPage] ${kind}: ${oneLine(String(text), 300)}`
+        if (said.size >= PAGE_LOG_LINES || said.has(line)) return
+        said.add(line)
+        console.warn(line)
+      }
+      page.on('console', (message) => {
+        const type = String(message.type())
+        if (type === 'error' || type === 'warn' || type === 'warning') say(type, message.text())
+      })
+      page.on('pageerror', (error) => say('uncaught', messageOf(error)))
+    }
     try {
       // The page loads nothing by URL: every request it makes is refused. blob: and data:
       // URLs, which is how assets reach it, never become requests.
@@ -629,5 +674,17 @@ export class PuppeteerManager {
       (sceneJson, STRIP_SLOTS, players) => { window.agentPage!.rehydrate(sceneJson, STRIP_SLOTS, players) },
       sceneJson, STRIP_SLOTS, players
     ));
+
+    // Diagnostics: what was sent, and what the page made of it and drew. Never fails the snapshot.
+    if (debugSnapshots()) {
+      try {
+        const drawn = await this.watched(page, () => page.evaluate(() => window.agentPage!.sceneReport()))
+        const eye = world.entities.player?.base.position.toArray().map((value) => Number(value).toFixed(1)).join(', ')
+        console.info(`[PuppeteerManager] Snapshot scene sent: ${sceneJsonSummary(sceneJson)}; ${players.length} other player(s); the agent stands at (${eye})`)
+        console.info(`[PuppeteerManager] Snapshot scene in the page: ${oneLine(JSON.stringify(drawn) ?? String(drawn), 600)}`)
+      } catch (error) {
+        console.warn('[PuppeteerManager] No scene report:', messageOf(error))
+      }
+    }
   }
 }

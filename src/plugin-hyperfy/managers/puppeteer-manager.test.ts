@@ -81,7 +81,7 @@ vi.mock('fs', async (importOriginal) => {
   return { ...mocked, default: mocked };
 });
 
-import { OFFLINE_CHROMIUM_ARGS, PageOperationCancelled, PuppeteerManager } from './puppeteer-manager';
+import { OFFLINE_CHROMIUM_ARGS, PageOperationCancelled, PuppeteerManager, sceneJsonSummary } from './puppeteer-manager';
 import { RenderBreaker, RenderPageKilled, RenderPageUnavailable } from '../lib/render-watchdog';
 import { PageWork } from '../lib/page-work';
 
@@ -694,6 +694,91 @@ describe('PuppeteerManager', () => {
     vi.stubEnv('HYPERFY_DEBUG_SNAPSHOTS', 'true');
     await all();
     expect(writes.map((file) => file.split('/').pop())).toEqual(['scene_equirectangular.jpeg', 'scene_facing_front.jpeg', 'scene_view_to_target.jpeg']);
+  });
+
+  it('logs what went into a snapshot only when HYPERFY_DEBUG_SNAPSHOTS=true: the scene in numbers and the page\'s report, and a failed report does not fail the snapshot', async () => {
+    const world = scene();
+    const manager = PuppeteerManager.getOrCreate() as any;
+    const page = await manager.init();
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const said = () => info.mock.calls.map((call) => String(call[0])).filter((line) => line.includes('Snapshot scene'));
+
+    await manager.capture(world, { kind: 'around' });
+    expect(said()).toEqual([]);
+
+    vi.stubEnv('HYPERFY_DEBUG_SNAPSHOTS', 'true');
+    page.evaluate.mockClear();
+    await manager.capture(world, { kind: 'around' });
+    // Rebuild, report, draw: the report is asked for between the two
+    expect(page.evaluate).toHaveBeenCalledTimes(3);
+    expect(said()).toEqual([
+      expect.stringMatching(/^\[PuppeteerManager\] Snapshot scene sent: \d+ objects \(\d+ meshes, \d+ instanced meshes with \d+ instances, \d+ lights, \d+ hidden\), \d+ geometries, \d+ materials, fog (on|off); 1 other player\(s\); the agent stands at \(1\.0, 0\.0, 1\.0\)$/),
+      expect.stringMatching(/^\[PuppeteerManager\] Snapshot scene in the page: /),
+    ]);
+
+    // The report failing in the page costs the report, not the picture
+    info.mockClear();
+    let calls = 0;
+    const evaluate = page.evaluate.getMockImplementation();
+    page.evaluate.mockImplementation(async (...args: any[]) => {
+      if (++calls === 2) throw new Error('no report');
+      return evaluate(...args);
+    });
+    await expect(manager.capture(world, { kind: 'around' })).resolves.toMatch(/^data:image\/jpeg;base64,/);
+    expect(said()).toEqual([]);
+    expect(warn.mock.calls.some((call) => String(call[0]).includes('No scene report'))).toBe(true);
+    page.evaluate.mockImplementation(evaluate);
+  });
+
+  it('sums a scene in three\'s JSON format up in numbers, whatever shape it has', () => {
+    const json = {
+      geometries: [{}, {}],
+      materials: [{}],
+      object: {
+        type: 'Scene',
+        fog: { type: 'Fog' },
+        children: [
+          { type: 'Mesh' },
+          { type: 'SkinnedMesh', visible: false },
+          { type: 'InstancedMesh', count: 7 },
+          { type: 'InstancedMesh', count: 'many' },
+          { type: 'DirectionalLight' },
+          { type: 'Group', children: [{ type: 'Mesh' }, null, 3] },
+        ],
+      },
+    };
+    expect(sceneJsonSummary(json)).toBe('8 objects (3 meshes, 2 instanced meshes with 7 instances, 1 lights, 1 hidden), 2 geometries, 1 materials, fog on');
+    for (const odd of [undefined, null, 'scene', 7, {}, { object: 'x' }]) {
+      expect(sceneJsonSummary(odd)).toMatch(/^[01] objects \(0 meshes, 0 instanced meshes with 0 instances, 0 lights, 0 hidden\), 0 geometries, 0 materials, fog off$/);
+    }
+  });
+
+  it('passes the render page\'s console errors and warnings on to the log only with HYPERFY_DEBUG_SNAPSHOTS=true, one cut line each, a repeated one once, and no more than 40 per page', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fromPage = () => warn.mock.calls.map((call) => String(call[0])).filter((line) => line.startsWith('[RenderPage]'));
+    const message = (type: string, text: string) => ({ type: () => type, text: () => text });
+
+    const quiet = await (PuppeteerManager.getOrCreate() as any).init();
+    quiet.emit('console', message('error', 'THREE.WebGLProgram: shader error'));
+    expect(fromPage()).toEqual([]);
+    await PuppeteerManager.getOrCreate().close();
+
+    vi.stubEnv('HYPERFY_DEBUG_SNAPSHOTS', 'true');
+    const page = await (PuppeteerManager.getOrCreate() as any).init();
+    page.emit('console', message('log', 'not passed on'));
+    page.emit('console', message('error', `shader error\n[Security] forged line ${'x'.repeat(500)}`));
+    page.emit('console', message('warn', 'a warning'));
+    page.emit('console', message('warn', 'a warning'));
+    page.emit('pageerror', new Error('thrown in the page'));
+    const lines = fromPage();
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toMatch(/^\[RenderPage\] error: shader error \[Security\] forged line x+$/);
+    expect(lines[0]).not.toContain('\n');
+    expect(lines[0].length).toBeLessThanOrEqual('[RenderPage] error: '.length + 300);
+    expect(lines.slice(1)).toEqual(['[RenderPage] warn: a warning', '[RenderPage] uncaught: thrown in the page']);
+    for (let i = 0; i < 100; i++) page.emit('console', message('error', `again ${i}`));
+    expect(fromPage()).toHaveLength(40);
   });
 });
 

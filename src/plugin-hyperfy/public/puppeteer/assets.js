@@ -173,6 +173,41 @@ async function loadGlb(base64, stripSlots, maxExportBytes, op) {
   }
 }
 
+/**
+ * three-vrm 3.3.3's MToon shader reads a mesh's tangents the way three.js does from 0.151 on, and
+ * does not compile in 0.132.2 for a mesh that has both a normal map and tangents. Without the
+ * tangents it works them out per pixel, which 0.132.2 can do: every mesh that only toon materials
+ * draw gets a geometry without them (its own, or a copy when other meshes share it and need
+ * theirs). GLTFLoader turned the normal map's y around in the materials of a mesh with tangents;
+ * that is turned back.
+ */
+function withoutToonTangents(root) {
+  const toonOnly = (mesh) => {
+    const materials = [mesh.material].flat();
+    return materials.length > 0 && materials.every((material) => material && material.isMToonMaterial);
+  };
+  const users = new Map(); // geometry with tangents -> the meshes it is drawn as
+  root.traverse((obj) => {
+    if (!obj.isMesh || !obj.geometry || !obj.geometry.attributes.tangent) return;
+    users.set(obj.geometry, [...(users.get(obj.geometry) ?? []), obj]);
+  });
+  const turnedBack = new Set();
+  for (const [geometry, meshes] of users) {
+    const toon = meshes.filter(toonOnly);
+    if (toon.length === 0) continue;
+    const bare = toon.length === meshes.length ? geometry : geometry.clone();
+    bare.deleteAttribute('tangent');
+    for (const mesh of toon) {
+      mesh.geometry = bare;
+      for (const material of [mesh.material].flat()) {
+        if (turnedBack.has(material) || !material.normalScale) continue;
+        material.normalScale.y *= -1;
+        turnedBack.add(material);
+      }
+    }
+  }
+}
+
 /** Parses a VRM, keeps a factory for it under `key` (the avatar's URL), and returns it as a GLB (at most `maxExportBytes`). */
 async function loadVrm(key, base64, maxExportBytes, op) {
   let gltf = null;
@@ -184,6 +219,7 @@ async function loadVrm(key, base64, maxExportBytes, op) {
   try {
     gltf = await parseGltf(window.VRMLoader, bytesOf(base64));
     const scene = gltf.scene;
+    withoutToonTangents(scene);
     factory = window.createVRMFactory(gltf, (m) => m);
 
     window.renderer.render(window.scene, window.camera);
@@ -293,6 +329,10 @@ function loadEnvironmentHDR(base64, op) {
   const previous = window.environment;
   const before = [window.environment, window.scene.environment, window.scene.background];
   const hdr = hdrTexture(bytesOf(base64).buffer);
+  // The file is a picture of the whole sky. Without this three.js takes it for a flat one: it then
+  // lights nothing (a material with no texture of its own is drawn black on every side the sun
+  // does not reach) and, as a background, is the same stretched picture whichever way one looks
+  hdr.mapping = window.THREE.EquirectangularReflectionMapping;
   try {
     window.environment = hdr;
     window.scene.environment = hdr;
@@ -399,6 +439,51 @@ function rehydrate(sceneJson, stripSlots, players) {
   window.renderer.render(window.scene, window.camera);
 }
 
+/**
+ * Diagnostics (HYPERFY_DEBUG_SNAPSHOTS): what the scene holds as the page has it, and what the
+ * draw at the end of rehydrate() drew. Numbers only.
+ */
+function sceneReport() {
+  const report = { meshes: 0, instancedMeshes: 0, instances: 0, hidden: 0, lights: 0, materials: 0, namedMaterials: 0, namedWithoutTexture: 0 };
+  const seen = new Set();
+  window.scene.traverse((object) => {
+    if (object.visible === false) report.hidden++;
+    if (object.isLight) report.lights++;
+    if (!object.isMesh) return;
+    if (object.isInstancedMesh) {
+      report.instancedMeshes++;
+      report.instances += Number.isFinite(object.count) ? object.count : 0;
+    } else report.meshes++;
+    for (const material of Array.isArray(object.material) ? object.material : [object.material]) {
+      if (!material || seen.has(material)) continue;
+      seen.add(material);
+      report.materials++;
+      const id = material.userData?.materialId;
+      if (typeof id !== 'string' || !id) continue;
+      report.namedMaterials++;
+      let found = false;
+      for (const key of texturesMap.keys()) if (key.startsWith(`${id}:`)) found = true;
+      if (!found) report.namedWithoutTexture++;
+    }
+  });
+  const info = window.renderer.info;
+  const programs = info.programs || [];
+  return {
+    ...report,
+    texturesKept: texturesMap.size,
+    avatarsKept: avatarMap.size,
+    avatarsDrawn: window.activeVRMInstances.length,
+    drawCalls: info.render.calls,
+    triangles: info.render.triangles,
+    programs: programs.length,
+    failedPrograms: programs.filter((program) => program.diagnostics && program.diagnostics.runnable === false).length,
+    background: !!window.scene.background,
+    environment: !!window.scene.environment,
+    fog: !!window.scene.fog,
+    contextLost: window.renderer.getContext().isContextLost(),
+  };
+}
+
 /** Drops a texture registerTexture kept, for an agent that accepted it and then had no use for it */
 function releaseTexture(id, slot) {
   const key = `${id}:${slot}`;
@@ -406,4 +491,4 @@ function releaseTexture(id, slot) {
   if (texture) forgetTexture(key, texture);
 }
 
-window.agentPage = { LIMITS, loadGlb, loadVrm, registerTexture, releaseTexture, loadEnvironmentHDR, hdrTexture, rehydrate, settle, pendingSettlements };
+window.agentPage = { LIMITS, loadGlb, loadVrm, registerTexture, releaseTexture, loadEnvironmentHDR, hdrTexture, rehydrate, sceneReport, settle, pendingSettlements };
