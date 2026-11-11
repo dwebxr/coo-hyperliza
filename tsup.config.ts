@@ -3,12 +3,14 @@ import { defineConfig } from 'tsup';
 export default defineConfig({
   entry: ['src/index.ts'],
   outDir: 'dist',
-  tsconfig: './tsconfig.build.json', // Use build-specific tsconfig
-  platform: 'node', // Revert platform back to node
+  tsconfig: './tsconfig.build.json',
+  platform: 'node',
   sourcemap: true,
-  clean: true,
-  format: ['esm'], // Ensure you're targeting CommonJS
-  dts: false, // Skip DTS generation to avoid external import issues // Ensure you're targeting CommonJS
+  // dist/ is cleaned by scripts/build-assets.mjs, which runs next: tsup's own clean deletes files
+  // and leaves their directories behind
+  clean: false,
+  format: ['esm'],
+  dts: false,
   external: [
     'dotenv',
     'fs',
@@ -23,5 +25,4 @@ export default defineConfig({
     'stream',
     'util'
   ],
-  banner: {},
 });

@@ -1,12 +1,14 @@
 import type { Content } from '@elizaos/core';
-import { OPENPAY_LINK_FLAG, SHARE_ACTION, formatLinkMessage, resolveProduct } from '../../openpay-store';
+import { OPENPAY_LINK_FLAG, SHARE_ACTION, formatLinkMessage, isShareable, isSpecificTitle, resolveProduct } from '../../openpay-store';
 import type { StoreProduct } from '../../openpay-store/catalog';
+import { findAddresses } from '../../openpay-store/addresses';
 import { IDLE_EMOTES } from './idle-behavior';
 
 /**
- * What the agent says when the Claude budget is used up, so it never just goes silent:
- * a purchase link when the message names a product on the shelf, otherwise a short notice
- * (at most once per player per NOTICE_INTERVAL_MS) that says how to still get a link.
+ * What the agent says when the Claude budget is used up, instead of going silent: a purchase link
+ * when the message names a product on the shelf, otherwise a short notice (when sent up front, at
+ * most once per player and room per OFFLINE_NOTICE_INTERVAL_MS: handlers/messageReceivedHandler.ts)
+ * that says how to still get a link when there is a product to name.
  */
 
 export const OFFLINE_NOTICE_INTERVAL_MS = 5 * 60_000;
@@ -22,11 +24,13 @@ export function composeOfflineReply({
   japanese: boolean;
 }): { kind: 'link' | 'notice'; content: Content } {
   const product = resolveProduct(products, { messageText: text });
-  if (product) {
+  // null when the link cannot be posted safely (logged): the notice instead
+  const link = product ? formatLinkMessage(product) : null;
+  if (product && link) {
     return {
       kind: 'link',
       content: {
-        text: formatLinkMessage(product),
+        text: link,
         actions: [SHARE_ACTION],
         source: 'hyperfy',
         // Posted to chat, never read aloud (see the Hyperfy callbacks)
@@ -35,7 +39,13 @@ export function composeOfflineReply({
     };
   }
 
-  const examples = products.slice(0, EXAMPLE_TITLES).map((p) => p.title);
+  // Only names that would be recognised when said (resolveProduct looks for specific titles only),
+  // of products whose link can be posted, and none that would put an address into the notice
+  // (the link message shows a title cut, the notice the whole title)
+  const examples = products
+    .filter((p) => isSpecificTitle(p.title) && isShareable(p) && !findAddresses(p.title).length)
+    .map((p) => p.title)
+    .slice(0, EXAMPLE_TITLES);
   const shopHint = examples.length
     ? japanese
       ? ` 商品名を言ってもらえれば、購入リンクをお送りします（例: ${examples.join('、')}）。`
@@ -52,8 +62,13 @@ export function composeOfflineReply({
   };
 }
 
-/** Allows one notice per key per interval. */
+// Players whose last notice is remembered (more than a world usually holds). The least recently
+// noticed is forgotten first, and a forgotten one can get a notice again at once.
+export const OFFLINE_NOTICE_TRACKED_KEYS = 256;
+
+/** Allows one notice per key per interval; remembers at most OFFLINE_NOTICE_TRACKED_KEYS keys. */
 export class NoticeThrottle {
+  /** Insertion order is recency: the first key is the least recently noticed. */
   private last = new Map<string, number>();
 
   constructor(
@@ -65,11 +80,13 @@ export class NoticeThrottle {
     const t = this.now();
     const previous = this.last.get(key);
     if (previous !== undefined && t - previous < this.intervalMs) return false;
+    this.last.delete(key);
     this.last.set(key, t);
-    // Forget players who have not asked for a while
-    if (this.last.size > 500) {
-      for (const [k, at] of this.last) if (t - at >= this.intervalMs) this.last.delete(k);
-    }
+    if (this.last.size > OFFLINE_NOTICE_TRACKED_KEYS) this.last.delete(this.last.keys().next().value as string);
     return true;
+  }
+
+  get trackedKeys(): number {
+    return this.last.size;
   }
 }

@@ -4,10 +4,11 @@
  * here tomorrow and explain X?" does not); everything else goes through the normal reply.
  */
 
+import { escapeRegExp } from './text';
+
 export type SimpleCommand = 'come' | 'stop';
 
 const ASCII_ONLY = /^[\x00-\x7F]+$/;
-const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const COME = [
   // English, spaces removed

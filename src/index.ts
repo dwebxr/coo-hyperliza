@@ -3,9 +3,11 @@ import { Buffer } from 'buffer';
 
 import dotenv from 'dotenv';
 
-// Values from the .env file, applied as character secrets below
-const envFile = dotenv.config().parsed ?? {};
+// The keys of the .env file: characterSecrets (below) gives each its value in the character
+// secrets, or the null that deletes a stored copy
+const envFileKeys = Object.keys(dotenv.config().parsed ?? {});
 import {
+  getAllowedEnvVars,
   logger,
   type Character,
   type IAgentRuntime,
@@ -17,7 +19,33 @@ import { anthropicModelsPlugin } from './anthropic-models';
 import { elevenLabsSpeechPlugin } from './elevenlabs-speech';
 import { createOpenPayStorePlugin } from './openpay-store';
 import { planModelPlugins } from './llm-provider';
-import { startUsageReports } from './usage-budget';
+import { startUsageReports, usageLimitProblems } from './usage-budget';
+import { characterSecrets, errorReportingDefaults, modelEndpointWarnings, removeStaleStoredSecrets, secureServerDefaults } from './agent-secrets';
+import { takeTipWalletAccount } from './plugin-hyperfy/lib/tip-wallet';
+import { guardErrorEventsForWorldScripts } from './plugin-hyperfy/lib/script-sandbox';
+
+// The tip wallet's key moves into memory and out of process.env (the server's later re-read of
+// .env puts it back until the service takes it again; characterSecrets keeps it out of the stored
+// secrets either way)
+takeTipWalletAccount();
+// HYPERFY_WORLD_SCRIPTS=sandboxed: the process's error events are guarded from here on, before
+// elizaOS's server and the plugins register their listeners (src/plugin-hyperfy/lib/error-events.ts)
+guardErrorEventsForWorldScripts(process.env);
+// Before the server starts listening: loopback unless SERVER_HOST says otherwise, and a locked API
+// unless ELIZA_SERVER_AUTH_TOKEN is set
+for (const line of secureServerDefaults(process.env)) logger.warn(line);
+// Before the server starts: no error reports to elizaOS's Sentry project unless SENTRY_DSN says where
+for (const line of errorReportingDefaults(process.env)) logger.warn(line);
+// Where Claude requests go, when that is not Anthropic's API
+for (const line of modelEndpointWarnings(process.env)) logger.warn(line);
+
+// A usage limit that cannot be read must not mean "no limit": say which one and stop
+const limitProblems = usageLimitProblems(process.env);
+if (limitProblems.length) {
+  for (const line of limitProblems) logger.error(line);
+  logger.error('[Usage] Not starting: fix the value(s) above in .env. An unreadable limit is never taken to mean "no limit".');
+  process.exit(1);
+}
 
 let modelPlan: ReturnType<typeof planModelPlugins>;
 try {
@@ -28,20 +56,15 @@ try {
   process.exit(1);
 }
 
-/**
- * Represents the default character (Eliza) with her specific attributes and behaviors.
- * Eliza responds to messages relevant to the community manager, offers help when asked, and stays focused on her job.
- * She interacts with users in a concise, direct, and helpful manner, using humor and silence effectively.
- * Eliza's responses are geared towards resolving issues, offering guidance, and maintaining a positive community environment.
- */
+/** Coo's character: name, system prompt, topics, examples and style. */
 export const character: Character = {
   name: 'Coo',
   plugins: modelPlan.packages,
   settings: {
-    // .env is authoritative. elizaOS keeps a copy of the environment from earlier runs in the agent's
-    // database record and prefers it over the current environment; secrets set here override that copy
-    // (an old, revoked API key stored there made every model call fail with 401).
-    secrets: { ...envFile },
+    // Not the .env file: elizaOS stores these in the agent's database record and its API returns
+    // them. A null deletes the stored copy of that key (src/agent-secrets.ts);
+    // src/anthropic-models.ts reads process.env first.
+    secrets: characterSecrets(envFileKeys, { env: process.env, coreCopies: getAllowedEnvVars() }),
     avatar: 'https://dwebxr.xyz/images/coo.jpg',
     voice: {
       model: 'tts-1',
@@ -223,6 +246,10 @@ export const character: Character = {
 const initCharacter = async ({ runtime }: { runtime: IAgentRuntime }) => {
   logger.info('Initializing character');
   logger.info('Name: ', character.name);
+  // Stored secrets nothing reads and that are not keys of .env (characterSecrets covers those that are)
+  await removeStaleStoredSecrets(runtime, { env: process.env, coreCopies: getAllowedEnvVars() }).catch((error) =>
+    logger.warn(`[Secrets] Could not clean up stored secrets: ${error instanceof Error ? error.message : String(error)}`)
+  );
   // Claude / vision / voice usage per purpose, to tune the limits in .env
   startUsageReports();
 };
@@ -235,7 +262,8 @@ export const projectAgent: ProjectAgent = {
   plugins: [
     // Claude gets a higher priority than any other plugin that registers text models
     anthropicModelsPlugin,
-    // Speech-to-text and text-to-speech models (used by Hyperfy voice chat)
+    // Speech-to-text and text-to-speech as runtime models (Hyperfy voice input uses the first; its
+    // speech output calls utils.ts generateSpeech directly)
     ...(process.env.ELEVENLABS_XI_API_KEY ? [elevenLabsSpeechPlugin] : []),
     // Shop clerk for OpenPay Store when OPENPAY_STORE_HANDLES is set
     ...(openPayStorePlugin ? [openPayStorePlugin] : []),

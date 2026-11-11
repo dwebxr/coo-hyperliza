@@ -1,7 +1,7 @@
 
 /**
- * Guards any async task and tracks if something is running.
- * Used to prevent behavior execution during active message processing.
+ * Counts the chat and voice turns in progress and remembers when the last one ended (it excludes
+ * nothing). The behavior manager skips its tick while one runs.
  */
 
 export class AgentActivityLock {

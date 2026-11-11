@@ -1,17 +1,33 @@
 import {
   type Action,
-  type HandlerCallback,
   type IAgentRuntime,
-  type Memory,
   type State,
   logger,
   composePromptFromState,
-  ModelType
+  ModelType,
 } from '@elizaos/core';
-import { HyperfyService } from '../service';
-import { forPurpose } from '../../usage-budget';
-import { AgentActions } from '../systems/actions';
+import { actingSession, connectedSession } from '../service';
+import { TurnCancelled } from '../lib/turn-context';
+import { AiBudgetExceededError, forPurpose } from '../../usage-budget';
+import { AnthropicRefusalError } from '../../anthropic-models';
+import { AgentActions, type PerformActionOutcome } from '../systems/actions';
 import { AgentControls } from '../systems/controls';
+import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
+import { errorText } from '../lib/error-text';
+import { shownName } from '../lib/text';
+import { notArrivedText } from '../lib/move-outcome';
+import type { MoveOutcome } from '../systems/controls';
+
+const USE_ITEM = 'HYPERFY_USE_ITEM';
+// An entity id in a reply (chosen by the model or a caller): one short line, nothing invisible
+const ENTITY_ID_MAX = 64;
+
+// What the player is told when the agent reached the item but nothing was used
+const USE_FAILURE_TEXT: Record<Exclude<PerformActionOutcome, 'started'>, string> = {
+  busy: "I'm already using something else.",
+  'no-action-nodes': "There's nothing near me I can use.",
+  'entity-has-no-action-node': "I can't use that one.",
+};
 
 // Template to extract entity to interact with
 const useItemTemplate = `
@@ -33,79 +49,97 @@ Response format:
 `;
 
 export const hyperfyUseItemAction: Action = {
-  name: 'HYPERFY_USE_ITEM',
+  name: USE_ITEM,
   similes: ['INTERACT_WITH_ITEM', 'USE_NEARBY_OBJECT', 'PICK_UP_ITEM'],
   description: 'Walks to and interacts with a nearby usable item (like picking it up); use when a player asks you to use or grab something.',
   validate: async (runtime: IAgentRuntime): Promise<boolean> => {
-    const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-    const world = service?.getWorld();
-    return !!service && service.isConnected() && !!world?.controls && !!world?.actions;
+    const world = connectedSession(runtime)?.world;
+    return !!world?.controls && !!world?.actions;
   },
-  handler: async (
-    runtime: IAgentRuntime,
-    message: Memory,
-    _state: State,
-    options: { entityId?: string },
-    callback: HandlerCallback
-  ) => {
-    const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-    const world = service?.getWorld();
-    const controls = world?.controls as AgentControls;
+  handler: async (runtime, message, _state, _options, callback) => {
+    // The turn's own connection (never a newer one); throws when the turn may no longer act
+    const session = actingSession(runtime);
+    const world = session?.world;
+    const controls = world?.controls as AgentControls | undefined;
     const actions = world?.actions as AgentActions | undefined;
 
-    if (!service || !world || !actions) {
+    if (!session || !world || !actions || !controls) {
       logger.error('Hyperfy service, world, or actions not found for HYPERFY_USE_ITEM action.');
-      await callback({ text: "Error: Cannot use item. Agent action system unavailable." });
-      return;
+      await tellFailure(callback, USE_ITEM, "Error: Cannot use item. Agent action system unavailable.");
+      return actionFailed(USE_ITEM, 'agent action system unavailable');
     }
 
-    let targetEntityId = options?.entityId;
+    // Which item: asked of the model (core hands an action nothing that names one)
+    let targetEntityId: string | undefined;
+    try {
+      const useState = await runtime.composeState(message, ['HYPERFY_WORLD_STATE', 'RECENT_MESSAGES'], true);
+      const prompt = composePromptFromState({ state: useState, template: useItemTemplate });
+      const response = await runtime.useModel(ModelType.OBJECT_SMALL, forPurpose('use-item', { prompt }));
 
-    if (!targetEntityId) {
-      logger.info('[USE ITEM] No entityId provided, attempting LLM extraction...');
-      try {
-        const useState = await runtime.composeState(message, ['HYPERFY_WORLD_STATE', 'RECENT_MESSAGES'], true);
-        const prompt = composePromptFromState({ state: useState, template: useItemTemplate });
-        const response = await runtime.useModel(ModelType.OBJECT_SMALL, forPurpose('use-item', { prompt }));
-
-        if (response?.entityId && typeof response.entityId === 'string') {
-          targetEntityId = response.entityId;
-          logger.info(`[USE ITEM] Extracted entity ID: ${targetEntityId}`);
-        } else {
-          logger.warn('[USE ITEM] No valid entityId extracted.');
-        }
-      } catch (err) {
-        logger.error('[USE ITEM] Extraction failed:', err);
+      if (response?.entityId && typeof response.entityId === 'string') {
+        targetEntityId = response.entityId;
+        logger.info(`[USE ITEM] Extracted entity ID: ${targetEntityId}`);
+      } else {
+        logger.warn('[USE ITEM] No valid entityId extracted.');
       }
+    } catch (err) {
+      // The turn's caller handles these (scripted or offline fallback, a fixed decline); a cancelled
+      // turn does nothing more
+      if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError || err instanceof TurnCancelled) throw err;
+      logger.error(`[USE ITEM] Extraction failed: ${errorText(err)}`);
     }
 
     if (!targetEntityId) {
       logger.warn('[USE ITEM] No suitable item found to use based on the context.');
-      return;
+      await tellFailure(callback, USE_ITEM, "I couldn't tell which item you mean.");
+      return actionFailed(USE_ITEM, 'no suitable item found');
     }
 
     
-    const entity = world.entities.items.get(targetEntityId);
+    const entity = world.entities?.items?.get(targetEntityId);
     const targetPosition = entity?.root?.position
     if (!targetPosition) {
-      await callback({
-        text: `Could not locate entity ${targetEntityId}.`,
-        metadata: { error: 'entity_not_found' }
-      });
-      return;
+      await tellFailure(callback, USE_ITEM, `Could not locate entity ${shownName(String(targetEntityId), ENTITY_ID_MAX)}.`, { metadata: { error: 'entity_not_found' } });
+      return actionFailed(USE_ITEM, 'entity not found', { targetEntityId });
     }
 
-    await controls.goto(targetPosition.x, targetPosition.z);
+    // How the walk ended, and what using the item did (only once the agent is next to it)
+    let done: { walked: Exclude<MoveOutcome, 'arrived'> } | { walked: 'arrived'; outcome: PerformActionOutcome };
+    try {
+      // The walk and the use are one section: nothing else moves the avatar in between
+      done = await session.withBody(async (signal) => {
+        const walked = await controls.goto(targetPosition.x, targetPosition.z, { signal });
+        session.assertLive();
+        // A walk that was stopped or replaced, or never got there, uses nothing
+        if (walked !== 'arrived') return { walked };
+        logger.info(`[USE ITEM] Attempting to use item with entity ID: ${targetEntityId}`);
+        return { walked, outcome: actions.performAction(targetEntityId) };
+      });
+    } catch (error: any) {
+      if (error instanceof TurnCancelled) throw error;
+      logger.error('[USE ITEM] Walking to or using the item failed:', error);
+      await tellFailure(callback, USE_ITEM, "I couldn't get to that item.");
+      return actionFailed(USE_ITEM, `could not reach or use the item: ${error?.message ?? error}`, { targetEntityId });
+    }
+    if (done.walked !== 'arrived') {
+      logger.warn(`[USE ITEM] Did not get to ${targetEntityId} (${done.walked}); nothing was used.`);
+      await tellFailure(callback, USE_ITEM, notArrivedText(done.walked), { metadata: { error: 'not_arrived', outcome: done.walked } });
+      return actionFailed(USE_ITEM, `did not get to the item (${done.walked})`, { targetEntityId, outcome: done.walked });
+    }
+    const { outcome } = done;
+    if (outcome !== 'started') {
+      logger.warn(`[USE ITEM] Nothing to use on ${targetEntityId} (${outcome}).`);
+      await tellFailure(callback, USE_ITEM, USE_FAILURE_TEXT[outcome]);
+      return actionFailed(USE_ITEM, `nothing was used (${outcome})`, { targetEntityId, outcome });
+    }
 
-    logger.info(`[USE ITEM] Attempting to use item with entity ID: ${targetEntityId}`);
-    actions.performAction(targetEntityId);
-
-    await callback({
-      text: `Using item: ${targetEntityId}`,
-      actions: ['HYPERFY_USE_ITEM'],
+    await callback?.({
+      text: `Using item: ${shownName(String(targetEntityId), ENTITY_ID_MAX)}`,
+      actions: [USE_ITEM],
       source: 'hyperfy',
       metadata: { targetEntityId, status: 'triggered' }
     });
+    return actionSucceeded(USE_ITEM, { targetEntityId });
   },
   examples: [
     [

@@ -1,9 +1,10 @@
-import { Readable } from 'node:stream';
 import { promises as fsPromises } from 'fs';
 import type { Action, IAgentRuntime, Memory, State } from '@elizaos/core';
-import { fileURLToPath } from 'url';
-import { dirname } from 'path';
 import path from 'path';
+import { bundledFile } from './lib/asset-root';
+import { describeUrl } from './lib/log-url';
+import { getUsageBudget } from '../usage-budget';
+import { assertTurnLive } from './lib/turn-context';
 
 
 export async function hashFileBuffer(buffer: Buffer): Promise<string> {
@@ -15,54 +16,7 @@ export async function hashFileBuffer(buffer: Buffer): Promise<string> {
   return hash
 }
 
-export async function convertToAudioBuffer(speechResponse: any): Promise<Buffer> {
-  if (Buffer.isBuffer(speechResponse)) {
-    return speechResponse;
-  }
-
-  if (typeof speechResponse?.getReader === 'function') {
-    // Handle Web ReadableStream
-    const reader = (speechResponse as ReadableStream<Uint8Array>).getReader();
-    const chunks: Uint8Array[] = [];
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) chunks.push(value);
-      }
-      return Buffer.concat(chunks);
-    } finally {
-      reader.releaseLock();
-    }
-  }
-
-  if (
-    speechResponse instanceof Readable ||
-    (speechResponse &&
-      speechResponse.readable === true &&
-      typeof speechResponse.pipe === 'function' &&
-      typeof speechResponse.on === 'function')
-  ) {
-    // Handle Node Readable Stream
-    return new Promise<Buffer>((resolve, reject) => {
-      const chunks: Buffer[] = [];
-      speechResponse.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-      speechResponse.on('end', () => resolve(Buffer.concat(chunks)));
-      speechResponse.on('error', (err) => reject(err));
-    });
-  }
-
-  throw new Error('Unexpected response type from TEXT_TO_SPEECH model');
-}
-
-export function getModuleDirectory(): string {
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = dirname(__filename);
-  return __dirname
-}
-
-const mimeTypes = {
+const mimeTypes: Record<string, string> = {
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
   '.png': 'image/png',
@@ -77,14 +31,14 @@ const mimeTypes = {
   '.hyp': 'application/octet-stream',
 };
 
-function getMimeTypeFromPath(filePath) {
+function getMimeTypeFromPath(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
   return mimeTypes[ext] || 'application/octet-stream';
 }
 
 export const resolveUrl = async (
-  url,
-  world,
+  url: unknown,
+  world: { assetsUrl?: string | null },
   { allowLocal = true }: { allowLocal?: boolean } = {}
 ): Promise<string | null> => {
   if (typeof url !== "string") {
@@ -107,16 +61,14 @@ export const resolveUrl = async (
   }
 
   if (!allowLocal) {
-    console.warn(`[resolveUrl] Refusing to read local path "${url}".`);
+    console.warn(`[resolveUrl] Refusing to read local path "${describeUrl(url)}".`);
     return null;
   }
 
-  // Local files are only read from inside the module directory (bundled assets),
-  // never from arbitrary paths supplied by world content.
-  const moduleDir = path.resolve(getModuleDirectory());
-  const fullPath = path.resolve(moduleDir, url);
-  if (path.isAbsolute(url) || (fullPath !== moduleDir && !fullPath.startsWith(moduleDir + path.sep))) {
-    console.warn(`[resolveUrl] Refusing to read "${url}" outside the module directory.`);
+  // The only local files read are the bundled ones (lib/asset-root.ts): assets/, avatars/, emotes/
+  const fullPath = bundledFile(url);
+  if (!fullPath) {
+    console.warn(`[resolveUrl] Refusing to read "${describeUrl(url)}": not a bundled file.`);
     return null;
   }
 
@@ -178,11 +130,7 @@ export async function getHyperfyActions(
   return validated.filter(Boolean) as Action[];
 }
 
-/**
- * Formats the provided actions into a detailed string listing each action's name and description, separated by commas and newlines.
- * @param actions - An array of `Action` objects to format.
- * @returns A detailed string of actions, including names and descriptions.
- */
+/** The actions as `- **NAME**: description` lines in random order, separated by blank lines. Reorders the given array in place. */
 export function formatActions(actions: Action[]) {
   return actions
     .sort(() => 0.5 - Math.random())
@@ -213,18 +161,115 @@ export function getWavHeader(
   return wavHeader;
 }
 
-/**
- * Direct ElevenLabs TTS API call
- * @param text - Text to convert to speech
- * @returns Buffer containing the audio data (PCM format)
- */
+// One deadline for a speech request and for reading its answer
 const TTS_REQUEST_TIMEOUT_MS = 30_000;
+// The audio of one utterance. A minute of speech is about 1 MB as 128 kbit/s MP3 and 6 MB as
+// 48 kHz PCM; what is spoken of one reply is capped before it is sent (voice-manager.ts)
+export const MAX_SPEECH_AUDIO_BYTES = 16 * 1024 * 1024;
+// A transcript with word timings for at most 30 s of audio is a few kilobytes
+export const MAX_TRANSCRIPT_RESPONSE_BYTES = 1024 * 1024;
+// How much of an API's error answer is read, to be logged
+const MAX_ERROR_BODY_BYTES = 2048;
 
-export async function generateElevenLabsTTS(text: string): Promise<Buffer | null> {
+/**
+ * The body of a fetch response, read as it arrives and given up as soon as it is larger than
+ * `maxBytes` (throws) or `signal` fires (throws). With `truncate` a larger body is cut at
+ * `maxBytes` instead. Either way the rest of the body is cancelled, not downloaded.
+ */
+export async function readBodyWithin(response: Response, maxBytes: number, signal: AbortSignal, { truncate = false }: { truncate?: boolean } = {}): Promise<Buffer> {
+  const declared = Number(response.headers.get('content-length'));
+  if (!truncate && Number.isFinite(declared) && declared > maxBytes) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`the response is ${declared} bytes, more than the ${maxBytes} allowed`);
+  }
+  const reader = response.body?.getReader();
+  if (!reader) return Buffer.alloc(0);
+  const onAbort = () => void reader.cancel().catch(() => {});
+  signal.addEventListener('abort', onAbort, { once: true });
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      if (signal.aborted) throw new Error('the response took too long');
+      const { done, value } = await reader.read();
+      if (signal.aborted) throw new Error('the response took too long');
+      if (done) break;
+      if (size + value.byteLength > maxBytes) {
+        if (!truncate) throw new Error(`the response is larger than the ${maxBytes} bytes allowed`);
+        chunks.push(value.subarray(0, maxBytes - size));
+        break;
+      }
+      chunks.push(value);
+      size += value.byteLength;
+    }
+    return Buffer.concat(chunks);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+    // A no-op when the body was read to its end
+    await reader.cancel().catch(() => {});
+  }
+}
+
+/** Runs one request under a deadline that also covers reading its answer. */
+async function withDeadline<T>(ms: number, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(new Error(`no complete answer within ${ms} ms`)), ms);
+  try {
+    return await run(deadline.signal);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The start of an API's error answer, on one line, for the log. */
+async function errorText(response: Response, signal: AbortSignal): Promise<string> {
+  const head = await readBodyWithin(response, MAX_ERROR_BODY_BYTES, signal, { truncate: true }).catch(() => Buffer.alloc(0));
+  return head.toString('utf8').replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ').trim();
+}
+
+/** One text-to-speech request to one provider, and whether it may be billed when it gave no audio. */
+export interface SpeechAttempt {
+  audio: Buffer | null;
+  /**
+   * False when no request was sent (no key) or the provider refused it with a 4xx answer (408 and
+   * 409 excepted: they can follow work already done). True otherwise: audio came, or the request
+   * went out and its outcome is not known (a connection error, a timeout, a 5xx, a body that failed
+   * or stalled after the provider accepted the request).
+   */
+  mayBeBilled: boolean;
+}
+
+const refusedStatus = (status: number) => status >= 400 && status < 500 && status !== 408 && status !== 409;
+
+/**
+ * Runs one speech request under TTS_REQUEST_TIMEOUT_MS: `request` makes it, the answer is read as it
+ * arrives (at most MAX_SPEECH_AUDIO_BYTES). Never throws.
+ */
+async function speechAttempt(label: string, request: (signal: AbortSignal) => Promise<Response>): Promise<SpeechAttempt> {
+  try {
+    return await withDeadline(TTS_REQUEST_TIMEOUT_MS, async (signal) => {
+      const response = await request(signal);
+      if (!response.ok) {
+        console.error(`[${label}] API error ${response.status}: ${await errorText(response, signal)}`);
+        return { audio: null, mayBeBilled: !refusedStatus(response.status) };
+      }
+      // Read as it arrives, at most MAX_SPEECH_AUDIO_BYTES and within the request's deadline
+      const buffer = await readBodyWithin(response, MAX_SPEECH_AUDIO_BYTES, signal);
+      console.log(`[${label}] Successfully generated ${buffer.length} bytes of audio`);
+      return { audio: buffer, mayBeBilled: true };
+    });
+  } catch (error) {
+    console.error(`[${label}] Error:`, error);
+    return { audio: null, mayBeBilled: true };
+  }
+}
+
+/** One ElevenLabs text-to-speech request (nothing is reserved here: the caller does, and settles it by `mayBeBilled`). */
+export function elevenLabsSpeech(text: string): Promise<SpeechAttempt> {
   const apiKey = process.env.ELEVENLABS_XI_API_KEY;
   if (!apiKey) {
     console.error('[ElevenLabs TTS] No ELEVENLABS_XI_API_KEY found in environment');
-    return null;
+    return Promise.resolve({ audio: null, mayBeBilled: false });
   }
 
   const voiceId = process.env.ELEVENLABS_VOICE_ID || 'EXAVITQu4vr4xnSDxMaL';
@@ -239,10 +284,10 @@ export async function generateElevenLabsTTS(text: string): Promise<Buffer | null
 
   console.log(`[ElevenLabs TTS] Generating speech with voiceId=${voiceId}, model=${modelId}, format=${outputFormat}`);
 
-  try {
-    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=${outputFormat}`, {
+  return speechAttempt('ElevenLabs TTS', (signal) =>
+    fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=${outputFormat}`, {
       method: 'POST',
-      signal: AbortSignal.timeout(TTS_REQUEST_TIMEOUT_MS),
+      signal,
       headers: {
         'xi-api-key': apiKey,
         'Content-Type': 'application/json',
@@ -257,34 +302,16 @@ export async function generateElevenLabsTTS(text: string): Promise<Buffer | null
           use_speaker_boost: process.env.ELEVENLABS_VOICE_USE_SPEAKER_BOOST === 'true',
         },
       }),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`[ElevenLabs TTS] API error ${response.status}: ${errorText}`);
-      return null;
-    }
-
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    console.log(`[ElevenLabs TTS] Successfully generated ${buffer.length} bytes of audio`);
-    return buffer;
-  } catch (error) {
-    console.error('[ElevenLabs TTS] Error:', error);
-    return null;
-  }
+    })
+  );
 }
 
-/**
- * Direct OpenAI TTS API call - bypasses the @elizaos/plugin-openai which has issues reading the API key
- * @param text - Text to convert to speech
- * @returns Buffer containing the audio data (MP3 format)
- */
-export async function generateOpenAITTS(text: string): Promise<Buffer | null> {
+/** One OpenAI text-to-speech request, made directly (this project loads no OpenAI plugin). */
+function openAISpeech(text: string): Promise<SpeechAttempt> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     console.error('[OpenAI TTS Direct] No OPENAI_API_KEY found in environment');
-    return null;
+    return Promise.resolve({ audio: null, mayBeBilled: false });
   }
 
   const model = process.env.OPENAI_TTS_MODEL || 'tts-1';
@@ -292,10 +319,10 @@ export async function generateOpenAITTS(text: string): Promise<Buffer | null> {
 
   console.log(`[OpenAI TTS Direct] Generating speech with model=${model}, voice=${voice}`);
 
-  try {
-    const response = await fetch('https://api.openai.com/v1/audio/speech', {
+  return speechAttempt('OpenAI TTS Direct', (signal) =>
+    fetch('https://api.openai.com/v1/audio/speech', {
       method: 'POST',
-      signal: AbortSignal.timeout(TTS_REQUEST_TIMEOUT_MS),
+      signal,
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
@@ -306,22 +333,8 @@ export async function generateOpenAITTS(text: string): Promise<Buffer | null> {
         voice: voice,
         response_format: 'mp3',
       }),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`[OpenAI TTS Direct] API error ${response.status}: ${errorText}`);
-      return null;
-    }
-
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    console.log(`[OpenAI TTS Direct] Successfully generated ${buffer.length} bytes of audio`);
-    return buffer;
-  } catch (error) {
-    console.error('[OpenAI TTS Direct] Error:', error);
-    return null;
-  }
+    })
+  );
 }
 
 /**
@@ -341,31 +354,69 @@ export async function transcribeWithElevenLabs(audio: Buffer, fileName = 'speech
   form.append('file', new Blob([new Uint8Array(audio)]), fileName);
 
   try {
-    const response = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
-      method: 'POST',
-      signal: AbortSignal.timeout(TTS_REQUEST_TIMEOUT_MS),
-      headers: { 'xi-api-key': apiKey },
-      body: form,
+    return await withDeadline(TTS_REQUEST_TIMEOUT_MS, async (signal) => {
+      const response = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
+        method: 'POST',
+        signal,
+        headers: { 'xi-api-key': apiKey },
+        body: form,
+      });
+      if (!response.ok) {
+        console.error(`[ElevenLabs STT] API error ${response.status}: ${await errorText(response, signal)}`);
+        return null;
+      }
+      const body = await readBodyWithin(response, MAX_TRANSCRIPT_RESPONSE_BYTES, signal);
+      const data = JSON.parse(body.toString('utf8')) as { text?: unknown };
+      return typeof data?.text === 'string' ? data.text : null;
     });
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`[ElevenLabs STT] API error ${response.status}: ${errorText}`);
-      return null;
-    }
-    const data = (await response.json()) as { text?: unknown };
-    return typeof data?.text === 'string' ? data.text : null;
   } catch (error) {
     console.error('[ElevenLabs STT] Error:', error);
     return null;
   }
 }
 
+/** Thrown by generateSpeech when VOICE_TTS_MAX_CHARS_PER_DAY does not admit the text: nothing was sent. */
+export class TtsLimitReached extends Error {
+  constructor() {
+    super('[TTS] VOICE_TTS_MAX_CHARS_PER_DAY does not admit this text');
+    this.name = 'TtsLimitReached';
+  }
+}
+
+const SPEECH_PROVIDERS = [
+  { name: 'ElevenLabs', key: 'ELEVENLABS_XI_API_KEY', attempt: elevenLabsSpeech },
+  { name: 'OpenAI', key: 'OPENAI_API_KEY', attempt: openAISpeech },
+] as const;
+
 /**
- * Generates speech audio, preferring ElevenLabs and falling back to OpenAI.
+ * Speech audio for `text`: ElevenLabs, then OpenAI when that gave none. Each request is reserved
+ * against VOICE_TTS_MAX_CHARS_PER_DAY on its own, before it is sent. A request the provider refused
+ * (a 4xx answer other than 408 and 409) is given back; any other failed one stays counted, as it may
+ * have been billed. A
+ * fallback the limit does not admit is not made, and neither is one for a turn that may no longer
+ * act (lib/turn-context.ts: TurnCancelled is thrown, the requests already sent stay counted).
+ * Resolves to null when no provider gave audio; throws TtsLimitReached when the limit admits not
+ * even the first request.
  */
 export async function generateSpeech(text: string): Promise<Buffer | null> {
-  const audio = await generateElevenLabsTTS(text);
-  if (audio) return audio;
-  console.log('[TTS] ElevenLabs unavailable, trying OpenAI TTS...');
-  return generateOpenAITTS(text);
+  const budget = getUsageBudget();
+  let sent = false;
+  for (const provider of SPEECH_PROVIDERS) {
+    if (!process.env[provider.key]) continue;
+    // Before each reservation and request, the fallback's included
+    assertTurnLive();
+    const reservation = budget.reserveTts(text.length);
+    if (!reservation) {
+      budget.recordSkip('tts');
+      if (!sent) throw new TtsLimitReached();
+      console.log(`[TTS] Not trying ${provider.name}: the daily text-to-speech limit has no room for another request`);
+      return null;
+    }
+    if (sent) console.log(`[TTS] Trying ${provider.name}...`);
+    sent = true;
+    const { audio, mayBeBilled } = await provider.attempt(text);
+    if (audio) return audio;
+    if (!mayBeBilled) reservation.release();
+  }
+  return null;
 }

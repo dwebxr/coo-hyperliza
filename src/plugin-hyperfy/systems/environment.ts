@@ -2,10 +2,12 @@
 import { CSM } from '../hyperfy/src/core/libs/csm/CSM'
 import { isNumber, isString } from 'lodash-es'
 import { System } from '../hyperfy/src/core/systems/System.js'
-import { logger } from '@elizaos/core';
 import * as THREE from 'three';
 import { PuppeteerManager } from "../managers/puppeteer-manager.js";
-import { resolveUrl } from '../utils.js';
+import { ASSET_BYTE_CAPS, type AssetBytes, assetKey, fetchAssetBytes } from '../lib/asset-bytes';
+import { assetMemory, workBytes } from '../lib/asset-memory';
+import { describeUrl } from '../lib/log-url';
+import { PageWork } from '../lib/page-work';
 
 interface SkyHandle {
   node: any
@@ -18,9 +20,9 @@ interface EnvironmentConfig {
   sunDirection?: THREE.Vector3
   sunIntensity?: number
   sunColor?: string | number
-  fogNear?: number
-  fogFar?: number
-  fogColor?: string
+  fogNear?: number | null
+  fogFar?: number | null
+  fogColor?: string | null
   model?: string
 }
 
@@ -34,6 +36,19 @@ export class AgentEnvironment extends System {
   bgUrl: string | null = null
   hdrUrl: string | null = null
   csm!: CSM
+  /** The sky update in progress: a newer one, or destroy(), stops it */
+  private skyWork: AbortController | null = null
+  /**
+   * What the render page holds for this world's sky, by the URL it was asked for under, and the
+   * page it is in (PuppeteerManager.pageEpoch): the sky's image as a texture, and the HDR that is
+   * the page's environment. A sky update that asks for the same URL again downloads and registers
+   * nothing; one that asks for another image releases the texture it replaces.
+   */
+  private skyTexture: { requested: string; url: string; id: string; epoch: unknown } | null = null
+  private skyHdr: { requested: string; epoch: unknown } | null = null
+  private destroyed = false
+  /** Page work when the world has no loader to share it with (lib/page-work.ts) */
+  private ownPageWork = new PageWork()
 
   constructor(world: any) {
     super(world)
@@ -87,9 +102,25 @@ export class AgentEnvironment extends System {
     return this.sky
   }
 
-  /** updateSky without an unhandled rejection: a disconnect closes the page it draws on mid-call. */
+  /**
+   * Starts a sky update and stops the one before it (latest wins): at most one sky download is in
+   * flight. Without an unhandled rejection: a disconnect closes the page it draws on mid-call.
+   */
   private refreshSky() {
-    this.updateSky().catch(error => this.reportRenderError('sky', error))
+    this.skyWork?.abort()
+    const work = new AbortController()
+    this.skyWork = work
+    this.updateSky(work.signal).catch(error => {
+      // A stopped update fails as it was meant to
+      if (!work.signal.aborted) this.reportRenderError('sky', error)
+    })
+  }
+
+  destroy() {
+    this.destroyed = true
+    this.skyWork?.abort()
+    this.skyWork = null
+    this.world.settings?.off?.('change', this.onSettingsChange)
   }
 
   private reportRenderError(what: string, error: any) {
@@ -101,7 +132,34 @@ export class AgentEnvironment extends System {
     }
   }
 
-  async updateSky() {
+  /**
+   * Downloads `url` and hands it to the render page with `pageCall`, under the world's page work
+   * (a kill blames it only when it was alone; lib/page-work.ts) and the agent's memory reservation
+   * (lib/asset-memory.ts), held until the page call is over. Null when `signal` fired, or the
+   * system was destroyed, between its steps (a wait or download the signal stops throws instead).
+   */
+  private async toPage<T>(url: string, kind: 'image' | 'hdr', signal: AbortSignal, pageCall: (asset: AssetBytes) => Promise<T>): Promise<{ asset: AssetBytes; result: T } | null> {
+    const work: PageWork = this.world.loader?.pageWork ?? this.ownPageWork
+    const key = assetKey(kind, url)
+    const refused = work.refusal(key)
+    if (refused) throw new Error(`[Environment] Not handing the ${kind} ${describeUrl(url)} to the render page again: ${refused}`)
+    const lease = await assetMemory.download(ASSET_BYTE_CAPS[kind], signal)
+    try {
+      const asset = await fetchAssetBytes(this.world, url, kind, { signal, lease })
+      if (signal.aborted || this.destroyed) return null
+      await lease.toWork(workBytes(kind, asset.bytes.byteLength), signal)
+      if (signal.aborted || this.destroyed) return null
+      const result = await work.run(key, `the ${kind} ${describeUrl(url)}`, () => pageCall(asset))
+      return { asset, result }
+    } finally {
+      lease.release()
+    }
+  }
+
+  /** Applies the current sky. Every change to the scene or the render page is made only while `signal` holds. */
+  async updateSky(signal: AbortSignal = new AbortController().signal) {
+    const stopped = () => signal.aborted || this.destroyed
+    if (stopped()) return
     if (!this.sky) {
       const geometry = new THREE.SphereGeometry(1000, 60, 40)
       const material = new THREE.MeshBasicMaterial({side: THREE.BackSide});      
@@ -129,9 +187,26 @@ export class AgentEnvironment extends System {
     const puppeteerManager = PuppeteerManager.getInstance()
     const n = ++this.skyN
     let bgUUID
-    if (bgUrl) {
-      bgUrl = await resolveUrl(bgUrl, this.world);
-      bgUUID = await puppeteerManager.registerTexture(bgUrl, 'map');
+    const kept = this.skyTexture
+    if (bgUrl && kept && kept.requested === bgUrl && kept.epoch === puppeteerManager.pageEpoch) {
+      // The page already holds this image as the sky's texture: not downloaded or registered again
+      bgUrl = kept.url
+      bgUUID = kept.id
+    } else if (bgUrl) {
+      // Downloaded here, under the world's network policy: the render page has no network
+      const requested = bgUrl
+      const done = await this.toPage(bgUrl, 'image', signal, (image) => puppeteerManager.registerTexture(image, 'map', { signal }))
+      if (!done) return
+      if (stopped()) {
+        // Accepted by the page just before a newer sky (or destroy) came: no use for it now
+        puppeteerManager.releaseTexture(done.result, 'map').catch(() => {})
+        return
+      }
+      bgUrl = done.asset.url;
+      bgUUID = done.result;
+      this.replaceSkyTexture({ requested, url: done.asset.url, id: done.result, epoch: puppeteerManager.pageEpoch })
+    } else {
+      this.replaceSkyTexture(null)
     }
     if (bgUUID) {
       this.sky.material.userData.materialId = bgUUID;
@@ -140,10 +215,14 @@ export class AgentEnvironment extends System {
       this.sky.visible = false
     }
 
-    if (hdrUrl) {
-      await puppeteerManager.loadEnvironmentHDR(hdrUrl);
+    // The page keeps one environment: the same HDR is not downloaded and sent to it again
+    if (hdrUrl && !(this.skyHdr && this.skyHdr.requested === hdrUrl && this.skyHdr.epoch === puppeteerManager.pageEpoch)) {
+      const done = await this.toPage(hdrUrl, 'hdr', signal, (hdr) => puppeteerManager.loadEnvironmentHDR(hdr.bytes, { signal }))
+      if (!done) return
+      // Accepted: it is the page's environment now, whatever comes of this update
+      this.skyHdr = { requested: hdrUrl, epoch: puppeteerManager.pageEpoch }
     }
-    if (n !== this.skyN) return
+    if (n !== this.skyN || stopped()) return
 
     this.csm.lightDirection = sunDirection
 
@@ -169,6 +248,16 @@ export class AgentEnvironment extends System {
       fogFar,
       fogColor,
     }
+  }
+
+  /** The texture the sky shows from now on (or none); the one it showed before is released in the page that holds it. */
+  private replaceSkyTexture(next: { requested: string; url: string; id: string; epoch: unknown } | null) {
+    const previous = this.skyTexture
+    this.skyTexture = next
+    if (!previous || previous.id === next?.id) return
+    const puppeteerManager = PuppeteerManager.getInstance()
+    // In a page built since, it is gone already
+    if (previous.epoch === puppeteerManager.pageEpoch) puppeteerManager.releaseTexture(previous.id, 'map').catch(() => {})
   }
 
   update(delta: number) {
@@ -203,11 +292,8 @@ export class AgentEnvironment extends System {
     } else {
       this.csm = new CSM({
         mode: 'practical',
-        cascades: 3,
         maxCascades: 3,
-        shadowMapSize: 2048,
         maxFar: 100,
-        lightIntensity: 1,
         lightDirection: new THREE.Vector3(0, -1, 0).normalize(),
         fade: true,
         parent: this.world.stage.scene,

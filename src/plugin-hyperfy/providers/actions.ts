@@ -1,4 +1,4 @@
-import type { Action, IAgentRuntime, Memory, Provider, State } from '@elizaos/core';
+import type { IAgentRuntime, Memory, Provider, State } from '@elizaos/core';
 import { addHeader, composeActionExamples, formatActionNames } from '@elizaos/core';
 import { getHyperfyActions, formatActions } from '../utils';
 
@@ -13,26 +13,6 @@ import { getHyperfyActions, formatActions } from '../utils';
  * @param {Memory} message - The message memory.
  * @param {State} state - The state object.
  * @returns {Object} An object containing the actions data, values, and combined text sections.
- */
-/**
- * Provider for ACTIONS
- *
- * @typedef {import('./Provider').Provider} Provider
- * @typedef {import('./Runtime').IAgentRuntime} IAgentRuntime
- * @typedef {import('./Memory').Memory} Memory
- * @typedef {import('./State').State} State
- * @typedef {import('./Action').Action} Action
- *
- * @type {Provider}
- * @property {string} name - The name of the provider
- * @property {string} description - Description of the provider
- * @property {number} position - The position of the provider
- * @property {Function} get - Asynchronous function to get actions that validate for a given message
- *
- * @param {IAgentRuntime} runtime - The agent runtime
- * @param {Memory} message - The message memory
- * @param {State} state - The state of the agent
- * @returns {Object} Object containing data, values, and text related to actions
  */
 export const hyperfyActionsProvider: Provider = {
   name: 'ACTIONS',

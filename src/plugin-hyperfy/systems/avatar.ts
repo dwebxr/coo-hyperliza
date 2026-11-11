@@ -140,16 +140,15 @@ export class AgentAvatar extends Node {
     return this.instance?.headToHeight ?? null
   }
 
-  getBoneTransform(_boneName: string): THREE.Matrix4 {
-    const matrix = new THREE.Matrix4()
-    if (this.parent && this.parent.position) {
-      matrix.makeTranslation(
-        this.parent.position.x,
-        this.parent.position.y,
-        this.parent.position.z
-      )
-    }
-    return matrix
+  /**
+   * Where a bone of the avatar is: null. The agent builds no skeleton for an avatar (its factory
+   * is null: avatars are drawn in the render page), so there is nothing to read a bone from, and
+   * no position is made up for one. The engine's own Avatar node answers the same way while it has
+   * no instance, and its callers (PlayerLocal, PlayerRemote, a script's player.getBoneTransform)
+   * take "no bone" for an answer.
+   */
+  getBoneTransform(_boneName: string): THREE.Matrix4 | null {
+    return null
   }
 
   setEmote(url: string | null) {
@@ -174,10 +173,10 @@ export class AgentAvatar extends Node {
     if (!this.proxy) {
       const self = this
       const baseProxy = super.getProxy()
-  
-      this.proxy = {
-        ...baseProxy,
-  
+
+      // The base proxy's descriptors, not a spread of it: a spread would read its getters once,
+      // freezing `_ref` (the engine's node reference) to null and every other getter to its value now
+      const proxy: Record<string, unknown> = {
         get src() {
           return self.src
         },
@@ -219,6 +218,8 @@ export class AgentAvatar extends Node {
           return self.height
         },
       }
+      const own = Object.getOwnPropertyDescriptors(proxy)
+      this.proxy = Object.defineProperties(Object.defineProperties({}, Object.getOwnPropertyDescriptors(baseProxy)), own) as typeof baseProxy
     }
 
     return this.proxy

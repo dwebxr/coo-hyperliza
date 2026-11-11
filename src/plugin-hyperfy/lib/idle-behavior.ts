@@ -25,7 +25,7 @@ export interface AutonomyConfig {
 export const DEFAULT_TICK_MIN_SEC = 15;
 export const DEFAULT_TICK_MAX_SEC = 30;
 export const WANDER_RADIUS_M = 6;
-/** Players closer than this get waved at in place; farther ones (up to GREET_APPROACH_MAX_M) are approached first. */
+/** Players closer than this get waved at in place; farther ones (up to GREET_APPROACH_MAX_M) are approached first when the agent may move. Beyond that, or when it may not move, they are waved at in place too. */
 export const GREET_IN_PLACE_M = 4;
 export const GREET_APPROACH_MAX_M = 20;
 /** After a conversation the agent stays where it is for this long instead of walking off. */
@@ -33,7 +33,7 @@ export const STAY_AFTER_CONVERSATION_MS = 90_000;
 
 export const IDLE_EMOTES = { lookAround: 'looking around', wave: 'waving both hands' } as const;
 
-/** "x,z; x,z; ..." (spaces optional). Malformed entries are skipped with a warning. */
+/** "x,z; x,z; ..." (spaces optional). Entries that are not two numbers are skipped with a warning (an empty coordinate reads as 0). */
 export function parsePatrolPoints(raw: string | undefined): Point[] {
   if (!raw?.trim()) return [];
   const points: Point[] = [];
@@ -80,7 +80,7 @@ export type IdleStep =
 export interface IdleInput {
   /** A player who arrived since the last tick, with their distance from the agent. */
   newcomer: { id: string; distance: number } | null;
-  /** False while navigating, or right after a conversation. */
+  /** False while navigating, right after a conversation, or while a turn has the avatar to itself. */
   canMove: boolean;
   patrolPoints: Point[];
   patrolIndex: number;

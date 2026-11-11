@@ -12,6 +12,7 @@ import {
   logger,
 } from '@elizaos/core';
 import { AiBudgetExceededError, currentOrigin, getUsageBudget, isAiPurpose, maxTokensFor, purposeEnvKey } from './usage-budget';
+import { TurnCancelled, assertTurnLive, currentTurn } from './plugin-hyperfy/lib/turn-context';
 
 /**
  * Text/JSON generation with current Claude models.
@@ -28,8 +29,64 @@ const DEFAULT_EFFORT: Effort = 'low';
 const DEFAULT_MAX_TOKENS = 16000;
 const IMAGE_DESCRIPTION_MAX_TOKENS = 4096;
 // The agent talks in real time and holds an activity lock while generating; this deadline
-// covers SDK retries, Retry-After waits and reading the response body.
+// covers both attempts, the wait between them and reading the response body.
 const GENERATION_DEADLINE_MS = 60_000;
+
+/**
+ * One more attempt is made only after an answer saying the API did not take the request now (429
+ * rate limited, 529 overloaded), which comes before anything is generated. Never after a timeout,
+ * a lost connection or another error: the first attempt may then have been answered and billed,
+ * and a second would pay twice for one reply. Each attempt is reserved on its own; the SDK itself
+ * retries nothing (maxRetries: 0), so every request sent is one the budget admitted.
+ */
+const RETRY_STATUSES = new Set([429, 529]);
+// The wait before it: the answer's retry-after, else this, and never more than RETRY_MAX_WAIT_MS
+const RETRY_WAIT_MS = 1000;
+const RETRY_MAX_WAIT_MS = 5000;
+
+// Reserved against AI_MAX_TOKENS_PER_DAY on top of the prompt's bytes: the request's own framing
+const FRAMING_TOKEN_RESERVE = 64;
+// Reserved per attached image. An estimate, not a bound: the API counts an image by its pixels
+// after its own downscaling, and nothing here measures the image
+const IMAGE_TOKEN_RESERVE = 5000;
+
+/**
+ * The most tokens a request can be billed for, as far as that can be known before it is sent:
+ * a token is at least one byte of text, so the prompt costs at most its UTF-8 bytes; the output
+ * (thinking included) at most `maxOutput`. Images are counted at IMAGE_TOKEN_RESERVE each.
+ */
+export function tokenReserve(system: string | undefined, content: string | Anthropic.ContentBlockParam[], maxOutput: number): number {
+  let reserve = FRAMING_TOKEN_RESERVE + maxOutput + Buffer.byteLength(system ?? '');
+  if (typeof content === 'string') return reserve + Buffer.byteLength(content);
+  for (const block of content) {
+    if (block.type === 'text') reserve += Buffer.byteLength(block.text);
+    else if (block.type === 'image') reserve += IMAGE_TOKEN_RESERVE;
+    // Nothing else is sent by this module; anything else is counted by its serialized size
+    else reserve += Buffer.byteLength(JSON.stringify(block));
+  }
+  return reserve;
+}
+
+/** Whether the API refused the request itself (a 4xx answer), so nothing was generated or billed. */
+function wasRejected(error: unknown): boolean {
+  const status = (error as { status?: unknown } | null)?.status;
+  // 408 and 409 can follow work the API already did
+  return typeof status === 'number' && status >= 400 && status < 500 && status !== 408 && status !== 409;
+}
+
+/** How long to wait before the one more attempt `error` allows (RETRY_STATUSES), or null for none. */
+function retryWait(error: unknown, deadlineAt: number): number | null {
+  const { status, headers } = (error ?? {}) as { status?: unknown; headers?: { get?: (name: string) => string | null } };
+  if (typeof status !== 'number' || !RETRY_STATUSES.has(status)) return null;
+  const header = (name: string) => {
+    const value = Number(headers?.get?.(name) ?? NaN);
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  };
+  const afterMs = header('retry-after-ms') ?? (header('retry-after') !== null ? header('retry-after')! * 1000 : null);
+  const wait = Math.min(afterMs ?? RETRY_WAIT_MS, RETRY_MAX_WAIT_MS);
+  // Not when the answer could not come within the deadline
+  return Date.now() + wait < deadlineAt ? wait : null;
+}
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 type Effort = (typeof EFFORTS)[number];
@@ -50,8 +107,9 @@ function getClient(runtime: IAgentRuntime): Anthropic {
   let client = clients.get(apiKey);
   if (!client) {
     // Without an explicit key the SDK falls back to ANTHROPIC_API_KEY / other credentials in the environment.
-    // This always runs in Node, but the Hyperfy loader (systems/loader.ts) installs a fake global
-    // window/document at import time, which the SDK's browser check would otherwise refuse.
+    // The SDK refuses to run where it sees a browser (a global window with a document) unless
+    // told otherwise. The agent itself has none; this keeps a host process that does from
+    // silencing it.
     client = new Anthropic({ ...(apiKey ? { apiKey } : {}), dangerouslyAllowBrowser: true });
     clients.set(apiKey, client);
   }
@@ -59,9 +117,8 @@ function getClient(runtime: IAgentRuntime): Anthropic {
 }
 
 function getSetting(runtime: IAgentRuntime, key: string, fallback: string): string {
-  // .env wins: elizaOS stores a copy of the environment in the agent's database record and
-  // runtime.getSetting prefers that copy, so a key changed in .env would otherwise be ignored
-  // (an old, revoked Anthropic key kept failing with 401 invalid x-api-key).
+  // process.env first: runtime.getSetting reads only the character's settings and secrets, where
+  // a stored copy can differ from .env or be null (src/agent-secrets.ts)
   const value = process.env[key]?.trim() || runtime.getSetting(key);
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
 }
@@ -96,12 +153,6 @@ async function generate(
   }
 ): Promise<string> {
   const budget = getUsageBudget();
-  const blocked = budget.aiBlockedReason();
-  if (blocked) {
-    budget.recordSkip('ai-call');
-    throw new AiBudgetExceededError(blocked);
-  }
-
   const model = getSetting(runtime, `ANTHROPIC_${size}_MODEL`, DEFAULT_MODEL);
   const effort = getEffort(runtime);
   // The API rejects empty or whitespace-only stop sequences
@@ -109,28 +160,76 @@ async function generate(
   // A tagged call's own cap wins over the caller's value, which may be a global model setting
   const maxOutput = maxTokensFor(purpose) ?? maxTokens ?? DEFAULT_MAX_TOKENS;
   const label = isAiPurpose(purpose) ? purpose : modelType;
+  const client = getClient(runtime);
 
-  const response = await getClient(runtime).messages.create(
-    {
-      model,
-      max_tokens: maxOutput,
-      ...(system ? { system } : {}),
-      ...(stops.length ? { stop_sequences: stops } : {}),
-      output_config: { effort },
-      messages: [{ role: 'user', content: content ?? prompt }],
-    },
-    { signal: AbortSignal.timeout(GENERATION_DEADLINE_MS), maxRetries: 1 }
-  );
+  const reserve = tokenReserve(system, content ?? prompt, maxOutput);
+  const deadlineAt = Date.now() + GENERATION_DEADLINE_MS;
+  // Every attempt is aborted by the deadline, and by the cancellation of the turn it is made for
+  // (its slot ran out, or its connection ended): a request nobody will use is not left running
+  // to its end. What an aborted request counts as is decided below, as for any other.
+  const deadline = AbortSignal.timeout(GENERATION_DEADLINE_MS);
+  const turnSignal = currentTurn()?.signal;
+  const signal = turnSignal ? AbortSignal.any([deadline, turnSignal]) : deadline;
+  /** Whether a request has gone out (a cancellation after that is marked: TurnCancelled.afterRequest) */
+  let sent = false;
+  const marked = (error: unknown): unknown => (sent && error instanceof TurnCancelled && !error.afterRequest ? new TurnCancelled(error.message, true) : error);
+  /** One request, under a reservation of its own; settled with what the API billed, or failed. */
+  const attempt = async (): Promise<Anthropic.Message> => {
+    // A turn that may no longer act (its connection ended, or its slot ran out) asks nothing more
+    // of the model: no request is made and nothing is counted (plugin-hyperfy/lib/turn-context.ts)
+    assertTurnLive();
+    // Admitted and counted before the request, in one step: calls that start together cannot all
+    // pass a limit only one of them fits (usage-budget.ts reserveAi)
+    const reservation = budget.reserveAi({ purpose: label, origin: currentOrigin() }, reserve);
+    if (typeof reservation === 'string') {
+      budget.recordSkip('ai-call');
+      throw new AiBudgetExceededError(reservation);
+    }
+    let response: Anthropic.Message;
+    sent = true;
+    try {
+      response = await client.messages.create(
+        {
+          model,
+          max_tokens: maxOutput,
+          ...(system ? { system } : {}),
+          ...(stops.length ? { stop_sequences: stops } : {}),
+          output_config: { effort },
+          messages: [{ role: 'user', content: content ?? prompt }],
+        },
+        { signal, maxRetries: 0 }
+      );
+    } catch (error) {
+      // A request the API refused cost nothing; one that timed out, was aborted or lost its
+      // connection may have been billed, so its whole reservation stays counted
+      reservation.fail(wasRejected(error) ? 'rejected' : 'unknown');
+      // Aborted with its turn: the caller sees why (TurnCancelled), not the SDK's abort error
+      assertTurnLive();
+      throw error;
+    }
+    // Billed even when the output turns out unusable
+    reservation.settle({
+      inputTokens: response.usage.input_tokens,
+      outputTokens: response.usage.output_tokens,
+      cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
+      cacheWriteTokens: response.usage.cache_creation_input_tokens ?? 0,
+    });
+    return response;
+  };
 
-  // Billed even when the output turns out unusable
-  budget.recordAi({
-    purpose: label,
-    origin: currentOrigin(),
-    inputTokens: response.usage.input_tokens,
-    outputTokens: response.usage.output_tokens,
-    cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
-    cacheWriteTokens: response.usage.cache_creation_input_tokens ?? 0,
-  });
+  let response: Anthropic.Message;
+  try {
+    response = await attempt();
+  } catch (error) {
+    const wait = retryWait(error, deadlineAt);
+    if (wait === null) throw marked(error);
+    logger.warn(`[Anthropic] ${label}: the API answered ${(error as { status: number }).status}; trying once more in ${wait} ms`);
+    await new Promise((resolve) => setTimeout(resolve, wait));
+    // Reserved again: a second attempt the budget does not admit is not made (AiBudgetExceededError)
+    response = await attempt().catch((again: unknown) => {
+      throw marked(again);
+    });
+  }
   if (response.stop_reason === 'max_tokens') {
     logger.warn(
       `[Anthropic] ${label} reply was cut off at max_tokens=${maxOutput}` +
@@ -250,7 +349,7 @@ async function generateText(runtime: IAgentRuntime, size: Size, params: Generate
   });
 }
 
-/** Accepts an http(s) URL, a data: URL, or bare base64 (what the Puppeteer snapshots return). */
+/** Accepts an http(s) URL, a data: URL (what the render page's snapshots are, managers/puppeteer-manager.ts capture), or bare base64. */
 export function toImageSource(image: string): Anthropic.ImageBlockParam['source'] {
   if (/^https?:\/\//.test(image)) return { type: 'url', url: image };
   const dataUrl = image.match(/^data:(image\/[a-z+]+);base64,(.*)$/s);

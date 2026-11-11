@@ -98,12 +98,18 @@ describe('ReconnectController', () => {
 
     controller.schedule();
     controller.stop();
+    expect(controller.isPending).toBe(false);
+    // Cancelled, not only held back: resuming does not bring the old timer back
+    controller.resume();
     await vi.advanceTimersByTimeAsync(RECONNECT_MAX_DELAY_MS);
     expect(reconnect).not.toHaveBeenCalled();
-    expect(controller.schedule()).toBeNull();
 
+    controller.stop();
+    expect(controller.schedule()).toBeNull();
     controller.resume();
     expect(controller.schedule()).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(RECONNECT_MAX_DELAY_MS);
+    expect(reconnect).toHaveBeenCalledTimes(1);
   });
 
   it('cancelPending() drops a waiting retry without disabling the controller', async () => {

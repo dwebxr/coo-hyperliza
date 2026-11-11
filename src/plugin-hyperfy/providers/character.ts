@@ -25,8 +25,9 @@ export const characterProvider: Provider = {
     const agentName = character.name;
 
     // Handle bio (string or random selection from array)
+    // Shuffled copies throughout: the character's own arrays are shared by everything that reads it
     const bioText = Array.isArray(character.bio)
-      ? character.bio
+      ? [...character.bio]
           .sort(() => 0.5 - Math.random())
           .slice(0, 10)
           .join(' ')
@@ -35,7 +36,7 @@ export const characterProvider: Provider = {
     const bio = addHeader(`# About ${character.name}`, bioText);
 
     // System prompt
-    const system = `# System Behavior\n${character.system}` ?? '';
+    const system = character.system ? `# System Behavior\n${character.system}` : '';
 
     // Select random topic if available
     const topicString =
@@ -43,9 +44,6 @@ export const characterProvider: Provider = {
         ? character.topics[Math.floor(Math.random() * character.topics.length)]
         : null;
 
-    // postCreationTemplate in core prompts.ts
-    // Write a post that is {{adjective}} about {{topic}} (without mentioning {{topic}} directly), from the perspective of {{agentName}}. Do not add commentary or acknowledge this request, just write the post.
-    // Write a post that is {{Spartan is dirty}} about {{Spartan is currently}}
     const topic = topicString || '';
 
     // Format topics list
@@ -78,7 +76,7 @@ export const characterProvider: Provider = {
     // Format post examples
     const formattedCharacterPostExamples = !character.postExamples
       ? ''
-      : character.postExamples
+      : [...character.postExamples]
           .sort(() => 0.5 - Math.random())
           .map((post) => {
             const messageString = `${post}`;
@@ -96,7 +94,7 @@ export const characterProvider: Provider = {
     // Format message examples
     const formattedCharacterMessageExamples = !character.messageExamples
       ? ''
-      : character.messageExamples
+      : [...character.messageExamples]
           .sort(() => 0.5 - Math.random())
           .slice(0, 5)
           .map((example) => {
@@ -108,7 +106,7 @@ export const characterProvider: Provider = {
               .map((message) => {
                 let messageString = `${message.name}: ${message.content.text}${
                   message.content.action || message.content.actions
-                    ? ` (actions: ${message.content.action || message.content.actions.join(', ')})`
+                    ? ` (actions: ${message.content.action || message.content.actions?.join(', ')})`
                     : ''
                 }`;
                 exampleNames.forEach((name, index) => {
@@ -136,7 +134,7 @@ export const characterProvider: Provider = {
 
     // Style directions
     const postDirections =
-      character?.style?.all?.length > 0 || character?.style?.post?.length > 0
+      (character?.style?.all?.length ?? 0) > 0 || (character?.style?.post?.length ?? 0) > 0
         ? addHeader(
             `# Post Directions for ${character.name}`,
             (() => {
@@ -148,7 +146,7 @@ export const characterProvider: Provider = {
         : '';
 
     const messageDirections =
-      character?.style?.all?.length > 0 || character?.style?.chat?.length > 0
+      (character?.style?.all?.length ?? 0) > 0 || (character?.style?.chat?.length ?? 0) > 0
         ? addHeader(
             `# Message Directions for ${character.name}`,
             (() => {

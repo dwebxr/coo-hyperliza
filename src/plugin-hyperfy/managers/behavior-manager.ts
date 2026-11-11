@@ -1,10 +1,13 @@
 import { ChannelType, Content, HandlerCallback, IAgentRuntime, Memory, ModelType, composePromptFromState, createUniqueUuid, logger, parseKeyValueXml } from "@elizaos/core";
-import { HyperfyService } from "../service";
+import type { ConnectionSession } from "../session/connection-session";
+import { deliverReply } from "../session/deliver-reply";
 import { autoTemplate } from "../templates";
 import { agentActivityLock } from "./guards";
 import { getHyperfyActions, formatActions, countOtherPlayers } from "../utils";
-import { isOpenPayLink } from "../../openpay-store";
-import { AiBudgetExceededError, forPurpose, getUsageBudget, runWithOrigin } from "../../usage-budget";
+import { AiBudgetExceededError, forPurpose, getUsageBudget } from "../../usage-budget";
+import { AUTONOMY_ACTIONS } from "../lib/authorization";
+import { TurnCancelled, currentTurn } from "../lib/turn-context";
+import { errorText } from "../lib/error-text";
 import {
   type AutonomyConfig,
   type Point,
@@ -14,6 +17,7 @@ import {
   chooseIdleStep,
   readAutonomyConfig,
 } from "../lib/idle-behavior";
+import { readActionNames, readString, readStringList } from "../lib/model-output";
 
 const TIME_INTERVAL_IDLE_MIN = 60000; // 60 seconds when no players around
 const TIME_INTERVAL_IDLE_MAX = 120000; // 120 seconds when no players around
@@ -27,6 +31,7 @@ const TIME_INTERVAL_IDLE_MAX = 120000; // 120 seconds when no players around
 export class BehaviorManager {
   private isRunning: boolean = false;
   private runtime: IAgentRuntime;
+  private session: ConnectionSession;
   private sleepTimer: NodeJS.Timeout | null = null;
   private wakeSleep: (() => void) | null = null;
   private readonly config: AutonomyConfig;
@@ -35,14 +40,13 @@ export class BehaviorManager {
   /** Players already greeted on this connection; someone who leaves and comes back is greeted again. */
   private seenPlayers = new Set<string>();
 
-  constructor(runtime: IAgentRuntime, config: AutonomyConfig = readAutonomyConfig()) {
+  constructor(runtime: IAgentRuntime, session: ConnectionSession, config: AutonomyConfig = readAutonomyConfig()) {
     this.runtime = runtime;
+    this.session = session;
     this.config = config;
   }
 
-  /**
-   * Starts the behavior loop if not already running and prerequisites are met.
-   */
+  /** Starts the behavior loop unless it is already running. */
   public start(): void {
     if (this.isRunning) {
       logger.warn("[BehaviorManager] Already running");
@@ -55,7 +59,7 @@ export class BehaviorManager {
 
     this.runLoop().catch((err) => {
       console.error("[BehaviorManager] Fatal error in run loop:", err);
-      logger.error("[BehaviorManager] Fatal error in run loop:", err);
+      logger.error(`[BehaviorManager] Fatal error in run loop: ${errorText(err)}`);
     });
   }
 
@@ -87,7 +91,7 @@ export class BehaviorManager {
       try {
         hasOtherPlayers = await this.executeBehavior();
       } catch (error) {
-        logger.error("[BehaviorManager] Error in behavior:", error);
+        logger.error(`[BehaviorManager] Error in behavior: ${errorText(error)}`);
       }
 
       // Adjust delay based on whether other players are present
@@ -113,26 +117,14 @@ export class BehaviorManager {
     });
   }
 
-  private getService() {
-    return this.runtime.getService<HyperfyService>(HyperfyService.serviceType);
-  }
-
   /**
    * Executes a behavior
    * @returns true if other players are present, false otherwise
    */
   private async executeBehavior(): Promise<boolean> {
-    const service = this.getService();
-    if (!service) {
-      logger.error("[BehaviorManager] Cannot start — service not available");
-      return false;
-    }
-
-    const world = service.getWorld();
-    if (!world) {
-      logger.warn("[BehaviorManager] World not found (disconnected or initializing). Skipping behavior.");
-      return false;
-    }
+    const session = this.session;
+    if (session.ended) return false;
+    const world = session.world;
 
     const player = world.entities?.player;
     if (!player) {
@@ -151,8 +143,6 @@ export class BehaviorManager {
       return false;
     }
 
-    // TODO: There may be slow post-processing in the bootstrap plugin's message handler.
-    // Investigate long tail after message handling, especially in emitEvent or runtime methods.
     if (agentActivityLock.isActive()) {
       logger.info("[BehaviorManager] Skipping behavior — message activity in progress");
       return hasOtherPlayers;
@@ -163,21 +153,31 @@ export class BehaviorManager {
       // Counted up front, so a failing tick cannot be retried on every loop
       budget.recordAutonomyAiTick();
       try {
-        await runWithOrigin('autonomous', () => this.runAiBehavior(service, world));
+        await session.runTurn({ origin: 'autonomy' }, () => this.runAiBehavior(world));
         return hasOtherPlayers;
       } catch (error) {
+        // The connection ended while the tick ran: what it had planned is not done
+        if (error instanceof TurnCancelled) {
+          logger.info(`[BehaviorManager] Autonomous tick stopped: ${error.message}`);
+          return hasOtherPlayers;
+        }
         if (!(error instanceof AiBudgetExceededError)) throw error;
         logger.info(`[BehaviorManager] ${error.message}; using scripted behavior`);
       }
     }
 
+    if (session.ended) return hasOtherPlayers;
     budget.recordScriptedTick();
-    this.runScriptedBehavior(service, world);
+    this.runScriptedBehavior(world);
     return hasOtherPlayers;
   }
 
-  /** One scripted step; movement and emotes are started, not awaited. */
-  private runScriptedBehavior(service: HyperfyService, world: any): void {
+  /**
+   * One scripted step; movement and emotes are started, not awaited. Not a turn: what it starts
+   * belongs to the connection and stops with it.
+   */
+  private runScriptedBehavior(world: any): void {
+    const session = this.session;
     const self = world.entities.player;
     const position = self?.base?.position;
     if (!this.home && position) this.home = { x: position.x, z: position.z };
@@ -187,7 +187,8 @@ export class BehaviorManager {
     const recentlyTalked = Date.now() - agentActivityLock.lastActivityAt() < STAY_AFTER_CONVERSATION_MS;
     const step = chooseIdleStep({
       newcomer: this.findNewcomer(world),
-      canMove: !!controls && !navigating && !recentlyTalked,
+      // Not while a turn has the avatar to itself (walking somewhere, editing, looking)
+      canMove: !!controls && !navigating && !recentlyTalked && !session.body.busy,
       patrolPoints: this.config.patrolPoints,
       patrolIndex: this.patrolIndex,
       home: this.home,
@@ -195,7 +196,7 @@ export class BehaviorManager {
     });
     logger.debug(`[BehaviorManager] Scripted step: ${JSON.stringify(step)}`);
 
-    const emotes = service.getEmoteManager();
+    const emotes = session.emotes;
     const ignore = (what: string) => (error: unknown) => logger.debug(`[BehaviorManager] ${what} failed: ${error}`);
     // Worlds that refuse emote uploads have no wave / look-around clips: turn instead, which
     // everyone sees
@@ -212,8 +213,9 @@ export class BehaviorManager {
         // Emotes stop while walking, so wave once there
         controls
           .followEntity(step.playerId)
-          .then(() => {
-            if (this.isRunning && service.getWorld() === world) wave(step.playerId);
+          .then((outcome: string) => {
+            // Only next to them: a walk that was stopped or replaced waves at nobody
+            if (outcome === 'arrived' && this.isRunning && !session.ended) wave(step.playerId);
           })
           .catch(ignore('Greeting walk'));
         break;
@@ -276,8 +278,11 @@ export class BehaviorManager {
   }
 
   /** Lets Claude choose the next action. Throws AiBudgetExceededError when the budget ran out. */
-  private async runAiBehavior(service: HyperfyService, world: any): Promise<void> {
-    const _currentWorldId = service.currentWorldId;
+  private async runAiBehavior(world: any): Promise<void> {
+    const session = this.session;
+    const turn = currentTurn();
+    if (!turn) throw new Error('an autonomous tick runs inside a turn');
+    const _currentWorldId = session.worldId;
 
     const elizaRoomId = createUniqueUuid(this.runtime, _currentWorldId || 'hyperfy-unknown-world')
     const entityId = createUniqueUuid(this.runtime, this.runtime.agentId);
@@ -295,24 +300,12 @@ export class BehaviorManager {
 
     const state = await this.runtime.composeState(newMessage);
 
-    const actionsData = await getHyperfyActions(
-      this.runtime,
-      newMessage,
-      state, [
-      'HYPERFY_GOTO_ENTITY',
-      'HYPERFY_WALK_RANDOMLY',
-      'HYPERFY_USE_ITEM',
-      'HYPERFY_UNUSE_ITEM',
-      'HYPERFY_AMBIENT_SPEECH',
-      'HYPERFY_TELEPORT_TO_USER',
-      'REPLY',
-      'IGNORE',
-    ]
-    );
+    // What the prompt offers; lib/authorization.ts refuses anything else the model names
+    const actionsData = await getHyperfyActions(this.runtime, newMessage, state, [...AUTONOMY_ACTIONS]);
 
     const actionsText = actionsData.length > 0 ? formatActions(actionsData) : '';
 
-    const responsePrompt = composePromptFromState({ state, template: autoTemplate(actionsText) });
+    const responsePrompt = composePromptFromState({ state: { ...state, values: { ...state.values, autonomousActions: actionsText } }, template: autoTemplate });
 
     // decide
     const response = await this.runtime.useModel(ModelType.TEXT_LARGE, forPurpose('autonomous', {
@@ -329,11 +322,11 @@ export class BehaviorManager {
     const responseMemory: Memory = {
       id: createUniqueUuid(this.runtime, Date.now().toString()),
       content: {
-        thought: parsedXml.thought as string,
-        text: parsedXml.text as string,
-        actions: parsedXml.actions as string[],
-        providers: parsedXml.providers as string[],
-        emote: parsedXml.emote as string,
+        thought: readString(parsedXml, 'thought'),
+        text: readString(parsedXml, 'text'),
+        actions: readActionNames(parsedXml),
+        providers: readStringList(parsedXml, 'providers'),
+        emote: readString(parsedXml, 'emote'),
       },
       entityId: createUniqueUuid(this.runtime, this.runtime.agentId),
       roomId: elizaRoomId,
@@ -352,36 +345,13 @@ export class BehaviorManager {
       worldId: _currentWorldId,
     })
 
+    // The model's answer came back for a connection that has ended meanwhile: nothing is done with it
+    turn.assertLive();
+
+    // Every reply of this tick goes out through the one delivery path (session/deliver-reply.ts)
+    const reply = { turn, runtime: this.runtime, session, roomId: elizaRoomId };
     const callback: HandlerCallback = async (responseContent: Content): Promise<Memory[]> => {
-      console.info(`[Hyperfy Auto Callback] Received response: ${JSON.stringify(responseContent)}`)
-      // Stopped (disconnect) while this tick was generating; don't act in a newer world
-      if (!this.isRunning || service.getWorld() !== world) return [];
-      const emote = responseContent.emote as string;
-      const callbackMemory: Memory = {
-        id: createUniqueUuid(this.runtime, Date.now().toString()),
-        entityId: this.runtime.agentId,
-        agentId: this.runtime.agentId,
-        content: {
-          ...responseContent,
-          channelType: ChannelType.WORLD,
-          emote
-        },
-        roomId: elizaRoomId,
-        createdAt: Date.now(),
-      };
-
-      await this.runtime.createMemory(callbackMemory, 'messages');
-
-      if (emote) {
-        const emoteManager = service.getEmoteManager();
-        emoteManager.playEmote(emote);
-      }
-
-      if (responseContent.text && !isOpenPayLink(responseContent)) {
-        service.getMessageManager().sendMessage(responseContent.text);
-        await service.getVoiceManager()?.speak(responseContent.text);
-      }
-
+      await deliverReply(reply, responseContent);
       return [];
     };
 

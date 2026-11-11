@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Postinstall script to inject custom CSS into ElizaOS client
- * This runs automatically after npm install
+ * Runs automatically after install (the package's postinstall script)
  */
 
 const fs = require('fs');

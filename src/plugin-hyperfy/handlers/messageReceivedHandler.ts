@@ -1,11 +1,23 @@
-import { Content, EventType, HandlerCallback, IAgentRuntime, Memory, MessageReceivedHandlerParams, ModelType, asUUID, composePromptFromState, createUniqueUuid, logger, parseKeyValueXml, truncateToCompleteSentence } from "@elizaos/core";
-import { v4 } from 'uuid';
+import { Content, EventType, HandlerCallback, IAgentRuntime, Memory, ModelType, type UUID, asUUID, composePromptFromState, createUniqueUuid, logger, parseKeyValueXml, truncateToCompleteSentence } from "@elizaos/core";
 import { hyperfyShouldRespondTemplate, hyperfyMessageHandlerTemplate } from "../templates";
 import { AiBudgetExceededError, forPurpose, getUsageBudget } from "../../usage-budget";
+import { AnthropicRefusalError } from "../../anthropic-models";
+import { cancelTurn, currentTurn, turnDelivered } from "../lib/turn-context";
+import { actingSession } from "../service";
 import { getShopProducts } from "../../openpay-store";
 import { parseAliases } from "../lib/addressing";
 import { isJapanese, matchSimpleCommand, simpleCommandReply } from "../lib/simple-commands";
+import { ignoredAsMuted } from "../lib/room-state";
 import { NoticeThrottle, composeOfflineReply } from "../lib/offline-reply";
+import { readActionNames, readString, readStringList } from "../lib/model-output";
+
+/** What the Hyperfy chat and voice events hand the handler (see ../events.ts). */
+export interface MessageReceivedHandlerParams {
+  runtime: IAgentRuntime;
+  message: Memory;
+  callback: HandlerCallback;
+  onComplete?: () => void;
+}
 
 const latestResponseIds = new Map<string, Map<string, string>>();
 
@@ -25,24 +37,52 @@ async function handleSimpleCommand(runtime: IAgentRuntime, message: Memory, call
   const command = matchSimpleCommand(message.content.text, names);
   if (!command) return false;
 
-  const world = (runtime.getService?.('hyperfy') as { getWorld?: () => any } | null)?.getWorld?.();
+  // The turn's own connection (never a newer one); throws when the turn may no longer act
+  const session = actingSession(runtime);
+  const world = session?.world;
   const controls = world?.controls;
-  if (!controls) return false;
+  if (!session || !controls) return false;
 
   if (command === 'come') {
     const senderId = (message.content.metadata as { hyperfyFromId?: string } | undefined)?.hyperfyFromId;
     const theirs = senderId ? world.entities?.items?.get(senderId)?.base?.position : null;
     const mine = world.entities?.player?.base?.position;
     if (!theirs || !mine) return false;
-    if (theirs.distanceTo(mine) > COME_TELEPORT_BEYOND_M) {
-      controls.teleportToEntity(senderId);
-    } else {
-      // Not awaited: the reply goes out while walking
-      controls.followEntity(senderId).catch((error: unknown) => logger.debug(`[Bootstrap] Walking to the speaker failed: ${error}`));
+    // Moves the avatar: in its turn among such sections (ConnectionSession.withBody)
+    const underWay = await session.withBody(async (signal): Promise<boolean | 'gone'> => {
+      // Again, now: the speaker may have left while this waited for the avatar
+      const theirsNow = world.entities?.items?.get(senderId)?.base?.position;
+      const mineNow = world.entities?.player?.base?.position;
+      if (!theirsNow || !mineNow) return 'gone';
+      if (theirsNow.distanceTo(mineNow) > COME_TELEPORT_BEYOND_M) {
+        return controls.teleportToEntity(senderId) === 'arrived';
+      } else {
+        // Not awaited: the reply goes out while walking. The walk goes on after this turn has
+        // completed, and stops if the turn is cancelled first, or with the connection
+        controls.followEntity(senderId, undefined, { signal }).catch((error: unknown) => logger.debug(`[Bootstrap] Walking to the speaker failed: ${error}`));
+        return true;
+      }
+    });
+    // The teleport could not be made (their position is not one): not handled here, so nothing
+    // is claimed; the turn goes on as for any other message
+    if (!underWay) return false;
+    if (underWay === 'gone') {
+      logger.info('[Bootstrap] "Come here" from a speaker who is no longer in the world');
+      await callback({
+        thought: 'Simple request (come), but the speaker is gone.',
+        text: isJapanese(message.content.text) ? 'あれ、どこにいるか分からなくなっちゃいました。' : "Hmm, I can't find you right now.",
+        actions: ['REPLY'],
+        source: 'hyperfy',
+        ...(message.id ? { inReplyTo: createUniqueUuid(runtime, message.id) } : {}),
+      });
+      return true;
     }
-  } else {
+  } else if (!(message.content.metadata as { hyperfyStopTaken?: boolean } | undefined)?.hyperfyStopTaken) {
+    // Waits for nobody: it ends whatever walk is in progress
     controls.stopAllActions('asked to stop');
   }
+  // else: it stopped the agent when it arrived (ConnectionSession.stopOnArrival); this turn only
+  // acknowledges it, and stops nothing asked for since
 
   logger.info(`[Bootstrap] Simple command "${command}" handled without a model call`);
   await callback({
@@ -55,15 +95,37 @@ async function handleSimpleCommand(runtime: IAgentRuntime, message: Memory, call
   return true;
 }
 
-/** Answers a player who talks to the agent while the Claude budget is used up. */
-async function replyWithoutAi(runtime: IAgentRuntime, message: Memory, callback: HandlerCallback): Promise<void> {
+/**
+ * Answers a player who talks to the agent while the Claude budget is used up. The "on a break"
+ * notice is throttled per player when it is sent up front (`throttle`), but not when it is the
+ * only answer to a request that ran out of budget partway (see the catch in the handler).
+ */
+async function replyWithoutAi(
+  runtime: IAgentRuntime,
+  message: Memory,
+  callback: HandlerCallback,
+  { throttle = true }: { throttle?: boolean } = {}
+): Promise<void> {
   const text = message.content.text ?? '';
   const reply = composeOfflineReply({ text, products: getShopProducts(runtime), japanese: isJapanese(text) });
-  if (reply.kind === 'notice' && !offlineNotices.allow(`${message.roomId}:${message.entityId}`)) return;
+  const key = `${message.roomId}:${message.entityId}`;
+  if (reply.kind === 'notice' && throttle && !offlineNotices.allow(key)) return;
   getUsageBudget().recordSkip('offline-reply');
   logger.info(`[Bootstrap] Claude budget reached; answering with a ${reply.kind} instead`);
   await callback({
     ...reply.content,
+    ...(message.id ? { inReplyTo: createUniqueUuid(runtime, message.id) } : {}),
+  });
+}
+
+/** Said without a model call when Claude declined the request. */
+async function replyDeclined(runtime: IAgentRuntime, message: Memory, callback: HandlerCallback): Promise<void> {
+  logger.info('[Bootstrap] The model declined the request; answering with a fixed reply');
+  await callback({
+    thought: 'The model declined this request.',
+    text: isJapanese(message.content.text) ? 'ごめんなさい、それはお手伝いできません。' : "Sorry, I can't help with that.",
+    actions: ['REPLY'],
+    source: 'hyperfy',
     ...(message.id ? { inReplyTo: createUniqueUuid(runtime, message.id) } : {}),
   });
 }
@@ -77,16 +139,24 @@ async function replyWithoutAi(runtime: IAgentRuntime, message: Memory, callback:
 export const messageReceivedHandler = async ({
   runtime,
   message,
-  callback,
+  callback: platformCallback,
   onComplete,
 }: MessageReceivedHandlerParams): Promise<void> => {
+  // Whether the player got anything during this turn: recorded where output actually happens (each
+  // chat chunk posted, an utterance played; see noteDelivered), not when a callback is entered,
+  // because a callback can drop or fail to deliver what it gets. An emote alone does not count: it
+  // answers nothing in words, so a fixed reply after it is not a duplicate. Core hands action
+  // replies to the callback only after the action returns, so an action that throws delivers nothing.
+  const turn = currentTurn();
+  const callback = platformCallback;
+  const delivered = () => turnDelivered(turn);
   // Set up timeout monitoring
   const timeoutDuration = 60 * 60 * 1000; // 1 hour
   let timeoutId: NodeJS.Timeout | undefined = undefined;
   try {
     logger.info(`[Bootstrap] Message received from ${message.entityId} in room ${message.roomId}`);
     // Generate a new response ID
-    const responseId = v4();
+    const responseId = crypto.randomUUID();
     // Get or create the agent-specific map
     if (!latestResponseIds.has(runtime.agentId)) {
       latestResponseIds.set(runtime.agentId, new Map<string, string>());
@@ -100,14 +170,16 @@ export const messageReceivedHandler = async ({
     agentResponses.set(message.roomId, responseId);
 
     // Generate a unique run ID for tracking this message handler execution
-    const runId = asUUID(v4());
+    const runId = asUUID(crypto.randomUUID());
     const startTime = Date.now();
+    // Every message the Hyperfy managers hand over has an id; core's run events require one
+    const messageId = message.id as UUID;
 
     // Emit run started event
     await runtime.emitEvent(EventType.RUN_STARTED, {
       runtime,
       runId,
-      messageId: message.id,
+      messageId,
       roomId: message.roomId,
       entityId: message.entityId,
       startTime,
@@ -120,7 +192,7 @@ export const messageReceivedHandler = async ({
         await runtime.emitEvent(EventType.RUN_TIMEOUT, {
           runtime,
           runId,
-          messageId: message.id,
+          messageId,
           roomId: message.roomId,
           entityId: message.entityId,
           startTime,
@@ -139,7 +211,6 @@ export const messageReceivedHandler = async ({
       // Set by the Hyperfy message/voice managers
       const metadata = (message.content?.metadata ?? {}) as { directlyAddressed?: boolean; soloPlayer?: boolean };
       const addressed = !!(metadata.directlyAddressed || metadata.soloPlayer);
-      let replied = false;
       try {
         if (message.entityId === runtime.agentId) {
           logger.debug(`[Bootstrap] Skipping message from self (${runtime.agentId})`);
@@ -160,30 +231,18 @@ export const messageReceivedHandler = async ({
           : undefined;
         await Promise.all([embedding, runtime.createMemory(message, 'messages')]);
 
-        const agentUserState = await runtime.getParticipantUserState(
-          message.roomId,
-          runtime.agentId
-        );
-
-        if (
-          agentUserState === 'MUTED' &&
-          !message.content.text?.toLowerCase().includes(runtime.character.name.toLowerCase())
-        ) {
+        if (await ignoredAsMuted(runtime, message.roomId, message.content.text)) {
           logger.debug(`[Bootstrap] Ignoring muted room ${message.roomId}`);
           return;
         }
 
         // Simple requests from the player talking to the agent need no model call
         if (addressed && (await handleSimpleCommand(runtime, message, callback))) {
-          replied = true;
           return;
         }
 
         if (!getUsageBudget().aiAvailable()) {
-          if (addressed) {
-            replied = true;
-            await replyWithoutAi(runtime, message, callback);
-          }
+          if (addressed) await replyWithoutAi(runtime, message, callback);
           return;
         }
 
@@ -245,11 +304,11 @@ export const messageReceivedHandler = async ({
 
             // Attempt to parse the XML response
             const parsedXml = parseKeyValueXml(response);
-            logger.debug('[Bootstrap] *** Parsed XML Content ***\n', parsedXml);
+            logger.debug({ parsedXml }, '[Bootstrap] *** Parsed XML Content ***');
 
             // Map parsed XML to Content type, handling potential missing fields
             if (parsedXml) {
-              let actions = parsedXml.actions || ['IGNORE'];
+              let actions = readActionNames(parsedXml) || ['IGNORE'];
 
               // Reorder actions so 'REPLY' always comes first if present
               const replyIndex = actions.findIndex(a => a.toUpperCase() === 'REPLY');
@@ -262,11 +321,11 @@ export const messageReceivedHandler = async ({
 
               responseContent = {
                 ...parsedXml,
-                thought: parsedXml.thought || '',
+                thought: readString(parsedXml, 'thought') || '',
                 actions,
-                providers: parsedXml.providers || [],
-                text: parsedXml.text || '',
-                simple: parsedXml.simple || false,
+                providers: readStringList(parsedXml, 'providers') || [],
+                text: readString(parsedXml, 'text') || '',
+                simple: parsedXml.simple === true,
               };
             } else {
               responseContent = null;
@@ -278,20 +337,25 @@ export const messageReceivedHandler = async ({
             }
           }
 
-          // Check if this is still the latest response ID for this agent+room
+          // Check if this is still the latest response ID for this agent+room. Turns of one
+          // connection run one at a time (lib/chat-intake.ts), so a newer one only starts while
+          // this one runs when this one outlived its slot; either way this turn does nothing more.
           const currentResponseId = agentResponses.get(message.roomId);
           if (currentResponseId !== responseId) {
             logger.info(
               `Response discarded - newer message being processed for agent: ${runtime.agentId}, room: ${message.roomId}`
             );
+            if (turn) cancelTurn(turn, 'a newer message took its place');
             return;
           }
+          // The answer came back for a turn that may no longer act: none of its plan is run
+          turn?.assertLive();
 
           if (responseContent && message.id) {
             responseContent.inReplyTo = createUniqueUuid(runtime, message.id);
 
             const responseMesssage = {
-              id: asUUID(v4()),
+              id: asUUID(crypto.randomUUID()),
               entityId: runtime.agentId,
               agentId: runtime.agentId,
               content: responseContent,
@@ -312,9 +376,8 @@ export const messageReceivedHandler = async ({
             state = await runtime.composeState(message, responseContent?.providers || []);
           }
 
-          // From here the player gets the generated reply; a budget error in a later action
-          // (e.g. navigation) must not add the offline notice on top
-          replied = responseMessages.length > 0;
+          // An action that runs out of budget or is declined stops the rest of the plan (the error
+          // propagates); the catch below answers only if nothing reached the player before that
           await runtime.processActions(message, responseMessages, state, callback);
           
           await runtime.evaluate(message, state, shouldRespond, callback, responseMessages);
@@ -328,6 +391,7 @@ export const messageReceivedHandler = async ({
             logger.info(
               `Ignore response discarded - newer message being processed for agent: ${runtime.agentId}, room: ${message.roomId}`
             );
+            if (turn) cancelTurn(turn, 'a newer message took its place');
             return; // Stop processing if a newer message took over
           }
 
@@ -359,9 +423,17 @@ export const messageReceivedHandler = async ({
 
       } catch (error: any) {
         runError = error?.message || String(error);
-        // The budget ran out partway through this turn: still answer the player
-        if (error instanceof AiBudgetExceededError && addressed && !replied) {
-          await replyWithoutAi(runtime, message, callback).catch((e) => logger.warn('[Bootstrap] Offline reply failed:', e));
+        // The budget ran out, or the model declined, before the player got anything: answer anyway,
+        // without a model call. Nothing is added when a reply (e.g. REPLY before the failing
+        // action) already reached them.
+        if (addressed && !delivered()) {
+          const fallback =
+            error instanceof AiBudgetExceededError
+              ? () => replyWithoutAi(runtime, message, callback, { throttle: false })
+              : error instanceof AnthropicRefusalError
+                ? () => replyDeclined(runtime, message, callback)
+                : null;
+          await fallback?.().catch((e) => logger.warn('[Bootstrap] Fallback reply failed:', e));
         }
       } finally {
         // Emitted on every path, including early returns (muted room, superseded response)

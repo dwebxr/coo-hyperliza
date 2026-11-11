@@ -1,77 +1,57 @@
 import {
-    logger,
-    type Action,
-    type HandlerCallback,
-    type IAgentRuntime,
-    type Memory,
-    type State
+  logger,
+  type Action,
+  type IAgentRuntime,
 } from '@elizaos/core';
-// No longer need THREE here
-import { AgentControls } from '../systems/controls'; // Still need type for casting
-import { HyperfyService } from '../service';
+import { AgentControls } from '../systems/controls'; // type only
+import { actingSession, connectedSession } from '../service';
+import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
 
-// Restore constants for default values
-const RANDOM_WALK_DEFAULT_INTERVAL = 4000; // ms (4 seconds)
-const RANDOM_WALK_DEFAULT_MAX_DISTANCE = 30; // meters
+const WALK_RANDOMLY = 'HYPERFY_WALK_RANDOMLY';
 
-// State management is now in AgentControls
+const RANDOM_WALK_INTERVAL_MS = 4000;
+const RANDOM_WALK_MAX_DISTANCE = 30; // meters
 
 export const hyperfyWalkRandomlyAction: Action = {
-    name: 'HYPERFY_WALK_RANDOMLY',
-    similes: ['WANDER', 'PACE_AROUND', 'WALK_AROUND', 'MOVE_RANDOMLY'], // Reverted similes/desc
+    name: WALK_RANDOMLY,
+    similes: ['WANDER', 'PACE_AROUND', 'WALK_AROUND', 'MOVE_RANDOMLY'],
     description: 'Makes your character wander to random points nearby; use for idle behavior or ambient movement.',
     validate: async (runtime: IAgentRuntime): Promise<boolean> => {
-      const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-      // Keep validation simple: Check if controls exist
-      return !!service && service.isConnected() && !!service.getWorld()?.controls;
+      return !!connectedSession(runtime)?.world?.controls;
     },
-    handler: async (
-      runtime: IAgentRuntime,
-      _message: Memory,
-      _state: State,
-      options: { interval?: number, distance?: number, command?: 'start' | 'stop' }, // Reverted options
-      callback: HandlerCallback,
-    ) => {
-      const service = runtime.getService<HyperfyService>(HyperfyService.serviceType);
-      const world = service?.getWorld();
+    // elizaOS core passes its own bookkeeping as options (actionContext, actionPlan), nothing of this action's
+    handler: async (runtime, _message, _state, _options, callback) => {
+      // The turn's own connection (never a newer one); throws when the turn may no longer act
+      const session = actingSession(runtime);
+      const world = session?.world;
       const controls = world?.controls as AgentControls | undefined;
 
-      if (!service || !world || !controls) {
+      if (!session || !world || !controls) {
         logger.error('Hyperfy service, world, or controls not found for HYPERFY_WALK_RANDOMLY action.');
-        await callback({ text: "Error: Cannot wander. Hyperfy connection/controls unavailable." });
-        return;
+        await tellFailure(callback, WALK_RANDOMLY, "Error: Cannot wander. Hyperfy connection/controls unavailable.");
+        return actionFailed(WALK_RANDOMLY, 'Hyperfy connection/controls unavailable');
       }
 
-      // Check for specific methods from the reverted AgentControls
-       if (typeof controls.startRandomWalk !== 'function' || typeof controls.stopRandomWalk !== 'function') {
-           logger.error('AgentControls missing startRandomWalk or stopRandomWalk methods.');
-           await callback({ text: "Error: Wander functionality not available in controls." });
-           return;
-       }
-
-      const command = options?.command || 'start';
-      // Use provided interval (in seconds) or default (in ms)
-      const intervalMs = options?.interval ? options.interval * 1000 : RANDOM_WALK_DEFAULT_INTERVAL;
-      const maxDistance = options?.distance || RANDOM_WALK_DEFAULT_MAX_DISTANCE;
-
-      if (command === 'stop') {
-          if (controls.getIsWalkingRandomly()) { // Use correct check
-               controls.stopRandomWalk(); // Call correct stop method
-              //  await callback({ text: "Stopped wandering.", actions: ['HYPERFY_WALK_RANDOMLY'], source: 'hyperfy', metadata: { status: 'stopped' } });
-          } else {
-              //  await callback({ text: "Was not wandering.", source: 'hyperfy' });
-          }
-      } else { // command === 'start'
-          // Call startRandomWalk with calculated interval and distance
-          controls.startRandomWalk(intervalMs, maxDistance);
-
-          await callback({
-             text: ``,
-             actions: ['HYPERFY_WALK_RANDOMLY'],
-             source: 'hyperfy',
-             metadata: { status: 'started', intervalMs: intervalMs, maxDistance: maxDistance }
-          });
+      if (typeof controls.startRandomWalk !== 'function') {
+        logger.error('AgentControls missing startRandomWalk.');
+        await tellFailure(callback, WALK_RANDOMLY, "Error: Wander functionality not available in controls.");
+        return actionFailed(WALK_RANDOMLY, 'wander functionality not available in controls');
       }
+
+      // Started in its turn among the sections that move the avatar, then left running: it
+      // goes on after this turn completes, and stops when the turn is cancelled, when another
+      // walk starts, on a stop (HYPERFY_STOP_MOVING), or with the connection
+      await session.withBody(async (signal) => {
+        controls.startRandomWalk(RANDOM_WALK_INTERVAL_MS, RANDOM_WALK_MAX_DISTANCE, undefined, { signal });
+      });
+
+      await callback?.({
+        text: ``,
+        actions: [WALK_RANDOMLY],
+        source: 'hyperfy',
+        metadata: { status: 'started', intervalMs: RANDOM_WALK_INTERVAL_MS, maxDistance: RANDOM_WALK_MAX_DISTANCE }
+      });
+      return actionSucceeded(WALK_RANDOMLY, { status: 'started' });
     },
      examples: [
         [
@@ -81,10 +61,6 @@ export const hyperfyWalkRandomlyAction: Action = {
          [
           { name: '{{name1}}', content: { text: 'Just pace around here.' } },
           { name: '{{name2}}', content: { text: 'Starting to wander randomly... (New target every ~5.0s)', actions: ['HYPERFY_WALK_RANDOMLY'], source: 'hyperfy' } }
-        ],
-        [
-          { name: '{{name1}}', content: { text: 'Stop wandering.' } }, // Assumes it was wandering
-          { name: '{{name2}}', content: { text: 'Stopped wandering.', actions: ['HYPERFY_WALK_RANDOMLY'], source: 'hyperfy' } }
         ]
        ]
 }; 

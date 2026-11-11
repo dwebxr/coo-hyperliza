@@ -1,4 +1,5 @@
-export const autoTemplate = (actionsText) => `
+// {{autonomousActions}} is a state value the behavior manager adds (the actions an autonomous turn may use)
+export const autoTemplate = `
 <note>
 This is a regular behavior update from {{agentName}}, not triggered by a user message.
 
@@ -37,7 +38,7 @@ When using REPLY or HYPERFY_AMBIENT_SPEECH, the spoken message in the "text" fie
 ---
 
 # Available Actions:
-${actionsText}
+{{autonomousActions}}
 
 
 ---
@@ -110,6 +111,8 @@ Your task is to observe, interpret, and respond to the current moment as a fully
 {{hyperfyAnimations}}
 
 {{openpayStore}}
+
+{{hyperfyTips}}
 
 </providers>
 

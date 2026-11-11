@@ -5,6 +5,8 @@ dist
 data
 package-lock.json
 .env
+.env.*
+!.env.example
 local.json
 # Hyperfy auth token (written at runtime) - never commit
 localstorage.json
