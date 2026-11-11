@@ -36,7 +36,6 @@ function setup() {
       if (!auth.live) throw new SceneEditStopped('the connection to the world changed');
       if (!auth.allowed) throw new SceneEditStopped('the requester is not a builder in this world');
     },
-    connectionLive: () => auth.live,
   };
   const app = { onUploaded: vi.fn(), destroy: vi.fn() };
   const entity = {
@@ -54,7 +53,7 @@ function setup() {
   network.upload = vi.fn((file: File, { check }: { check?: () => void } = {}) => uploadAsset(network, file, { net: new NetPolicy({ worldOrigin: 'https://world.test' }), authToken: 'session', fetchImpl, check }));
   const world: any = {
     assetsUrl: 'https://world.test/assets',
-    controls: { goto: vi.fn().mockResolvedValue(undefined) },
+    controls: { goto: vi.fn().mockResolvedValue('arrived') },
     network,
     blueprints: { add: vi.fn() },
     entities: { items: new Map<string, unknown>([['box', entity]]), add: vi.fn(() => app) },
@@ -143,7 +142,12 @@ describe('BuildManager reports what each operation did', () => {
     await expect(manager.translate(guard, 'box', [0, 2, 0])).resolves.toEqual({ outcome: 'applied' });
     expect(entity.root.position.toArray()).toEqual([0, 2, 0]);
     expect(world.network.send).toHaveBeenCalledWith('entityModified', expect.objectContaining({ id: 'box' }));
-    await expect(manager.duplicate(guard, 'box')).resolves.toEqual({ outcome: 'applied' });
+    // A duplicate says which entity it made: the id it announced to the world
+    const copy = await manager.duplicate(guard, 'box');
+    const [added] = world.entities.add.mock.calls[0];
+    expect(copy).toEqual({ outcome: 'applied', newId: added.id });
+    expect(added.id).toMatch(/^[A-Za-z0-9_-]{6,}$/);
+    expect(added.id).not.toBe('box');
     await expect(manager.delete(guard, 'box')).resolves.toEqual({ outcome: 'applied' });
   });
 
@@ -170,6 +174,55 @@ describe('BuildManager reports what each operation did', () => {
     await expect(manager.translate(guard, 'box', ['up'] as never)).resolves.toEqual({ outcome: 'failed', reason: 'invalid position (three finite numbers within ±1e6)' });
     await expect(manager.scale(guard, 'box', undefined as never)).resolves.toEqual({ outcome: 'failed', reason: 'invalid scale (three finite numbers, none of them zero)' });
     expect(effects()).toEqual(none);
+  });
+
+  /*
+   * What the world's own builder lets a builder do by hand (coo-world ClientBuilder.js): move,
+   * rotate, scale and delete apps that are neither pinned nor the scene; duplicate any app but the
+   * scene. The agent keeps to that for every operation, before it walks over and again after.
+   */
+  const everyOperation: [string, (m: BuildManager, g: EditGuard) => Promise<unknown>][] = [
+    ['translate', (m, g) => m.translate(g, 'box', [0, 2, 0])],
+    ['rotate', (m, g) => m.rotate(g, 'box', [0, 0, 0, 1])],
+    ['scale', (m, g) => m.scale(g, 'box', [2, 2, 2])],
+    ['duplicate', (m, g) => m.duplicate(g, 'box')],
+    ['delete', (m, g) => m.delete(g, 'box')],
+  ];
+
+  it.each(everyOperation)('%s leaves a pinned app as it is (a duplicate, which the builder allows, is made)', async (name, run) => {
+    const { guard, world, entity, effects, manager } = setup();
+    entity.data.pinned = true;
+    if (name === 'duplicate') {
+      await expect(run(manager, guard)).resolves.toMatchObject({ outcome: 'applied' });
+      // The copy is not pinned
+      expect(world.entities.add.mock.calls[0][0]).toMatchObject({ pinned: false });
+      return;
+    }
+    await expect(run(manager, guard)).resolves.toEqual({ outcome: 'skipped', reason: 'the app is pinned' });
+    expect(effects()).toEqual(none);
+    // Decided before walking over
+    expect(world.controls.goto).not.toHaveBeenCalled();
+    expect(entity.root.position.toArray()).toEqual([1, 0, 1]);
+    expect(entity.root.scale.toArray()).toEqual([1, 1, 1]);
+  });
+
+  it.each(everyOperation)("%s leaves the world's scene app as it is", async (_name, run) => {
+    const { guard, world, entity, effects, manager } = setup();
+    Object.assign(entity.blueprint, { scene: true });
+    await expect(run(manager, guard)).resolves.toEqual({ outcome: 'skipped', reason: "it is the world's scene" });
+    expect(effects()).toEqual(none);
+    expect(world.controls.goto).not.toHaveBeenCalled();
+  });
+
+  it.each(everyOperation.filter(([name]) => name !== 'duplicate'))('%s leaves an app that was pinned while the agent walked over as it is', async (_name, run) => {
+    const { guard, world, entity, effects, manager } = setup();
+    world.controls.goto.mockImplementation(async () => {
+      entity.data.pinned = true;
+      return 'arrived';
+    });
+    await expect(run(manager, guard)).resolves.toEqual({ outcome: 'skipped', reason: 'the app is pinned' });
+    expect(effects()).toEqual(none);
+    expect(entity.root.position.toArray()).toEqual([1, 0, 1]);
   });
 
   it('skips a player: the server takes transforms for apps only', async () => {
@@ -224,6 +277,7 @@ describe('BuildManager reports what each operation did', () => {
         if (removal === 'removed') world.entities.items.delete('box');
         if (removal === 'destroyed') Object.assign(entity, { destroyed: true });
         if (removal === 'replaced') world.entities.items.set('box', replacement);
+        return 'arrived';
       });
       await expect(run(manager, guard), removal).resolves.toEqual({ outcome: 'skipped', reason: 'the target was removed while I walked over' });
       expect(effects(), removal).toEqual(none);
@@ -249,7 +303,7 @@ describe('BuildManager reports what each operation did', () => {
   it('duplicates with the rotation normalised, as the world stores it', async () => {
     const { guard, world, entity, manager } = setup();
     entity.root.quaternion.set(0, 0, 0, 1.05);
-    await expect(manager.duplicate(guard, 'box')).resolves.toEqual({ outcome: 'applied' });
+    await expect(manager.duplicate(guard, 'box')).resolves.toMatchObject({ outcome: 'applied' });
     expect(world.entities.add).toHaveBeenCalledWith(expect.objectContaining({ quaternion: [0, 0, 0, 1], position: [1, 0, 1], scale: [1, 1, 1] }), true);
   });
 
@@ -262,16 +316,40 @@ describe('BuildManager reports what each operation did', () => {
     }
     const { guard, entity, effects, manager } = setup();
     Object.assign(entity.blueprint, { unique: true, model: 'asset://a.glb', script: 'https://cdn.example.com/a.js', image: null });
-    await expect(manager.duplicate(guard, 'box')).resolves.toEqual({ outcome: 'applied' });
+    await expect(manager.duplicate(guard, 'box')).resolves.toMatchObject({ outcome: 'applied' });
     expect(effects()).toMatchObject({ blueprints: 1, added: 1 });
   });
 
-  it('skips a delete when the app was pinned while the agent walked over', async () => {
-    const { world, guard, entity, effects, manager } = setup();
+  it.each([
+    ['stopped', 'I was stopped on the way there'],
+    ['replaced', 'I was sent somewhere else on the way there'],
+    ['timed-out', 'I could not get there in time'],
+    ['unreachable', 'I could not find a way there'],
+  ])('applies no edit whose walk ended as %s: the operation is skipped with that reason', async (outcome, reason) => {
+    const operations: [string, (manager: BuildManager, guard: EditGuard) => Promise<unknown>][] = [
+      ['translate', (manager, guard) => manager.translate(guard, 'box', [0, 2, 0])],
+      ['rotate', (manager, guard) => manager.rotate(guard, 'box', [0, 0, 0, 1])],
+      ['scale', (manager, guard) => manager.scale(guard, 'box', [2, 2, 2])],
+      ['duplicate', (manager, guard) => manager.duplicate(guard, 'box')],
+      ['delete', (manager, guard) => manager.delete(guard, 'box')],
+    ];
+    for (const [name, run] of operations) {
+      const { world, guard, entity, effects, manager } = setup();
+      world.controls.goto.mockResolvedValue(outcome);
+      await expect(run(manager, guard), name).resolves.toEqual({ outcome: 'skipped', reason });
+      expect(effects(), name).toEqual(none);
+      expect(entity.root.position.toArray(), name).toEqual([1, 0, 1]);
+      expect(entity.root.scale.toArray(), name).toEqual([1, 1, 1]);
+    }
+  });
+
+  it('a request that may no longer edit stops after its walk, however the walk ended', async () => {
+    const { world, guard, auth, effects, manager } = setup();
     world.controls.goto.mockImplementation(async () => {
-      entity.data.pinned = true;
+      auth.allowed = false;
+      return 'cancelled';
     });
-    await expect(manager.delete(guard, 'box')).resolves.toEqual({ outcome: 'skipped', reason: 'the app is pinned' });
+    await expect(manager.translate(guard, 'box', [0, 2, 0])).rejects.toBeInstanceOf(SceneEditStopped);
     expect(effects()).toEqual(none);
   });
 
@@ -457,43 +535,41 @@ describe('BuildManager imports through the real upload helper', () => {
     expect(effects()).toEqual({ ...none, requests: ['GET /api/upload-check', 'POST /api/upload'] });
   });
 
-  it("never posts an app's asset it was withdrawn for, and takes the app back from the world", async () => {
+  /*
+   * A .hyp import announces nothing (no blueprint, no app) until every one of its files is
+   * uploaded: whatever stops or fails it before that leaves the world as it was.
+   */
+  it("never posts an app's asset it was withdrawn for, and has announced nothing to the world", async () => {
     const { auth, guard, world, effects, answer, manager } = setup();
     await download(world, hyp());
     const result = manager.importEntity(guard, 'https://cdn.test/thing.hyp');
     await vi.waitFor(() => expect(effects().requests).toEqual(['GET /api/upload-check']));
+    // Nothing yet, while its file is being uploaded
+    expect(effects()).toEqual({ ...none, requests: ['GET /api/upload-check'] });
     auth.allowed = false;
     await answer(0, 200, { exists: false });
     await expect(result).rejects.toBeInstanceOf(SceneEditStopped);
-    // destroy(true) broadcasts entityRemoved; the blueprint stays (no packet removes one)
-    expect(effects()).toEqual({ ...none, requests: ['GET /api/upload-check'], blueprints: 1, added: 1, rolledBack: [true] });
+    expect(effects()).toEqual({ ...none, requests: ['GET /api/upload-check'] });
   });
 
-  it("takes back an app whose upload failed, even though the requester was demoted meanwhile (same connection)", async () => {
+  it.each([
+    ['the requester still may build', (_auth: { allowed: boolean; live: boolean }) => {}],
+    ['the requester was demoted meanwhile', (auth: { allowed: boolean; live: boolean }) => void (auth.allowed = false)],
+    ['the connection changed meanwhile', (auth: { allowed: boolean; live: boolean }) => void (auth.live = false)],
+  ])('an app whose upload failed leaves nothing in the world to take back (%s)', async (_what, meanwhile) => {
     const { auth, guard, world, effects, answer, manager } = setup();
     await download(world, hyp());
     const result = manager.importEntity(guard, 'https://cdn.test/thing.hyp');
     await answer(0, 200, { exists: false });
     await vi.waitFor(() => expect(effects().requests).toHaveLength(2));
-    auth.allowed = false;
+    meanwhile(auth);
     await answer(1, 500, { error: 'disk full' });
     await expect(result).resolves.toEqual({ outcome: 'failed', reason: 'upload failed: Upload failed (HTTP 500): disk full' });
-    expect(effects()).toMatchObject({ rolledBack: [true], finished: 0 });
+    // No blueprint, no app, nothing sent: only the two requests of the upload that failed
+    expect(effects()).toEqual({ ...none, requests: ['GET /api/upload-check', 'POST /api/upload'] });
   });
 
-  it('does not touch a new connection when an upload fails after the connection changed', async () => {
-    const { auth, guard, world, effects, answer, manager } = setup();
-    await download(world, hyp());
-    const result = manager.importEntity(guard, 'https://cdn.test/thing.hyp');
-    await answer(0, 200, { exists: false });
-    await vi.waitFor(() => expect(effects().requests).toHaveLength(2));
-    auth.live = false;
-    await answer(1, 500, { error: 'gone' });
-    await expect(result).resolves.toMatchObject({ outcome: 'failed' });
-    expect(effects()).toMatchObject({ rolledBack: [], finished: 0 });
-  });
-
-  it('takes back an app whose uploads finished after it was withdrawn, instead of finishing it', async () => {
+  it('adds no app when it was withdrawn while its files were uploaded: nothing was announced, so nothing is taken back', async () => {
     const { auth, guard, world, effects, answer, manager } = setup();
     await download(world, hyp());
     const result = manager.importEntity(guard, 'https://cdn.test/thing.hyp');
@@ -502,6 +578,26 @@ describe('BuildManager imports through the real upload helper', () => {
     auth.allowed = false;
     await answer(1, 200, {});
     await expect(result).rejects.toBeInstanceOf(SceneEditStopped);
-    expect(effects()).toMatchObject({ rolledBack: [true], finished: 0 });
+    expect(effects()).toEqual({ ...none, requests: ['GET /api/upload-check', 'POST /api/upload'] });
+  });
+
+  it('announces an app only once its files are uploaded: the blueprint, then the app that uses it, then the upload as finished', async () => {
+    const { guard, world, app, effects, answer, manager } = setup();
+    await download(world, hyp());
+    const order: string[] = [];
+    world.blueprints.add.mockImplementation(() => void order.push('blueprint'));
+    world.entities.add.mockImplementation(() => (order.push('app'), app));
+    app.onUploaded.mockImplementation(() => void order.push('uploaded'));
+    const result = manager.importEntity(guard, 'https://cdn.test/thing.hyp', [1, 0, 2]);
+    await answer(0, 200, { exists: false });
+    await vi.waitFor(() => expect(effects().requests).toHaveLength(2));
+    expect(order).toEqual([]);
+    await answer(1, 200, {});
+    await expect(result).resolves.toEqual({ outcome: 'applied' });
+    expect(order).toEqual(['blueprint', 'app', 'uploaded']);
+    const [blueprint] = world.blueprints.add.mock.calls[0];
+    const [data] = world.entities.add.mock.calls[0];
+    expect(blueprint).toMatchObject({ name: 'Thing', version: 0 });
+    expect(data).toMatchObject({ type: 'app', blueprint: blueprint.id, position: [1, 0, 2], quaternion: [0, 0, 0, 1], uploader: 'coo', pinned: false });
   });
 });

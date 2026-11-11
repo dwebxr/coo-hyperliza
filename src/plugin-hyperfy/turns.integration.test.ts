@@ -115,6 +115,13 @@ function connected(on: ReturnType<typeof scene>, models: Record<string, unknown>
   return { session: first, open, runtime, recorded, useModel, say, calls, results };
 }
 
+/**
+ * A model answer that takes `ms`. A walk ends by itself after NAVIGATION_TIMEOUT_MS, which is less
+ * than a turn's slot: for a slot to run out during a walk, the turn has to spend time before it.
+ */
+const after = (ms: number, answer: unknown) => () => new Promise((resolve) => setTimeout(() => resolve(answer), ms));
+const THINKING_MS = 90_000;
+
 /** Answers model calls of one type in turn: the n-th call gets the n-th answer (a value, or a function of the params) */
 function inTurn(...answers: unknown[]) {
   let call = 0;
@@ -130,7 +137,7 @@ describe('a turn that outlives its slot', () => {
     const agent = connected(on, {
       [ModelType.TEXT_LARGE]: inTurn(plan('REPLY,HYPERFY_GOTO_ENTITY,HYPERFY_EDIT_ENTITY', 'On my way!'), plan('REPLY', 'Second answer')),
       // The walk's target; the scene edit's plan, should it ever be asked for
-      [ModelType.OBJECT_LARGE]: inTurn({ navigationType: 'entity', parameter: { entityId: 'tower' } }, { operations: [move('box', 'Moved the box up')] }),
+      [ModelType.OBJECT_LARGE]: inTurn(after(THINKING_MS, { navigationType: 'entity', parameter: { entityId: 'tower' } }), { operations: [move('box', 'Moved the box up')] }),
       [ModelType.TEXT_SMALL]: '<response><thought>t</thought><text>Box is up!</text></response>',
     });
     agent.say('Coo, go to the tower, then move the box up');
@@ -169,15 +176,14 @@ describe('a turn that outlives its slot', () => {
     const agent = connected(on, {
       [ModelType.TEXT_LARGE]: inTurn(plan('HYPERFY_EDIT_ENTITY'), plan('REPLY', 'Second answer')),
       // The box next to the agent, then one it never reaches within its slot
-      [ModelType.OBJECT_LARGE]: { operations: [move('box', 'Moved the box up'), move('far-box', 'Moved the far box up'), move('box', 'Moved the box again')] },
+      [ModelType.OBJECT_LARGE]: after(THINKING_MS, { operations: [move('box', 'Moved the box up'), move('far-box', 'Moved the far box up'), move('box', 'Moved the box again')] }),
       [ModelType.TEXT_SMALL]: '<response><thought>t</thought><text>All done!</text></response>',
     });
     agent.say('Coo, move the boxes up');
-    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.advanceTimersByTimeAsync(100_000);
     expect(on.edits()).toEqual(['box']);
     expect(on.posted()).toEqual(['Moved the box up']);
     expect(on.walking()).toBe(true);
-    await vi.advanceTimersByTimeAsync(90_000);
     agent.say('Coo, are you there?');
 
     await vi.advanceTimersByTimeAsync(CHAT_TURN_SLOT_MS - 100_000);
@@ -196,13 +202,59 @@ describe('a turn that outlives its slot', () => {
   });
 });
 
+describe('a walk that "stop" ended', () => {
+  it('is not reported as arrived: the walk\'s turn says it stopped, and core records the walk as failed', async () => {
+    const on = scene();
+    const agent = connected(on, {
+      [ModelType.TEXT_LARGE]: plan('HYPERFY_GOTO_ENTITY'),
+      [ModelType.OBJECT_LARGE]: { navigationType: 'entity', parameter: { entityId: 'tower' } },
+    });
+    agent.say('Coo, go to the tower');
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(on.walking()).toBe(true);
+    agent.say('Coo, stop!');
+    // At once, on arrival
+    expect(on.walking()).toBe(false);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await agent.session.conversation.idle();
+    expect(on.posted()).toEqual(['I stopped before I got there.', "Okay, I'll stay right here."]);
+    expect(on.posted().join(' ')).not.toMatch(/Arrived/);
+    expect(agent.results()).toEqual(['HYPERFY_GOTO_ENTITY: failed']);
+    const walk = agent.recorded.memories.find((m) => m.content.actionName === 'HYPERFY_GOTO_ENTITY')!.content as any;
+    expect(walk.actionResult).toMatchObject({ error: 'did not arrive (stopped)', data: { outcome: 'stopped' } });
+  });
+
+  it('leaves the scene edit it was walking to undone, and the edit says so', async () => {
+    const on = scene();
+    const agent = connected(on, {
+      [ModelType.TEXT_LARGE]: plan('HYPERFY_EDIT_ENTITY'),
+      [ModelType.OBJECT_LARGE]: { operations: [move('far-box', 'Moved the far box up')] },
+      [ModelType.TEXT_SMALL]: (params: any) => `<response><thought>t</thought><text>${/NOT DONE \(skipped\): translate on "far-box" → I was stopped on the way there/.test(params.prompt) ? 'I stopped before moving it.' : 'Moved it!'}</text></response>`,
+    });
+    agent.say('Coo, move the far box up');
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(on.walking()).toBe(true);
+    agent.say('Coo, stop!');
+    await vi.advanceTimersByTimeAsync(5_000);
+    await agent.session.conversation.idle();
+    // Nothing was changed and nothing announced as done
+    expect(on.edits()).toEqual([]);
+    expect(on.items.get('far-box').root.position.toArray()).toEqual([FAR, 0, 0]);
+    expect(on.posted()).toEqual(['I stopped before moving it.', "Okay, I'll stay right here."]);
+    const edit = agent.recorded.memories.find((m) => m.content.actionName === 'HYPERFY_EDIT_ENTITY')!.content as any;
+    expect(edit.actionStatus).toBe('failed');
+    expect(edit.actionResult.data).toMatchObject({ executed: 0, skipped: 1, failed: 0 });
+    expect(edit.actionResult.data.outcomes).toEqual([{ operation: 'translate', target: 'far-box', outcome: 'skipped', reason: 'I was stopped on the way there' }]);
+  });
+});
+
 describe('what a turn was about to do when its slot ran out', () => {
   it('does not use the item it was walking to', async () => {
     const on = scene();
     on.items.set('far-crate', { data: { id: 'far-crate' }, root: { position: new THREE.Vector3(FAR, 0, 0) } });
-    const node = { ctx: { entity: { data: { id: 'far-crate' } } }, _duration: 0, _onTrigger: vi.fn() };
+    const node = { ctx: { entity: on.items.get('far-crate') }, _duration: 0, _onTrigger: vi.fn() };
     on.world.actions.register(node);
-    const agent = connected(on, { [ModelType.TEXT_LARGE]: plan('HYPERFY_USE_ITEM'), [ModelType.OBJECT_SMALL]: { entityId: 'far-crate' } });
+    const agent = connected(on, { [ModelType.TEXT_LARGE]: plan('HYPERFY_USE_ITEM'), [ModelType.OBJECT_SMALL]: after(THINKING_MS, { entityId: 'far-crate' }) });
     agent.say('Coo, use the crate over there');
     await vi.advanceTimersByTimeAsync(CHAT_TURN_SLOT_MS - 1_000);
     expect(on.walking()).toBe(true);
@@ -219,7 +271,7 @@ describe('what a turn was about to do when its slot ran out', () => {
     const budget = new UsageBudget({ ...noLimits, visionPerHour: 1 });
     resetUsageBudget(budget);
     const renderPage = { capture: vi.fn(async () => 'data:image/jpeg;base64,aGVsbG8='), resetPage: vi.fn(async () => {}) };
-    const agent = connected(on, { [ModelType.TEXT_LARGE]: plan('HYPERFY_SCENE_PERCEPTION'), [ModelType.IMAGE_DESCRIPTION]: '<response><thought>t</thought><text>A tower.</text></response>' }, { renderPage });
+    const agent = connected(on, { [ModelType.TEXT_LARGE]: after(THINKING_MS, plan('HYPERFY_SCENE_PERCEPTION')), [ModelType.IMAGE_DESCRIPTION]: '<response><thought>t</thought><text>A tower.</text></response>' }, { renderPage });
     // Looking at the tower means walking up to it first
     agent.say('Coo, look at the Tower');
     await vi.advanceTimersByTimeAsync(CHAT_TURN_SLOT_MS - 1_000);
@@ -234,7 +286,7 @@ describe('what a turn was about to do when its slot ran out', () => {
 });
 
 describe('a walk a turn leaves running', () => {
-  it('goes on after the turn completed (follow), for longer than a slot, and stops when the session ends', async () => {
+  it('goes on after the turn completed (follow), and stops when the session ends', async () => {
     const on = scene();
     // Bob keeps walking away as fast as the agent follows
     setInterval(() => void (on.bob.base.position.x += 0.5), 100);
@@ -246,9 +298,9 @@ describe('a walk a turn leaves running', () => {
     expect(agent.useModel).not.toHaveBeenCalled();
     expect([on.controls.getIsNavigating(), on.walking(), agent.session.body.busy]).toEqual([true, true, false]);
 
-    await vi.advanceTimersByTimeAsync(CHAT_TURN_SLOT_MS + 60_000);
+    await vi.advanceTimersByTimeAsync(60_000);
     expect([on.controls.getIsNavigating(), on.walking()]).toEqual([true, true]);
-    expect(on.player.base.position.x).toBeGreaterThan(1_000);
+    expect(on.player.base.position.x).toBeGreaterThan(250);
 
     void agent.session.end();
     expect([on.controls.getIsNavigating(), on.walking()]).toEqual([false, false]);

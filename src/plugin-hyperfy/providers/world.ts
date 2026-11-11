@@ -56,7 +56,9 @@ export const hyperfyProvider: Provider = {
         const agentId = world?.entities?.player?.data?.id;
 
         const allEntityIds: string[] = [];
-        const categorizedEntities: Record<string, { line: string; compact: string; distance: number }[]> = {};
+        // By the type the world gives each entity: a Map, so no type name (`__proto__`,
+        // `constructor`) is anything but a key
+        const categorizedEntities = new Map<string, { line: string; compact: string; distance: number }[]>();
         let agentText = '## Agent Info (You)\nUnable to find your own entity.';
         const nearbyPlayers: string[] = [];
         const agentPos = world?.entities?.player?.base?.position;
@@ -97,18 +99,16 @@ export const hyperfyProvider: Provider = {
             nearbyPlayers.push(line);
           }
 
-          if (!categorizedEntities[type]) {
-            categorizedEntities[type] = [];
-          }
-
           const distance = pos && agentPos && typeof pos.distanceTo === 'function'
             ? pos.distanceTo(agentPos)
             : Number.POSITIVE_INFINITY;
-          categorizedEntities[type].push({ line, compact: `${name} (${shownId})`, distance });
+          const ofType = categorizedEntities.get(type) ?? [];
+          if (!ofType.length) categorizedEntities.set(type, ofType);
+          ofType.push({ line, compact: `${name} (${shownId})`, distance });
         }
 
         let categorizedSummary = '';
-        for (const [type, items] of Object.entries(categorizedEntities)) {
+        for (const [type, items] of categorizedEntities) {
           items.sort((a, b) => a.distance - b.distance);
           const limit = type === 'player' ? items.length : MAX_DETAILED_ENTITIES_PER_TYPE;
           const detailed = items.slice(0, limit).map(item => item.line);

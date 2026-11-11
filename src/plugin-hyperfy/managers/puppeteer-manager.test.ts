@@ -28,7 +28,7 @@ vi.mock('puppeteer', () => {
         return page;
       }),
       emit: (event: string, ...args: any[]) => (listeners.get(event) ?? []).forEach((listener) => listener(...args)),
-      goto: vi.fn().mockResolvedValue(undefined),
+      goto: vi.fn().mockResolvedValue('arrived'),
       setRequestInterception: vi.fn().mockResolvedValue(undefined),
       setContent: vi.fn().mockResolvedValue(undefined),
       addScriptTag: vi.fn().mockResolvedValue(undefined),
@@ -109,6 +109,24 @@ describe('PuppeteerManager', () => {
     expect(browser.pages).toHaveLength(2);
     expect(browser.pages[0].close).toHaveBeenCalled();
     expect(browser.pages[1].close).not.toHaveBeenCalled();
+  });
+
+  it('counts the pages it builds (pageEpoch): the same page keeps its number, a reset or a crashed page gets a new one', async () => {
+    const manager = PuppeteerManager.getOrCreate();
+    expect(manager.pageEpoch).toBe(0);
+    await (manager as any).init();
+    await (manager as any).init();
+    expect(manager.pageEpoch).toBe(1);
+    await manager.resetPage();
+    await (manager as any).init();
+    expect(manager.pageEpoch).toBe(2);
+    // The page crashes: the next use builds another
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    launched[0].pages[1].emit('error', new Error('Page crashed!'));
+    await (manager as any).init();
+    expect(launched[0].pages).toHaveLength(3);
+    expect(manager.pageEpoch).toBe(3);
+    vi.restoreAllMocks();
   });
 
   it('close() closes the browser and allows a new manager', async () => {

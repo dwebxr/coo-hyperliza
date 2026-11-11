@@ -81,14 +81,24 @@ describe('deliverReply', () => {
     }
   });
 
-  it('does not put a shop link in chat on an autonomous turn, and says so', async () => {
+  it('does not put a shop link in chat on an autonomous turn, says so, and does not remember it as said', async () => {
     const info = vi.spyOn(logger, 'info').mockImplementation(() => {});
     const set = channels();
     const delivery = await deliver('autonomy', LINK, set);
     expect(set.session.messages.sendMessage).not.toHaveBeenCalled();
     expect(set.session.voice.speak).not.toHaveBeenCalled();
-    expect(delivery).toMatchObject({ posted: false, spoken: 'none' });
+    expect(delivery).toEqual({ posted: false, spoken: 'none', stored: false });
+    // Memory matches what was delivered: nothing
+    expect(set.runtime.createMemory).not.toHaveBeenCalled();
+    expect(set.stored).toEqual([]);
     expect(info.mock.calls.flat().map(String)).toContain('[Reply] Not posting a shop link on an autonomous turn');
+  });
+
+  it('remembers a shop link a chat turn posted, exactly as it was posted', async () => {
+    const set = channels();
+    const delivery = await deliver('chat', LINK, set);
+    expect(delivery).toEqual({ posted: true, spoken: 'none', stored: true });
+    expect(set.stored.map((memory) => memory.content.text)).toEqual([LINK.text]);
   });
 
   it.each([

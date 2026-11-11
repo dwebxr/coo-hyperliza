@@ -140,16 +140,15 @@ export class AgentAvatar extends Node {
     return this.instance?.headToHeight ?? null
   }
 
-  getBoneTransform(_boneName: string): THREE.Matrix4 {
-    const matrix = new THREE.Matrix4()
-    if (this.parent && this.parent.position) {
-      matrix.makeTranslation(
-        this.parent.position.x,
-        this.parent.position.y,
-        this.parent.position.z
-      )
-    }
-    return matrix
+  /**
+   * Where a bone of the avatar is: null. The agent builds no skeleton for an avatar (its factory
+   * is null: avatars are drawn in the render page), so there is nothing to read a bone from, and
+   * no position is made up for one. The engine's own Avatar node answers the same way while it has
+   * no instance, and its callers (PlayerLocal, PlayerRemote, a script's player.getBoneTransform)
+   * take "no bone" for an answer.
+   */
+  getBoneTransform(_boneName: string): THREE.Matrix4 | null {
+    return null
   }
 
   setEmote(url: string | null) {

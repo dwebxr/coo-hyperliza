@@ -19,6 +19,30 @@ import { createWorldScripts } from '../lib/script-api'
 // The engine's key-value store: localstorage.json next to the engine's own files
 const engine = engineStorage as { storage: { get(key: string): string | null } }
 
+/** How long the engine's physics may take to start. PhysX is one WebAssembly module: well under a second. */
+export const PHYSICS_INIT_TIMEOUT_MS = 30_000
+
+/**
+ * Bounds how long `physics.init()` (the engine's Physics system) may take. The engine loads PhysX
+ * through a promise that cannot reject (hyperfy/src/core/loadPhysX.js builds it with an async
+ * executor): when PhysX cannot start, the error surfaces only as an unhandled rejection, that
+ * promise stays pending, and Physics.init(), and with it world.init(), would wait for ever. With
+ * this, the wait ends in a rejection after `timeoutMs`, so a connection whose engine cannot start
+ * fails like any other failed connection. What it does not do: carry the loader's own error (the
+ * runtime reports that one as an unhandled rejection), or make a later attempt succeed (the
+ * engine's loader keeps its pending promise).
+ */
+export function boundPhysicsInit(physics: { init(...args: unknown[]): Promise<unknown> }, timeoutMs = PHYSICS_INIT_TIMEOUT_MS): void {
+  const engineInit = physics.init
+  physics.init = function (this: unknown, ...args: unknown[]) {
+    let timer: NodeJS.Timeout | undefined
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`[Hyperfy] The engine's physics (PhysX) did not start within ${timeoutMs} ms`)), timeoutMs)
+    })
+    return Promise.race([Promise.resolve().then(() => engineInit.apply(physics, args)), deadline]).finally(() => clearTimeout(timer))
+  }
+}
+
 /** An engine world as the agent uses it, before it is connected. */
 export interface AgentWorld {
   world: any
@@ -68,6 +92,9 @@ export function createAgentWorld({ wsUrl, sandboxedScripts }: { wsUrl: string; s
   // withheld from the socket (lib/world-protocol.ts): that world's API is not encrypted either.
   world.network.upload = (file: File, { check }: UploadOptions = {}) =>
     uploadAsset(world.network, file, { net, authToken: protocol.sessionToken() ?? undefined, check })
+
+  // world.init() fails instead of waiting for ever when PhysX cannot start (boundPhysicsInit)
+  if (typeof world.physics?.init === 'function') boundPhysicsInit(world.physics)
 
   ;(globalThis as { self?: unknown }).self = globalThis
 

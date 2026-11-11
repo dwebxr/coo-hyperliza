@@ -3,6 +3,7 @@ import { WORLD_URL_PROTOCOLS, sessionTokenProblem } from './world-url';
 import { describeUrl } from './log-url';
 import { readChatMessage } from './chat-intake';
 import { RateLimitedLog } from './rate-limited-log';
+import { PacketOverLimit, decodeServerFrame } from './packet-decode';
 
 /**
  * The network protocol of coo-world (github.com/dwebxr/coo-world, src/core/packets.js as of
@@ -72,8 +73,7 @@ export const PACKET_NAMES = [
   'evmTipStatus',
 ] as const;
 
-// What the world sends
-const serverPackr = new Packr({ structuredClone: true });
+// What the world sends is read by lib/packet-decode.ts (msgpackr's format, under limits).
 // What the world accepts from clients: plain msgpack, no extension types
 const clientPackr = new Packr({ useRecords: false, structuredClone: false, moreTypes: false, bundleStrings: false });
 
@@ -90,8 +90,10 @@ export function writeClientPacket(name: string, data: unknown): Uint8Array {
  * The largest frame from the world that is decoded. A snapshot of a large world (every entity,
  * blueprint and the chat history) is a few megabytes at most. What this bounds: the decode work
  * and the input of the decoder for one frame. What it does not bound: receipt (the WebSocket
- * implementation has buffered the whole frame before this code sees it), nor the memory of the
- * decoded value, which can be many times the frame's size (one small object per byte).
+ * implementation has buffered the whole frame before this code sees it). What a frame may decode
+ * into is bounded separately: at most PACKET_LIMITS.maxNodes values, nested at most
+ * PACKET_LIMITS.maxDepth deep (lib/packet-decode.ts); a frame over either is dropped like one that
+ * is too large.
  */
 export const MAX_SERVER_FRAME_BYTES = 8 * 1024 * 1024;
 // Unknown packet ids are each reported once; after this many different ones, no more
@@ -101,10 +103,15 @@ export const MAX_REPORTED_PACKET_IDS = 32;
  * What may wait for the engine's next flush (ClientNetwork.flush, every tick: 30 a second once the
  * world runs). A tick's worth is a handful of packets; this is room for seconds of a busy world
  * before the first tick and a snapshot of the largest size four times over. Counted per packet:
- * its frame's size, or for a chat message QUEUED_CHAT_BYTES (it is cut down before it waits).
+ * its frame's size, or what it decoded into when that is more (QUEUED_NODE_BYTES for each value:
+ * a frame of small containers takes several times its size in memory), or for a chat message
+ * QUEUED_CHAT_BYTES (it is cut down before it waits). So what waits is at most
+ * MAX_QUEUED_BYTES / QUEUED_NODE_BYTES decoded values, whatever the frames looked like.
  */
 export const MAX_QUEUED_PACKETS = 4096;
 export const MAX_QUEUED_BYTES = 4 * MAX_SERVER_FRAME_BYTES;
+// What one decoded value is counted as while it waits: about what a small array or object costs
+export const QUEUED_NODE_BYTES = 32;
 // A chat message as readChatMessage leaves it: 500 code points of body and four short fields
 const QUEUED_CHAT_BYTES = 4096;
 // Close code the agent gives a connection it ends because the world sent more than it can take
@@ -130,17 +137,23 @@ export function resetReportedPacketIds(): void {
 }
 
 /**
- * [handler method, data], or [] when the packet cannot be read (logged at most once per
- * FRAME_LOG_INTERVAL_MS with the count; once per unknown id, for the first
- * MAX_REPORTED_PACKET_IDS different ones).
+ * [handler method, data, the number of values the packet decoded into], or [] when the packet
+ * cannot be read (logged at most once per FRAME_LOG_INTERVAL_MS with the count; once per unknown
+ * id, for the first MAX_REPORTED_PACKET_IDS different ones). A packet that would decode into more
+ * than the limits allow (lib/packet-decode.ts) is not read either: `overLimit`, when given, is
+ * told why.
  */
-export function readServerPacket(packet: ArrayBuffer | Uint8Array): [string, unknown] | [] {
+export function readServerPacket(packet: ArrayBuffer | Uint8Array, overLimit?: (why: string) => void): [string, unknown, number] | [] {
   let id: unknown;
   let data: unknown;
+  let nodes: number;
   try {
-    [id, data] = serverPackr.unpack(packet instanceof Uint8Array ? packet : new Uint8Array(packet));
-  } catch {
-    undecodable.note(String(packet.byteLength));
+    const decoded = decodeServerFrame(packet instanceof Uint8Array ? packet : new Uint8Array(packet));
+    [id, data] = decoded.value as [unknown, unknown];
+    nodes = decoded.nodes;
+  } catch (error) {
+    if (error instanceof PacketOverLimit && overLimit) overLimit(error.message);
+    else undecodable.note(String(packet.byteLength));
     return [];
   }
   const name = typeof id === 'number' ? PACKET_NAMES[id] : undefined;
@@ -153,7 +166,7 @@ export function readServerPacket(packet: ArrayBuffer | Uint8Array): [string, unk
     }
     return [];
   }
-  return [methodOf(name), data];
+  return [methodOf(name), data, nodes];
 }
 
 /** The parts of a CloseEvent worth logging; the event itself holds the socket URL with the auth token. */
@@ -287,10 +300,11 @@ export function adaptToWorldProtocol(network: any, getAuthToken: () => string | 
     if (!(frame instanceof ArrayBuffer) && !(frame instanceof Uint8Array)) return dropFrame('not a binary frame');
     // Before unpack: see MAX_SERVER_FRAME_BYTES for what this does and does not bound
     if (frame.byteLength > MAX_SERVER_FRAME_BYTES) return dropFrame(`${frame.byteLength} bytes exceeds the ${MAX_SERVER_FRAME_BYTES}-byte limit`);
-    const [method, data] = readServerPacket(frame);
+    // Over the decode limits: dropped like a frame that is too large
+    const [method, data, nodes = 0] = readServerPacket(frame, (why) => dropFrame(`a frame of ${frame.byteLength} bytes is not decoded: ${why}`));
     if (!method) return;
     let queued = data;
-    let size = frame.byteLength;
+    let size = Math.max(frame.byteLength, nodes * QUEUED_NODE_BYTES);
     if (method === 'onChatAdded') {
       // Cut down before it waits: a chat body is 500 code points however large the frame was
       // (world-chat.ts reads it again when the engine hands it over)

@@ -39,6 +39,12 @@ try {
     const bytes = new Uint8Array(readFileSync(path.join(assets, file)));
     const url = `https://world.invalid/assets/${path.basename(file)}`;
     const result = await world.loader.parseGLB(type, `${type}/${url}`, { bytes, url, contentType: '' });
+    if (type === 'emote') {
+      // An emote is its clip, read by the agent itself from the file (no render page): retargeted as an avatar would ask
+      const clip = result.toClip({ rootToHips: 1, version: '1', getBoneName: (name: string) => name });
+      parsed[type] = { tracks: clip.tracks.length, duration: clip.duration };
+      continue;
+    }
     let meshes = 0;
     result.gltf.scene.traverse((node: { isMesh?: boolean }) => void (node.isMesh && meshes++));
     parsed[type] = {
@@ -46,7 +52,6 @@ try {
       animations: result.gltf.animations.length,
       images: result.gltf.parser.json.images?.length ?? 0,
       nodes: typeof result.toNodes === 'function' ? result.toNodes().constructor.name.length > 0 : null,
-      clip: typeof result.toClip === 'function',
     };
   }
   report.parsed = parsed;

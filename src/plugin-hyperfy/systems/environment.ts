@@ -38,6 +38,14 @@ export class AgentEnvironment extends System {
   csm!: CSM
   /** The sky update in progress: a newer one, or destroy(), stops it */
   private skyWork: AbortController | null = null
+  /**
+   * What the render page holds for this world's sky, by the URL it was asked for under, and the
+   * page it is in (PuppeteerManager.pageEpoch): the sky's image as a texture, and the HDR that is
+   * the page's environment. A sky update that asks for the same URL again downloads and registers
+   * nothing; one that asks for another image releases the texture it replaces.
+   */
+  private skyTexture: { requested: string; url: string; id: string; epoch: unknown } | null = null
+  private skyHdr: { requested: string; epoch: unknown } | null = null
   private destroyed = false
   /** Page work when the world has no loader to share it with (lib/page-work.ts) */
   private ownPageWork = new PageWork()
@@ -178,8 +186,14 @@ export class AgentEnvironment extends System {
     const puppeteerManager = PuppeteerManager.getInstance()
     const n = ++this.skyN
     let bgUUID
-    if (bgUrl) {
+    const kept = this.skyTexture
+    if (bgUrl && kept && kept.requested === bgUrl && kept.epoch === puppeteerManager.pageEpoch) {
+      // The page already holds this image as the sky's texture: not downloaded or registered again
+      bgUrl = kept.url
+      bgUUID = kept.id
+    } else if (bgUrl) {
       // Downloaded here, under the world's network policy: the render page has no network
+      const requested = bgUrl
       const done = await this.toPage(bgUrl, 'image', signal, (image) => puppeteerManager.registerTexture(image, 'map', { signal }))
       if (!done) return
       if (stopped()) {
@@ -189,6 +203,9 @@ export class AgentEnvironment extends System {
       }
       bgUrl = done.asset.url;
       bgUUID = done.result;
+      this.replaceSkyTexture({ requested, url: done.asset.url, id: done.result, epoch: puppeteerManager.pageEpoch })
+    } else {
+      this.replaceSkyTexture(null)
     }
     if (bgUUID) {
       this.sky.material.userData.materialId = bgUUID;
@@ -197,9 +214,12 @@ export class AgentEnvironment extends System {
       this.sky.visible = false
     }
 
-    if (hdrUrl) {
+    // The page keeps one environment: the same HDR is not downloaded and sent to it again
+    if (hdrUrl && !(this.skyHdr && this.skyHdr.requested === hdrUrl && this.skyHdr.epoch === puppeteerManager.pageEpoch)) {
       const done = await this.toPage(hdrUrl, 'hdr', signal, (hdr) => puppeteerManager.loadEnvironmentHDR(hdr.bytes, { signal }))
       if (!done) return
+      // Accepted: it is the page's environment now, whatever comes of this update
+      this.skyHdr = { requested: hdrUrl, epoch: puppeteerManager.pageEpoch }
     }
     if (n !== this.skyN || stopped()) return
 
@@ -227,6 +247,16 @@ export class AgentEnvironment extends System {
       fogFar,
       fogColor,
     }
+  }
+
+  /** The texture the sky shows from now on (or none); the one it showed before is released in the page that holds it. */
+  private replaceSkyTexture(next: { requested: string; url: string; id: string; epoch: unknown } | null) {
+    const previous = this.skyTexture
+    this.skyTexture = next
+    if (!previous || previous.id === next?.id) return
+    const puppeteerManager = PuppeteerManager.getInstance()
+    // In a page built since, it is gone already
+    if (previous.epoch === puppeteerManager.pageEpoch) puppeteerManager.releaseTexture(previous.id, 'map').catch(() => {})
   }
 
   update(delta: number) {

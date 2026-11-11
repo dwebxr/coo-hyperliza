@@ -2,6 +2,7 @@ import { ModelType, type Action } from '@elizaos/core';
 import * as THREE from 'three';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SHARE_ACTION, createOpenPayStorePlugin } from '../../openpay-store';
+import { hyperfyPlugin } from '../index';
 import { AgentActions } from '../systems/actions';
 import { AgentControls } from '../systems/controls';
 import { connectedService, createRuntime, run, runPlan } from '../test-support/core-runtime';
@@ -32,7 +33,8 @@ const addPlayer = (world: any, id: string) =>
   world.entities.items.set(id, { isPlayer: true, data: { id }, base: { position: new THREE.Vector3(3, 0, 4) } });
 
 const addActionNode = (world: any, entityId: string, extra: Record<string, unknown> = {}) => {
-  const node = { ctx: { entity: { data: { id: entityId } } }, _duration: 0, _onTrigger: vi.fn(), ...extra };
+  // As the engine's action nodes are: they know their entity, which has a place in the world
+  const node = { ctx: { entity: world.entities.items.get(entityId) }, _duration: 0, _onTrigger: vi.fn(), ...extra };
   world.actions.register(node);
   return node;
 };
@@ -109,7 +111,7 @@ describe('action status recorded by core for every Hyperfy action', () => {
     const world = createWorld();
     addPlayer(world, 'player-1');
     const node = addActionNode(world, 'crate');
-    const goto = vi.spyOn(world.controls, 'goto').mockResolvedValue(undefined);
+    const goto = vi.spyOn(world.controls, 'goto').mockResolvedValue('arrived');
     vi.spyOn(world.controls, 'startRandomWalk').mockResolvedValue(undefined);
     const service = connectedService(world);
     const { runtime, recorded } = createRuntime({
@@ -138,7 +140,7 @@ describe('action status recorded by core for every Hyperfy action', () => {
     // The sender left and nobody else is in the world; the crate has no action node; nothing is held
     function setup() {
       const world = createWorld();
-      vi.spyOn(world.controls, 'goto').mockResolvedValue(undefined);
+      vi.spyOn(world.controls, 'goto').mockResolvedValue('arrived');
       const { runtime, recorded } = createRuntime({
         service: connectedService(world),
         models: { [ModelType.OBJECT_SMALL]: { entityId: 'crate' } },
@@ -157,6 +159,7 @@ describe('action status recorded by core for every Hyperfy action', () => {
       expect(use.actionStatus).toBe('failed');
       expect(use.actionResult.data).toMatchObject({ targetEntityId: 'crate', outcome: 'no-action-nodes' });
 
+      world.entities.items.set('lamp', { data: { id: 'lamp' }, root: { position: new THREE.Vector3(2, 0, 2) } });
       addActionNode(world, 'lamp');
       const otherNode = await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_USE_ITEM'));
       expect(otherNode.actionResult.data).toMatchObject({ outcome: 'entity-has-no-action-node' });
@@ -186,8 +189,8 @@ describe('action status recorded by core for every Hyperfy action', () => {
     });
   });
 
-  it('turns a rejected navigation into a failed result and still runs the next planned action', async () => {
-    // Real AgentControls during teardown: the player entity is gone, so navigation rejects
+  it('turns a walk that has no player to walk with into a failed result that says so, uses nothing, and still runs the next planned action', async () => {
+    // Real AgentControls during teardown: the player entity is gone, so the walk is 'unreachable'
     const world = createWorld({ withPlayer: false });
     const { runtime, recorded } = createRuntime({
       service: connectedService(world),
@@ -195,9 +198,9 @@ describe('action status recorded by core for every Hyperfy action', () => {
     });
     const [use, ignore] = await runPlan(runtime, recorded, ['HYPERFY_USE_ITEM', 'IGNORE']);
     expect(use.actionStatus).toBe('failed');
-    expect(use.actionResult.error).toMatch(/^could not reach or use the item: /);
+    expect(use.actionResult.error).toBe('did not get to the item (unreachable)');
     expect(ignore.actionStatus).toBe('completed');
-    expect(recorded.callbacks[0]).toMatchObject({ text: "I couldn't get to that item.", actions: ['HYPERFY_USE_ITEM'] });
+    expect(recorded.callbacks[0]).toMatchObject({ text: "I can't find where to go.", actions: ['HYPERFY_USE_ITEM'] });
   });
 
   it('turns a throwing teleport or release into a failed result', async () => {
@@ -211,7 +214,7 @@ describe('action status recorded by core for every Hyperfy action', () => {
         throw new Error('app script error');
       },
     });
-    vi.spyOn(world.controls, 'goto').mockResolvedValue(undefined);
+    vi.spyOn(world.controls, 'goto').mockResolvedValue('arrived');
     const { runtime, recorded } = createRuntime({
       service: connectedService(world),
       models: { [ModelType.OBJECT_SMALL]: { entityId: 'crate' } },
@@ -241,6 +244,99 @@ describe('action status recorded by core for every Hyperfy action', () => {
     expect(goto.actionStatus).toBe('failed');
     expect(goto.actionResult.error).toBe('navigation failed: blocked');
     expect((await run(runtime, recorded, 'HYPERFY_USE_ITEM')).actionStatus).toBe('failed');
+  });
+
+  describe('a walk that did not arrive is reported as it ended', () => {
+    const NOT_ARRIVED = [
+      ['stopped', 'I stopped before I got there.'],
+      ['replaced', 'I headed somewhere else before I got there.'],
+      ['timed-out', "I couldn't get there in time."],
+      ['unreachable', "I can't find where to go."],
+    ] as const;
+
+    it.each(NOT_ARRIVED)('HYPERFY_GOTO_ENTITY whose walk ended as %s is failed and says so, never "Arrived" or "Reached"', async (outcome, said) => {
+      for (const [target, walk] of [
+        [{ navigationType: 'entity', parameter: { entityId: 'crate' } }, 'followEntity'],
+        [{ navigationType: 'position', parameter: { position: { x: 5, z: -3 } } }, 'goto'],
+      ] as const) {
+        const world = createWorld();
+        vi.spyOn(world.controls, walk).mockResolvedValue(outcome);
+        const { runtime, recorded } = createRuntime({ service: connectedService(world), models: { [ModelType.OBJECT_LARGE]: target } });
+        const stored = await run(runtime, recorded, 'HYPERFY_GOTO_ENTITY');
+        expect(stored.actionStatus).toBe('failed');
+        expect(stored.actionResult).toMatchObject({ success: false, error: `did not arrive (${outcome})`, data: { outcome } });
+        expect(recorded.callbacks.map((c) => c.text)).toEqual([said]);
+      }
+    });
+
+    it('HYPERFY_GOTO_ENTITY says it arrived when the walk did', async () => {
+      const world = createWorld();
+      vi.spyOn(world.controls, 'followEntity').mockResolvedValue('arrived');
+      const { runtime, recorded } = createRuntime({ service: connectedService(world), models: { [ModelType.OBJECT_LARGE]: { navigationType: 'entity', parameter: { entityId: 'crate' } } } });
+      expect((await run(runtime, recorded, 'HYPERFY_GOTO_ENTITY')).actionStatus).toBe('completed');
+      expect(recorded.callbacks.map((c) => c.text)).toEqual(['Arrived at entity crate.']);
+    });
+
+    it.each(NOT_ARRIVED)('HYPERFY_USE_ITEM whose walk ended as %s uses nothing and says so', async (outcome, said) => {
+      const world = createWorld();
+      const node = addActionNode(world, 'crate');
+      vi.spyOn(world.controls, 'goto').mockResolvedValue(outcome);
+      const perform = vi.spyOn(world.actions, 'performAction');
+      const { runtime, recorded } = createRuntime({ service: connectedService(world), models: { [ModelType.OBJECT_SMALL]: { entityId: 'crate' } } });
+      const stored = await run(runtime, recorded, 'HYPERFY_USE_ITEM');
+      await settleTimers();
+      expect(stored.actionStatus).toBe('failed');
+      expect(stored.actionResult).toMatchObject({ error: `did not get to the item (${outcome})`, data: { outcome } });
+      expect(perform).not.toHaveBeenCalled();
+      expect(node._onTrigger).not.toHaveBeenCalled();
+      expect(world.controls.keyE.down).toBe(false);
+      expect(recorded.callbacks.map((c) => c.text)).toEqual([said]);
+    });
+
+    it('HYPERFY_GOTO_ENTITY walks to a position only for finite numbers, brought back to what the world takes as one', async () => {
+      const world = createWorld();
+      const goto = vi.spyOn(world.controls, 'goto').mockResolvedValue('arrived');
+      for (const position of [{ x: '5', z: 1 }, { x: Number.NaN, z: 1 }, { x: 1, z: Number.POSITIVE_INFINITY }, { x: 1 }]) {
+        const { runtime, recorded } = createRuntime({ service: connectedService(world), models: { [ModelType.OBJECT_LARGE]: { navigationType: 'position', parameter: { position } } } });
+        const stored = await run(runtime, recorded, 'HYPERFY_GOTO_ENTITY');
+        expect(stored.actionStatus).toBe('failed');
+        expect(stored.actionResult.error).toBe('navigation failed: Invalid position coordinates.');
+      }
+      expect(goto).not.toHaveBeenCalled();
+      const { runtime, recorded } = createRuntime({ service: connectedService(world), models: { [ModelType.OBJECT_LARGE]: { navigationType: 'position', parameter: { position: { x: 4e9, z: -4e9 } } } } });
+      expect((await run(runtime, recorded, 'HYPERFY_GOTO_ENTITY')).actionStatus).toBe('completed');
+      expect(goto).toHaveBeenCalledWith(1e6, -1e6, expect.anything());
+      expect(recorded.callbacks.map((c) => c.text)).toEqual(['Reached position (1000000, -1000000).']);
+    });
+  });
+
+  it('walk, use and stop take nothing from handler options (core passes only its own bookkeeping there)', async () => {
+    const world = createWorld();
+    addActionNode(world, 'crate');
+    world.entities.items.set('other', { data: { id: 'other' }, root: { position: new THREE.Vector3(9, 0, 9) } });
+    const wander = vi.spyOn(world.controls, 'startRandomWalk').mockResolvedValue(undefined);
+    const stopWander = vi.spyOn(world.controls, 'stopRandomWalk');
+    const goto = vi.spyOn(world.controls, 'goto').mockResolvedValue('arrived');
+    const stop = vi.spyOn(world.controls, 'stopAllActions');
+    const { runtime, useModel } = createRuntime({ service: connectedService(world), models: { [ModelType.OBJECT_SMALL]: { entityId: 'crate' } } });
+    const handler = (name: string) => hyperfyPlugin.actions!.find((action) => action.name === name)!.handler;
+    const said: any[] = [];
+    const callback = async (content: any) => (said.push(content), []);
+    const message = { id: crypto.randomUUID(), entityId: crypto.randomUUID(), roomId: crypto.randomUUID(), content: { text: 'x' } } as never;
+    const state = { values: {}, data: {}, text: '' };
+
+    // What only a direct caller could pass; none of it changes what the action does
+    await handler('HYPERFY_WALK_RANDOMLY')(runtime, message, state, { command: 'stop', interval: 1, distance: 2 } as never, callback);
+    expect(stopWander).not.toHaveBeenCalled();
+    expect(wander).toHaveBeenCalledWith(4000, 30, undefined, expect.anything());
+
+    await handler('HYPERFY_USE_ITEM')(runtime, message, state, { entityId: 'other' } as never, callback);
+    expect(useModel).toHaveBeenCalledTimes(1);
+    expect(goto).toHaveBeenCalledWith(1, 2, expect.anything());
+
+    await handler('HYPERFY_STOP_MOVING')(runtime, message, state, { reason: 'because a caller said so' } as never, callback);
+    expect(stop).toHaveBeenCalledWith('stop action called');
+    expect(JSON.stringify(said)).not.toContain('because a caller said so');
   });
 
   it('records a scene edit as completed after running the planned operations', async () => {
@@ -323,6 +419,140 @@ describe('action status recorded by core for every Hyperfy action', () => {
       expect(stored.actionStatus).toBe('completed');
       expect(stored.actionResult.data).toMatchObject({ executed: 1, skipped: 1, failed: 0 });
       expect(stored.actionResult.data.outcomes[1]).toEqual({ operation: 'delete', outcome: 'skipped', reason: 'not found' });
+    });
+  });
+
+  describe('what a scene-edit plan may make the agent do', () => {
+    const summary = '<response><thought>t</thought><text>Summary</text></response>';
+    const applied = { outcome: 'applied' };
+    /** Runs the edit action over `operations` with a recording build manager; `summaryPrompts` are what the summary model was asked */
+    async function edit(operations: unknown[], manager: Record<string, ReturnType<typeof vi.fn>> = {}) {
+      const build: Record<string, ReturnType<typeof vi.fn>> = {};
+      for (const name of ['translate', 'rotate', 'scale', 'duplicate', 'delete', 'importEntity']) build[name] = manager[name] ?? vi.fn().mockResolvedValue(applied);
+      const world = worldWithBuilder({ controls: {} });
+      const summaryPrompts: string[] = [];
+      const { runtime, recorded } = createRuntime({
+        service: connectedService(world, { build, messages: { sendMessage: vi.fn() } }),
+        models: {
+          [ModelType.OBJECT_LARGE]: { operations },
+          [ModelType.TEXT_SMALL]: (params: any) => (summaryPrompts.push(params.prompt), summary),
+        },
+      });
+      const stored = await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_EDIT_ENTITY'));
+      const calls = Object.fromEntries(Object.entries(build).map(([name, fn]) => [name, fn.mock.calls.map((args) => args.slice(1))]));
+      return { stored, calls, summaryPrompts, data: stored.actionResult.data as { executed: number; skipped: number; failed: number; outcomes: any[] } };
+    }
+    const move = (target: string, extra: Record<string, unknown> = {}) => ({ operation: 'translate', target, parameters: { position: [0, 2, 0] }, ...extra });
+
+    it("runs an operation by its shape, whatever the plan says of its own success: no flag, true, or something that is not a boolean", async () => {
+      const { calls, data } = await edit([move('a'), move('b', { success: true }), move('c', { success: 'no' }), move('d', { success: 0 }), move('e', { success: null })]);
+      expect(calls.translate.map(([target]) => target)).toEqual(['a', 'b', 'c', 'd', 'e']);
+      expect(data).toMatchObject({ executed: 5, skipped: 0, failed: 0 });
+    });
+
+    it('runs nothing for an entry that claims success but is not an operation in shape, and says which and why', async () => {
+      const { calls, data } = await edit([
+        { success: true, operation: 'translate', target: 'box' },
+        { success: true, operation: 'translate', target: 'box', parameters: { position: ['0', '2', '0'] } },
+        { success: true, operation: 'delete', target: { id: 'box' } },
+        { success: true, operation: 'explode', target: 'box' },
+        { success: true, operation: 'import', target: 'https://cdn.example.com/a.glb', parameters: { position: 'origin' } },
+        'delete box',
+      ]);
+      expect(Object.values(calls).flat()).toEqual([]);
+      expect(data).toMatchObject({ executed: 0, skipped: 0, failed: 6 });
+      expect(data.outcomes.map((o) => o.reason)).toEqual([
+        'invalid operation (parameters: Invalid input: expected object, received undefined)',
+        'invalid operation (parameters.position.0: Invalid input: expected number, received string)',
+        'invalid operation (target: Invalid input: expected string, received object)',
+        'unsupported operation type',
+        expect.stringMatching(/^invalid operation \(parameters\.position: /),
+        'not an operation object',
+      ]);
+    });
+
+    it("never runs an entry the plan itself declined, however complete the entry is", async () => {
+      const { calls, data } = await edit([move('box', { success: false, reason: 'the owner said to leave it' })]);
+      expect(calls.translate).toEqual([]);
+      expect(data.outcomes).toEqual([{ operation: 'translate', target: 'box', outcome: 'skipped', reason: 'the owner said to leave it' }]);
+    });
+
+    it('hands the build manager exactly what the operation takes: its target and its own parameters', async () => {
+      const { calls } = await edit([
+        move('a', { parameters: { position: [1, 2, 3], rotation: [0, 0, 0, 1], extra: true }, speed: 9 }),
+        { operation: 'rotate', target: 'b', parameters: { rotation: [0, 0, 0, 1] } },
+        { operation: 'scale', target: 'c', parameters: { scale: [2, 2, 2] } },
+        { operation: 'delete', target: 'd', parameters: { force: true } },
+        { operation: 'import', target: 'https://cdn.example.com/a.glb' },
+        { operation: 'import', target: 'https://cdn.example.com/b.glb', parameters: { position: [1, 0, 1], rotation: null } },
+      ]);
+      expect(calls.translate).toEqual([['a', [1, 2, 3]]]);
+      expect(calls.rotate).toEqual([['b', [0, 0, 0, 1]]]);
+      expect(calls.scale).toEqual([['c', [2, 2, 2]]]);
+      expect(calls.delete).toEqual([['d']]);
+      expect(calls.importEntity).toEqual([
+        ['https://cdn.example.com/a.glb', undefined, undefined],
+        ['https://cdn.example.com/b.glb', [1, 0, 1], undefined],
+      ]);
+    });
+
+    it('runs at most 20 operations of one request and reports the rest as not run; entries that are no operations do not count', async () => {
+      const operations = [{ success: false, operation: 'delete', reason: 'kept' }, null, ...Array.from({ length: 25 }, (_, i) => move(`box${i}`))];
+      const { calls, data } = await edit(operations);
+      expect(calls.translate.map(([target]) => target)).toEqual(Array.from({ length: 20 }, (_, i) => `box${i}`));
+      expect(data).toMatchObject({ executed: 20, skipped: 1, failed: 6 });
+      expect(data.outcomes.slice(-5)).toEqual(Array.from({ length: 5 }, (_, i) => ({ operation: 'translate', target: `box${20 + i}`, outcome: 'failed', reason: 'not run: one request runs at most 20 operations' })));
+    });
+
+    it('counts an operation that was tried and not done toward the 20 as well', async () => {
+      const translate = vi.fn().mockResolvedValue({ outcome: 'skipped', reason: 'target not found' });
+      const { calls } = await edit(Array.from({ length: 30 }, (_, i) => move(`box${i}`)), { translate });
+      expect(calls.translate).toHaveLength(20);
+    });
+
+    it('lets a later entry act on the copy an earlier entry made, by the label the plan gave it; the duplicate reports the new id', async () => {
+      const duplicate = vi.fn().mockResolvedValueOnce({ outcome: 'applied', newId: 'copy-of-block' }).mockResolvedValueOnce({ outcome: 'applied', newId: 'second-copy' });
+      const { calls, data, summaryPrompts } = await edit(
+        [
+          { success: true, operation: 'duplicate', target: 'block', as: 'copy1', description: 'Duplicated the block' },
+          { success: true, operation: 'translate', targetRef: 'copy1', parameters: { position: [0, 3, 0] }, description: 'Put the copy on top of the water' },
+          { success: true, operation: 'duplicate', target: 'block', description: 'Another one' },
+          { success: true, operation: 'delete', targetRef: 'copy1', description: 'Removed the first copy again' },
+        ],
+        { duplicate }
+      );
+      expect(calls.duplicate).toEqual([['block'], ['block']]);
+      // The copy, not the original
+      expect(calls.translate).toEqual([['copy-of-block', [0, 3, 0]]]);
+      expect(calls.delete).toEqual([['copy-of-block']]);
+      expect(data.outcomes).toEqual([
+        { operation: 'duplicate', target: 'block', outcome: 'executed', newId: 'copy-of-block' },
+        { operation: 'translate', target: 'copy-of-block', outcome: 'executed' },
+        { operation: 'duplicate', target: 'block', outcome: 'executed', newId: 'second-copy' },
+        { operation: 'delete', target: 'copy-of-block', outcome: 'executed' },
+      ]);
+      expect(summaryPrompts[0]).toContain('DONE: Duplicated the block (the copy is entity copy-of-block)');
+    });
+
+    it('does not guess at a copy: a reference to one that was not made fails, and nothing is done to the original', async () => {
+      const duplicate = vi.fn().mockResolvedValue({ outcome: 'skipped', reason: "it is the world's scene" });
+      const { calls, data } = await edit(
+        [
+          { operation: 'translate', targetRef: 'copy1', parameters: { position: [0, 3, 0] } },
+          { operation: 'duplicate', target: 'scene-app', as: 'copy1' },
+          { operation: 'translate', targetRef: 'copy1', parameters: { position: [0, 3, 0] } },
+          { operation: 'delete', targetRef: 'copy2' },
+        ],
+        { duplicate }
+      );
+      expect(calls.translate).toEqual([]);
+      expect(calls.delete).toEqual([]);
+      expect(data.outcomes.map((o) => [o.operation, o.target, o.outcome, o.reason])).toEqual([
+        ['translate', 'copy1', 'failed', 'no copy named "copy1" was made earlier in this request'],
+        ['duplicate', 'scene-app', 'skipped', "it is the world's scene"],
+        ['translate', 'copy1', 'failed', 'no copy named "copy1" was made earlier in this request'],
+        ['delete', 'copy2', 'failed', 'no copy named "copy2" was made earlier in this request'],
+      ]);
     });
   });
 

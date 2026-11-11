@@ -43,6 +43,21 @@ describe('formatShelf', () => {
     expect(text).toContain('Never post links');
   });
 
+  it('cuts a long description on a code point, never through a surrogate pair, and never into an address', () => {
+    // 'a' puts every emoji's pair across an even UTF-16 offset: a cut by UTF-16 units would split one
+    const emoji = product('h_emoji', 'Sticker', { desc: `a${'🛹'.repeat(200)}` });
+    const line = formatShelf([emoji], { autonomous: false }).split('\n').find((l) => l.startsWith('- [h_emoji]'))!;
+    const shown = line.slice(line.indexOf('): ') + 3);
+    expect(shown.isWellFormed()).toBe(true);
+    expect(shown).toBe(`a${'🛹'.repeat(78)}…`);
+    expect(Array.from(shown)).toHaveLength(80);
+    // A cut that would leave the start of a file name looking like an address goes back to before it
+    const dotted = product('h_dot', 'Pack', { desc: `${'x'.repeat(70)} photo.jpeg and more words after it` });
+    const dottedLine = formatShelf([dotted], { autonomous: false }).split('\n').find((l) => l.startsWith('- [h_dot]'))!;
+    expect(linkLikeParts(dottedLine)).toEqual([]);
+    expect(dottedLine.endsWith(`${'x'.repeat(70)}…`)).toBe(true);
+  });
+
   it('caps the shelf and says how many are hidden', () => {
     const many = Array.from({ length: 20 }, (_, i) => product(`h_${i}`, `Item ${i}`));
     const text = formatShelf(many, { autonomous: false });

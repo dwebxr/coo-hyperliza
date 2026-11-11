@@ -12,7 +12,7 @@ import {
   logger,
 } from '@elizaos/core';
 import { AiBudgetExceededError, currentOrigin, getUsageBudget, isAiPurpose, maxTokensFor, purposeEnvKey } from './usage-budget';
-import { assertTurnLive } from './plugin-hyperfy/lib/turn-context';
+import { assertTurnLive, currentTurn } from './plugin-hyperfy/lib/turn-context';
 
 /**
  * Text/JSON generation with current Claude models.
@@ -165,7 +165,12 @@ async function generate(
 
   const reserve = tokenReserve(system, content ?? prompt, maxOutput);
   const deadlineAt = Date.now() + GENERATION_DEADLINE_MS;
-  const signal = AbortSignal.timeout(GENERATION_DEADLINE_MS);
+  // Every attempt is aborted by the deadline, and by the cancellation of the turn it is made for
+  // (its slot ran out, or its connection ended): a request nobody will use is not left running
+  // to its end. What an aborted request counts as is decided below, as for any other.
+  const deadline = AbortSignal.timeout(GENERATION_DEADLINE_MS);
+  const turnSignal = currentTurn()?.signal;
+  const signal = turnSignal ? AbortSignal.any([deadline, turnSignal]) : deadline;
   /** One request, under a reservation of its own; settled with what the API billed, or failed. */
   const attempt = async (): Promise<Anthropic.Message> => {
     // A turn that may no longer act (its connection ended, or its slot ran out) asks nothing more
@@ -195,6 +200,8 @@ async function generate(
       // A request the API refused cost nothing; one that timed out, was aborted or lost its
       // connection may have been billed, so its whole reservation stays counted
       reservation.fail(wasRejected(error) ? 'rejected' : 'unknown');
+      // Aborted with its turn: the caller sees why (TurnCancelled), not the SDK's abort error
+      assertTurnLive();
       throw error;
     }
     // Billed even when the output turns out unusable

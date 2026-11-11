@@ -1,3 +1,7 @@
+import { readFileSync, readdirSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import * as THREE from 'three';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // The loader hands model bytes to the render page and gets them back without textures; here the
@@ -93,6 +97,7 @@ vi.mock('../lib/asset-bytes', async (importOriginal) => {
 });
 
 import { AgentLoader, LOADER_LIMITS, type LoaderLimits } from './loader';
+import { GLTFLoader } from '../hyperfy/src/core/libs/gltfloader/GLTFLoader.js';
 import { RenderPageKilled } from '../lib/render-watchdog';
 import { assetMemory, modelReservation } from '../lib/asset-memory';
 import { gltfCharge, modelBudget } from '../lib/gltf-budget';
@@ -441,17 +446,19 @@ describe('AgentLoader', () => {
     expect(page.glb).toEqual([]);
     await loader.load('model', 'asset://ok.glb');
     await loader.load('avatar', 'asset://ok.vrm');
-    // A model with no animation is no emote
-    await expect(loader.load('emote', 'asset://ok-emote.glb')).rejects.toThrow();
+    // A model with no animation is no emote; an emote is read here and never goes to the page
+    await expect(loader.load('emote', 'asset://ok-emote.glb')).rejects.toThrow('holds no animation: it is not an emote');
+    expect(loader.has('emote', 'asset://ok-emote.glb')).toBe(false);
     // The ceiling for this load, which its reservation is sized from (lib/asset-memory.ts): for a
-    // file this small, the 1 MiB floor; an emote's export budget is smaller (lib/gltf-budget.test.ts)
+    // file this small, the 1 MiB floor
     const glb = minimalGlb();
-    const ceiling = (type: 'model' | 'avatar' | 'emote') => {
+    const ceiling = (type: 'model' | 'avatar') => {
       const reservation = modelReservation(type, glb.byteLength, (gltfCharge(glb, modelBudget(type)) as any).charge.exportBytes, modelBudget(type).exportBytes);
       return 'problem' in reservation ? null : reservation.exportBytes;
     };
-    expect(page.budgets).toEqual([ceiling('model'), ceiling('avatar'), ceiling('emote')]);
-    expect(page.budgets).toEqual([1024 * 1024, 1024 * 1024, 1024 * 1024]);
+    expect(page.budgets).toEqual([ceiling('model'), ceiling('avatar')]);
+    expect(page.budgets).toEqual([1024 * 1024, 1024 * 1024]);
+    expect(page.glb).toHaveLength(1);
   });
 
   it("gives the page, for a large model, a ceiling lowered so that the reservation fits the pool, and refuses one whose estimated export cannot fit", () => {
@@ -615,5 +622,121 @@ describe('AgentLoader', () => {
     await expect.poll(() => assets.cutShort).toBe(1);
     await expect(loader.load('script', 'asset://c.js')).rejects.toThrow('The world was destroyed');
     expect(assets.hits).toHaveLength(1);
+  });
+});
+
+/*
+ * Emotes, end to end, with the files the agent ships: served by the world, downloaded under its
+ * policy, admitted by the glTF filter, and read here by the engine's own loader and emote factory.
+ */
+describe('AgentLoader emotes', () => {
+  const emotesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '../public/emotes');
+  const bundled = readdirSync(emotesDir).filter((name) => name.endsWith('.glb')).sort();
+  const serveEmotes: Handler = (request, response) => {
+    const name = path.basename(request.url ?? '');
+    if (!bundled.includes(name)) return void response.writeHead(404).end();
+    response.end(readFileSync(path.join(emotesDir, name)));
+  };
+  /** What the engine's avatar factory asks an emote for: its clip, for an avatar's own bones */
+  const retarget = { rootToHips: 1, version: '1', getBoneName: (vrmBoneName: string) => `bone:${vrmBoneName}` };
+
+  it('ships the emotes this is about', () => {
+    expect(bundled.length).toBeGreaterThanOrEqual(21);
+  });
+
+  it.each(bundled)('loads %s as a clip an avatar can play, without the render page and without leaving anything reserved', async (name) => {
+    const { loader } = await setup({ handler: serveEmotes });
+    const emote = await loader.load('emote', `asset://${name}`);
+    // The render page was not asked: it hands back a scene without its animations
+    expect(page.glb).toEqual([]);
+    expect(page.kept.size).toBe(0);
+
+    const clip = emote.toClip(retarget);
+    expect(clip).toBeInstanceOf((THREE as any).AnimationClip);
+    expect(clip.duration).toBeGreaterThan(0.1);
+    expect(clip.tracks.length).toBeGreaterThan(10);
+    // Retargeted: every track drives a bone of the avatar by the name the avatar gave for it
+    for (const track of clip.tracks) {
+      expect(track.name).toMatch(/^bone:[A-Za-z]+\.(quaternion|position)$/);
+      expect(track.times.length).toBeGreaterThan(0);
+      expect(track.values.every(Number.isFinite)).toBe(true);
+    }
+    expect(clip.tracks.some((track: { name: string }) => track.name === 'bone:hips.quaternion')).toBe(true);
+    // A second load is the same emote, from the cache
+    expect(await loader.load('emote', `asset://${name}`)).toBe(emote);
+    expect(loader.get('emote', `asset://${name}`)).toBe(emote);
+    expect(assetMemory.held).toEqual({ downloads: 0, work: 0 });
+  });
+
+  it('reserves memory for an emote while it is read, and refuses one the filter does not admit, before parsing anything', async () => {
+    const { loader } = await setup({ handler: serveEmotes });
+    const parse = vi.spyOn(loader.gltfLoader, 'parse');
+    let heldWhileParsing = { downloads: 0, work: 0 };
+    parse.mockImplementationOnce(function (this: unknown, ...args: any[]) {
+      heldWhileParsing = { ...assetMemory.held };
+      return (parse.getMockImplementation() ?? (GLTFLoader.prototype.parse as any)).apply(this, args);
+    });
+    parse.mockImplementation(function (this: unknown, ...args: any[]) {
+      return (GLTFLoader.prototype.parse as any).apply(this, args);
+    });
+    await loader.load('emote', 'asset://emote-idle.glb');
+    const size = readFileSync(path.join(emotesDir, 'emote-idle.glb')).byteLength;
+    expect(heldWhileParsing.work).toBeGreaterThanOrEqual(size);
+    expect(assetMemory.held).toEqual({ downloads: 0, work: 0 });
+
+    // The same file with a second JSON chunk: refused by the filter, never handed to the parser
+    const calls = parse.mock.calls.length;
+    const { loader: other } = await setup({ handler: (_request, response) => response.end(Buffer.from(glbOfChunks([jsonChunk({ asset: { version: '2.0' } }), jsonChunk({ asset: { version: '2.0' } })]))) });
+    const otherParse = vi.spyOn(other.gltfLoader, 'parse');
+    await expect(other.load('emote', 'asset://two-json.glb')).rejects.toThrow();
+    expect(otherParse).not.toHaveBeenCalled();
+    expect(parse.mock.calls.length).toBe(calls);
+  });
+});
+
+/*
+ * Embedded images. The agent decodes none; the engine's loader would make a blob: URL for each
+ * and, as the load fails outside a browser, never revoke it.
+ */
+describe('AgentLoader and images embedded in a model', () => {
+  // A 1x1 PNG in the BIN chunk, used as the base colour texture of the one material
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+  const texturedGlb = () =>
+    glbOfChunks([
+      jsonChunk({
+        asset: { version: '2.0' },
+        scene: 0,
+        scenes: [{ nodes: [0] }],
+        nodes: [{ name: 'Textured', mesh: 0 }],
+        meshes: [{ primitives: [{ attributes: { POSITION: 0 }, material: 0 }] }],
+        materials: [{ name: 'Painted', pbrMetallicRoughness: { baseColorTexture: { index: 0 } }, emissiveTexture: { index: 1 } }],
+        textures: [{ source: 0 }, { source: 0 }],
+        images: [{ bufferView: 1, mimeType: 'image/png' }],
+        accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: 'VEC3', min: [0, 0, 0], max: [1, 1, 0] }],
+        bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: 36 }, { buffer: 0, byteOffset: 36, byteLength: png.byteLength }],
+        buffers: [{ byteLength: 36 + png.byteLength }],
+      }),
+      [0x004e4942, new Uint8Array(Buffer.concat([Buffer.from(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]).buffer), png]))],
+    ]);
+
+  it('makes no blob: URL for an image in a model it parses: the model loads with that map absent', async () => {
+    const created = vi.spyOn(URL, 'createObjectURL');
+    const revoked = vi.spyOn(URL, 'revokeObjectURL');
+    // As in the agent's process once a world exists (session/create-agent-world.ts): the engine's loader reads self.URL
+    vi.stubGlobal('self', globalThis);
+    try {
+      const glb = texturedGlb();
+      const { loader } = await setup({ handler: (_request, response) => response.end(Buffer.from(glb)) });
+      const model = await loader.load('model', 'asset://textured.glb');
+      const mesh = model.gltf.scene.children[0];
+      expect(mesh.name).toBe('Textured');
+      expect(mesh.material.name).toBe('Painted');
+      expect(mesh.material.map).toBeNull();
+      expect(mesh.material.emissiveMap).toBeNull();
+      expect(created).not.toHaveBeenCalled();
+      expect(revoked).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

@@ -474,8 +474,9 @@ describe('HyperfyService chat provenance', () => {
     // The real tip wallet on this connection, signed in and shown as receiving by the world
     const account = privateKeyToAccount(generatePrivateKey());
     const { s, runtime, world, sent } = chatService(withTipWallet(account));
-    await signIn(s.tipWallet, world.network, sent, account);
-    world.network.onEvmWalletStatus({ verified: true, wallet: account.address });
+    const { verify } = await signIn(s.tipWallet, world.network, sent, account);
+    // As coo-world answers a verified signature
+    world.network.onEvmWalletStatus({ verified: true, wallet: account.address, attempt: verify.attempt, reason: 'ok' });
     vi.spyOn(console, 'error').mockImplementation(() => {}); // the engine finds no 'coo' entity to modify
     world.network.onEntityModified({ id: 'coo', evmTips: true });
     expect(s.tipWallet.receiving).toBe(true);
@@ -501,8 +502,8 @@ describe('HyperfyService chat provenance', () => {
     async function receivingTips() {
       const account = privateKeyToAccount(generatePrivateKey());
       const ctx = chatService(withTipWallet(account));
-      await signIn(ctx.s.tipWallet, ctx.world.network, ctx.sent, account);
-      ctx.world.network.onEvmWalletStatus({ verified: true, wallet: account.address });
+      const { verify } = await signIn(ctx.s.tipWallet, ctx.world.network, ctx.sent, account);
+      ctx.world.network.onEvmWalletStatus({ verified: true, wallet: account.address, attempt: verify.attempt, reason: 'ok' });
       // The engine finds no 'coo' entity to modify (console.error, silenced)
       ctx.world.network.onEntityModified({ id: 'coo', evmTips: true });
       expect(ctx.s.tipWallet.receiving).toBe(true);
@@ -594,8 +595,9 @@ describe('HyperfyService chat provenance', () => {
   it('still thanks for a tip confirmed after "Receive tips" was switched off again on the same connection', async () => {
     const account = privateKeyToAccount(generatePrivateKey());
     const { s, runtime, world, sent } = chatService(withTipWallet(account));
-    await signIn(s.tipWallet, world.network, sent, account);
-    world.network.onEvmWalletStatus({ verified: true, wallet: account.address });
+    const { verify } = await signIn(s.tipWallet, world.network, sent, account);
+    // As coo-world answers a verified signature
+    world.network.onEvmWalletStatus({ verified: true, wallet: account.address, attempt: verify.attempt, reason: 'ok' });
     vi.spyOn(console, 'error').mockImplementation(() => {});
     world.network.onEntityModified({ id: 'coo', evmTips: true });
     world.network.onEntityModified({ id: 'coo', evmTips: false });

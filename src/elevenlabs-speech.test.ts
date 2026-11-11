@@ -2,11 +2,11 @@ import { Readable } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ModelType } from '@elizaos/core';
 
-const { transcribeWithElevenLabs, generateElevenLabsTTS } = vi.hoisted(() => ({
+const { transcribeWithElevenLabs, elevenLabsSpeech } = vi.hoisted(() => ({
   transcribeWithElevenLabs: vi.fn(),
-  generateElevenLabsTTS: vi.fn(),
+  elevenLabsSpeech: vi.fn(),
 }));
-vi.mock('./plugin-hyperfy/utils', () => ({ transcribeWithElevenLabs, generateElevenLabsTTS }));
+vi.mock('./plugin-hyperfy/utils', () => ({ transcribeWithElevenLabs, elevenLabsSpeech }));
 
 import { MAX_TTS_CODE_POINTS, elevenLabsSpeechPlugin, toAudioBuffer } from './elevenlabs-speech';
 import { UsageBudget, resetUsageBudget } from './usage-budget';
@@ -26,7 +26,7 @@ describe('elevenLabsSpeechPlugin', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     transcribeWithElevenLabs.mockReset();
-    generateElevenLabsTTS.mockReset();
+    elevenLabsSpeech.mockReset();
   });
 
   it('transcribes a WAV buffer (what Discord voice passes)', async () => {
@@ -96,17 +96,17 @@ describe('elevenLabsSpeechPlugin', () => {
   });
 
   it('returns speech as a readable stream (Discord passes it to createAudioResource)', async () => {
-    generateElevenLabsTTS.mockResolvedValue(Buffer.from('mp3-bytes'));
+    elevenLabsSpeech.mockResolvedValue({ audio: Buffer.from('mp3-bytes'), mayBeBilled: true });
     const stream = await models[ModelType.TEXT_TO_SPEECH](runtime, 'こんにちは');
     expect(stream).toBeInstanceOf(Readable);
     expect((await readAll(stream)).toString()).toBe('mp3-bytes');
 
     await models[ModelType.TEXT_TO_SPEECH](runtime, { text: 'hello' });
-    expect(generateElevenLabsTTS).toHaveBeenLastCalledWith('hello');
+    expect(elevenLabsSpeech).toHaveBeenLastCalledWith('hello');
   });
 
   it('throws when synthesis fails or there is no text', async () => {
-    generateElevenLabsTTS.mockResolvedValue(null);
+    elevenLabsSpeech.mockResolvedValue({ audio: null, mayBeBilled: true });
     await expect(models[ModelType.TEXT_TO_SPEECH](runtime, 'hi')).rejects.toThrow('synthesis failed');
     await expect(models[ModelType.TEXT_TO_SPEECH](runtime, '  ')).rejects.toThrow('needs text');
   });
@@ -117,14 +117,14 @@ describe('elevenLabsSpeechPlugin text-to-speech limits', () => {
     new UsageBudget({ aiCallsPerHour: null, aiTokensPerDay: null, visionPerHour: null, ttsCharsPerDay, sttSecondsPerDay: null, autonomyAiPerHour: null, autonomyAiMinIntervalMs: 0 });
   afterEach(() => {
     resetUsageBudget();
-    generateElevenLabsTTS.mockReset();
+    elevenLabsSpeech.mockReset();
   });
 
   it('synthesizes at most 1000 code points of one request, never half a surrogate pair', async () => {
     resetUsageBudget(budgetWith(null));
-    generateElevenLabsTTS.mockResolvedValue(Buffer.from('mp3'));
+    elevenLabsSpeech.mockResolvedValue({ audio: Buffer.from('mp3'), mayBeBilled: true });
     await models[ModelType.TEXT_TO_SPEECH](runtime, `a${'🛹'.repeat(2000)}`);
-    const [spoken] = generateElevenLabsTTS.mock.calls[0];
+    const [spoken] = elevenLabsSpeech.mock.calls[0];
     expect(spoken).toBe(`a${'🛹'.repeat(MAX_TTS_CODE_POINTS - 1)}`);
   });
 
@@ -132,13 +132,13 @@ describe('elevenLabsSpeechPlugin text-to-speech limits', () => {
     const budget = budgetWith(10);
     resetUsageBudget(budget);
     // Requests that start together: only what fits is sent
-    const pending: ((audio: Buffer) => void)[] = [];
-    generateElevenLabsTTS.mockImplementation(() => new Promise((resolve) => pending.push(resolve)));
+    const pending: ((attempt: { audio: Buffer; mayBeBilled: boolean }) => void)[] = [];
+    elevenLabsSpeech.mockImplementation(() => new Promise((resolve) => pending.push(resolve)));
     const calls = ['123456', '123456', '1234'].map((text) => models[ModelType.TEXT_TO_SPEECH](runtime, text).then(() => 'spoken', (error: Error) => error.message));
     await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(generateElevenLabsTTS.mock.calls.map(([text]) => text)).toEqual(['123456', '1234']);
+    expect(elevenLabsSpeech.mock.calls.map(([text]) => text)).toEqual(['123456', '1234']);
     expect(budget.snapshot(60_000)).toMatchObject({ ttsChars: 10, skipped: { tts: 1 } });
-    for (const finish of pending) finish(Buffer.from('mp3'));
+    for (const finish of pending) finish({ audio: Buffer.from('mp3'), mayBeBilled: true });
     expect(await Promise.all(calls)).toEqual(['spoken', '[ElevenLabs] Text-to-speech limit reached (VOICE_TTS_MAX_CHARS_PER_DAY)', 'spoken']);
   });
 });
@@ -146,7 +146,7 @@ describe('elevenLabsSpeechPlugin text-to-speech limits', () => {
 describe('elevenLabsSpeechPlugin through the real runtime', () => {
   it('serves useModel(TEXT_TO_SPEECH, "text") as Discord calls it, despite core\'s string-param bug', async () => {
     const { AgentRuntime } = await import('@elizaos/core');
-    generateElevenLabsTTS.mockResolvedValue(Buffer.from('mp3-bytes'));
+    elevenLabsSpeech.mockResolvedValue({ audio: Buffer.from('mp3-bytes'), mayBeBilled: true });
     const runtime = new AgentRuntime({ character: { name: 'probe', bio: [], plugins: [] } as any, plugins: [elevenLabsSpeechPlugin] });
     // registers the plugin (running its init), then stops for lack of a database adapter
     await runtime.initialize().catch(() => {});
@@ -154,7 +154,7 @@ describe('elevenLabsSpeechPlugin through the real runtime', () => {
     (runtime as any).adapter = { log: vi.fn().mockResolvedValue(undefined) };
 
     const stream = await runtime.useModel(ModelType.TEXT_TO_SPEECH, 'hello Discord' as any);
-    expect(generateElevenLabsTTS).toHaveBeenCalledWith('hello Discord');
+    expect(elevenLabsSpeech).toHaveBeenCalledWith('hello Discord');
     expect((await readAll(stream as any)).toString()).toBe('mp3-bytes');
   });
 });

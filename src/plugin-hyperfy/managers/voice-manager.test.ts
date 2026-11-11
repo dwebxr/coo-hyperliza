@@ -13,7 +13,7 @@ vi.mock('@livekit/rtc-node', () => ({
   AudioStream: class {},
 }));
 
-import { MAX_CONCURRENT_TRANSCRIPTIONS, MAX_HELD_VOICE_BYTES, MAX_SPEAKERS, MAX_SPOKEN_CODE_POINTS, MAX_UTTERANCE_BYTES, UTTERANCE_PAUSE_MS, spokenPart } from './voice-manager';
+import { MAX_CONCURRENT_TRANSCRIPTIONS, MAX_HELD_VOICE_BYTES, MAX_SPEAKERS, MAX_SPOKEN_CODE_POINTS, MAX_UTTERANCE_BYTES, MIN_UTTERANCE_BYTES, UTTERANCE_PAUSE_MS, spokenPart } from './voice-manager';
 import { installWorldChat } from '../lib/world-chat';
 import { sessionFor, sessionRuntime, withParts } from '../test-support/session';
 import { Events } from '../hyperfy/src/core/systems/Events.js';
@@ -383,6 +383,31 @@ describe('VoiceManager voice input', () => {
     expect(useModel.mock.calls[0][1].subarray(0, 4).toString()).toBe('RIFF');
     expect(heard).toHaveLength(1);
     expect(heard[0]).toMatchObject({ text: 'hello there', speaker: 'p1', turn: { origin: 'voice', requesterId: 'p1', generation: session.generation, live: true } });
+  });
+
+  it('asks speech-to-text nothing for a sound too short to be a word, and counts nothing for it; 100 ms of speech is transcribed', async () => {
+    const { say, budget, useModel, heard, requests, state } = listening({ limits: { sttSecondsPerDay: 100 } });
+    // 100 ms of 48 kHz 16-bit mono
+    expect(MIN_UTTERANCE_BYTES).toBe(9600);
+    // One 10 ms frame (a click); then nine of them, with quiet frames in between that do not count
+    say('p1', loud(10));
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS);
+    for (let i = 0; i < 9; i++) {
+      say('p2', loud(10));
+      say('p2', quiet(10));
+    }
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS);
+    expect(useModel).not.toHaveBeenCalled();
+    expect(heard).toEqual([]);
+    expect(budget.snapshot(24 * 3600_000).sttSeconds).toBe(0);
+    // Nothing of them is held either
+    expect(state()).toEqual({ speakers: 0, transcribing: 0, held: 0 });
+
+    for (let i = 0; i < 10; i++) say('p3', loud(10));
+    await vi.advanceTimersByTimeAsync(UTTERANCE_PAUSE_MS);
+    expect(requests()).toEqual([0.1]);
+    expect(heard.map(({ speaker }) => speaker)).toEqual(['p3']);
+    expect(budget.snapshot(24 * 3600_000).sttSeconds).toBeCloseTo(0.1);
   });
 
   it('transcribes two people who speak at the same time, each on their own', async () => {

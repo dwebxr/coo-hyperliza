@@ -23,7 +23,7 @@ export const hyperfyStopMovingAction: Action = {
       runtime: IAgentRuntime,
       _message: Memory,
       _state: State,
-      options: { reason?: string }, // Optional reason for stopping
+      _options: unknown,
       callback: HandlerCallback
     ) => {
       // The turn's own connection (never a newer one); throws when the turn may no longer act.
@@ -44,7 +44,7 @@ export const hyperfyStopMovingAction: Action = {
            return actionFailed(STOP_MOVING, 'stop functionality not available in controls');
       }
 
-      const reason = options?.reason || "stop action called";
+      const reason = "stop action called";
 
       try {
         // Call the stop navigation method

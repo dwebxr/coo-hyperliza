@@ -1,5 +1,5 @@
 import type { IAgentRuntime, Memory, State } from '@elizaos/core';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { characterProvider } from './character';
 
 const message: Memory = {
@@ -22,5 +22,25 @@ describe('characterProvider system section', () => {
     expect(result.values?.system).toBe('');
     expect(result.text).not.toContain('System Behavior');
     expect(result.text).not.toContain('undefined');
+  });
+});
+
+describe("characterProvider and the character's own arrays", () => {
+  it('leaves bio, post examples and message examples in the order the character has them, whatever order it shows', async () => {
+    const bio = Array.from({ length: 12 }, (_, i) => `bio ${i}`);
+    const postExamples = Array.from({ length: 12 }, (_, i) => `post ${i}`);
+    const messageExamples = Array.from({ length: 12 }, (_, i) => [{ name: 'a', content: { text: `example ${i}` } }]);
+    const topics = Array.from({ length: 12 }, (_, i) => `topic ${i}`);
+    const before = structuredClone({ bio, postExamples, messageExamples, topics });
+    // The arrays are shared by everything that reads the character: frozen, so sorting one in place throws
+    const character = { name: 'Coo', bio: Object.freeze(bio), postExamples: Object.freeze(postExamples), messageExamples: Object.freeze(messageExamples), topics: Object.freeze(topics) };
+    const runtime = { character } as unknown as IAgentRuntime;
+    for (const random of [0.9, 0.1, 0.5]) {
+      const spy = vi.spyOn(Math, 'random').mockReturnValue(random);
+      const result = await characterProvider.get(runtime, message, state);
+      spy.mockRestore();
+      expect(result.text).toContain('bio ');
+    }
+    expect({ bio, postExamples, messageExamples, topics }).toEqual(before);
   });
 });

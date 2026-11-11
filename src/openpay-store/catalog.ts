@@ -87,8 +87,9 @@ export function shownText(text: string, max: number): string {
  * reply format (no <, >, backticks, control characters or newlines), shows as it reads (format
  * characters such as bidi overrides and isolates, zero-width characters and tags are removed;
  * compatibility characters are NFKC-normalized, so full-width letters become ASCII), and holds no
- * address that addresses.ts recognises: each becomes LINK_REMOVED, also one that cutting the text
- * to `max` would make (shownText). Only the start of the field is read (RAW_UNITS_PER_SHOWN).
+ * address that addresses.ts recognises: each becomes LINK_REMOVED (the whole field, when the text
+ * with them replaced still holds one), also one that cutting the text to `max` would make
+ * (shownText). Only the start of the field is read (RAW_UNITS_PER_SHOWN).
  * `steps` counts the characters the address scan looked at (tests).
  */
 export function sanitizeText(value: unknown, max: number, steps?: ScanSteps): string {
@@ -99,7 +100,10 @@ export function sanitizeText(value: unknown, max: number, steps?: ScanSteps): st
     .replace(/[<>`]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  return shownText(replaceAddresses(clean, LINK_REMOVED, steps), max);
+  const replaced = replaceAddresses(clean, LINK_REMOVED, steps);
+  // Taking one address out can complete another (a wallet whose 41st hex digit was the next
+  // one's): what is still recognised then, the whole field goes
+  return shownText(findAddresses(replaced, steps).length ? LINK_REMOVED : replaced, max);
 }
 
 const HANDLE = /^[\w.-]{1,64}$/;

@@ -52,7 +52,7 @@ function voiceWorld(players: { id: string; name: string; rank: number }[], model
     network: { send: (name: string, data: unknown) => sent.push([name, data]) },
     chat: { msgs: [], listeners: new Set(), add: vi.fn() },
     events: { emit: vi.fn() },
-    controls: { goto: vi.fn().mockResolvedValue(undefined) },
+    controls: { goto: vi.fn().mockResolvedValue('arrived') },
     livekit: { on: vi.fn(), off: vi.fn() },
     entities: {
       items: new Map<string, unknown>([['box', box]]),

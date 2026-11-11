@@ -127,7 +127,7 @@ describe('messageReceivedHandler cost controls', () => {
   afterEach(() => resetUsageBudget());
 
   function world() {
-    const controls = { followEntity: vi.fn().mockResolvedValue(undefined), teleportToEntity: vi.fn(), stopAllActions: vi.fn() };
+    const controls = { followEntity: vi.fn().mockResolvedValue('arrived'), teleportToEntity: vi.fn(), stopAllActions: vi.fn() };
     const at = (x: number) => ({ base: { position: { distanceTo: (o: any) => Math.abs(o.x - x), x } } });
     const items = new Map<string, any>([['player-bob', at(5)]]);
     return { controls, entities: { items, player: at(0) } };
@@ -145,6 +145,26 @@ describe('messageReceivedHandler cost controls', () => {
     // The walk is tied to what it is for (here, outside a turn, the connection)
     expect(w.controls.followEntity).toHaveBeenCalledWith('player-bob', undefined, { signal: session.signal });
     expect(callback).toHaveBeenCalledWith(expect.objectContaining({ text: 'On my way!', actions: ['HYPERFY_GOTO_ENTITY'] }));
+  });
+
+  it('"come here" from far away teleports, and says it is on its way only when the teleport was made', async () => {
+    for (const [made, answered] of [['arrived', true], ['unreachable', false]] as const) {
+      const { runtime, message } = setup({ embeddingModel: false });
+      const w = world();
+      // Beyond walking distance
+      w.entities.items.set('player-bob', { base: { position: { x: 500, distanceTo: (o: any) => Math.abs(o.x - 500) } } });
+      w.controls.teleportToEntity.mockReturnValue(made);
+      runtime.getService = vi.fn(() => serviceFor(sessionFor(w)));
+      message.content = { text: 'Coo, come here!', metadata: { directlyAddressed: true, hyperfyFromId: 'player-bob' } };
+      const callback = vi.fn();
+      await messageReceivedHandler({ runtime, message, callback } as any);
+      expect(w.controls.teleportToEntity).toHaveBeenCalledWith('player-bob');
+      expect(w.controls.followEntity).not.toHaveBeenCalled();
+      const said = callback.mock.calls.some(([content]) => content.text === 'On my way!');
+      expect(said, made).toBe(answered);
+      // Not handled as a simple command then: the turn goes on to the model like any other message
+      expect(runtime.useModel.mock.calls.length > 0, made).toBe(!answered);
+    }
   });
 
   it('stops on "stop" without a model call; one that already stopped the agent when it arrived is only acknowledged', async () => {
@@ -287,7 +307,7 @@ describe('messageReceivedHandler answers when an action stops the turn before an
       network: { send: (name: string, data: unknown) => sent.push([name, data]) },
       chat: { msgs: [], listeners: new Set(), add: vi.fn() },
       events: { emit: vi.fn() },
-      controls: { goto: vi.fn().mockResolvedValue(undefined) },
+      controls: { goto: vi.fn().mockResolvedValue('arrived') },
       entities: { items: new Map([['box', box]]), player: { data: { id: 'coo', name: 'Coo' } } },
     });
     installWorldChat(world);

@@ -217,8 +217,9 @@ export class BehaviorManager {
         // Emotes stop while walking, so wave once there
         controls
           .followEntity(step.playerId)
-          .then(() => {
-            if (this.isRunning && !session.ended) wave(step.playerId);
+          .then((outcome: string) => {
+            // Only next to them: a walk that was stopped or replaced waves at nobody
+            if (outcome === 'arrived' && this.isRunning && !session.ended) wave(step.playerId);
           })
           .catch(ignore('Greeting walk'));
         break;

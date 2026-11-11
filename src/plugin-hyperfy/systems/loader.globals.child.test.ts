@@ -90,7 +90,8 @@ describe.each(['bun', 'node'])('the agent process under %s', (runtime) => {
     expect(report.parsed.model.meshes).toBeGreaterThan(0);
     expect(report.parsed.avatar.meshes).toBeGreaterThan(0);
     expect(report.parsed.avatar.images).toBeGreaterThan(0);
-    expect(report.parsed.emote).toMatchObject({ animations: 1, clip: true });
+    expect(report.parsed.emote.tracks).toBeGreaterThan(10);
+    expect(report.parsed.emote.duration).toBeGreaterThan(1);
     // The embedded database elizaOS can use instead of Postgres starts in such a process
     expect(report.pglite).toEqual({ two: 2 });
   }, 90_000);

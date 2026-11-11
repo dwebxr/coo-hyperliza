@@ -295,7 +295,7 @@ describe('a scene edit that loses its authorization while it runs', () => {
     const send = vi.fn();
     const world = worldFromSnapshot(cooWorldSnapshot({ players: [{ id: 'builder-1', name: 'Bob', rank }] }), {
       network: { send },
-      controls: { goto: vi.fn().mockResolvedValue(undefined) },
+      controls: { goto: vi.fn().mockResolvedValue('arrived') },
       entities: { items: new Map([['box', box()]]) },
     });
     return { world, send, box: world.entities.items.get('box')! };

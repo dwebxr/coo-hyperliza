@@ -167,6 +167,12 @@ export interface PuppeteerManagerOptions {
 export class PuppeteerManager {
   private static instance: PuppeteerManager | null = null
   private operations = 0
+  /**
+   * Counts the render pages built. What a page was given (a texture, an environment) is in that
+   * page only: a caller that remembers such a thing remembers this number with it, and takes it
+   * as gone once the number has changed (the page was reset, or rebuilt after a crash or a kill).
+   */
+  pageEpoch = 0
   /** The current browser generation (each launch is one); what the watchdog, kills and launches are bound to */
   private generation = 0
   private readonly pageGeneration = new WeakMap<Page, number>()
@@ -336,6 +342,7 @@ export class PuppeteerManager {
         }
         this.pageGeneration.set(page, generation)
         this.page = page
+        this.pageEpoch++
         console.info('[PuppeteerManager] Render page ready (Chromium has no network access)')
         return page
       })()

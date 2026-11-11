@@ -1,6 +1,6 @@
 import { Readable } from 'node:stream';
 import { type IAgentRuntime, type Plugin, ModelType } from '@elizaos/core';
-import { generateElevenLabsTTS, transcribeWithElevenLabs } from './plugin-hyperfy/utils';
+import { elevenLabsSpeech, transcribeWithElevenLabs } from './plugin-hyperfy/utils';
 import { describeUrl } from './plugin-hyperfy/lib/log-url';
 import { MAX_AUDIO_BYTES, type NetPolicy, publicNet } from './plugin-hyperfy/lib/net-policy';
 import { truncateCodePoints } from './plugin-hyperfy/lib/text';
@@ -46,14 +46,21 @@ async function textToSpeech(_runtime: IAgentRuntime, input: string | { text: str
   const text = typeof input === 'string' ? input : input?.text;
   if (typeof text !== 'string' || !text.trim()) throw new Error('[ElevenLabs] TEXT_TO_SPEECH needs text');
   const spoken = truncateCodePoints(text.trim(), MAX_TTS_CODE_POINTS);
-  // Counted against VOICE_TTS_MAX_CHARS_PER_DAY before the request, like Hyperfy voice
+  // Counted against VOICE_TTS_MAX_CHARS_PER_DAY before the request and settled by the same rule
+  // as Hyperfy voice (utils.ts generateSpeech, usage-budget.ts reserveTts): a request the
+  // provider refused (a 4xx answer) is given back; any other failed one stays counted, as it may
+  // have been billed
   const budget = getUsageBudget();
-  if (!budget.reserveTts(spoken.length)) {
+  const reservation = budget.reserveTts(spoken.length);
+  if (!reservation) {
     budget.recordSkip('tts');
     throw new Error('[ElevenLabs] Text-to-speech limit reached (VOICE_TTS_MAX_CHARS_PER_DAY)');
   }
-  const audio = await generateElevenLabsTTS(spoken);
-  if (!audio) throw new Error('[ElevenLabs] Speech synthesis failed');
+  const { audio, mayBeBilled } = await elevenLabsSpeech(spoken);
+  if (!audio) {
+    if (!mayBeBilled) reservation.release();
+    throw new Error('[ElevenLabs] Speech synthesis failed');
+  }
   return Readable.from(audio);
 }
 

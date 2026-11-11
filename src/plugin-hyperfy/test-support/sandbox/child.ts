@@ -305,7 +305,8 @@ async function main() {
 
   if (scenario.useItem) {
     report.useItem = world.actions.performAction('app');
-    await sleep(60);
+    // The fixture apps' action takes one second of holding E (duration: 1, in seconds)
+    await sleep(1100);
     frame();
     report.releaseItem = world.actions.releaseAction();
     await sleep(600);

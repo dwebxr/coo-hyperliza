@@ -74,6 +74,7 @@ vi.mock('../managers/puppeteer-manager.js', async (importOriginal) => {
 });
 
 import { AgentEnvironment } from './environment';
+import { PuppeteerManager } from '../managers/puppeteer-manager.js';
 import { NetPolicy, installWorldNet } from '../lib/net-policy';
 import { closeServers, startServer } from '../test-support/net';
 import { assetMemory } from '../lib/asset-memory';
@@ -226,6 +227,88 @@ describe('AgentEnvironment sky updates', () => {
     const [second] = [...page.textures.keys()];
     expect([...page.textures.values()]).toEqual([`${origin}/assets/second.jpg`]);
     expect(`${env.sky.material.userData.materialId}:map`).toBe(second);
+  });
+
+  it('downloads and registers a sky image once: a sky update that asks for the same image and HDR again reuses what the page holds', async () => {
+    const { env, assets, origin } = await environment();
+    env.addSky(sky('asset://day.jpg', 'asset://day.hdr'));
+    await expect.poll(() => env.csm.lightDirection).toBe('direction of asset://day.jpg');
+    const shown = env.sky.material.userData.materialId;
+    expect(page.calls).toEqual([`registerTexture ${origin}/assets/day.jpg`, 'loadEnvironmentHDR']);
+
+    // Another sky node with the same image and HDR and another sun (what an app's script does when it changes its sky)
+    const second = env.addSky({ ...sky('asset://day.jpg', 'asset://day.hdr'), _sunDirection: 'evening' });
+    await expect.poll(() => env.csm.lightDirection).toBe('evening');
+    // ...and back to the first when that node goes away
+    second.destroy();
+    await expect.poll(() => env.csm.lightDirection).toBe('direction of asset://day.jpg');
+
+    expect(page.calls).toEqual([`registerTexture ${origin}/assets/day.jpg`, 'loadEnvironmentHDR']);
+    expect(assets.hits.map((hit) => hit.url)).toEqual(['/assets/day.jpg', '/assets/day.hdr']);
+    expect(page.textures.size).toBe(1);
+    expect(env.sky.material.userData.materialId).toBe(shown);
+    expect(env.sky.visible).toBe(true);
+    expect(env.skyInfo.bgUrl).toBe(`${origin}/assets/day.jpg`);
+    expect(page.released).toEqual([]);
+  });
+
+  it('releases the texture of the sky image it replaces, so the page holds one sky texture at a time', async () => {
+    const { env, origin } = await environment();
+    env.addSky(sky('asset://day.jpg'));
+    await expect.poll(() => env.csm.lightDirection).toBe('direction of asset://day.jpg');
+    const [first] = [...page.textures.keys()];
+    for (const image of ['night.jpg', 'dawn.jpg', 'day.jpg']) {
+      env.addSky(sky(`asset://${image}`));
+      await expect.poll(() => env.csm.lightDirection).toBe(`direction of asset://${image}`);
+      expect([...page.textures.values()]).toEqual([`${origin}/assets/${image}`]);
+    }
+    expect(page.released[0]).toBe(first);
+    expect(page.released).toHaveLength(3);
+    expect(`${env.sky.material.userData.materialId}:map`).toBe([...page.textures.keys()][0]);
+  });
+
+  it('registers the sky image and the HDR again once the render page was rebuilt, and releases nothing in the new page', async () => {
+    const { env, origin } = await environment();
+    const manager = PuppeteerManager.getInstance() as unknown as { pageEpoch: number };
+    manager.pageEpoch = 1;
+    try {
+      env.addSky(sky('asset://day.jpg', 'asset://day.hdr'));
+      await expect.poll(() => env.csm.lightDirection).toBe('direction of asset://day.jpg');
+      // A crash or a kill: the next page starts with nothing of the old one
+      manager.pageEpoch = 2;
+      page.textures.clear();
+      page.environment = null;
+      env.addSky({ ...sky('asset://day.jpg', 'asset://day.hdr'), _sunDirection: 'after the rebuild' });
+      await expect.poll(() => env.csm.lightDirection).toBe('after the rebuild');
+      expect(page.calls).toEqual([`registerTexture ${origin}/assets/day.jpg`, 'loadEnvironmentHDR', `registerTexture ${origin}/assets/day.jpg`, 'loadEnvironmentHDR']);
+      expect(page.textures.size).toBe(1);
+      expect(page.environment).not.toBeNull();
+      expect(`${env.sky.material.userData.materialId}:map`).toBe([...page.textures.keys()][0]);
+      expect(page.released).toEqual([]);
+    } finally {
+      delete (manager as { pageEpoch?: number }).pageEpoch;
+    }
+  });
+
+  it('a sky update that was replaced does not put its image on the sky when the page answers it after the newer sky is in place', async () => {
+    const { env, origin } = await environment();
+    let acknowledge!: () => void;
+    page.acknowledge = new Promise<void>((resolve) => (acknowledge = resolve));
+    env.addSky(sky('asset://first.jpg'));
+    // The page holds the first image and has dropped its record; its answer is held back
+    await expect.poll(() => page.committed.length).toBe(1);
+    page.acknowledge = null;
+    env.addSky(sky('asset://second.jpg'));
+    // The newer sky is fully in place before the first update hears from the page
+    await expect.poll(() => env.csm.lightDirection).toBe('direction of asset://second.jpg');
+    const shown = env.sky.material.userData.materialId;
+    acknowledge();
+    await expect.poll(() => page.released.length).toBe(1);
+    // The sky still shows the newer image, and that image is the one the page keeps
+    expect(env.sky.material.userData.materialId).toBe(shown);
+    expect([...page.textures.values()]).toEqual([`${origin}/assets/second.jpg`]);
+    expect(`${shown}:map`).toBe([...page.textures.keys()][0]);
+    expect(env.csm.lightDirection).toBe('direction of asset://second.jpg');
   });
 
   it("holds the agent's memory reservation for a sky image while it is on its way, and gives it back", async () => {

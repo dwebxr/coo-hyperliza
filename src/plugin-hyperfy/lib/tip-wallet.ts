@@ -1,6 +1,7 @@
 import { logger } from '@elizaos/core';
 import { type PrivateKeyAccount, privateKeyToAccount } from 'viem/accounts';
 import { createSiweMessage, parseSiweMessage } from 'viem/siwe';
+import { shownName } from './text';
 
 /**
  * Lets the agent receive tips (投げゼニ) in coo-world. The world only offers the Tip button for a
@@ -21,6 +22,8 @@ export const SIGN_IN_STATEMENT = 'Verify wallet ownership for this world. This d
 const MAX_VALIDITY_MS = 10 * 60_000;
 const ANSWER_TIMEOUT_MS = 20_000;
 const RETRY_BASE_MS = 30_000;
+// The longest wait before the next request that the world can ask for
+const MAX_COOLDOWN_MS = 60_000;
 const MAX_FAILURES = 3;
 const RECEIVE_CHECK_MS = 3_000;
 const MAX_REQUEST_ID = 0x7fffffff;
@@ -122,16 +125,30 @@ export interface TipWalletOptions {
 }
 
 /**
+ * Where the sign-in of one connection stands:
+ *  - 'idle': not begun;
+ *  - 'awaiting-nonce': the world was asked for its sign-in message (attempt N) and has
+ *    ANSWER_TIMEOUT_MS to send it;
+ *  - 'answering': the message came and is being signed and verified; the world has
+ *    ANSWER_TIMEOUT_MS from the message to say what it made of the signature;
+ *  - 'verified': the world said this wallet is signed in;
+ *  - 'waiting': an attempt failed (or the world asked to wait); the next one is scheduled;
+ *  - 'stopped': over for this connection (stop(), a message it refused to sign, too many failures).
+ * Nothing the world sends changes anything unless it answers the attempt in progress in the phase
+ * that waits for it: that is checked before any state is touched.
+ */
+type Phase = 'idle' | 'awaiting-nonce' | 'answering' | 'verified' | 'waiting' | 'stopped';
+
+/**
  * Signs the agent's wallet in on one connection and turns on "Receive tips". Retries a few times
  * on failure; never retries a message it refused to sign.
  */
 export class TipWallet {
+  private phase: Phase = 'idle';
   private attempt = 0;
   private failures = 0;
+  /** The one timer of the phase: its deadline, or the wait before the next attempt */
   private timer: unknown = null;
-  private stopped = false;
-  private begun = false;
-  private verified = false;
   /** The world's evmTips flag on the agent's player, read from entityModified. */
   private tipsOn = false;
   private hasReceived = false;
@@ -167,7 +184,7 @@ export class TipWallet {
 
   /** Signed in and shown as receiving tips on this connection. */
   get receiving(): boolean {
-    return this.verified && !this.stopped && this.tipsOn;
+    return this.phase === 'verified' && this.tipsOn;
   }
 
   /**
@@ -188,38 +205,32 @@ export class TipWallet {
    * world for a new message would sign the wallet out.
    */
   begin(): void {
-    if (this.begun) return;
-    this.begun = true;
+    if (this.phase !== 'idle') return;
     this.request();
   }
 
   private request(): void {
-    if (this.stopped) return;
-    this.clearTimer();
+    if (this.phase === 'stopped') return;
     this.attempt = (this.attempt % MAX_REQUEST_ID) + 1;
+    this.phase = 'awaiting-nonce';
     this.network.send('requestEvmNonce', { address: this.account.address, attempt: this.attempt });
-    const attempt = this.attempt;
-    this.timer = this.schedule(() => {
-      this.timer = null;
-      if (attempt !== this.attempt || this.verified || this.stopped) return;
-      logger.warn('[Tips] The world did not answer the wallet sign-in (are EVM wallets enabled there?)');
-      this.retryLater();
-    }, ANSWER_TIMEOUT_MS);
+    this.setTimer(() => this.failed('the world did not answer (are EVM wallets enabled there?)'), ANSWER_TIMEOUT_MS);
   }
 
   stop(): void {
-    this.stopped = true;
+    this.phase = 'stopped';
     this.clearTimer();
   }
 
   private async onNonce(data: any): Promise<void> {
-    if (this.stopped || !data || data.attempt !== this.attempt) return;
-    this.clearTimer();
-    if (typeof data.retryAfterMs === 'number') {
-      this.timer = this.schedule(() => {
-        this.timer = null;
-        this.request();
-      }, Math.min(Math.max(data.retryAfterMs, 0), 60_000) + 250);
+    // Only the answer to the request in progress, and only once
+    if (this.phase !== 'awaiting-nonce' || !data || typeof data !== 'object' || data.attempt !== this.attempt) return;
+    if ('retryAfterMs' in data) {
+      // The world's cooldown: a failed attempt like any other, so a world that keeps answering this
+      // way is given up on. The wait it names is taken only when it is a finite number.
+      const wait = data.retryAfterMs;
+      const finite = typeof wait === 'number' && Number.isFinite(wait);
+      this.failed('the world asked to wait', finite ? Math.min(Math.max(wait, 0), MAX_COOLDOWN_MS) + 250 : undefined);
       return;
     }
     const problem = signInMessageProblem(data.message, {
@@ -235,47 +246,74 @@ export class TipWallet {
       return;
     }
     const attempt = this.attempt;
-    const signature = await this.account.signMessage({ message: data.message });
-    if (this.stopped || attempt !== this.attempt) return;
+    this.phase = 'answering';
+    // From the message on: signing it, and the world's verdict on the signature
+    this.setTimer(() => this.failed('the world did not say whether it accepted the signature'), ANSWER_TIMEOUT_MS);
+    let signature: string;
+    try {
+      signature = await this.account.signMessage({ message: data.message });
+    } catch (error: any) {
+      if (this.phase === 'answering' && attempt === this.attempt) this.failed(`the message could not be signed (${error?.message ?? error})`);
+      return;
+    }
+    if (this.phase !== 'answering' || attempt !== this.attempt) return;
     this.network.send('requestEvmVerify', { address: this.account.address, signature, nonce: data.nonce, attempt });
   }
 
   private onStatus(data: any): void {
-    if (this.stopped || !data || typeof data.verified !== 'boolean') return;
-    if (data.verified) {
+    if (this.phase === 'stopped' || !data || typeof data !== 'object' || typeof data.verified !== 'boolean') return;
+    if (Object.prototype.hasOwnProperty.call(data, 'attempt')) {
+      // The world's verdict on a signature: only the one this wallet is waiting for. One for an
+      // earlier attempt, or for a signature that was never sent, changes nothing.
+      if (data.attempt !== this.attempt || this.phase !== 'answering') return;
+      if (!data.verified) {
+        this.failed(`the world refused the signature${typeof data.reason === 'string' && data.reason ? ` (${shownName(data.reason, 64)})` : ''}`);
+        return;
+      }
       if (typeof data.wallet !== 'string' || data.wallet.toLowerCase() !== this.account.address.toLowerCase()) return;
-      this.verified = true;
-      this.noteReceiving();
+      this.phase = 'verified';
       this.failures = 0;
+      this.noteReceiving();
       this.network.send('setEvmTipReceive', { enabled: true });
-      this.timer = this.schedule(() => {
-        this.timer = null;
-        if (this.stopped) return;
+      this.setTimer(() => {
         if (this.tipsOn) logger.info(`[Tips] Receiving tips at ${this.account.address}`);
         else logger.warn('[Tips] Wallet signed in, but the world did not turn tips on (are tips enabled there?)');
       }, RECEIVE_CHECK_MS);
       return;
     }
-    const wasVerified = this.verified;
-    this.verified = false;
-    // A reply to an older attempt
-    if (data.attempt !== undefined && data.attempt !== this.attempt) return;
-    logger.warn(`[Tips] Wallet ${wasVerified ? 'signed out' : 'sign-in failed'}${data.reason ? ` (${data.reason})` : ''}`);
-    this.retryLater();
+    // Without an attempt the world only ever tells a signed-in wallet that it no longer is
+    if (data.verified || this.phase !== 'verified') return;
+    this.failed('the world signed the wallet out');
   }
 
-  private retryLater(): void {
-    if (this.stopped) return;
+  /**
+   * The attempt in progress failed. The next one is made after `retryInMs` (by default longer
+   * after each failure); after MAX_FAILURES failures in a row there is none on this connection.
+   */
+  private failed(what: string, retryInMs?: number): void {
+    if (this.phase === 'stopped') return;
+    logger.warn(`[Tips] Wallet sign-in: ${what}`);
     if (++this.failures > MAX_FAILURES) {
       logger.error(`[Tips] Giving up on the wallet sign-in for this connection after ${MAX_FAILURES} retries`);
       this.stop();
       return;
     }
+    this.phase = 'waiting';
+    this.setTimer(() => this.request(), retryInMs ?? RETRY_BASE_MS * this.failures);
+  }
+
+  /**
+   * Puts `fn` on the one timer, in place of whatever was on it. A timer that was replaced or
+   * cleared does nothing when it fires all the same.
+   */
+  private setTimer(fn: () => void, ms: number): void {
     this.clearTimer();
-    this.timer = this.schedule(() => {
+    const timer: unknown = this.schedule(() => {
+      if (this.timer !== timer) return;
       this.timer = null;
-      this.request();
-    }, RETRY_BASE_MS * this.failures);
+      fn();
+    }, ms);
+    this.timer = timer;
   }
 
   private clearTimer(): void {

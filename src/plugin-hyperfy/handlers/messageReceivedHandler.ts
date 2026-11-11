@@ -48,15 +48,19 @@ async function handleSimpleCommand(runtime: IAgentRuntime, message: Memory, call
     const mine = world.entities?.player?.base?.position;
     if (!theirs || !mine) return false;
     // Moves the avatar: in its turn among such sections (ConnectionSession.withBody)
-    await session.withBody(async (signal) => {
+    const underWay = await session.withBody(async (signal) => {
       if (theirs.distanceTo(mine) > COME_TELEPORT_BEYOND_M) {
-        controls.teleportToEntity(senderId);
+        return controls.teleportToEntity(senderId) === 'arrived';
       } else {
         // Not awaited: the reply goes out while walking. The walk goes on after this turn has
         // completed, and stops if the turn is cancelled first, or with the connection
         controls.followEntity(senderId, undefined, { signal }).catch((error: unknown) => logger.debug(`[Bootstrap] Walking to the speaker failed: ${error}`));
+        return true;
       }
     });
+    // The teleport could not be made (their position is not one): not handled here, so nothing
+    // is claimed; the turn goes on as for any other message
+    if (!underWay) return false;
   } else if (!(message.content.metadata as { hyperfyStopTaken?: boolean } | undefined)?.hyperfyStopTaken) {
     // Waits for nobody: it ends whatever walk is in progress
     controls.stopAllActions('asked to stop');

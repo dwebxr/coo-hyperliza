@@ -114,6 +114,8 @@ export class MessageManager {
         await this.runtime.ensureConnection({
           entityId: entityId,
           roomId: elizaRoomId,
+          // Core stores it as metadata.hyperfy.id: the player id the history shows next to the name
+          userId: msg.fromId as UUID,
           userName: senderName,
           name: senderName,
           source: 'hyperfy',

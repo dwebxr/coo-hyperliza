@@ -27,9 +27,10 @@ import type { TurnContext } from '../lib/turn-context';
  *     was cancelled meanwhile posts nothing more. A shop link is posted and never read aloud; an
  *     autonomous tick does not post one at all.
  *  5. Memory: the reply (the neutral line, where step 2 replaced it). Not written for a turn that
- *     died before any of it went out. A reply whose words reached nobody while its turn was live
- *     (nothing could be posted or played; an autonomous tick's shop link) is still remembered as
- *     said; the log says which of the two it was.
+ *     died before any of it went out, nor for a shop link an autonomous tick did not post (step
+ *     4): what was deliberately not said is not remembered as said. A reply whose words reached
+ *     nobody while its turn was live because nothing could be posted or played is still
+ *     remembered (the agent tried to say it; the log says so).
  *
  * Posting and speaking check the turn themselves (MessageManager.sendMessage, VoiceManager.speak),
  * so a turn cancelled between two steps stops at the next one.
@@ -148,6 +149,9 @@ export async function deliverReply(ctx: ReplyContext, content: Content): Promise
       logger.warn(`[Reply] A reply of a ${turn.origin} turn reached nobody: ${deadReason(ctx) ?? 'it could be neither posted nor spoken'}`);
     }
   }
+
+  // Withheld on purpose: memory holds what was said, and this was not
+  if (words && !say) return delivery;
 
   // What reached the world is remembered even when the turn was cancelled while it went out
   const reached = delivery.posted || delivery.spoken !== 'none';

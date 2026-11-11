@@ -25,8 +25,9 @@ export const characterProvider: Provider = {
     const agentName = character.name;
 
     // Handle bio (string or random selection from array)
+    // Shuffled copies throughout: the character's own arrays are shared by everything that reads it
     const bioText = Array.isArray(character.bio)
-      ? character.bio
+      ? [...character.bio]
           .sort(() => 0.5 - Math.random())
           .slice(0, 10)
           .join(' ')
@@ -78,7 +79,7 @@ export const characterProvider: Provider = {
     // Format post examples
     const formattedCharacterPostExamples = !character.postExamples
       ? ''
-      : character.postExamples
+      : [...character.postExamples]
           .sort(() => 0.5 - Math.random())
           .map((post) => {
             const messageString = `${post}`;
@@ -96,7 +97,7 @@ export const characterProvider: Provider = {
     // Format message examples
     const formattedCharacterMessageExamples = !character.messageExamples
       ? ''
-      : character.messageExamples
+      : [...character.messageExamples]
           .sort(() => 0.5 - Math.random())
           .slice(0, 5)
           .map((example) => {

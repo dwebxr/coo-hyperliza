@@ -21,6 +21,7 @@ import {
   MAX_SERVER_FRAME_BYTES,
   PACKET_NAMES,
   PROTOCOL_VERSION,
+  QUEUED_NODE_BYTES,
   QUEUE_OVERFLOW_CLOSE_CODE,
   adaptToWorldProtocol,
   describeClose,
@@ -29,6 +30,7 @@ import {
   writeClientPacket,
 } from './world-protocol';
 import { sessionTokenProblem } from './world-url';
+import { PACKET_LIMITS } from './packet-decode';
 import { cooWorldSnapshot } from '../test-support/world-packets';
 
 const TOKEN = 'test-session-token';
@@ -154,13 +156,29 @@ describe('readServerPacket', () => {
   });
 
   it("reads the world's packets, including the ones the engine's table lacks", () => {
-    expect(readServerPacket(serverPackr.pack([18, 'outdated']))).toEqual(['onKick', 'outdated']);
+    // With each: how many values it decoded into (lib/packet-decode.ts)
+    expect(readServerPacket(serverPackr.pack([18, 'outdated']))).toEqual(['onKick', 'outdated', 3]);
     const settings = serverPackr.pack([15, { key: 'customAvatars', value: true }]);
     const arrayBuffer = settings.buffer.slice(settings.byteOffset, settings.byteOffset + settings.byteLength) as ArrayBuffer;
     expect(readServerPacket(arrayBuffer)).toEqual([
       'onSettingsModified',
       { key: 'customAvatars', value: true },
+      5,
     ]);
+  });
+
+  it('does not read a packet that would decode into more values than the limit, and tells whoever asked why', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // 600,000 empty arrays in 600 KB, as the data of a known packet
+    const frame = new Uint8Array(7 + 600_000).fill(0x90);
+    frame.set([0x92, 0x07, 0xdd, 0x00, 0x09, 0x27, 0xc0]);
+    const why: string[] = [];
+    expect(readServerPacket(frame, (reason) => why.push(reason))).toEqual([]);
+    expect(why).toEqual([`it holds more than ${PACKET_LIMITS.maxNodes} values`]);
+    expect(error).not.toHaveBeenCalled();
+    // Nobody to tell: counted with the packets that could not be read
+    expect(readServerPacket(frame)).toEqual([]);
+    expect(error).toHaveBeenCalledTimes(1);
   });
 
   it('skips an unknown packet and says so once', () => {
@@ -456,6 +474,39 @@ describe('adaptToWorldProtocol on the engine ClientNetwork', () => {
       ws.dispatch('close', { code: 1006, reason: '', wasClean: false });
       expect(world.emit.mock.calls.filter(([name]: [string]) => name === 'disconnect')).toHaveLength(1);
       expect(error.mock.calls.flat().map(String).filter((line) => line.includes('Closing the connection'))).toHaveLength(1);
+    });
+
+    it('drops a frame that would decode into more values than the limit like a frame that is too large: nothing of it is queued, and the connection stays', () => {
+      const { ws, send } = connected();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const tooMany = new Uint8Array(7 + 600_000).fill(0x90);
+      tooMany.set([0x92, 0x07, 0xdd, 0x00, 0x09, 0x27, 0xc0]);
+      const tooDeep = new Uint8Array(100).fill(0x91);
+      tooDeep.set([0x92, 0x07]);
+      tooDeep[99] = 0xc0;
+      send(tooMany);
+      send(tooDeep);
+      send(entityModified(1));
+      expect(network.queue).toEqual([['onEntityModified', { id: 'e1', p: [1, 0, 0] }]]);
+      expect(ws.close).not.toHaveBeenCalled();
+      expect(warn.mock.calls.map(([line]) => String(line))).toEqual([`[Hyperfy] Dropped 1 frame(s) from the world: a frame of 600007 bytes is not decoded: it holds more than ${PACKET_LIMITS.maxNodes} values`]);
+    });
+
+    it('counts what waits by what it decoded into, not only by its frame: frames of small containers fill the queue long before their bytes would', () => {
+      const { ws, send } = connected();
+      // 400,000 empty arrays in 400 KB: under the per-frame limit, 12.8 MB as it waits
+      const dense = new Uint8Array(7 + 400_000).fill(0x90);
+      dense.set([0x92, 0x07, 0xdd, 0x00, 0x06, 0x1a, 0x80]);
+      const fit = Math.floor(MAX_QUEUED_BYTES / (400_003 * QUEUED_NODE_BYTES));
+      expect(fit).toBe(2);
+      for (let i = 0; i < fit; i++) send(dense);
+      expect(network.queue).toHaveLength(fit);
+      expect(ws.close).not.toHaveBeenCalled();
+      // By their bytes alone, eighty of them would fit
+      expect(Math.floor(MAX_QUEUED_BYTES / dense.byteLength)).toBeGreaterThan(80);
+      send(dense);
+      expect(ws.close).toHaveBeenCalledTimes(1);
+      expect(network.queue).toEqual([]);
     });
 
     it(`closes the connection when the frames waiting add up to more than ${MAX_QUEUED_BYTES / 1024 / 1024} MiB`, () => {

@@ -24,8 +24,8 @@ const position = (x: number) => ({ x, z: 0, distanceTo: (o: { x: number }) => Ma
 
 function setup({ emoteClips = true }: { emoteClips?: boolean } = {}) {
   const controls = {
-    goto: vi.fn().mockResolvedValue(undefined),
-    followEntity: vi.fn().mockResolvedValue(undefined),
+    goto: vi.fn().mockResolvedValue('arrived'),
+    followEntity: vi.fn().mockResolvedValue('arrived'),
     faceEntity: vi.fn().mockResolvedValue(undefined),
     rotateTo: vi.fn().mockResolvedValue(undefined),
     getIsNavigating: () => false,
@@ -53,7 +53,7 @@ function setup({ emoteClips = true }: { emoteClips?: boolean } = {}) {
   runtime.getService = () => serviceFor(session);
   const manager = new BehaviorManager(runtime, session, AUTONOMY);
   const tick = () => (manager as any).executeBehavior() as Promise<boolean>;
-  return { runtime, world, session, controls, emotes, tick };
+  return { runtime, world, session, controls, emotes, tick, manager };
 }
 
 describe('BehaviorManager', () => {
@@ -116,6 +116,22 @@ describe('BehaviorManager', () => {
     vi.spyOn(Math, 'random').mockReturnValue(0.6); // a look-around step
     await tick();
     expect(controls.rotateTo).toHaveBeenCalledTimes(1);
+  });
+
+  it('waves at a newcomer it walked up to only when the walk got there', async () => {
+    for (const [walk, waved] of [['arrived', true], ['stopped', false], ['replaced', false], ['timed-out', false], ['unreachable', false]] as const) {
+      resetUsageBudget(new UsageBudget({ ...noLimits, autonomyAiPerHour: 0 }));
+      const { world, emotes, controls, tick, manager } = setup();
+      // As while the behavior loop runs (start() sets it; these tests call the tick themselves)
+      (manager as unknown as { isRunning: boolean }).isRunning = true;
+      // Far enough to be approached first
+      world.entities.items.get('bob').base.position = position(10);
+      controls.followEntity.mockResolvedValue(walk);
+      await tick();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(controls.followEntity, walk).toHaveBeenCalledWith('bob');
+      expect(emotes.playEmote.mock.calls.length, walk).toBe(waved ? 1 : 0);
+    }
   });
 
   it('does nothing, and calls nothing, when no one else is around', async () => {

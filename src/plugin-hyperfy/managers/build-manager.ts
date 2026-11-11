@@ -6,6 +6,7 @@ import { resolveUrl } from "../utils.js";
 import { SceneEditStopped } from "../lib/authorization";
 import { describeUrl } from "../lib/log-url";
 import { MAX_MODEL_BYTES, SafeFetchError, worldNet } from "../lib/net-policy";
+import type { MoveOutcome } from "../systems/controls";
 
 const IMPORT_DOWNLOAD_TIMEOUT_MS = 60_000;
 
@@ -23,22 +24,20 @@ export function importByteCap(worldMaxUploadMb: unknown): number {
 /**
  * What one scene edit request may act on: the world it was authorized for, a check that throws
  * SceneEditStopped once that authorization no longer holds (the turn was cancelled or its
- * connection ended, or the requester may no longer build), and whether the connection is still
- * the one it started on. Every method acts only on `world` and calls `check()` right before each
- * effect on it (walking there, changing or adding entities, each upload request), which also
- * covers every await before that effect.
+ * connection ended, or the requester may no longer build). Every method acts only on `world` and
+ * calls `check()` right before each effect on it (walking there, changing or adding entities,
+ * each upload request), which also covers every await before that effect.
  */
 export interface EditGuard {
   readonly world: any;
   check(): void;
-  connectionLive(): boolean;
   /** The request's turn: a walk the edit started stops when it fires. */
   readonly signal?: AbortSignal;
 }
 
-/** What one operation did: only `applied` changed the world. */
+/** What one operation did: only `applied` changed the world. `newId`: the entity a duplicate made. */
 export type EditResult =
-  | { outcome: 'applied' }
+  | { outcome: 'applied'; newId?: string }
   | { outcome: 'skipped'; reason: string }
   | { outcome: 'failed'; reason: string };
 
@@ -83,6 +82,15 @@ interface PlacedAt {
 
 const invalid = (field: TransformField) => failed(`invalid ${field} (${ACCEPTED[field]})`);
 
+/** Why an edit whose walk did not arrive is not made (systems/controls.ts MoveOutcome) */
+const NOT_THERE: Record<Exclude<MoveOutcome, 'arrived'>, string> = {
+  stopped: 'I was stopped on the way there',
+  replaced: 'I was sent somewhere else on the way there',
+  cancelled: 'the walk there was cancelled',
+  'timed-out': 'I could not get there in time',
+  unreachable: 'I could not find a way there',
+};
+
 /** What coo-world's isBlueprintURL (src/core/extras/assetURL.js) accepts: asset://<one file name> or an http(s) URL. */
 function blueprintReference(value: unknown): boolean {
   if (typeof value !== 'string') return false;
@@ -99,14 +107,36 @@ function blueprintReference(value: unknown): boolean {
   }
 }
 
+/**
+ * Why the agent leaves an app as it is, or null. These are the rules of coo-world's own builder
+ * (src/core/systems/ClientBuilder.js), which is how a builder edits the world by hand: it selects
+ * (to move, rotate or scale) and deletes only apps that are neither pinned nor the world's scene
+ * app, and duplicates any app but the scene. coo-world's server does not enforce them (it takes
+ * any of these changes to an app from a builder); the agent keeps to what the builder itself can
+ * do, and has no operation that unpins.
+ */
+function untouchable(entity: any, operation: 'transform' | 'duplicate' | 'delete'): EditResult | null {
+  if (entity.blueprint?.scene) return skipped("it is the world's scene");
+  if (operation !== 'duplicate' && entity.data?.pinned) return skipped('the app is pinned');
+  return null;
+}
+
 /** Scene edits. Keeps no state: every method acts on the world of the guard it is given. */
 export class BuildManager {
-  /** Walks next to the target first, as before; the edit itself is checked again afterwards. */
-  private async walkTo(guard: EditGuard, x: number, z: number) {
+  /**
+   * Walks next to the target first. Null once the agent stands there (or the world has no
+   * controls to walk with); otherwise why the edit is not made: a walk that was stopped, replaced
+   * by another, timed out or had nowhere to go did not bring the agent there, and its edit is not
+   * applied. The edit itself is checked again afterwards.
+   */
+  private async walkTo(guard: EditGuard, x: number, z: number): Promise<EditResult | null> {
     const controls = guard.world.controls;
-    if (!controls) return;
+    if (!controls) return null;
     guard.check();
-    await controls.goto(x, z, { signal: guard.signal });
+    const outcome: MoveOutcome = await controls.goto(x, z, { signal: guard.signal });
+    // First, however the walk ended: a request that may no longer edit stops here (SceneEditStopped)
+    guard.check();
+    return outcome === 'arrived' ? null : skipped(NOT_THERE[outcome]);
   }
 
   /**
@@ -124,9 +154,15 @@ export class BuildManager {
     if (!entity) return skipped('target not found');
     // The server takes transforms for apps only (a player moves itself)
     if (!entity.isApp) return skipped('only apps can be moved, rotated or scaled');
-    await this.walkTo(guard, entity.root.position.x, entity.root.position.z);
+    const kept = untouchable(entity, 'transform');
+    if (kept) return kept;
+    const notThere = await this.walkTo(guard, entity.root.position.x, entity.root.position.z);
+    if (notThere) return notThere;
     const gone = this.gone(guard, entityId, entity);
     if (gone) return gone;
+    // Again: it may have been pinned while the agent walked over
+    const keptNow = untouchable(entity, 'transform');
+    if (keptNow) return keptNow;
     guard.check();
     entity.root[field].fromArray(accepted);
     this.entityUpdate(guard, entity);
@@ -150,9 +186,14 @@ export class BuildManager {
     const entity = world.entities.items.get(entityId);
     if (!entity) return skipped('target not found');
     if (!entity.isApp) return skipped('only apps can be duplicated');
-    await this.walkTo(guard, entity.root.position.x, entity.root.position.z);
+    const kept = untouchable(entity, 'duplicate');
+    if (kept) return kept;
+    const notThere = await this.walkTo(guard, entity.root.position.x, entity.root.position.z);
+    if (notThere) return notThere;
     const gone = this.gone(guard, entityId, entity);
     if (gone) return gone;
+    const keptNow = untouchable(entity, 'duplicate');
+    if (keptNow) return keptNow;
     // The copy is added with the original's transform as it is now (a script may have set it to
     // anything): coo-world's sanitizeEntityAdd refuses the whole app when one of them is invalid
     const position = acceptedTransform('position', entity.root.position.toArray());
@@ -205,19 +246,23 @@ export class BuildManager {
         state: {},
       }
       world.entities.add(data, true)
+      // The copy's id, for whoever asked (a later operation of the same plan can act on it)
+      return { outcome: 'applied', newId: data.id };
     }
-    return applied;
   }
 
   async delete(guard: EditGuard, entityId: unknown): Promise<EditResult> {
     const entity = guard.world.entities.items.get(entityId);
     if (!entity) return skipped('target not found');
     if (!entity.isApp) return skipped('only apps can be deleted');
-    if (entity.data.pinned) return skipped('the app is pinned');
-    await this.walkTo(guard, entity.root.position.x, entity.root.position.z);
+    const kept = untouchable(entity, 'delete');
+    if (kept) return kept;
+    const notThere = await this.walkTo(guard, entity.root.position.x, entity.root.position.z);
+    if (notThere) return notThere;
     const gone = this.gone(guard, entityId, entity);
     if (gone) return gone;
-    if (entity.data.pinned) return skipped('the app is pinned');
+    const keptNow = untouchable(entity, 'delete');
+    if (keptNow) return keptNow;
     guard.check();
     entity.destroy(true)
     this.entityUpdate(guard, entity);
@@ -272,8 +317,9 @@ export class BuildManager {
     
     await new Promise(resolve => setTimeout(resolve, 100))
 
-    await this.walkTo(guard, position[0], position[2]);
-    
+    const notThere = await this.walkTo(guard, position[0], position[2]);
+    if (notThere) return notThere;
+
     const transform = {
       position,
       quaternion,
@@ -287,11 +333,27 @@ export class BuildManager {
     }
   }
 
+  /**
+   * Adds the app of a .hyp file. Its files are uploaded first, and only then are its blueprint and
+   * the app announced to the world, one right after the other with nothing awaited in between: an
+   * import that fails or is stopped has announced nothing, so there is nothing to take back. What
+   * a failed import leaves: the files it had uploaded by then, on the world's asset server, with
+   * nothing in the world referring to them.
+   */
   async addApp(guard: EditGuard, file: File, transform: PlacedAt): Promise<EditResult> {
     const world = guard.world;
     const info = await importApp(file)
     guard.check();
-    
+    try {
+      await Promise.all(info.assets.map(asset => world.network.upload(asset.file, { check: () => guard.check() })))
+    } catch (err) {
+      if (err instanceof SceneEditStopped) throw err
+      console.error('failed to upload .hyp assets')
+      console.error(err)
+      return failed(`upload failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    guard.check();
+
     const blueprint = {
       id: uuid(),
       version: 0,
@@ -324,19 +386,6 @@ export class BuildManager {
       state: {},
     }
     const app = world.entities.add(data, true)
-    try {
-      await Promise.all(info.assets.map(asset => world.network.upload(asset.file, { check: () => guard.check() })))
-      guard.check();
-    } catch (err) {
-      // Takes back the app this edit added (entityRemoved, which coo-world accepts from the app's
-      // uploader), also when the requester may no longer build: that restores the world. Never on
-      // another connection. Its blueprint stays: the protocol has no way to remove one.
-      if (guard.connectionLive()) app.destroy(true)
-      if (err instanceof SceneEditStopped) throw err
-      console.error('failed to upload .hyp assets')
-      console.error(err)
-      return failed(`upload failed: ${err instanceof Error ? err.message : String(err)}`)
-    }
     app.onUploaded()
     return applied
   }

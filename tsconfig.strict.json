@@ -16,6 +16,7 @@
     "src/anthropic-models.turns.test.ts",
     "src/elevenlabs-speech.ts",
     "src/elevenlabs-speech.test.ts",
+    "src/elevenlabs-speech.budget.test.ts",
     "src/llm-provider.ts",
     "src/llm-provider.test.ts",
     "src/usage-budget.ts",

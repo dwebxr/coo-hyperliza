@@ -17,6 +17,28 @@ import { PageWork } from "../lib/page-work";
 const LOADABLE: ReadonlySet<string> = new Set<AssetKind>(["model", "avatar", "emote", "script"]);
 
 /**
+ * The agent decodes no image: it has no canvas and no GPU, and a model's textures stay in the
+ * render page. Without this, the engine's glTF loader makes a blob: URL for every image embedded
+ * in a file it parses here (what the render page hands back keeps the textures of the slots it
+ * does not strip), fails to load it, as it always does outside a browser, and never revokes the
+ * URL: the image's bytes then stay registered with the process for good. Asked for a texture, this
+ * answers at once that there is none, which is what the failed load came to (a material without
+ * that map), and no blob: URL is ever made.
+ */
+const NO_TEXTURES = Object.freeze({
+  name: 'AGENT_no_textures',
+  loadTexture: (): Promise<null> => Promise.resolve(null),
+});
+
+/** The engine's glTF loader as the agent uses it: no texture is loaded (NO_TEXTURES). */
+export function createGltfLoader(): GLTFLoader {
+  const loader: any = new GLTFLoader();
+  // First, before the loader's own texture extensions (WebP, AVIF, Basis), which load images too
+  loader.pluginCallbacks.unshift(() => NO_TEXTURES);
+  return loader;
+}
+
+/**
  * Bounds on what one world can make the loader do and keep. The cache holds what the loader itself
  * keeps for a repeated load; assets the world's live entities are built from stay referenced by
  * those entities whatever is dropped here.
@@ -68,7 +90,7 @@ export class AgentLoader extends System {
     this.limits = { ...LOADER_LIMITS, ...limits };
     this.promises = new Map();
     this.results = new Map();
-    this.gltfLoader = new GLTFLoader();
+    this.gltfLoader = createGltfLoader();
 
     // --- Dummy Scene for Hooks ---
     // Create one dummy object to act as the scene target for all avatar loads
@@ -223,6 +245,7 @@ export class AgentLoader extends System {
     const budget = modelBudget(type);
     const admitted = gltfCharge(asset.bytes, budget);
     if ('problem' in admitted) throw new Error(`[AgentLoader] ${admitted.problem}`);
+    if (type === 'emote') return this.parseEmote(key, asset, admitted.charge.bytes, lease);
     // The most the page may hand back for this load, and the agent's memory for the rest of the way
     // sized from that (lib/asset-memory.ts); the page is held to the same number
     const reservation = modelReservation(type, asset.bytes.byteLength, admitted.charge.exportBytes, budget.exportBytes);
@@ -246,9 +269,6 @@ export class AgentLoader extends System {
       if (type === 'model') {
         const node = glbToNodes(gltf, this.world);
         result = { gltf, toNodes() { return node.clone(true); } };
-      } else if (type === 'emote') {
-        const factory = createEmoteFactory(gltf, asset.url);
-        result = { gltf, toClip(o: any) { return factory.toClip(o); } };
       } else {
         const factory = null;
         const root = createNode('group', { id: '$root' });
@@ -266,5 +286,30 @@ export class AgentLoader extends System {
     // What is held: the parsed copy the page returned (its buffer stays referenced), or the download if larger
     this.keep(key, loaded.result, loaded.bytes);
     return loaded.result;
+  }
+
+  /**
+   * An emote is its animation clip, read here from the downloaded file itself. The render page has
+   * no part in it: it plays no emotes, and what it hands back for a model is the scene alone,
+   * without animations. The file has passed the download cap and the glTF filter with an emote's
+   * budget by now (parseGLB); `chargedBytes` is what the filter found the parse allocates, which
+   * is reserved, with the download, until the parse is over.
+   */
+  private async parseEmote(key: string, asset: AssetBytes, chargedBytes: number, lease?: AssetLease) {
+    await lease?.toWork(asset.bytes.byteLength + chargedBytes, this.stopped.signal);
+    this.throwIfStopped();
+    const bytes = asset.bytes;
+    const arrayBuffer = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength ? bytes.buffer : bytes.slice().buffer;
+    const gltf: any = await new Promise((ok, bad) => this.gltfLoader.parse(arrayBuffer, '', ok, bad));
+    this.throwIfStopped();
+    if (!gltf.animations?.length) throw new Error(`[AgentLoader] ${describeUrl(asset.url)} holds no animation: it is not an emote`);
+    if (!gltf.scene?.children?.length) throw new Error(`[AgentLoader] ${describeUrl(asset.url)} has no scene to read an emote's skeleton from`);
+    // Retargeted onto an avatar by whoever plays it (the engine's createVRMFactory): toClip
+    const factory = createEmoteFactory(gltf, asset.url);
+    const result = { toClip(options: any) { return factory.toClip(options); } };
+    this.throwIfStopped();
+    // What stays referenced: the clip's tracks, which view into the parsed file
+    this.keep(key, result, asset.bytes.byteLength + chargedBytes);
+    return result;
   }
 }

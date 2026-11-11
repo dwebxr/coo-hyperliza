@@ -37,6 +37,28 @@ export interface PlaybackOutcome {
 }
 
 const FFMPEG_TIMEOUT_MS = 30_000;
+// How long leaving a room waits for each native step (unpublish, close): a join waits for it
+const RELEASE_STEP_TIMEOUT_MS = 5_000;
+
+/** Waits for `step` to settle, at most RELEASE_STEP_TIMEOUT_MS; a failure is logged, never thrown. */
+async function released(what: string, step: () => Promise<unknown> | undefined): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      Promise.resolve().then(step),
+      new Promise((resolve) => {
+        timer = setTimeout(() => {
+          console.warn(`[LiveKit] Gave up ${what} after ${RELEASE_STEP_TIMEOUT_MS} ms`);
+          resolve(undefined);
+        }, RELEASE_STEP_TIMEOUT_MS);
+      }),
+    ]);
+  } catch (error: any) {
+    console.warn(`[LiveKit] Error while ${what}:`, error?.message || error);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export class AgentLiveKit extends System {
   private room: Room | null = null;
@@ -102,10 +124,22 @@ export class AgentLiveKit extends System {
 
   private async leaveRoom(): Promise<void> {
     const room = this.room;
+    const track = this.localTrack;
+    const source = this.audioSource;
     this.room = null;
     // The track and source belong to the old room's publication.
     this.audioSource = null;
     this.localTrack = null;
+    // The agent's own voice track: unpublished from the room it is in, then closed with its
+    // source. These are native objects; dropping the references does not free them.
+    if (track) {
+      const sid = track.sid;
+      if (room && sid) await released('unpublishing the voice track', () => room.localParticipant?.unpublishTrack(sid));
+      // Closes its audio source with it
+      await released('closing the voice track', () => track.close());
+    } else if (source) {
+      await released('closing the audio source', () => source.close());
+    }
     if (room) {
       try {
         await room.disconnect();
@@ -197,7 +231,11 @@ export class AgentLiveKit extends System {
 
     console.log('[LiveKit] Converting to PCM...');
     const int16 = await this.convertToPcm(audioBuffer, sampleRate);
-    if (!int16 || int16.length === 0) {
+    if (int16 === null) {
+      console.warn('[LiveKit] Not playing audio in a format that is neither MP3 nor WAV');
+      return { played: 'none', reason: 'the audio is in no format the agent plays (MP3 or WAV)' };
+    }
+    if (int16.length === 0) {
       console.warn('[LiveKit] No PCM data decoded');
       return { played: 'none', reason: 'no audio was decoded' };
     }
@@ -217,7 +255,11 @@ export class AgentLiveKit extends System {
       console.log('[LiveKit] Publishing track to room...');
       if (!room.localParticipant) return { played: 'none', reason: 'the voice room has no local participant' };
       await room.localParticipant.publishTrack(localTrack, options);
-      if (this.room !== room) return { played: 'none', reason: 'the voice room went away' };
+      if (this.room !== room) {
+        // Nobody keeps it: closed here (the room it was published to is being left)
+        await localTrack.close().catch(() => { });
+        return { played: 'none', reason: 'the voice room went away' };
+      }
       this.audioSource = audioSource;
       this.localTrack = localTrack;
       console.log('[LiveKit] Track published successfully');
@@ -260,14 +302,15 @@ export class AgentLiveKit extends System {
     return sent === totalFrames ? { played: 'all' } : { played: 'partial', reason: stoppedWhy };
   }
 
-  private async convertToPcm(buffer: Buffer, sampleRate = 48000): Promise<Int16Array> {
+  /**
+   * The audio as 16-bit mono PCM at `sampleRate`, decoded by ffmpeg, or null when it is neither
+   * MP3 nor WAV by its first bytes: bytes in an unknown format are not played as if they were raw
+   * PCM (that is noise at full volume, or speech at the wrong speed).
+   */
+  private async convertToPcm(buffer: Buffer, sampleRate = 48000): Promise<Int16Array | null> {
     const format = this.detectAudioFormat(buffer);
-    console.log('[LiveKit] Detected audio format:', format);
-
-    if (format === 'pcm') {
-      console.log('[LiveKit] Already PCM, no conversion needed');
-      return toInt16Array(buffer);
-    }
+    console.log('[LiveKit] Detected audio format:', format ?? 'none recognised');
+    if (format === null) return null;
 
     const ffmpegArgs: string[] = [
       '-f',
@@ -336,9 +379,8 @@ export class AgentLiveKit extends System {
     });
   }
 
-  private detectAudioFormat(buffer: Buffer): 'mp3' | 'wav' | 'pcm' {
+  private detectAudioFormat(buffer: Buffer): 'mp3' | 'wav' | null {
     const header = buffer.slice(0, 4).toString('ascii');
-    console.log('[LiveKit] Buffer header bytes:', buffer.slice(0, 10).toString('hex'));
 
     // Check for WAV (RIFF header)
     if (header === 'RIFF') return 'wav';
@@ -357,8 +399,7 @@ export class AgentLiveKit extends System {
       }
     }
 
-    console.log('[LiveKit] Format detection fallback to pcm');
-    return 'pcm';
+    return null;
   }
 }
 

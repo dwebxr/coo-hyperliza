@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ModelType } from '@elizaos/core';
 import { closeServers, startServer, type TestServer } from './plugin-hyperfy/test-support/net';
-import { anthropicModelsPlugin } from './anthropic-models';
+import { anthropicModelsPlugin, tokenReserve } from './anthropic-models';
 import { UsageBudget, type UsageLimits, resetUsageBudget } from './usage-budget';
 import { TurnCancelled, neverAbortedSignal, runTurn } from './plugin-hyperfy/lib/turn-context';
 
@@ -15,13 +15,21 @@ const noLimits: UsageLimits = { aiCallsPerHour: null, aiTokensPerDay: null, visi
 const runtime = () => ({ getSetting: () => undefined, character: { system: 'You are Coo.' }, emitEvent: vi.fn().mockResolvedValue(undefined) });
 const message = { id: 'msg_1', type: 'message', role: 'assistant', model: 'claude-haiku-5-5', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { input_tokens: 12, output_tokens: 3 } };
 
-let statuses: number[] = [];
+let statuses: (number | 'hold')[] = [];
 let api: TestServer;
 let key = 0;
 
+// Requests the API has received and not answered (statuses: 'hold'), and how each of them ended
+let held: { closed: Promise<void> }[] = [];
+
 beforeAll(async () => {
-  api = await startServer((_request, response) => {
+  api = await startServer((request, response) => {
     const status = statuses.shift() ?? 200;
+    if (status === 'hold') {
+      // Never answered: the test sees whether the client gave the request up (its socket closes)
+      held.push({ closed: new Promise((resolve) => response.on('close', () => resolve())) });
+      return;
+    }
     response.writeHead(status, { 'content-type': 'application/json', ...(status === 200 ? {} : { 'retry-after-ms': '50' }) });
     response.end(JSON.stringify(status === 200 ? message : { type: 'error', error: { type: 'overloaded_error', message: 'no' } }));
   });
@@ -40,6 +48,7 @@ function setup() {
   resetUsageBudget(budget);
   api.hits.length = 0;
   statuses = [];
+  held = [];
   vi.spyOn(console, 'warn').mockImplementation(() => {});
   const slot = new AbortController();
   const connection = new AbortController();
@@ -90,6 +99,38 @@ describe('Claude requests of a turn', () => {
     });
     expect(outcome).toBeInstanceOf(TurnCancelled);
     expect(api.hits).toHaveLength(1);
+  });
+
+  it.each([
+    ['its slot runs out', (ctx: ReturnType<typeof setup>) => ctx.slot.abort()],
+    ['its connection ends', (ctx: ReturnType<typeof setup>) => ctx.connection.abort()],
+  ])('are aborted while in flight when %s: the request is given up, the turn sees TurnCancelled, and its reservation stays counted', async (_what, end) => {
+    const ctx = setup();
+    statuses = ['hold'];
+    const started = Date.now();
+    const outcome = await ctx.inTurn(async () => {
+      const pending = ctx.call().then(
+        () => 'answered',
+        (error: unknown) => error
+      );
+      await vi.waitFor(() => expect(held).toHaveLength(1));
+      end(ctx);
+      return pending;
+    });
+    expect(outcome).toBeInstanceOf(TurnCancelled);
+    // The API saw the request closed by the client, long before the 60 s deadline
+    await held[0].closed;
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(api.hits).toHaveLength(1);
+    // As for any aborted request: it may have been billed, so what was reserved for it stays counted
+    expect(ctx.budget.snapshot(60_000).ai).toMatchObject({ calls: 1, reservedTokens: tokenReserve('You are Coo.', 'x', 2048) });
+  });
+
+  it('are not aborted by a turn that completed: a request made outside it afterwards runs to its end', async () => {
+    const ctx = setup();
+    expect(await ctx.inTurn(ctx.call)).toBe('ok');
+    ctx.slot.abort();
+    expect(await ctx.call()).toBe('ok');
   });
 
   it('are made for a turn that belongs to no session at all (a signal that never fires)', async () => {

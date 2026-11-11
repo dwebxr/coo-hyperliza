@@ -11,7 +11,8 @@ import {
 import { actingSession, connectedSession } from '../service';
 import { AiBudgetExceededError, forPurpose } from '../../usage-budget';
 import { AnthropicRefusalError } from '../../anthropic-models';
-import { AgentControls } from '../systems/controls'; // Import AgentControls type
+import { AgentControls, WORLD_COORDINATE_LIMIT } from '../systems/controls';
+import { notArrivedText } from '../lib/move-outcome';
 import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
 import { oneLine, shownName } from '../lib/text';
 import { TurnCancelled } from '../lib/turn-context';
@@ -88,7 +89,7 @@ export const hyperfyGotoEntityAction: Action = {
       runtime: IAgentRuntime,
       message: Memory,
       _state: State,
-      options: { entityId?: string },
+      _options: unknown,
       callback: HandlerCallback,
       responses,
     ) => {
@@ -157,8 +158,13 @@ export const hyperfyGotoEntityAction: Action = {
             logger.info(`Navigating to entity ${entityId}`);
             // One walk at a time, started only for a turn that may still act (withBody). It stops
             // when the turn is cancelled, and then nothing is said and nothing recorded as done
-            await session.withBody((signal) => controls.followEntity(entityId, undefined, { signal }));
+            const outcome = await session.withBody((signal) => controls.followEntity(entityId, undefined, { signal }));
             session.assertLive();
+            // Said as it ended: a walk that was stopped, replaced, timed out or had nowhere to go did not arrive
+            if (outcome !== 'arrived') {
+              await tellFailure(callback, GOTO_ENTITY, notArrivedText(outcome), { metadata: { error: 'not_arrived', outcome } });
+              return actionFailed(GOTO_ENTITY, `did not arrive (${outcome})`, { navigationType, entityId, outcome });
+            }
 
             const targetEntity = world.entities.items.get(parameter.entityId);
             // World content (and an id the model chose): one short line, nothing invisible
@@ -177,20 +183,27 @@ export const hyperfyGotoEntityAction: Action = {
 
           case NavigationType.POSITION: {
             const pos = parameter?.position;
-            if (!pos || typeof pos.x !== 'number' || typeof pos.z !== 'number') {
+            // The model's numbers: finite, and within what the world takes as a position
+            if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.z) || typeof pos.x !== 'number' || typeof pos.z !== 'number') {
               throw new Error('Invalid position coordinates.');
             }
+            const x = Math.max(-WORLD_COORDINATE_LIMIT, Math.min(WORLD_COORDINATE_LIMIT, pos.x));
+            const z = Math.max(-WORLD_COORDINATE_LIMIT, Math.min(WORLD_COORDINATE_LIMIT, pos.z));
 
-            logger.info(`Navigating to position (${pos.x}, ${pos.z})`);
-            await session.withBody((signal) => controls.goto(pos.x, pos.z, { signal }));
+            logger.info(`Navigating to position (${x}, ${z})`);
+            const outcome = await session.withBody((signal) => controls.goto(x, z, { signal }));
             session.assertLive();
+            if (outcome !== 'arrived') {
+              await tellFailure(callback, GOTO_ENTITY, notArrivedText(outcome), { metadata: { error: 'not_arrived', outcome } });
+              return actionFailed(GOTO_ENTITY, `did not arrive (${outcome})`, { navigationType, position: { x, z }, outcome });
+            }
 
             await callback({
-              text: `Reached position (${pos.x}, ${pos.z}).`,
+              text: `Reached position (${x}, ${z}).`,
               actions: [GOTO_ENTITY],
               source: 'hyperfy',
             });
-            return actionSucceeded(GOTO_ENTITY, { navigationType, position: { x: pos.x, z: pos.z } });
+            return actionSucceeded(GOTO_ENTITY, { navigationType, position: { x, z } });
           }
 
           default:

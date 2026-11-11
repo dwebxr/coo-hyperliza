@@ -241,7 +241,7 @@ async function errorText(response: Response, signal: AbortSignal): Promise<strin
 }
 
 /** One text-to-speech request to one provider, and whether it may be billed when it gave no audio. */
-interface SpeechAttempt {
+export interface SpeechAttempt {
   audio: Buffer | null;
   /**
    * False when no request was sent (no key) or the provider refused it with a 4xx answer (408 and
@@ -277,7 +277,8 @@ async function speechAttempt(label: string, request: (signal: AbortSignal) => Pr
   }
 }
 
-function elevenLabsSpeech(text: string): Promise<SpeechAttempt> {
+/** One ElevenLabs text-to-speech request (nothing is reserved here: the caller does, and settles it by `mayBeBilled`). */
+export function elevenLabsSpeech(text: string): Promise<SpeechAttempt> {
   const apiKey = process.env.ELEVENLABS_XI_API_KEY;
   if (!apiKey) {
     console.error('[ElevenLabs TTS] No ELEVENLABS_XI_API_KEY found in environment');

@@ -75,6 +75,10 @@ const ADDRESSES = [
   'attacker.com%2fpay',
   'attacker.test%2fpay',
   'attacker.test%5cpay',
+  // A listed top-level domain in another script, percent-encoded as UTF-8
+  'attacker.%E3%82%B3%E3%83%A0/pay',
+  'attacker.%D1%80%D1%84/pay',
+  'attacker.%D1%80%D1%84',
   // Schemes a browser or the system acts on
   'bitcoin:bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq',
   'ethereum:0xabc',
@@ -95,6 +99,12 @@ const ADDRESSES = [
   'wallet0x52908400098527886E0F7030069857D2E4169EE7です',
   // Addresses attached to other characters: IPv6, IPv4, an IDN host with a capitalised top-level domain
   'pay[2606:4700:4700::1111]',
+  '[::]/pay',
+  // Numeric hosts a browser reads as IPv4, with a path, port, query or fragment after them
+  '0xcb007107/pay',
+  '0xcb.0.0x71.7/pay',
+  '203.0.28935/pay',
+  '203.28935:8080',
   '送金先192.168.0.1',
   'pay192.168.0.1/x',
   'Pay at 支払.Me',
@@ -165,6 +175,20 @@ describe('findAddresses', () => {
     '3.14',
     '0x1234 is short',
     '0x52908400098527886E0F7030069857D2E4169EE7FF is too long for a wallet',
+    // Fractions, scores, sizes and model numbers with a slash, and bare numbers
+    '1/2',
+    '24/7',
+    '3.5/5',
+    '2.5/10 stars',
+    '1.5/2.0',
+    '1000/month',
+    '1920/1080',
+    '007/skyfall',
+    '01.02/2026',
+    '0x10',
+    'Model 203.0.28935',
+    // A percent-encoded label that is not UTF-8 is no top-level domain
+    'attacker.%E3%82',
   ])('leaves ordinary text alone: %s', (text) => {
     expect(findAddresses(text)).toEqual([]);
     expect(sanitizeText(text, 200)).toBe(text.normalize('NFKC'));
@@ -185,6 +209,7 @@ describe('findAddresses', () => {
     ['', 'おいしいです．It is good'],
     ['a word that is a scheme, a colon and no space', 'About:Me card'],
     ['', 'Big data:analysis'],
+    ['a decimal number with more than three digits after the point, then a slash (a numeric host to a browser)', 'rate 0.1234/s'],
   ])('knowingly removes %s: %s', (_what, text) => {
     expect(sanitizeText(text, 200)).toContain(LINK_REMOVED);
   });
@@ -193,7 +218,7 @@ describe('findAddresses', () => {
 describe('the work of finding addresses', () => {
   it('is linear in the length of the text, also for a long chain of labels that never ends in a top-level domain', () => {
     // Each pass looks at every character a bounded number of times; together at most 8 times
-    for (const piece of ['a。', 'a.', 'a・', 'a dot ', 'a[.]', '0x', 'a:', '1.', '%2e', 'a%61', '[::', 'x@']) {
+    for (const piece of ['a。', 'a.', 'a・', 'a dot ', 'a[.]', '0x', 'a:', '1.', '%2e', 'a%61', '[::', 'x@', '1.1.1.1/', '0x1.', '1.1000/', '[::]/', 'a%E3%82%B3.']) {
       const steps: ScanSteps = { count: 0 };
       const text = `${piece.repeat(3000)}1`;
       findAddresses(text, steps);
@@ -207,8 +232,9 @@ describe('the work of finding addresses', () => {
     const steps: ScanSteps = { count: 0 };
     const title = sanitizeText(field, 120, steps);
     expect(Array.from(title).length).toBeLessThanOrEqual(120);
-    // The scan never sees more than 8 UTF-16 units for each code point shown
-    expect(steps.count).toBeLessThanOrEqual(8 * 8 * 120);
+    // Two scans (the replacement, and the check of its result), each at most 8 steps for each of
+    // the at most 8 UTF-16 units read for every code point shown
+    expect(steps.count).toBeLessThanOrEqual(2 * 8 * 8 * 120);
   });
 });
 
@@ -327,5 +353,34 @@ describe('the completed texts the shop hands on', () => {
     expect(warn.mock.calls.map(([line]) => String(line))).toEqual([expect.stringContaining('@alice: 1 of 2 item(s) were rejected')]);
     expect(String(warn.mock.calls[0][0])).toContain('or a link message that could not be made');
     vi.restoreAllMocks();
+  });
+});
+
+describe('an address that taking another out completes', () => {
+  // Two wallets back to back: the first is followed by a hex digit (the second's 0), so only the
+  // second is recognised; taking it out leaves the first one exactly 40 hex digits long
+  const DOUBLE = 'Pay to 0x52908400098527886E0F7030069857D2E4169EE70x52908400098527886E0F7030069857D2E4169EE7';
+
+  it('replaces the whole field when the text with its addresses replaced still holds one', () => {
+    expect(addressParts(DOUBLE)).toEqual(['0x52908400098527886E0F7030069857D2E4169EE7']);
+    expect(sanitizeText(DOUBLE, 120)).toBe(LINK_REMOVED);
+    expect(addressParts(sanitizeText(DOUBLE, 120))).toEqual([]);
+  });
+
+  it('puts it neither on the shelf nor into an offline answer, also from a product the catalog never cleaned', () => {
+    const cleaned = toStoreProduct(listing({ id: 'h_d', url: URL_OF('h_d'), title: DOUBLE }), ORIGIN)!;
+    const good = toStoreProduct(listing({ id: 'h_g', url: URL_OF('h_g'), title: 'Good Board' }), ORIGIN)!;
+    // By hand: the link message shows the title cut before the wallet, so it can be shared
+    const byHand = { ...good, id: 'h_b', url: URL_OF('h_b'), title: `${'B'.repeat(58)} 0x52908400098527886E0F7030069857D2E4169EE7` };
+    expect(isShareable(byHand)).toBe(true);
+    for (const products of [[cleaned, good], [byHand, good]]) {
+      expect(addressParts(formatShelf(products, { autonomous: false }))).toEqual([]);
+      for (const japanese of [false, true]) {
+        const notice = composeOfflineReply({ text: 'hello', products, japanese });
+        expect(notice.kind).toBe('notice');
+        expect(addressParts(String(notice.content.text))).toEqual([]);
+        expect(String(notice.content.text)).toContain('Good Board');
+      }
+    }
   });
 });

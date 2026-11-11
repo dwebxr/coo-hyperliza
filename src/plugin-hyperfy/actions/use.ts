@@ -16,6 +16,8 @@ import { AgentActions, type PerformActionOutcome } from '../systems/actions';
 import { AgentControls } from '../systems/controls';
 import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
 import { shownName } from '../lib/text';
+import { notArrivedText } from '../lib/move-outcome';
+import type { MoveOutcome } from '../systems/controls';
 
 const USE_ITEM = 'HYPERFY_USE_ITEM';
 // An entity id in a reply (chosen by the model or a caller): one short line, nothing invisible
@@ -59,7 +61,7 @@ export const hyperfyUseItemAction: Action = {
     runtime: IAgentRuntime,
     message: Memory,
     _state: State,
-    options: { entityId?: string },
+    _options: unknown,
     callback: HandlerCallback
   ) => {
     // The turn's own connection (never a newer one); throws when the turn may no longer act
@@ -74,26 +76,23 @@ export const hyperfyUseItemAction: Action = {
       return actionFailed(USE_ITEM, 'agent action system unavailable');
     }
 
-    let targetEntityId = options?.entityId;
+    // Which item: asked of the model (core hands an action nothing that names one)
+    let targetEntityId: string | undefined;
+    try {
+      const useState = await runtime.composeState(message, ['HYPERFY_WORLD_STATE', 'RECENT_MESSAGES'], true);
+      const prompt = composePromptFromState({ state: useState, template: useItemTemplate });
+      const response = await runtime.useModel(ModelType.OBJECT_SMALL, forPurpose('use-item', { prompt }));
 
-    if (!targetEntityId) {
-      logger.info('[USE ITEM] No entityId provided, attempting LLM extraction...');
-      try {
-        const useState = await runtime.composeState(message, ['HYPERFY_WORLD_STATE', 'RECENT_MESSAGES'], true);
-        const prompt = composePromptFromState({ state: useState, template: useItemTemplate });
-        const response = await runtime.useModel(ModelType.OBJECT_SMALL, forPurpose('use-item', { prompt }));
-
-        if (response?.entityId && typeof response.entityId === 'string') {
-          targetEntityId = response.entityId;
-          logger.info(`[USE ITEM] Extracted entity ID: ${targetEntityId}`);
-        } else {
-          logger.warn('[USE ITEM] No valid entityId extracted.');
-        }
-      } catch (err) {
-        // The turn's caller handles these (scripted or offline fallback, a fixed decline)
-        if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError) throw err;
-        logger.error('[USE ITEM] Extraction failed:', err);
+      if (response?.entityId && typeof response.entityId === 'string') {
+        targetEntityId = response.entityId;
+        logger.info(`[USE ITEM] Extracted entity ID: ${targetEntityId}`);
+      } else {
+        logger.warn('[USE ITEM] No valid entityId extracted.');
       }
+    } catch (err) {
+      // The turn's caller handles these (scripted or offline fallback, a fixed decline)
+      if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError) throw err;
+      logger.error('[USE ITEM] Extraction failed:', err);
     }
 
     if (!targetEntityId) {
@@ -110,14 +109,17 @@ export const hyperfyUseItemAction: Action = {
       return actionFailed(USE_ITEM, 'entity not found', { targetEntityId });
     }
 
-    let outcome: PerformActionOutcome;
+    // How the walk ended, and what using the item did (only once the agent is next to it)
+    let done: { walked: Exclude<MoveOutcome, 'arrived'> } | { walked: 'arrived'; outcome: PerformActionOutcome };
     try {
       // The walk and the use are one section: nothing else moves the avatar in between
-      outcome = await session.withBody(async (signal) => {
-        await controls.goto(targetPosition.x, targetPosition.z, { signal });
+      done = await session.withBody(async (signal) => {
+        const walked = await controls.goto(targetPosition.x, targetPosition.z, { signal });
         session.assertLive();
+        // A walk that was stopped or replaced, or never got there, uses nothing
+        if (walked !== 'arrived') return { walked };
         logger.info(`[USE ITEM] Attempting to use item with entity ID: ${targetEntityId}`);
-        return actions.performAction(targetEntityId);
+        return { walked, outcome: actions.performAction(targetEntityId) };
       });
     } catch (error: any) {
       if (error instanceof TurnCancelled) throw error;
@@ -125,6 +127,12 @@ export const hyperfyUseItemAction: Action = {
       await tellFailure(callback, USE_ITEM, "I couldn't get to that item.");
       return actionFailed(USE_ITEM, `could not reach or use the item: ${error?.message ?? error}`, { targetEntityId });
     }
+    if (done.walked !== 'arrived') {
+      logger.warn(`[USE ITEM] Did not get to ${targetEntityId} (${done.walked}); nothing was used.`);
+      await tellFailure(callback, USE_ITEM, notArrivedText(done.walked), { metadata: { error: 'not_arrived', outcome: done.walked } });
+      return actionFailed(USE_ITEM, `did not get to the item (${done.walked})`, { targetEntityId, outcome: done.walked });
+    }
+    const { outcome } = done;
     if (outcome !== 'started') {
       logger.warn(`[USE ITEM] Nothing to use on ${targetEntityId} (${outcome}).`);
       await tellFailure(callback, USE_ITEM, USE_FAILURE_TEXT[outcome]);

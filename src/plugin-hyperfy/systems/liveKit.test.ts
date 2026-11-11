@@ -1,9 +1,12 @@
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 const rooms: any[] = [];
+// The native voice tracks made (LocalAudioTrack.createAudioTrack), and what was done to each, in order
+const tracks: any[] = [];
+const released: string[] = [];
 vi.mock('@livekit/rtc-node', () => {
   class Room {
     connected = false;
@@ -11,9 +14,13 @@ vi.mock('@livekit/rtc-node', () => {
     disconnect = vi.fn(async () => {
       // like the SDK: a no-op while the join is still pending
       this.connected = false;
+      released.push('room left');
     });
     on = vi.fn();
-    localParticipant = { publishTrack: vi.fn(async () => {}) };
+    localParticipant = {
+      publishTrack: vi.fn(async () => {}),
+      unpublishTrack: vi.fn(async (sid: string) => void released.push(`unpublished ${sid}`)),
+    };
     connectedTo: unknown[] = [];
     constructor() {
       rooms.push(this);
@@ -33,8 +40,17 @@ vi.mock('@livekit/rtc-node', () => {
     AudioFrame: class {},
     AudioSource: class {
       captureFrame = vi.fn(async () => {});
+      close = vi.fn(async () => void released.push('source closed'));
     },
-    LocalAudioTrack: { createAudioTrack: vi.fn() },
+    LocalAudioTrack: {
+      createAudioTrack: vi.fn((_name: string, source: any) => {
+        const sid = `TR_${tracks.length + 1}`;
+        // As the SDK's track: closing it closes its source
+        const track = { sid, source, close: vi.fn(async () => (released.push(`closed ${sid}`), source.close())) };
+        tracks.push(track);
+        return track;
+      }),
+    },
     TrackPublishOptions: class {},
     TrackSource: { SOURCE_MICROPHONE: 1 },
     RoomEvent: {},
@@ -148,10 +164,27 @@ describe('AgentLiveKit and the voice server the world names', () => {
   });
 });
 
+/*
+ * Playback takes encoded audio (MP3 or WAV by its first bytes) and has ffmpeg decode it. Here a
+ * stand-in `ffmpeg` at the front of PATH gives back what follows the four header bytes, as PCM.
+ */
 describe('AgentLiveKit playback outcome', () => {
-  const pcm = () => Buffer.alloc(4800 * 2);
+  const FRAME_BYTES = 4800 * 2;
+  /** Encoded audio that decodes to `frames` frames of 100 ms */
+  const mp3 = (frames = 1) => Buffer.concat([Buffer.from([0xff, 0xfb, 0x90, 0x00]), Buffer.alloc(FRAME_BYTES * frames)]);
+  let dir = '';
+  beforeAll(() => {
+    dir = mkdtempSync(path.join(tmpdir(), 'coo-ffmpeg-'));
+    writeFileSync(path.join(dir, 'ffmpeg'), '#!/bin/sh\ntail -c +5\n');
+    chmodSync(path.join(dir, 'ffmpeg'), 0o755);
+  });
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
   async function joined() {
     rooms.length = 0;
+    tracks.length = 0;
+    released.length = 0;
+    vi.stubEnv('PATH', `${dir}${path.delimiter}${process.env.PATH}`);
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const livekit = new AgentLiveKit(worldOnLk());
@@ -161,58 +194,90 @@ describe('AgentLiveKit playback outcome', () => {
     await joining;
     return livekit;
   }
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
 
   it('reports nothing played when no room is connected', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await expect(new AgentLiveKit({}).publishAudioStream(pcm())).resolves.toEqual({ played: 'none', reason: 'not connected to a voice room' });
+    await expect(new AgentLiveKit({}).publishAudioStream(mp3())).resolves.toEqual({ played: 'none', reason: 'not connected to a voice room' });
   });
 
   it('reports played once audio went out to the room', async () => {
     const livekit = await joined();
-    await expect(livekit.publishAudioStream(pcm())).resolves.toEqual({ played: 'all' });
+    await expect(livekit.publishAudioStream(mp3())).resolves.toEqual({ played: 'all' });
+  });
+
+  it.each([
+    ['raw 16-bit PCM', Buffer.alloc(FRAME_BYTES, 1)],
+    ['bytes of no audio format', Buffer.from('<html><body>503 Service Unavailable</body></html>')],
+    ['an Ogg file', Buffer.concat([Buffer.from('OggS'), Buffer.alloc(FRAME_BYTES)])],
+    ['nothing', Buffer.alloc(0)],
+  ])('does not play %s as if it were PCM: nothing goes out, and no track is published for it', async (_what, audio) => {
+    const livekit = await joined();
+    await expect(livekit.publishAudioStream(audio)).resolves.toEqual({ played: 'none', reason: 'the audio is in no format the agent plays (MP3 or WAV)' });
+    expect(rooms[0].localParticipant.publishTrack).not.toHaveBeenCalled();
+    expect(tracks).toEqual([]);
+    // ...and a track there already takes no frame of it
+    await livekit.publishAudioStream(mp3());
+    const capture = (livekit as any).audioSource.captureFrame;
+    const before = capture.mock.calls.length;
+    await expect(livekit.publishAudioStream(audio)).resolves.toMatchObject({ played: 'none' });
+    expect(capture.mock.calls.length).toBe(before);
+  });
+
+  it('takes MP3 (frame sync or ID3 tag) and WAV by their first bytes', async () => {
+    const livekit = await joined();
+    for (const header of [[0xff, 0xfb, 0x90, 0x00], [0x49, 0x44, 0x33, 0x04], [0x52, 0x49, 0x46, 0x46]]) {
+      await expect(livekit.publishAudioStream(Buffer.concat([Buffer.from(header), Buffer.alloc(FRAME_BYTES)]))).resolves.toEqual({ played: 'all' });
+    }
   });
 
   it('reports nothing played when stopped before the first frame, or when the room went away while the track was published', async () => {
     const livekit = await joined();
     const stopped = new AbortController();
     stopped.abort();
-    await expect(livekit.publishAudioStream(pcm(), { signal: stopped.signal })).resolves.toEqual({ played: 'none', reason: 'stopped' });
+    await expect(livekit.publishAudioStream(mp3(), { signal: stopped.signal })).resolves.toEqual({ played: 'none', reason: 'stopped' });
     rooms[0].localParticipant.publishTrack.mockImplementation(async () => {
       await livekit.disconnectRoom();
     });
-    await expect(livekit.publishAudioStream(pcm())).resolves.toEqual({ played: 'none', reason: 'the voice room went away' });
+    await expect(livekit.publishAudioStream(mp3())).resolves.toEqual({ played: 'none', reason: 'the voice room went away' });
+    // The track made for the room that went away is closed, with its source: nobody else holds it
+    expect(tracks).toHaveLength(1);
+    expect(tracks[0].close).toHaveBeenCalledTimes(1);
+    expect(tracks[0].source.close).toHaveBeenCalledTimes(1);
   });
 
   it('reports nothing played when it was stopped before the first frame went out (during the lead-in silence)', async () => {
     const livekit = await joined();
-    await livekit.publishAudioStream(pcm());
+    await livekit.publishAudioStream(mp3());
     const stop = new AbortController();
     (livekit as any).audioSource.captureFrame.mockImplementationOnce(async () => stop.abort());
-    await expect(livekit.publishAudioStream(pcm(), { signal: stop.signal })).resolves.toEqual({ played: 'none', reason: 'stopped' });
+    await expect(livekit.publishAudioStream(mp3(), { signal: stop.signal })).resolves.toEqual({ played: 'none', reason: 'stopped' });
   });
 
   it('reports nothing played for audio that decodes to nothing', async () => {
     const livekit = await joined();
-    await expect(livekit.publishAudioStream(Buffer.alloc(1))).resolves.toEqual({ played: 'none', reason: 'no audio was decoded' });
+    await expect(livekit.publishAudioStream(mp3(0))).resolves.toEqual({ played: 'none', reason: 'no audio was decoded' });
   });
 
   it('reports partly played, never nothing, when the stream fails after a frame went out, and counts frames as they go', async () => {
     const livekit = await joined();
-    await livekit.publishAudioStream(pcm());
+    await livekit.publishAudioStream(mp3());
     const capture = (livekit as any).audioSource.captureFrame;
     // The lead-in silence, the first frame, then a failure
     capture.mockImplementationOnce(async () => {}).mockImplementationOnce(async () => {}).mockImplementationOnce(async () => {
       throw new Error('capture failed');
     });
     const progress = { frames: 0 };
-    await expect(livekit.publishAudioStream(Buffer.alloc(4800 * 2 * 3), { progress })).resolves.toEqual({ played: 'partial', error: 'capture failed' });
+    await expect(livekit.publishAudioStream(mp3(3), { progress })).resolves.toEqual({ played: 'partial', error: 'capture failed' });
     expect(progress.frames).toBe(1);
     // A capture that never returns: the count holds what went out before it
     capture.mockImplementationOnce(async () => {}).mockImplementationOnce(async () => {}).mockImplementationOnce(() => new Promise(() => {}));
     const hung = { frames: 0 };
-    void livekit.publishAudioStream(Buffer.alloc(4800 * 2 * 3), { progress: hung });
+    void livekit.publishAudioStream(mp3(3), { progress: hung });
     // 2 for the first playback, 3 for the failed one, 3 for this one (silence, a frame, the hung one)
     await vi.waitFor(() => expect(capture).toHaveBeenCalledTimes(2 + 3 + 3));
     expect(hung.frames).toBe(1);
@@ -220,11 +285,63 @@ describe('AgentLiveKit playback outcome', () => {
 
   it('reports nothing played, without rejecting, when the stream fails before any frame went out', async () => {
     const livekit = await joined();
-    await livekit.publishAudioStream(pcm());
+    await livekit.publishAudioStream(mp3());
     (livekit as any).audioSource.captureFrame.mockImplementationOnce(async () => {
       throw new Error('capture failed');
     });
-    await expect(livekit.publishAudioStream(pcm())).resolves.toEqual({ played: 'none', error: 'capture failed' });
+    await expect(livekit.publishAudioStream(mp3())).resolves.toEqual({ played: 'none', error: 'capture failed' });
+  });
+
+  describe("the agent's own voice track when its room is left", () => {
+    it.each([
+      ['a disconnect', (livekit: AgentLiveKit) => livekit.disconnectRoom()],
+      ['the world being destroyed', async (livekit: AgentLiveKit) => {
+        livekit.destroy();
+        await vi.waitFor(() => expect(released).toContain('room left'));
+      }],
+    ])('is unpublished from that room and closed with its source, before the room is left (%s)', async (_what, leave) => {
+      const livekit = await joined();
+      await livekit.publishAudioStream(mp3());
+      expect(tracks).toHaveLength(1);
+      released.length = 0;
+      await leave(livekit);
+      expect(released).toEqual(['unpublished TR_1', 'closed TR_1', 'source closed', 'room left']);
+      expect(rooms[0].localParticipant.unpublishTrack).toHaveBeenCalledWith('TR_1');
+    });
+
+    it('is released when a new join replaces the room, and the new room gets a track of its own', async () => {
+      const livekit = await joined();
+      await livekit.publishAudioStream(mp3());
+      released.length = 0;
+      const rejoining = livekit.deserialize(opts);
+      await vi.waitFor(() => expect(rooms).toHaveLength(2));
+      rooms[1].resolveConnect();
+      await rejoining;
+      expect(released).toEqual(['unpublished TR_1', 'closed TR_1', 'source closed', 'room left']);
+      await expect(livekit.publishAudioStream(mp3())).resolves.toEqual({ played: 'all' });
+      expect(tracks).toHaveLength(2);
+      expect(tracks[1].close).not.toHaveBeenCalled();
+    });
+
+    it('leaving goes on when the native unpublish or close fails or never returns', async () => {
+      const livekit = await joined();
+      await livekit.publishAudioStream(mp3());
+      released.length = 0;
+      rooms[0].localParticipant.unpublishTrack.mockImplementation(() => new Promise(() => {}));
+      tracks[0].close.mockRejectedValue(new Error('handle already disposed'));
+      vi.useFakeTimers();
+      try {
+        const leaving = livekit.disconnectRoom();
+        await vi.advanceTimersByTimeAsync(5_000);
+        await leaving;
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(tracks[0].close).toHaveBeenCalledTimes(1);
+      expect(released).toEqual(['room left']);
+      // Nothing of the old room is used again
+      await expect(livekit.publishAudioStream(mp3())).resolves.toEqual({ played: 'none', reason: 'not connected to a voice room' });
+    });
   });
 });
 

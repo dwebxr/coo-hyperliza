@@ -31,6 +31,14 @@ const VOICE_LIMIT_NOTICE_INTERVAL_MS = 10 * 60_000;
 export const UTTERANCE_PAUSE_MS = 1500;
 // One speaker without a pause: after 30 s the audio so far is transcribed and a new utterance starts
 export const MAX_UTTERANCE_BYTES = 30 * PCM_BYTES_PER_SECOND;
+/**
+ * An utterance with less speech than this (100 ms above the loudness threshold: ten LiveKit frames)
+ * is not sent to speech-to-text: every request costs, and audio this short holds no word (a click,
+ * a breath, a cough's onset). 0.1 s is also the shortest audio OpenAI's transcription API accepts
+ * (it refuses shorter files). A spoken word, the shortest ones included ("hi", "no", "stop"), has
+ * more voiced sound than this.
+ */
+export const MIN_UTTERANCE_BYTES = PCM_BYTES_PER_SECOND / 10;
 // All speakers together, waiting or being transcribed: four full utterances (11.5 MB of PCM; a
 // request holds its audio about twice while it builds the WAV)
 export const MAX_HELD_VOICE_BYTES = 4 * MAX_UTTERANCE_BYTES;
@@ -303,8 +311,9 @@ export class VoiceManager {
     utterance.timer = null;
     this.speakers.delete(participant);
     const world = this.session.world;
-    // Nobody who is not a player in the world now is transcribed (that costs money)
-    if (this.stopped || !world || utterance.bytes === 0 || !world.entities?.getPlayer?.(participant)) {
+    // Nobody who is not a player in the world now is transcribed (that costs money), and nothing
+    // too short to be a word (MIN_UTTERANCE_BYTES)
+    if (this.stopped || !world || utterance.bytes < MIN_UTTERANCE_BYTES || !world.entities?.getPlayer?.(participant)) {
       this.heldVoiceBytes -= utterance.bytes;
       return;
     }
@@ -432,6 +441,8 @@ export class VoiceManager {
       await this.runtime.ensureConnection({
         entityId,
         roomId,
+        // Core stores it as metadata.hyperfy.id, as for a chat sender (managers/message-manager.ts)
+        userId: playerId,
         userName,
         name,
         source: 'hyperfy',

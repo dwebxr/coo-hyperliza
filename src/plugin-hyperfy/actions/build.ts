@@ -15,6 +15,7 @@ import {
   import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
   import { EDIT_ENTITY_ACTION, SceneEditStopped, readSceneEditsMode, reportsPrivilegedAction, sceneEditRefusal, sceneEditStillAllowed } from '../lib/authorization';
   import type { EditGuard, EditResult } from '../managers/build-manager';
+  import { MAX_OPERATIONS_PER_REQUEST, readPlanEntry } from '../lib/edit-plan';
   import { readString } from '../lib/model-output';
   import { isJapanese } from '../lib/simple-commands';
   import { TurnCancelled, currentTurn } from '../lib/turn-context';
@@ -60,15 +61,18 @@ import {
 
   /**
    * What happened to one entry of the model's edit plan, from what the build manager reported:
-   * executed (the change was made), skipped (the plan itself marked it as not possible, or there was
-   * nothing to do: the target was gone, pinned, not an app), or failed (refused or failed import,
-   * invalid parameters, unsupported type, not an object, threw, or not run because the edit stopped).
+   * executed (the change was made), skipped (the plan itself said it cannot be done, or there was
+   * nothing to do: the target was gone, pinned, not an app, or the walk to it did not get there),
+   * or failed (refused or failed import, an entry that is no operation (lib/edit-plan.ts), invalid
+   * parameters, a copy it refers to that was not made, threw, or not run: the edit stopped, or the
+   * request already ran MAX_OPERATIONS_PER_REQUEST operations). `newId`: the entity a duplicate made.
    */
   interface OperationOutcome {
     operation?: string;
     target?: string;
     outcome: 'executed' | 'skipped' | 'failed';
     reason?: string;
+    newId?: string;
   }
 
   const stringOrUndefined = (value: unknown) => (typeof value === 'string' ? value : undefined);
@@ -106,21 +110,12 @@ import {
     };
   }
 
-  export enum EditOperationType {
-    DUPLICATE = 'duplicate',
-    TRANSLATE = 'translate',
-    ROTATE = 'rotate',
-    SCALE = 'scale',
-    DELETE = 'delete',
-    IMPORT = 'import'
-  }
-  
 const sceneEditOperationExtractionTemplate = `
   # Task:
   You are a scene editing reasoning module. Based on the user's request and the current Hyperfy world state, generate a scene edit plan as a JSON object with an "operations" array, in the intended execution order.
   
   # Supported Operations:
-  - "duplicate": Duplicate an existing entity.
+  - "duplicate": Duplicate an existing entity. The copy appears where the original is. To act on the copy later in the same plan, name it with "as": "<label>" (for example "copy1").
   - "delete": Remove an entity.
   - "translate": Move an entity to a new position → "position": [x, y, z]
   - "rotate": Rotate an entity using a quaternion → "rotation": [x, y, z, w]
@@ -172,7 +167,17 @@ const sceneEditOperationExtractionTemplate = `
         "operation": "duplicate",
         "target": "qr66FaMVIj",
         "parameters": {},
+        "as": "copy1",
         "description": "Duplicated block"
+      },
+      {
+        "success": true,
+        "operation": "translate",
+        "targetRef": "copy1",
+        "parameters": {
+          "position": [0, 2, 0]
+        },
+        "description": "Moved the copy upward"
       },
       {
         "success": true,
@@ -199,6 +204,8 @@ const sceneEditOperationExtractionTemplate = `
   - Analyze the user’s request and determine the sequence of scene changes needed.
   - Use only valid entity IDs from the world state. Do **not invent** or modify IDs.
   - If a duplicate operation is required, use the original 'target'; the system will assign the new ID.
+  - To move, rotate, scale or delete a copy made earlier in the same plan, use "targetRef": "<the label given in that duplicate's 'as'>" instead of "target". Never guess the copy's ID.
+  - A plan runs at most ${MAX_OPERATIONS_PER_REQUEST} operations.
   - If an entity cannot be found, return a failed operation with "success": false and a clear reason.
   - Format all vector parameters as arrays (e.g., [x, y, z]).
   - Maintain the order of operations as implied by the user.
@@ -312,7 +319,6 @@ Don't list every action like a log — instead, summarize the overall outcome na
           const reason = stillAllowed();
           if (reason) throw new SceneEditStopped(reason);
         },
-        connectionLive,
         signal: turn.signal,
       };
       // Posted while the turn runs (core holds callback content until the handler returns), and only
@@ -393,6 +399,10 @@ Don't list every action like a log — instead, summarize the overall outcome na
       const descriptions: (string | undefined)[] = [];
       // Why the remaining operations were not run, once the edit had to stop
       let stopped: string | null = null;
+      // Operations this request has run or tried to run: at most MAX_OPERATIONS_PER_REQUEST
+      let attempted = 0;
+      // The copies this plan made, by the label the plan gave each (`as`), for its later entries (`targetRef`)
+      const copies = new Map<string, string>();
       const record = (outcome: OperationOutcome, description?: string) => {
         outcomes.push(outcome);
         descriptions.push(description);
@@ -404,48 +414,62 @@ Don't list every action like a log — instead, summarize the overall outcome na
           record({ ...describe(entry), outcome: 'failed', reason: `not run: ${stopped}` });
           continue;
         }
-        if (!entry || typeof entry !== 'object') {
-          logger.warn(`[EDIT_ENTITY Action] Ignoring an edit plan entry that is not an object (${entry === null ? 'null' : typeof entry})`);
-          record({ outcome: 'failed', reason: 'not an operation object' });
+        // What the entry is, by its shape alone (lib/edit-plan.ts)
+        const read = readPlanEntry(entry);
+        if (read.kind === 'invalid') {
+          logger.warn(`[EDIT_ENTITY Action] Ignoring an edit plan entry: ${read.problem}`);
+          record({ ...describe(entry), outcome: 'failed', reason: read.problem });
           continue;
         }
-        const op = entry as Record<string, any>;
-        const { operation, target, parameters, description } = op;
-        const outcome = record({ ...describe(op), outcome: 'executed' }, stringOrUndefined(description));
-        if (!op.success) {
-          logger.warn(`[EDIT_ENTITY Action] Skipping ${stringOrUndefined(operation) ?? 'an operation'} on "${shownTarget(operation, target)}" the plan marked as failed`);
-          outcome.outcome = 'skipped';
-          outcome.reason = stringOrUndefined(op.reason);
+        if (read.kind === 'declined') {
+          logger.warn(`[EDIT_ENTITY Action] Skipping an entry the plan itself says cannot be done`);
+          record({ ...describe(entry), outcome: 'skipped', reason: read.reason });
           continue;
         }
+        const op = read.op;
+        const { operation } = op;
+        if (++attempted > MAX_OPERATIONS_PER_REQUEST) {
+          record({ ...describe(entry), outcome: 'failed', reason: `not run: one request runs at most ${MAX_OPERATIONS_PER_REQUEST} operations` });
+          continue;
+        }
+        // The entity it acts on: one in the world, or a copy an earlier entry of this plan made
+        let target: string;
+        if (op.operation !== 'import' && op.targetRef !== undefined) {
+          const copy = copies.get(op.targetRef);
+          if (copy === undefined) {
+            record({ operation, target: op.targetRef, outcome: 'failed', reason: `no copy named "${op.targetRef}" was made earlier in this request` });
+            continue;
+          }
+          target = copy;
+        } else {
+          target = op.target as string;
+        }
+        const description = op.description;
+        const outcome = record({ operation, target: shownTarget(operation, target), outcome: 'executed' }, description);
 
         let done: EditResult;
         try {
           // One operation at a time has the avatar and the scene (ConnectionSession.withBody): it
           // walks to its target, checks again, then edits
           done = await session.withBody(async (): Promise<EditResult> => {
-            switch (operation) {
-              case EditOperationType.TRANSLATE:
-                return buildManager.translate(guard, target, parameters?.position);
+            switch (op.operation) {
+              case 'translate':
+                return buildManager.translate(guard, target, op.parameters.position);
 
-              case EditOperationType.ROTATE:
-                return buildManager.rotate(guard, target, parameters?.rotation);
+              case 'rotate':
+                return buildManager.rotate(guard, target, op.parameters.rotation);
 
-              case EditOperationType.SCALE:
-                return buildManager.scale(guard, target, parameters?.scale);
+              case 'scale':
+                return buildManager.scale(guard, target, op.parameters.scale);
 
-              case EditOperationType.DUPLICATE:
+              case 'duplicate':
                 return buildManager.duplicate(guard, target);
 
-              case EditOperationType.DELETE:
+              case 'delete':
                 return buildManager.delete(guard, target);
 
-              case EditOperationType.IMPORT:
-                return buildManager.importEntity(guard, target, parameters?.position, parameters?.rotation);
-
-              default:
-                logger.warn(`[EDIT_ENTITY Action] Unsupported operation type: ${operation}`);
-                return { outcome: 'failed', reason: 'unsupported operation type' };
+              case 'import':
+                return buildManager.importEntity(guard, target, op.parameters?.position ?? undefined, op.parameters?.rotation ?? undefined);
             }
           });
         } catch (error: any) {
@@ -461,7 +485,11 @@ Don't list every action like a log — instead, summarize the overall outcome na
           done = { outcome: 'failed', reason: String(error?.message ?? error) };
         }
         if (done.outcome === 'applied') {
-          if (typeof description === 'string' && description) postNow(description);
+          if (op.operation === 'duplicate' && done.newId) {
+            outcome.newId = done.newId;
+            if (op.as !== undefined) copies.set(op.as, done.newId);
+          }
+          if (description) postNow(description);
         } else {
           logger.warn(`[EDIT_ENTITY Action] ${operation} on "${shownTarget(operation, target)}" ${done.outcome}: ${done.reason}`);
           outcome.outcome = done.outcome;
@@ -505,7 +533,7 @@ Don't list every action like a log — instead, summarize the overall outcome na
       const summaryText = outcomes.slice(0, MAX_SUMMARY_LINES).map((o, i) => {
         const what = `${oneLine(o.operation ?? 'an operation', 40)}${o.target ? ` on "${o.target}"` : ''}`;
         return o.outcome === 'executed'
-          ? `DONE: ${oneLine(descriptions[i] ?? what, MAX_SUMMARY_LINE_CODE_POINTS)}`
+          ? `DONE: ${oneLine(descriptions[i] ?? what, MAX_SUMMARY_LINE_CODE_POINTS)}${o.newId ? ` (the copy is entity ${oneLine(o.newId, 64)})` : ''}`
           : `NOT DONE (${o.outcome}): ${what} → ${oneLine(o.reason ?? 'no reason given', MAX_SUMMARY_LINE_CODE_POINTS)}`;
       }).concat(outcomes.length > MAX_SUMMARY_LINES ? [`(and ${outcomes.length - MAX_SUMMARY_LINES} more)`] : []).join('\n');
       

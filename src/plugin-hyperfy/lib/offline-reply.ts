@@ -1,6 +1,7 @@
 import type { Content } from '@elizaos/core';
 import { OPENPAY_LINK_FLAG, SHARE_ACTION, formatLinkMessage, isShareable, isSpecificTitle, resolveProduct } from '../../openpay-store';
 import type { StoreProduct } from '../../openpay-store/catalog';
+import { findAddresses } from '../../openpay-store/addresses';
 import { IDLE_EMOTES } from './idle-behavior';
 
 /**
@@ -38,9 +39,10 @@ export function composeOfflineReply({
   }
 
   // Only names that would be recognised when said (resolveProduct looks for specific titles only),
-  // of products whose link can be posted
+  // of products whose link can be posted, and none that would put an address into the notice
+  // (the link message shows a title cut, the notice the whole title)
   const examples = products
-    .filter((p) => isSpecificTitle(p.title) && isShareable(p))
+    .filter((p) => isSpecificTitle(p.title) && isShareable(p) && !findAddresses(p.title).length)
     .map((p) => p.title)
     .slice(0, EXAMPLE_TITLES);
   const shopHint = examples.length

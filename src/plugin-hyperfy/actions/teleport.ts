@@ -42,14 +42,15 @@ export const teleportToUserAction: Action = {
 
         logger.info(`[Teleport Action] Attempting to teleport to user: ${targetUserId ?? "(nearest player)"}`);
 
+        // 'arrived' only when the agent was moved (systems/controls.ts MoveOutcome)
         let teleported: boolean;
         try {
             if (world.actions && typeof world.actions.teleportToUser === 'function') {
                 // Moves the avatar: one such section at a time (ConnectionSession.withBody)
-                teleported = await session.withBody(async () => world.actions.teleportToUser(targetUserId) === true);
+                teleported = await session.withBody(async () => world.actions.teleportToUser(targetUserId) === 'arrived');
             } else if (world.controls && typeof world.controls.teleportToEntity === 'function') {
                 // Fallback direct control
-                teleported = await session.withBody(async () => world.controls.teleportToEntity(targetUserId) === true);
+                teleported = await session.withBody(async () => world.controls.teleportToEntity(targetUserId) === 'arrived');
             } else {
                 logger.error("[Teleport Action] Teleport capability not found on world.actions or world.controls.");
                 await tellFailure(callback, TELEPORT_TO_USER, "I can't teleport right now.");
