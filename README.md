@@ -160,6 +160,26 @@ Coo can act as a shop clerk for [OpenPay Store](https://open-pay.jp/ja/store): i
 
 The catalog loads at startup and, once it is more than 5 minutes old, refreshes in the background the next time it is used (with retry backoff after failures); prompts never wait on the API. Prompts show up to 12 products. The reply names the product by id or an unambiguous title, and the `OPENPAY_SHARE_PRODUCT` action posts the purchase URL from the validated catalog record (only URLs on the API's origin are accepted).
 
+### Tips (投げゼニ)
+
+coo-world lets players tip each other in JPYC from their own wallets. With a wallet of its own, Coo can receive tips too: other players see a Tip button next to Coo in the Players list, and Coo thanks whoever tips it (without a model call) and remembers it in the conversation.
+
+1. Create Coo's wallet. This writes a new private key into `.env` as `TIP_WALLET_PRIVATE_KEY` (it is never printed) and shows the address. Run again, it only shows the address.
+   ```bash
+   npm run tip-wallet
+   ```
+2. Back the key up, e.g. in a password manager: without it, tokens sent to the address cannot be moved.
+3. Restart the agent. The log says `[Tips] Receiving tips at 0x…` once the world shows Coo as receiving tips.
+
+How it works and what it can do:
+- The world only offers the Tip button for a player whose wallet signed in on the current connection, so Coo signs in on every connection with its key (Sign-In with Ethereum), then turns "Receive tips" on. The world shares only that yes/no flag; the address goes only to a signed-in player who is sending a tip.
+- The key only ever signs the world's own sign-in message. Before signing, Coo checks that it is exactly that: the world's domain (the host of `WS_URL`), its statement, Coo's address, the nonce it was given, no extra content and a short expiry. Anything else is refused and tips stay off for that connection. Nothing in the agent builds or sends a transaction.
+- Tips arrive as ERC-20 tokens at Coo's address; Coo never moves them. Move them to your main wallet now and then (for example by importing the key into a wallet app; that needs a little POL for gas) and keep only small amounts at this address. If the key may have leaked, create a new wallet and move what is left.
+- The key is kept out of the character secrets elizaOS stores in its database and returns from its API. Its name must not start with `COO_`, which elizaOS would copy into those secrets.
+- Coo explains how to tip it when asked, while it is receiving tips, and never asks for tips on its own.
+- Tips work only while Coo is connected, and the world announces a tip only once it is confirmed on chain (the world needs its RPC for that).
+- Check the rules that apply to you (taxes, and whether perks in return for tips make you a seller) before relying on tips.
+
 ### Agent Aliases
 
 `HYPERFY_AGENT_ALIASES` is a comma-separated list of extra names the agent answers to (e.g. `クー`). A message containing the agent's name or one of these aliases skips the "should I respond?" LLM check. The check is also skipped when the agent is 1-on-1 with a single player.
@@ -211,6 +231,8 @@ Each limit may go over by one call or utterance. Counts are kept in memory and s
 src/
 ├── plugin-hyperfy/
 │   ├── lib/
+│   │   ├── tip-wallet.ts        # Coo's wallet sign-in for tips
+│   │   ├── tip-notice.ts        # Reads the world's tip announcements
 │   │   ├── idle-behavior.ts     # Scripted patrol / wander / greeting steps
 │   │   ├── simple-commands.ts   # "Come here" / "stop" handled without Claude
 │   │   ├── offline-reply.ts     # Replies when the Claude budget is used up
@@ -231,6 +253,7 @@ src/
 │   │   ├── controls.ts         # Agent movement control
 │   │   └── loader.ts           # Asset loader
 │   ├── providers/
+│   │   ├── tips.ts             # How to tip Coo (while it receives tips)
 │   │   └── world.ts            # World state provider
 │   ├── templates.ts            # Prompt templates
 │   ├── service.ts              # Main service
@@ -258,6 +281,7 @@ stubs/unused-elizaos-plugin/    # Stands in for plugins @elizaos/cli lists but n
 8. **OpenPay Store Shop Clerk**: Product recommendations and purchase links
 9. **coo-world Compatibility**: Current network protocol, authenticated uploads, the world's walking clips, chat split to the world's length limit
 10. **Lean, Pinned Dependencies**: Unused integrations removed and `bun.lock` committed (`bun audit` to check)
+11. **Tips**: Coo can receive coo-world tips (JPYC) with its own wallet and thanks the tippers
 
 ## Troubleshooting
 

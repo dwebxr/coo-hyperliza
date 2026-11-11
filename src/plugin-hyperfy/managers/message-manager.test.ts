@@ -193,3 +193,61 @@ describe('MessageManager shop links', () => {
     expect(runtime.createMemory).toHaveBeenCalled();
   });
 });
+
+describe('MessageManager tip notices', () => {
+  function setup() {
+    const add = vi.fn();
+    const faceEntity = vi.fn().mockResolvedValue(undefined);
+    const self = { data: { id: 'me', type: 'player', name: 'Coo' } };
+    const world = {
+      chat: { add },
+      controls: { faceEntity },
+      entities: { player: self, items: new Map<string, any>([['me', self], ['p1', { data: { id: 'p1', type: 'player', name: 'Alice' } }]]) },
+    };
+    const speak = vi.fn().mockResolvedValue(true);
+    const service = {
+      isConnected: () => true,
+      getWorld: () => world,
+      getEntityName: () => 'Coo',
+      getEmoteManager: () => ({ hasEmote: () => false, playEmote: vi.fn() }),
+      getVoiceManager: () => ({ speak }),
+      currentWorldId: '00000000-0000-0000-0000-0000000000ee',
+    };
+    const runtime: any = {
+      agentId: '00000000-0000-0000-0000-0000000000aa',
+      character: { name: 'Coo', templates: {} },
+      getService: () => service,
+      createMemory: vi.fn().mockResolvedValue(undefined),
+      ensureConnection: vi.fn().mockResolvedValue(undefined),
+      getEntityById: vi.fn().mockResolvedValue({ id: 'e' }),
+      emitEvent: vi.fn().mockResolvedValue(undefined),
+    };
+    const notice = (body: string) => ({ id: `n-${body}`, from: null, fromId: null, body, createdAt: new Date().toISOString() });
+    return { manager: new MessageManager(runtime), add, speak, faceEntity, runtime, notice };
+  }
+
+  it('thanks the tipper without a model call: faces them, speaks, and remembers it', async () => {
+    const { manager, add, speak, faceEntity, runtime, notice } = setup();
+    await manager.handleMessage(notice('Alice tipped Coo 100 JPYC'));
+    expect(add).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining('Aliceさん、100 JPYCの投げゼニ') }), true);
+    expect(speak).toHaveBeenCalledWith(expect.stringContaining('ありがとうございます'));
+    expect(faceEntity).toHaveBeenCalledWith('p1');
+    expect(runtime.createMemory.mock.calls[0][0].content.thought).toBe('Alice tipped me 100 JPYC.');
+    expect(runtime.emitEvent).not.toHaveBeenCalled();
+  });
+
+  it('thanks in English a player who last wrote in English', async () => {
+    const { manager, add, notice } = setup();
+    await manager.handleMessage({ id: 'm1', from: 'Alice', fromId: 'p1', body: 'hello Coo', createdAt: new Date().toISOString() });
+    await manager.handleMessage(notice('(only you) Alice tipped you 5 JPYC'));
+    expect(add).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining('Thank you so much for the 5 JPYC tip, Alice') }), true);
+  });
+
+  it('ignores other world notices and tips to someone else', async () => {
+    const { manager, add, speak, notice } = setup();
+    await manager.handleMessage(notice('Alice tipped Bob 100 JPYC'));
+    await manager.handleMessage(notice('The world will restart in 5 minutes'));
+    expect(add).not.toHaveBeenCalled();
+    expect(speak).not.toHaveBeenCalled();
+  });
+});

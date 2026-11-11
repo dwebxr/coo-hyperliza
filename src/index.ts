@@ -3,8 +3,9 @@ import { Buffer } from 'buffer';
 
 import dotenv from 'dotenv';
 
-// Values from the .env file, applied as character secrets below
-const envFile = dotenv.config().parsed ?? {};
+// Values from the .env file, applied as character secrets below. The tip wallet's key stays out:
+// elizaOS stores character secrets in its database and returns them from its API.
+const { TIP_WALLET_PRIVATE_KEY: _tipWalletKey, ...envFile } = dotenv.config().parsed ?? {};
 import {
   logger,
   type Character,

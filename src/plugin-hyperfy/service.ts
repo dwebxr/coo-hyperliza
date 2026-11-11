@@ -27,6 +27,7 @@ import { ReconnectController } from './lib/reconnect'
 import { type AssetUploadError, ensureAsset, uploadAsset } from './lib/asset-upload'
 import { PROTOCOL_VERSION, adaptToWorldProtocol } from './lib/world-protocol'
 import { storage } from './hyperfy/src/core/storage.js'
+import { TipWallet, readTipWalletAccount, signInHost } from './lib/tip-wallet'
 
 const moduleDirPath = getModuleDirectory();
 const LOCAL_AVATAR_PATH = `${moduleDirPath}/avatars/avatar.vrm`;
@@ -76,6 +77,7 @@ export class HyperfyService extends Service {
   private voiceManager: VoiceManager;
   private puppeteerManager: PuppeteerManager;
   private buildManager: BuildManager;
+  private tipWallet: TipWallet | null = null;
 
   public get currentWorldId(): UUID | null {
     return this._currentWorldId
@@ -186,9 +188,14 @@ export class HyperfyService extends Service {
           console.error('[Hyperfy] Error while handling disconnect:', error)
         })
       })
+      // Tips: the agent's wallet signs in on every connection (TIP_WALLET_PRIVATE_KEY)
+      this.tipWallet = this.createTipWallet(world, config.wsUrl)
+
       // The local player only spawns after a real session is established.
       world.on('player', () => {
-        if (world === this.world) this.reconnectController.markEstablished()
+        if (world !== this.world) return
+        this.reconnectController.markEstablished()
+        this.tipWallet?.begin()
       })
 
       this.puppeteerManager = PuppeteerManager.getOrCreate(this.runtime);
@@ -580,6 +587,8 @@ export class HyperfyService extends Service {
     this.connectionGeneration++
 
     this.stopAppearancePolling()
+    this.tipWallet?.stop();
+    this.tipWallet = null;
     this.behaviorManager?.stop();
     this.voiceManager?.stop();
     this.emoteManager?.stop();
@@ -764,6 +773,25 @@ export class HyperfyService extends Service {
 
   getBuildManager() {
     return this.buildManager;
+  }
+
+  /** The agent's tip wallet on this connection; null when tips are not configured. */
+  getTipWallet(): TipWallet | null {
+    return this.tipWallet;
+  }
+
+  private createTipWallet(world: any, wsUrl: string): TipWallet | null {
+    const account = readTipWalletAccount()
+    if (!account) return null
+    const host = signInHost(wsUrl)
+    if (!host) {
+      console.warn(`[Tips] Cannot tell the world's sign-in domain from ${wsUrl}; tips stay off`)
+      return null
+    }
+    return new TipWallet(world.network, account, {
+      host,
+      selfId: () => world.entities?.player?.data?.id,
+    })
   }
 }
 

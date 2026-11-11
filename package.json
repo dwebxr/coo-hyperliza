@@ -39,6 +39,7 @@
     "ses": "^1.12.0",
     "three": "^0.176.0",
     "three-mesh-bvh": "^0.9.0",
+    "viem": "2.57.11",
     "yoga-layout": "^3.2.1",
     "zod": "^4.1.12"
   },
@@ -51,6 +52,7 @@
   },
   "scripts": {
     "postinstall": "node scripts/postinstall.cjs",
+    "tip-wallet": "node scripts/tip-wallet.mjs",
     "start": "elizaos start",
     "dev": "elizaos dev",
     "build": "tsup && cp src/plugin-hyperfy/physx/physx-js-webidl.js src/plugin-hyperfy/physx/physx-js-webidl.wasm dist/ && cp -r src/plugin-hyperfy/public/scripts dist/ && cp -r src/plugin-hyperfy/public/assets dist/ && cp -r src/plugin-hyperfy/public/avatars dist/ && cp -r src/plugin-hyperfy/public/emotes dist/ && cp -r src/plugin-hyperfy/public/puppeteer dist/",

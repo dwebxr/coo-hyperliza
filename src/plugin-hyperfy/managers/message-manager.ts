@@ -7,6 +7,8 @@ import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
 import { splitChatText } from "../lib/chat-chunks";
 import { isOpenPayLink } from "../../openpay-store";
 import { runWithOrigin } from "../../usage-budget";
+import { isJapanese } from "../lib/simple-commands";
+import { type TipNotice, parseTipNotice, tipThanks } from "../lib/tip-notice";
 import moment from 'moment'
 import { uuid } from '../hyperfy/src/core/utils';
 
@@ -15,10 +17,15 @@ export interface ChatTurn {
   cancelled: boolean;
 }
 
+// Players whose language is remembered for tip thanks
+const MAX_REMEMBERED_SENDERS = 500;
+
 export class MessageManager {
   private runtime: IAgentRuntime;
   // Managers are per connection; replies from turns that started before a teardown are dropped
   private stopped = false;
+  /** Whether each player (by display name) last wrote in Japanese. */
+  private senderJapanese = new Map<string, boolean>();
   
   constructor(runtime: IAgentRuntime) {
     this.runtime = runtime;
@@ -42,9 +49,18 @@ export class MessageManager {
       const _currentWorldId = service.currentWorldId;
       console.info(`[Chat Received] From: ${senderName}, ID: ${msg.id}, Body: "${messageBody}"`)
 
+      // World notices have no sender (players cannot send one: the world sets fromId)
+      if (!msg.fromId) {
+        const agentName = world.entities.player.data?.name || this.runtime.character.name
+        const tip = parseTipNotice(messageBody, agentName)
+        if (tip) await this.thankForTip(tip, service, world)
+        return
+      }
+
       // Respond only to messages not from the agent itself
       if (msg.fromId && msg.fromId !== agentPlayerId) {
         console.info(`[Hyperfy Chat] Processing message from ${senderName}`)
+        this.rememberLanguage(senderName, messageBody)
 
         // First, ensure we register the entity (world, room, sender) in Eliza properly
         const hyperfyWorldId = createUniqueUuid(this.runtime, 'hyperfy-world') as UUID
@@ -165,6 +181,48 @@ export class MessageManager {
         console.info(`[Hyperfy Chat] Successfully emitted event for message: ${messageId}`)
       }
     }));
+  }
+
+  private rememberLanguage(name: string, text: string) {
+    this.senderJapanese.delete(name)
+    this.senderJapanese.set(name, isJapanese(text))
+    if (this.senderJapanese.size > MAX_REMEMBERED_SENDERS) {
+      this.senderJapanese.delete(this.senderJapanese.keys().next().value)
+    }
+  }
+
+  /** Thanks a player for a tip without a model call: turns to them, says thanks, remembers it. */
+  private async thankForTip(tip: TipNotice, service: HyperfyService, world: any) {
+    if (this.stopped || service.getWorld() !== world) return
+    logger.info(`[Tips] ${tip.fromName} tipped ${tip.amount} ${tip.token}`)
+    // JPYC tippers are most likely Japanese speakers
+    const text = tipThanks(tip, this.senderJapanese.get(tip.fromName) ?? true)
+
+    const selfId = world.entities.player?.data?.id
+    for (const [id, entity] of world.entities.items?.entries?.() ?? []) {
+      if (id !== selfId && entity?.data?.type === 'player' && entity.data.name === tip.fromName) {
+        world.controls?.faceEntity?.(id)?.catch?.(() => {})
+        break
+      }
+    }
+    const emotes = service.getEmoteManager()
+    if (emotes?.hasEmote?.('waving both hands')) emotes.playEmote('waving both hands')
+
+    this.sendMessage(text)
+    await service.getVoiceManager()?.speak(text)
+    await this.runtime.createMemory({
+      id: createUniqueUuid(this.runtime, `tip-thanks-${Date.now()}`),
+      entityId: this.runtime.agentId,
+      agentId: this.runtime.agentId,
+      roomId: createUniqueUuid(this.runtime, service.currentWorldId || 'hyperfy-unknown-world'),
+      content: {
+        text,
+        thought: `${tip.fromName} tipped me ${tip.amount} ${tip.token}.`,
+        source: 'hyperfy',
+        channelType: ChannelType.WORLD,
+      },
+      createdAt: Date.now(),
+    }, 'messages')
   }
 
   /**

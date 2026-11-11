@@ -111,6 +111,8 @@ Your task is to observe, interpret, and respond to the current moment as a fully
 
 {{openpayStore}}
 
+{{hyperfyTips}}
+
 </providers>
 
 <instructions>

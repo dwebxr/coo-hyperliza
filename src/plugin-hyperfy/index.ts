@@ -22,6 +22,7 @@ import { hyperfyProvider } from './providers/world';
 import { hyperfyEmoteProvider } from './providers/emote';
 import { hyperfyActionsProvider } from './providers/actions';
 import { characterProvider } from './providers/character';
+import { hyperfyTipsProvider } from './providers/tips';
 import { hyperfyEvents } from './events';
 
 // --- Hardcoded values matching agent/index.mjs ---
@@ -83,7 +84,8 @@ export const hyperfyPlugin: Plugin = {
     hyperfyProvider,
     hyperfyEmoteProvider,
     hyperfyActionsProvider,
-    characterProvider
+    characterProvider,
+    hyperfyTipsProvider
   ],
 };
 

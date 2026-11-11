@@ -2,7 +2,8 @@ import { Packr } from 'msgpackr';
 
 /**
  * The network protocol of coo-world (github.com/dwebxr/coo-world, src/core/packets.js as of
- * 7abb25e "protocol version 2"), spoken by the agent's older engine through adaptToWorldProtocol.
+ * dbae3cf: protocol version 2 with the wallet and tip packets appended), spoken by the agent's
+ * older engine through adaptToWorldProtocol.
  *
  * The world kicks clients whose socket URL lacks `v=<PROTOCOL_VERSION>` ('outdated'), silently
  * drops client packets that are not plain msgpack, and numbers packets by their position in
@@ -13,6 +14,9 @@ export const PROTOCOL_VERSION = 2;
 
 // The world's inboundPolicy.js silently drops packets above these byte limits
 const INBOUND_BYTE_LIMITS: Record<string, number> = {
+  requestEvmNonce: 128,
+  requestEvmVerify: 8704,
+  setEvmTipReceive: 32,
   entityEvent: 64 * 1024,
   blueprintAdded: 64 * 1024,
   blueprintModified: 64 * 1024,
@@ -48,6 +52,20 @@ export const PACKET_NAMES = [
   'revokeBuilderByToken',
   'requestBuilderNonce',
   'builderNonce',
+  'walletStatus',
+  'tokenBalanceRequest',
+  'tokenBalance',
+  'requestBuilderRecheck',
+  'requestEvmNonce',
+  'evmNonce',
+  'requestEvmVerify',
+  'evmWalletStatus',
+  'revokeEvmWallet',
+  'setEvmTipReceive',
+  'requestEvmTipIntent',
+  'evmTipIntent',
+  'evmTip',
+  'evmTipStatus',
 ] as const;
 
 // What the world sends

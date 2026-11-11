@@ -83,7 +83,10 @@ class FakeWebSocket {
 describe('world protocol table', () => {
   it("numbers packets as the world does", () => {
     expect(PROTOCOL_VERSION).toBe(2);
-    expect(PACKET_NAMES).toHaveLength(26);
+    expect(PACKET_NAMES).toHaveLength(40);
+    expect(PACKET_NAMES.indexOf('requestEvmNonce')).toBe(30);
+    expect(PACKET_NAMES.indexOf('evmWalletStatus')).toBe(33);
+    expect(PACKET_NAMES.indexOf('setEvmTipReceive')).toBe(35);
     expect(PACKET_NAMES.indexOf('entityModified')).toBe(7);
     expect(PACKET_NAMES.indexOf('settingsModified')).toBe(15);
     expect(PACKET_NAMES.indexOf('kick')).toBe(18);
