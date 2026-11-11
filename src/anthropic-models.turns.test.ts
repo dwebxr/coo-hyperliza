@@ -79,6 +79,8 @@ describe('Claude requests of a turn', () => {
       );
     });
     expect(outcome).toBeInstanceOf(TurnCancelled);
+    // No request went out: what the caller reserved for it may be given back
+    expect(outcome).toMatchObject({ afterRequest: false });
     expect(api.hits).toEqual([]);
     expect(ctx.budget.snapshot(60_000).ai).toMatchObject({ calls: 0, reservedTokens: 0 });
     // Not a budget skip either: nothing was refused for lack of budget
@@ -101,6 +103,8 @@ describe('Claude requests of a turn', () => {
     // Cancelled at the start of the wait, not while the first request was in flight
     expect(ctx.slot.signal.aborted).toBe(true);
     expect(outcome).toBeInstanceOf(TurnCancelled);
+    // The first request went out
+    expect(outcome).toMatchObject({ afterRequest: true });
     expect(api.hits).toHaveLength(1);
     // The answered request stays counted; nothing was reserved for a second one
     expect(ctx.budget.snapshot(60_000).ai).toMatchObject({ calls: 1, reservedTokens: tokenReserve('You are Coo.', 'x', 2048) });
@@ -123,6 +127,7 @@ describe('Claude requests of a turn', () => {
       return pending;
     });
     expect(outcome).toBeInstanceOf(TurnCancelled);
+    expect(outcome).toMatchObject({ afterRequest: true });
     // The API saw the request closed by the client, long before the 60 s deadline
     await held[0].closed;
     expect(Date.now() - started).toBeLessThan(10_000);

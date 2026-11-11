@@ -31,6 +31,8 @@ export class WorldIdentity {
   private settingsRank: number | undefined;
   private hasAdminCode: boolean | undefined;
   private readonly players = new Map<string, PlayerIdentity>();
+  /** The agent's own player id: the snapshot's id */
+  private selfId: string | undefined;
 
   /**
    * The rank every player has at least (coo-world Settings.effectiveRank): admin when the world
@@ -48,6 +50,18 @@ export class WorldIdentity {
     return Math.max(player.rank ?? Ranks.VISITOR, this.worldRank());
   }
 
+  /**
+   * The agent's own effective rank, as for any player, and whether the world's server sent a rank
+   * for the agent's player at all (an upstream Hyperfy server does not); undefined before the
+   * snapshot has named and listed it.
+   */
+  ownRank(): { rank: number; reported: boolean } | undefined {
+    if (this.selfId === undefined) return undefined;
+    const player = this.players.get(this.selfId);
+    if (!player) return undefined;
+    return { rank: this.effectiveRank(this.selfId)!, reported: player.rank !== undefined };
+  }
+
   /** The account id the server gave a present player, if it sent one. */
   userIdOf(playerId: string): string | undefined {
     return this.players.get(playerId)?.userId;
@@ -56,6 +70,7 @@ export class WorldIdentity {
   onSnapshot(data: unknown): void {
     if (!isData(data)) return;
     this.players.clear();
+    this.selfId = typeof data.id === 'string' ? data.id : undefined;
     this.hasAdminCode = typeof data.hasAdminCode === 'boolean' ? data.hasAdminCode : undefined;
     this.settingsRank = isData(data.settings) ? rankOf(data.settings.rank) : undefined;
     if (Array.isArray(data.entities)) for (const entity of data.entities) this.onEntityAdded(entity);

@@ -174,8 +174,14 @@ describe('activating the sandbox', () => {
     expect(() => createScriptCompartment({})).toThrow('after the sandbox has been activated');
   });
 
-  // (A test of its own: an activation asked for in the same turn in which the one before it ended
-  // is handed that one's result, and its own self-test does not run)
+  it('runs again when asked after a failure, also when asked as the failed result arrives', async () => {
+    const selfTest = vi.fn((): ProbeResult[] => []);
+    const deps = { guardErrorEvents: () => null, lockdown: () => {}, selfTest, log: log() };
+    const again = await activateScriptSandbox(deps).then(() => activateScriptSandbox(deps));
+    expect(again).toBe(false);
+    expect(selfTest).toHaveBeenCalledTimes(2);
+  });
+
   it('refuses when the self-test runs no checks', async () => {
     const out = log();
     const selfTest = vi.fn(() => []);

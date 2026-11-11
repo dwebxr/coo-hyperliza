@@ -155,6 +155,16 @@ describe('AgentLiveKit joins that come to nothing', () => {
     // The room that could not be joined is not kept: there is nothing to play into
     await expect(livekit.publishAudioStream(Buffer.from([0xff, 0xfb, 0x90, 0x00, 0, 0]))).resolves.toEqual({ played: 'none', reason: 'not connected to a voice room' });
   });
+
+  it('never rejects when something before the connection throws (the voice server check, the native room): it says so once', async () => {
+    rooms.length = 0;
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const world = {};
+    installWorldNet(world, { voiceUrlProblem: async () => { throw new Error('lookup failed'); } } as never);
+    await expect(new AgentLiveKit(world).deserialize(opts)).resolves.toBeUndefined();
+    expect(error.mock.calls.map((call) => call.join(' '))).toEqual(['[LiveKit] Voice chat off: joining the voice room failed: lookup failed']);
+    expect(rooms).toHaveLength(0);
+  });
 });
 
 describe('AgentLiveKit and the voice server the world names', () => {
@@ -536,6 +546,25 @@ describe('AgentLiveKit and the audio of other participants', () => {
     await subscribed({ kind: 2, sid: 'TR_video', frames: video }, {}, { identity: 'bob' });
     expect(video).not.toHaveBeenCalled();
     expect(heard).toHaveLength(2);
+  });
+
+  it('goes on with the frames when a listener throws on one, saying so once for the track; a stream that fails ends there, said once, without rejecting', async () => {
+    const { livekit, heard, subscribed } = await listening();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    (livekit as any).on('audio', () => {
+      throw new Error('handler broke');
+    });
+    const frame = { data: new Int16Array([1, 2]) };
+    await expect(subscribed({ kind: 1, sid: 'TR_alice', async *frames() { yield frame; yield frame; yield frame; } }, {}, { identity: 'alice' })).resolves.toBeUndefined();
+    // The listener before the throwing one heard every frame
+    expect(heard).toHaveLength(3);
+    expect(error.mock.calls.map((call) => call.join(' '))).toEqual(['[LiveKit] Handling the audio of alice failed (further failures on this track are not logged): handler broke']);
+    error.mockClear();
+    await expect(subscribed({ kind: 1, sid: 'TR_bob', async *frames() { yield frame; throw new Error('stream broke'); } }, {}, { identity: 'bob' })).resolves.toBeUndefined();
+    expect(error.mock.calls.map((call) => call.join(' '))).toEqual([
+      '[LiveKit] Handling the audio of bob failed (further failures on this track are not logged): handler broke',
+      '[LiveKit] The audio track of bob ended with an error: stream broke',
+    ]);
   });
 
   it('emits no frame of a room that was left, also when its track goes on yielding', async () => {

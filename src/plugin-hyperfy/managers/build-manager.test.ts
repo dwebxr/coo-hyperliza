@@ -624,6 +624,27 @@ describe('BuildManager imports through the real upload helper', () => {
   });
 });
 
+describe('BuildManager uploads', () => {
+  it('clears its upload deadline when the upload ends, done or failed: no 30 s timer is left behind', async () => {
+    const { guard, world, manager } = setup();
+    const model = () => new File([new Uint8Array([1, 2, 3, 4])], 'thing.glb');
+    const placed = { position: [0, 0, 0], quaternion: [0, 0, 0, 1] };
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      world.network.upload = vi.fn(async () => {});
+      await expect(manager.addModel(guard, model(), placed)).resolves.toEqual({ outcome: 'applied' });
+      expect(vi.getTimerCount()).toBe(0);
+      world.network.upload = vi.fn(async () => {
+        throw new Error('refused by the world');
+      });
+      await expect(manager.addModel(guard, model(), placed)).rejects.toThrow('refused by the world');
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe('BuildManager and packets the world would drop', () => {
   /** setup() with the real protocol adapter on its network, and the engine's add-and-announce */
   function announcing() {
@@ -651,31 +672,86 @@ describe('BuildManager and packets the world would drop', () => {
     expect(frames).toHaveLength(2);
   });
 
-  it("fails a duplicate whose blueprint the world's scan would refuse (nested too deep, or too many values once shared ones are written out), and changes nothing", async () => {
+  it("fails a duplicate whose blueprint the world would refuse (nested too deep, or too many values once shared ones are written out), and changes nothing", async () => {
     const { manager, guard, entity, world, frames } = announcing();
-    // The review's props: 33 nested objects, a 229-byte packet
+    // The review's props: 33 nested objects, a 229-byte packet (the world's blueprint policy takes 16 levels)
     let deep: unknown = null;
     for (let i = 0; i < 33; i++) deep = { a: deep };
     Object.assign(entity.blueprint, { unique: true, name: 'Deep', model: 'asset://box.glb', props: deep });
-    await expect(manager.duplicate(guard, 'box')).resolves.toEqual({ outcome: 'failed', reason: 'the blueprintAdded packet nests deeper than the 32 levels the world accepts' });
-    // One list held at both places of each level: a million values once the packer writes it out
-    let shared: unknown = [0];
-    for (let i = 0; i < 20; i++) shared = [shared, shared];
-    (entity.blueprint as Record<string, unknown>).props = { shared };
-    await expect(manager.duplicate(guard, 'box')).resolves.toEqual({ outcome: 'failed', reason: 'the blueprintAdded packet holds more than the 8192 values the world accepts' });
+    await expect(manager.duplicate(guard, 'box')).resolves.toEqual({ outcome: 'failed', reason: 'the world would refuse the blueprint: its props nests deeper than 16 levels' });
+    // One list of 100 held 100 times: 10,000 values once it is written out
+    const leaf = new Array(100).fill(0);
+    (entity.blueprint as Record<string, unknown>).props = { shared: new Array(100).fill(leaf) };
+    await expect(manager.duplicate(guard, 'box')).resolves.toEqual({ outcome: 'failed', reason: 'the world would refuse the blueprint: its props holds more than 8192 values and keys' });
     expect([world.blueprints.add.mock.calls.length, world.entities.add.mock.calls.length, frames.length]).toEqual([0, 0, 0]);
   });
   it('fails the import of a .hyp whose blueprint is over what the world takes in one packet, and adds nothing', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const { manager, guard, world, frames, answer } = announcing();
+    const { manager, guard, world, frames, requests } = announcing();
     const header = new TextEncoder().encode(JSON.stringify({ blueprint: { name: 'Big', props: { notes: 'x'.repeat(70 * 1024) } }, assets: [{ type: 'model', url: 'asset://thing.glb', size: 4, mime: 'model/gltf-binary' }] }));
     const bytes = new Uint8Array(4 + header.length + 4);
     new DataView(bytes.buffer).setUint32(0, header.length, true);
     bytes.set(header, 4);
     bytes.set([9, 9, 9, 9], 4 + header.length);
-    const importing = manager.addApp(guard, new File([bytes], 'big.hyp'), { position: [0, 0, 0], quaternion: [0, 0, 0, 1] });
+    // Refused before anything is uploaded
+    await expect(manager.addApp(guard, new File([bytes], 'big.hyp'), { position: [0, 0, 0], quaternion: [0, 0, 0, 1] })).resolves.toEqual({ outcome: 'failed', reason: expect.stringContaining('the blueprintAdded packet would be') });
+    expect([world.blueprints.add.mock.calls.length, world.entities.add.mock.calls.length, frames.length, requests.length]).toEqual([0, 0, 0, 0]);
+  });
+});
+
+describe("BuildManager and coo-world's blueprint and app policies (lib/world-add-policy.ts)", () => {
+  /** A .hyp whose blueprint is `blueprint` */
+  const hypOf = (blueprint: Record<string, unknown>) => {
+    const header = new TextEncoder().encode(JSON.stringify({ blueprint, assets: [{ type: 'model', url: 'asset://thing.glb', size: 4, mime: 'model/gltf-binary' }] }));
+    const out = new Uint8Array(4 + header.length + 4);
+    new DataView(out.buffer).setUint32(0, header.length, true);
+    out.set(header, 4);
+    out.set([9, 9, 9, 9], 4 + header.length);
+    return new File([out], 'thing.hyp');
+  };
+  const nested = (levels: number): unknown => (levels === 0 ? null : { a: nested(levels - 1) });
+  const placed = { position: [0, 0, 0], quaternion: [0, 0, 0, 1] };
+
+  it.each([
+    ['props nested 17 levels (the review)', { name: 'Deep', model: 'asset://thing.glb', props: nested(17) }, 'the world would refuse the blueprint: its props nests deeper than 16 levels'],
+    ['props that are an array (the review)', { name: 'List', model: 'asset://thing.glb', props: [1, 2, 3] }, 'the world would refuse the blueprint: its props is not an object'],
+    ['a script that is no asset or http(s) URL', { name: 'S', model: 'asset://thing.glb', script: 'javascript:alert(1)' }, 'the world would refuse the blueprint: its script names a file that is not an asset or an http(s) URL'],
+    ['an image whose url is a path', { name: 'I', model: 'asset://thing.glb', image: { url: '../x.png' } }, 'the world would refuse the blueprint: its image names a file that is not an asset or an http(s) URL'],
+    ['a flag that is not true or false', { name: 'F', model: 'asset://thing.glb', preload: 'yes' }, 'the world would refuse the blueprint: its preload is not true or false'],
+  ])('fails a .hyp import with %s before anything is uploaded or added', async (_what, blueprint, reason) => {
+    const { manager, guard, world } = setup();
+    // (an upload that answers at once: an import that went on to it would not wait)
+    world.network.upload = vi.fn(async () => {});
+    await expect(manager.addApp(guard, hypOf(blueprint), placed)).resolves.toEqual({ outcome: 'failed', reason });
+    expect(world.network.upload).not.toHaveBeenCalled();
+    expect([world.blueprints.add.mock.calls.length, world.entities.add.mock.calls.length]).toEqual([0, 0]);
+  });
+
+  it('adds and announces what the world would store: props one level within the limit, a name cut to 256 characters, unknown fields left out', async () => {
+    const { manager, guard, world, answer } = setup();
+    const importing = manager.addApp(guard, hypOf({ name: 'n'.repeat(300), model: 'asset://thing.glb', props: { deep: nested(14), gone: undefined }, mystery: 1 }), placed);
     await answer(0, 200, { exists: true });
-    await expect(importing).resolves.toEqual({ outcome: 'failed', reason: expect.stringContaining('the blueprintAdded packet would be') });
-    expect([world.blueprints.add.mock.calls.length, world.entities.add.mock.calls.length, frames.length]).toEqual([0, 0, 0]);
+    await expect(importing).resolves.toEqual({ outcome: 'applied' });
+    const [[blueprint]] = world.blueprints.add.mock.calls;
+    expect(blueprint.name).toBe('n'.repeat(256));
+    expect(blueprint).not.toHaveProperty('mystery');
+    expect(blueprint.props).toEqual({ deep: nested(14) });
+    const [[app]] = world.entities.add.mock.calls;
+    expect(app).toEqual({ id: expect.stringMatching(/^[A-Za-z0-9_-]{10}$/), type: 'app', blueprint: blueprint.id, position: [0, 0, 0], quaternion: [0, 0, 0, 1], scale: [1, 1, 1], mover: null, uploader: 'coo', pinned: false, state: {} });
+  });
+
+  it("fails a duplicate of an app whose blueprint the world does not hold (the world's app policy), and adds nothing", async () => {
+    const { manager, guard, world } = setup();
+    world.blueprints.get = () => undefined;
+    await expect(manager.duplicate(guard, 'box')).resolves.toEqual({ outcome: 'failed', reason: 'the world would refuse the app: its blueprint does not exist' });
+    expect(world.entities.add).not.toHaveBeenCalled();
+  });
+
+  it('fails a model import whose app the world would refuse before uploading it', async () => {
+    const { manager, guard, world, effects } = setup();
+    world.assetsUrl = 'ftp://world.test/assets';
+    await expect(manager.addModel(guard, new File([glb], 'thing.glb'), placed)).resolves.toEqual({ outcome: 'failed', reason: 'the world would refuse the blueprint: its model names a file that is not an asset or an http(s) URL' });
+    expect(world.network.upload).not.toHaveBeenCalled();
+    expect(effects().requests).toEqual([]);
   });
 });

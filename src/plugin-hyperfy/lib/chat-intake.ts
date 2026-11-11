@@ -1,9 +1,10 @@
 /**
  * Chat as it comes off the network, made safe to keep and bounded before it costs anything.
  *
- * readChatMessage is the only way a message from the world gets into the local chat history: a
- * new object with exactly the five fields below, or null (lib/world-chat.ts calls it for every
- * chatAdded packet and every element of the snapshot's history).
+ * readChatMessage is the only way a message the world's server sends gets into the local chat
+ * history: a new object with exactly the five fields below, or null (lib/world-chat.ts calls it for
+ * every chatAdded packet and each of the last 50 elements of the snapshot's history; what app
+ * scripts and the agent add locally is not read here).
  *
  * ChatIntake is the conversation queue of one connection. It turns what players say to the agent
  * into turns, one at a time, in the order it arrived: the live chat messages as they came off the
@@ -19,8 +20,9 @@
  *   first) and CHAT_QUEUE_MAX in all (dropped from whoever has the most waiting).
  * What it does not bound: how long one turn takes within its slot, and what a sender who rotates
  * ids does on a world that lets clients choose their own (upstream Hyperfy; coo-world sets the
- * sender id itself). Each new id of such a sender gets one message once the sender table is full,
- * and a full queue turns its newest message away before anyone's earlier one.
+ * sender id itself). Each new id of such a sender gets one message once the sender table is full;
+ * a full queue first drops the oldest of whoever has several waiting, and turns the newest message
+ * away once everyone waiting has one.
  */
 
 import { RateLimitedLog } from './rate-limited-log';
@@ -55,7 +57,8 @@ const isId = (value: unknown): value is string =>
 
 /**
  * The chat message in `raw`, or null when it is not one: not an object, no usable id, a body that
- * is not text or has nothing visible in it, or a sender id / name of the wrong type. The body is
+ * is not text or has nothing visible in it, a sender id that is not a usable id, or a name that is
+ * not text. The body is
  * one line of at most CHAT_BODY_MAX_CODE_POINTS code points (control characters and line breaks
  * become spaces); the name is at most CHAT_NAME_MAX_CODE_POINTS code points with nothing invisible.
  */
@@ -107,7 +110,8 @@ export const CHAT_SENDER_WAITING_MAX = CHAT_SENDER_BURST;
 // most 3 tips at once and then one every 3 s, plus a private notice per throttled tip.
 export const CHAT_NOTICE_BURST = 10;
 export const CHAT_NOTICE_REFILL_MS = 1_000;
-// More than a world's player limit. A sender that is not in the table starts with a full bucket
+// More senders than a world usually holds (its player limit is its own setting, none by default).
+// A sender that is not in the table starts with a full bucket
 // while the table has room, and with CHAT_NEWCOMER_TOKENS once it is full: forgetting a sender
 // by cycling 256 other ids gives it one message back, not a new burst.
 export const CHAT_TRACKED_SENDERS = 256;
@@ -325,7 +329,7 @@ export class ChatIntake {
     });
   }
 
-  /** Resolves once nothing is being handled and nothing waits. */
+  /** Resolves once no turn is in progress and nothing waits (a handler whose turn was cancelled may still be running). */
   async idle(): Promise<void> {
     while (this.#draining) await this.#draining;
   }

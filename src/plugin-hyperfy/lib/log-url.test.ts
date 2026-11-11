@@ -8,6 +8,8 @@ describe('describeUrl', () => {
     ['a signed query', 'https://bucket.example.com/a.glb?X-Amz-Credential=AKIA123&X-Amz-Signature=deadbeef', 'https://bucket.example.com/a.glb?X-Amz-Credential=…&X-Amz-Signature=…'],
     ['a fragment', 'https://cdn.example.com/a.glb#token=secret', 'https://cdn.example.com/a.glb'],
     ['a port and a websocket scheme', 'wss://lk.example.com:7880/rtc?access_token=secret', 'wss://lk.example.com:7880/rtc?access_token=…'],
+    ['a bare signature as the query', 'https://cdn.example.com/a.glb?deadbeefsignature', 'https://cdn.example.com/a.glb?…'],
+    ['a bare signature among named parts', 'https://cdn.example.com/a.glb?v=2&deadbeef&x=1', 'https://cdn.example.com/a.glb?v=…&x=…&…'],
     ['an asset URL', 'asset://abc.glb', 'asset://abc.glb'],
     ['a bundled path with a query', '/emotes/wave.glb?v=secret', '/emotes/wave.glb?…'],
     ['a path with a fragment', 'avatar.vrm#secret', 'avatar.vrm'],

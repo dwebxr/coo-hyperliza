@@ -4,7 +4,7 @@ import { isNumber, isString } from 'lodash-es'
 import { System } from '../hyperfy/src/core/systems/System.js'
 import * as THREE from 'three';
 import { PuppeteerManager } from "../managers/puppeteer-manager.js";
-import { ASSET_BYTE_CAPS, type AssetBytes, fetchAssetBytes } from '../lib/asset-bytes';
+import { ASSET_BYTE_CAPS, type AssetBytes, assetKey, fetchAssetBytes } from '../lib/asset-bytes';
 import { assetMemory, workBytes } from '../lib/asset-memory';
 import { describeUrl } from '../lib/log-url';
 import { PageWork } from '../lib/page-work';
@@ -140,7 +140,7 @@ export class AgentEnvironment extends System {
    */
   private async toPage<T>(url: string, kind: 'image' | 'hdr', signal: AbortSignal, pageCall: (asset: AssetBytes) => Promise<T>): Promise<{ asset: AssetBytes; result: T } | null> {
     const work: PageWork = this.world.loader?.pageWork ?? this.ownPageWork
-    const key = `${kind}/${url}`
+    const key = assetKey(kind, url)
     const refused = work.refusal(key)
     if (refused) throw new Error(`[Environment] Not handing the ${kind} ${describeUrl(url)} to the render page again: ${refused}`)
     const lease = await assetMemory.download(ASSET_BYTE_CAPS[kind], signal)

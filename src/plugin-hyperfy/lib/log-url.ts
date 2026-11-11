@@ -1,11 +1,11 @@
 /**
  * The one way a URL is written into a log line or an error message (which can reach chat): scheme,
  * host and path, with no user name or password, no query values (the names stay; a query part
- * without "=" counts as a name and is written), no fragment, and at most MAX_LOGGED_URL characters in all (a note of the full length included when it is cut). A
- * data: URL keeps its media type only. Text that does not parse but has a scheme, a user part or an
+ * without "=" is taken for a value: only "…" says that there was one), no fragment, and at most
+ * MAX_LOGGED_URL characters in all (a note of the full length included when it is cut). A data:
+ * URL keeps its media type only. Text that does not parse but has a scheme, a user part or an
  * authority, a URL of any other scheme, and a blob: inside a blob:, keep only their length. Signed
- * URLs carry their signature in the query and credentials in the user part: the user part is never
- * written, a signature only when it stands in the query without a name.
+ * URLs carry their signature in the query and credentials in the user part: neither is written.
  */
 
 export const MAX_LOGGED_URL = 200;
@@ -18,13 +18,12 @@ function cap(text: string, length: number): string {
   return `${text.slice(0, MAX_LOGGED_URL - note.length)}${note}`;
 }
 
+/** The names of a query's parts; a part without "=" is a value (a bare signature) and is not written */
 function queryNames(search: string): string {
   if (!search) return '';
-  const names = search
-    .slice(1)
-    .split('&')
-    .filter(Boolean)
-    .map((pair) => `${pair.split('=')[0]}=…`);
+  const parts = search.slice(1).split('&').filter(Boolean);
+  const names = parts.filter((part) => part.includes('=')).map((pair) => `${pair.split('=')[0]}=…`);
+  if (names.length < parts.length) names.push('…');
   return names.length ? `?${names.join('&')}` : '';
 }
 

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { hyperfyScenePerceptionAction } from './perception';
 import { serviceFor, sessionFor, sessionRuntime } from '../test-support/session';
 import { UsageBudget, resetUsageBudget } from '../../usage-budget';
+import { TurnCancelled } from '../lib/turn-context';
 
 /*
  * The real look action over a real session: the walk to the entity ends as `outcome`, with the
@@ -99,6 +100,17 @@ describe('the look at an entity, after the walk there', () => {
     expect(visionUsed()).toBe(0);
     expect(result).toMatchObject({ success: false });
     expect(callback).toHaveBeenCalledWith(expect.objectContaining({ text: "I couldn't take a look at treasure chest: it isn't there any more." }));
+  });
+
+  it.each([
+    ['before its request went out: the look is given back', false, 0],
+    ['while its request was in flight: the look stays counted', true, 1],
+  ])('ends with a cancelled turn when the vision call is cancelled %s', async (_what, afterRequest, counted) => {
+    const { run, runtime, visionUsed } = looking('arrived', 2);
+    const cancelled = new TurnCancelled('its slot ran out', afterRequest);
+    runtime.useModel.mockRejectedValue(cancelled);
+    await expect(run()).rejects.toBe(cancelled);
+    expect(visionUsed()).toBe(counted);
   });
 
   it('judges a walk that did not arrive by where the entity is now, and takes the picture toward it there', async () => {

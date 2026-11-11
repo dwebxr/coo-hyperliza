@@ -90,20 +90,47 @@ describe('HYPERFY_EDIT_ENTITY', () => {
     }
   });
 
-  it('on an upstream world, runs only for HYPERFY_OPERATOR_IDS', async () => {
+  it('on an upstream world, refuses everyone, HYPERFY_OPERATOR_IDS included: the world does not say whether the agent itself may build', async () => {
     const upstream = () => worldFromSnapshot(upstreamSnapshot({ players: [{ id: 'p-admin', name: 'Root', roles: ['admin'] }] }), { controls: {} });
     const refused = editSetup(upstream());
-    expect((await inChatTurn(refused.world, () => run(refused.runtime, refused.recorded, 'HYPERFY_EDIT_ENTITY'), 'p-admin')).actionStatus).toBe('failed');
+    expect((await inChatTurn(refused.world, () => run(refused.runtime, refused.recorded, 'HYPERFY_EDIT_ENTITY'), 'p-admin')).actionResult.error).toBe('the requester is not a builder in this world');
     expect(refused.useModel).not.toHaveBeenCalled();
 
-    vi.stubEnv('HYPERFY_OPERATOR_IDS', 'p-admin');
+    vi.stubEnv('HYPERFY_OPERATOR_IDS', 'p-admin,coo-agent');
     const listed = editSetup(upstream());
-    expect((await inChatTurn(listed.world, () => run(listed.runtime, listed.recorded, 'HYPERFY_EDIT_ENTITY'), 'p-admin')).actionStatus).toBe('completed');
-    expect(listed.buildManager.translate).toHaveBeenCalled();
+    const stored = await inChatTurn(listed.world, () => run(listed.runtime, listed.recorded, 'HYPERFY_EDIT_ENTITY'), 'p-admin');
+    expect(stored.actionResult.error).toBe("the world's server does not say whether the agent's own player may build");
+    expect(listed.useModel).not.toHaveBeenCalled();
+    expect(listed.buildManager.translate).not.toHaveBeenCalled();
+    expect(listed.recorded.callbacks.map((c) => c.text)).toEqual(["I can't build in this world: it doesn't tell me whether I'm allowed to."]);
+  });
+
+  it("refuses a builder's request before any model call when the agent's own account is a visitor in the world, says so once in the log, and tells them", async () => {
+    const visitorAgent = (extra: Record<string, unknown> = {}) =>
+      worldFromSnapshot(cooWorldSnapshot({ selfRank: 0, players: [{ id: 'builder-1', name: 'Bob', rank: 1 }], ...extra }), { controls: {} });
+    const warn = vi.spyOn(logger, 'warn');
+    const { world, buildManager, runtime, recorded, useModel } = editSetup(visitorAgent());
+    const stored = await inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_EDIT_ENTITY'), 'builder-1');
+    expect(stored.actionResult.error).toBe("the agent's own player is not a builder in this world");
+    expect(useModel).not.toHaveBeenCalled();
+    expect(buildManager.translate).not.toHaveBeenCalled();
+    expect(recorded.callbacks.map((c) => c.text)).toEqual(["I'm not allowed to build in this world."]);
+    expect(warn.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('EDIT_ENTITY'))).toEqual(["[EDIT_ENTITY Action] Refused: the agent's own player is not a builder in this world"]);
+    // In Japanese to a Japanese request
+    const ja = editSetup(visitorAgent());
+    await inChatTurn(ja.world, () => run(ja.runtime, ja.recorded, 'HYPERFY_EDIT_ENTITY', { message: { content: { text: '箱を動かして', source: 'hyperfy' } } }), 'builder-1');
+    expect(ja.recorded.callbacks.map((c) => c.text)).toEqual(['このワールドでは、私には編集の権限がありません。']);
+    // HYPERFY_OPERATOR_IDS gives the agent no rights on the world's server, even when it names the agent
+    vi.stubEnv('HYPERFY_OPERATOR_IDS', 'builder-1,coo-agent');
+    const listed = editSetup(visitorAgent());
+    expect((await inChatTurn(listed.world, () => run(listed.runtime, listed.recorded, 'HYPERFY_EDIT_ENTITY'), 'builder-1')).actionResult.error).toBe("the agent's own player is not a builder in this world");
+    // A world whose rank makes every player a builder makes the agent one too (the effective rank)
+    const everyone = editSetup(visitorAgent({ worldRank: 1 }));
+    expect((await inChatTurn(everyone.world, () => run(everyone.runtime, everyone.recorded, 'HYPERFY_EDIT_ENTITY'), 'builder-1')).actionStatus).toBe('completed');
   });
 
   it('stops at the first budget error or model refusal, which propagate out of processActions', async () => {
-    for (const error of [new AiBudgetExceededError('AI_MAX_CALLS_PER_HOUR=1'), new AnthropicRefusalError('m', 'cyber')]) {
+    for (const error of [new AiBudgetExceededError('AI_MAX_CALLS_PER_HOUR=1'), new AnthropicRefusalError('m', 'cyber'), new TurnCancelled('its slot ran out')]) {
       const { world, buildManager, runtime, recorded, useModel } = editSetup(coo(), {
         [ModelType.OBJECT_LARGE]: () => {
           throw error;
@@ -114,6 +141,18 @@ describe('HYPERFY_EDIT_ENTITY', () => {
       expect(useModel).toHaveBeenCalledTimes(1);
       expect(buildManager.translate).not.toHaveBeenCalled();
     }
+  });
+
+  it('ends the plan with a cancelled turn when the summary call is cancelled: the edits stand, nothing more is said', async () => {
+    const cancelled = new TurnCancelled('its slot ran out', true);
+    const { world, buildManager, runtime, recorded } = editSetup(coo(), {
+      [ModelType.OBJECT_LARGE]: { operations: plan },
+      [ModelType.TEXT_SMALL]: () => {
+        throw cancelled;
+      },
+    });
+    await expect(inChatTurn(world, () => run(runtime, recorded, 'HYPERFY_EDIT_ENTITY'), 'builder-1')).rejects.toBe(cancelled);
+    expect(buildManager.translate).toHaveBeenCalledTimes(1);
   });
 
   it('still retries other model errors', async () => {
@@ -249,8 +288,10 @@ describe('outside any turn', () => {
 });
 
 describe('budget errors from actions', () => {
-  it('propagate out of processActions from the item extraction', async () => {
-    const error = new AiBudgetExceededError('AI_MAX_TOKENS_PER_DAY=1');
+  it.each([
+    ['a budget error', new AiBudgetExceededError('AI_MAX_TOKENS_PER_DAY=1')],
+    ['a cancelled turn', new TurnCancelled('its slot ran out')],
+  ])('propagate out of processActions from the item extraction: %s', async (_what, error) => {
     const world = { controls: {}, actions: {}, entities: { items: new Map() } };
     const { runtime, recorded } = createRuntime({
       service: connectedService(world),
@@ -362,6 +403,20 @@ describe('a scene edit that loses its authorization while it runs', () => {
     expect(ctx.sendMessage).not.toHaveBeenCalled();
     // No summary call for a stopped edit
     expect(ctx.useModel.mock.calls.map(([type]) => type)).toEqual([ModelType.OBJECT_LARGE]);
+  });
+
+  it("changes nothing when the agent's own account was demoted during the planner call", async () => {
+    const ctx = liveEdit(plan, {
+      [ModelType.OBJECT_LARGE]: () => {
+        ctx.first.world.network.onEntityModified({ id: 'coo-agent', rank: 0 });
+        return { operations: plan };
+      },
+    });
+    const stored = await ctx.edit();
+    expect(stored.actionResult.error).toBe("stopped: the agent's own player is not a builder in this world");
+    expect(ctx.first.world.controls.goto).not.toHaveBeenCalled();
+    expect(ctx.first.send).not.toHaveBeenCalled();
+    expect(ctx.first.box.root.position.toArray()).toEqual([1, 0, 1]);
   });
 
   it('changes nothing when the requester was demoted during the planner call', async () => {

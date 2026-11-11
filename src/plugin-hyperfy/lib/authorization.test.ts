@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { privateKeyToAccount } from 'viem/accounts';
 import {
+  AGENT_NOT_BUILDER,
+  AGENT_RANK_UNKNOWN,
   AUTONOMY_ACTIONS,
   actionRefusal,
+  agentBuildRefusal,
   describeSceneEditsMode,
   isBuilder,
   operatorIds,
@@ -93,6 +96,30 @@ describe('builder decisions from what a coo-world server sends', () => {
 
   it('grants nobody by rank on a world whose identity is not tracked', () => {
     expect(isBuilder({}, 'builder-1', noOperators)).toBe(false);
+  });
+});
+
+describe("the agent's own right to build", () => {
+  it('follows the effective rank of the player the snapshot names as the agent, and its changes', () => {
+    const world = worldFromSnapshot(cooWorldSnapshot({ selfRank: Ranks.VISITOR }));
+    expect(worldIdentity(world)!.ownRank()).toEqual({ rank: Ranks.VISITOR, reported: true });
+    expect(agentBuildRefusal(world)).toBe(AGENT_NOT_BUILDER);
+    world.network.onEntityModified({ id: 'coo-agent', rank: Ranks.BUILDER });
+    expect(agentBuildRefusal(world)).toBeNull();
+    world.network.onEntityModified({ id: 'coo-agent', rank: Ranks.VISITOR });
+    world.network.onSettingsModified({ key: 'rank', value: Ranks.BUILDER });
+    expect(agentBuildRefusal(world)).toBeNull();
+    // No admin code: everyone, the agent included, is an admin
+    expect(agentBuildRefusal(worldFromSnapshot(cooWorldSnapshot({ selfRank: Ranks.VISITOR, hasAdminCode: false })))).toBeNull();
+  });
+
+  it('is not known on a world that sends no rank for the agent (upstream Hyperfy), on one not tracked, or before a snapshot', () => {
+    expect(agentBuildRefusal(worldFromSnapshot(upstreamSnapshot()))).toBe(AGENT_RANK_UNKNOWN);
+    expect(agentBuildRefusal({})).toBe(AGENT_RANK_UNKNOWN);
+    const world: { network: Record<string, any> } = { network: {} };
+    trackWorldIdentity(world);
+    expect(worldIdentity(world)!.ownRank()).toBeUndefined();
+    expect(agentBuildRefusal(world)).toBe(AGENT_RANK_UNKNOWN);
   });
 });
 

@@ -7,7 +7,7 @@ import { createEmoteFactory } from "../hyperfy/src/core/extras/createEmoteFactor
 import { AgentAvatar } from "./avatar.js";
 import { PuppeteerManager } from "../managers/puppeteer-manager.js";
 import type { WorldScripts } from "../lib/script-api";
-import { ASSET_BYTE_CAPS, type AssetBytes, type AssetKind, describeUrl, fetchAssetBytes } from "../lib/asset-bytes";
+import { ASSET_BYTE_CAPS, type AssetBytes, type AssetKind, assetKey, describeUrl, fetchAssetBytes } from "../lib/asset-bytes";
 import { SafeFetchError } from "../lib/net-policy";
 import { externalUriProblem, gltfCharge, modelBudget } from "../lib/gltf-budget";
 import { type AssetLease, PARSE_COPIES, assetMemory, modelReservation, workBytes } from "../lib/asset-memory";
@@ -119,11 +119,11 @@ export class AgentLoader extends System {
   // ---------------------------
 
   has(type: string, url: unknown) {
-    const key = `${type}/${url}`;
+    const key = assetKey(type, url);
     return this.results.has(key) || this.promises.has(key);
   }
   get(type: string, url: unknown) {
-    const key = `${type}/${url}`;
+    const key = assetKey(type, url);
     const result = this.results.get(key);
     if (result !== undefined) {
       // Most recently used last
@@ -143,7 +143,7 @@ export class AgentLoader extends System {
       console.warn(`[AgentLoader] Unsupported type in load(): ${type}`);
       return Promise.resolve(null);
     }
-    const key = `${type}/${url}`;
+    const key = assetKey(type, url);
     const refused = this.pageWork.refusal(key);
     if (refused) return Promise.reject(new Error(`[AgentLoader] Not loading ${type} from ${describeUrl(url)} again: ${refused}`));
     const existing = this.promises.get(key);

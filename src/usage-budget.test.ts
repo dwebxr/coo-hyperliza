@@ -12,6 +12,7 @@ import {
   maxTokensFor,
   readUsageLimits,
   runWithOrigin,
+  startUsageReports,
   usageLimitProblems,
 } from './usage-budget';
 
@@ -112,6 +113,16 @@ describe('usageLimitProblems', () => {
       '[Usage] AI_MAX_TOKENS_SHOULD_RESPOND="-5" is not a number of 0 or more. Leave it empty for the default cap, or set a number of output tokens above 0.',
       '[Usage] USAGE_REPORT_INTERVAL_MIN="hourly" is not a number of 0 or more. Leave it empty for the default (for a limit: no limit), or set a number (0 turns that use off).',
     ]);
+  });
+
+  it('refuses a report interval longer than a day (the budget keeps 24 hours; a 32-bit timer of 35,792 minutes or more fires without pause)', () => {
+    expect(usageLimitProblems({ USAGE_REPORT_INTERVAL_MIN: '1440' })).toEqual([]);
+    for (const value of ['1441', '35792', '100000']) {
+      expect(usageLimitProblems({ USAGE_REPORT_INTERVAL_MIN: value })).toEqual([
+        `[Usage] USAGE_REPORT_INTERVAL_MIN=${value} is more than 1440 (one report a day; the agent keeps 24 hours of usage). Leave it empty for the default, or set a number from 0 (no reports) to 1440.`,
+      ]);
+    }
+    expect(() => startUsageReports({ USAGE_REPORT_INTERVAL_MIN: '35792' })).toThrow('USAGE_REPORT_INTERVAL_MIN=35792 is more than 1440');
   });
 
   it('refuses 0 for a per-purpose cap, which sets the size of a reply and is not a switch, and says so', () => {

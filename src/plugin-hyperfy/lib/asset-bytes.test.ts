@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ASSET_BYTE_CAPS, decodeDataUrl, describeUrl, fetchAssetBytes } from './asset-bytes';
+import { createHash } from 'node:crypto';
+import { ASSET_BYTE_CAPS, assetKey, dataUrlName, decodeDataUrl, describeUrl, fetchAssetBytes } from './asset-bytes';
 import { MAX_EMOTE_BYTES, MAX_IMAGE_BYTES, MAX_MODEL_BYTES, MAX_SCRIPT_BYTES, NetPolicy, installWorldNet } from './net-policy';
 import { PUBLIC_ADDRESS, closeServers, startServer, testNet } from '../test-support/net';
 import { AssetMemory } from './asset-memory';
@@ -75,6 +76,8 @@ describe('fetchAssetBytes', () => {
     expect(text(bundled.bytes.subarray(0, 10))).toBe('#?RADIANCE');
     const inline = await fetchAssetBytes(world, 'data:model/gltf-binary;base64,Z2xURg==', 'model');
     expect([text(inline.bytes), inline.contentType]).toEqual(['glTF', 'model/gltf-binary']);
+    // Named by its type and the hash of its text, not by the URL that holds the file
+    expect(inline.url).toBe(`data:model/gltf-binary;sha256=${createHash('sha256').update('data:model/gltf-binary;base64,Z2xURg==').digest('hex')}`);
     expect(server.connections).toBe(0);
   });
 
@@ -135,6 +138,21 @@ describe("fetchAssetBytes and the download's memory reservation (lib/asset-memor
     expect(inline.bytes).toBe(8);
     for (const lease of [declared, chunked, inline]) lease.release();
     expect(memory.held).toEqual({ downloads: 0, work: 0 });
+  });
+});
+
+describe('assetKey and dataUrlName', () => {
+  it('name a data: URL by its media type and the hash of its text: short, the same for the same text, different for other content', () => {
+    const long = `data:image/png;base64,${Buffer.alloc(3 * 1024 * 1024, 7).toString('base64')}`;
+    const other = `data:image/png;base64,${Buffer.alloc(3 * 1024 * 1024, 8).toString('base64')}`;
+    expect(assetKey('image', long)).toMatch(/^image\/data:image\/png;sha256=[0-9a-f]{64}$/);
+    expect(assetKey('image', long)).toBe(assetKey('image', `${long}`));
+    expect(assetKey('image', other)).not.toBe(assetKey('image', long));
+    // A media type is cut and stripped of anything unusual; other URLs are their own name
+    expect(dataUrlName(`data:${'x'.repeat(500)},a`)).toMatch(/^data:x{100};sha256=/);
+    expect(dataUrlName('DATA:Text/Plain;charset=utf-8,hi')).toMatch(/^data:text\/plain;sha256=/);
+    expect(assetKey('model', 'asset://a.glb')).toBe('model/asset://a.glb');
+    expect(dataUrlName('https://x.test/a.png')).toBeNull();
   });
 });
 

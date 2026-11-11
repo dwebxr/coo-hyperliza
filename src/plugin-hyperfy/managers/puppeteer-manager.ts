@@ -3,6 +3,7 @@ import fs from 'fs'
 import { promises as fsPromises } from 'fs';
 import puppeteer, { type Browser, type Page } from 'puppeteer'
 import { resolveUrl } from '../utils.js';
+import { dataUrlName } from '../lib/asset-bytes';
 import { ASSET_LAYOUT } from '../lib/asset-root';
 import { childEnv } from '../lib/child-env';
 import { modelBudget } from '../lib/gltf-budget';
@@ -564,8 +565,10 @@ export class PuppeteerManager {
 
   /** Keeps an image in the page as a texture and returns the id to name it by. `url` is where it came from. */
   async registerTexture(image: { bytes: Uint8Array; contentType: string; url: string }, slot: string, { signal }: { signal?: AbortSignal } = {}): Promise<string> {
-    // Only the part three's TextureLoader looks at: of a data: URL, that is what comes before the data
-    const source = image.url.startsWith('data:') ? image.url.slice(0, image.url.indexOf(',')) : image.url;
+    // Only the part three's TextureLoader looks at: of a data: URL, what comes before the data (an
+    // image from fetchAssetBytes names one by dataUrlName, which has none)
+    const comma = image.url.startsWith('data:') ? image.url.indexOf(',') : -1;
+    const source = comma === -1 ? image.url : image.url.slice(0, comma);
     return this.pageCall(
       signal,
       (page, op) =>
@@ -608,7 +611,9 @@ export class PuppeteerManager {
       Array.from(world.entities.players.entries())
         .filter(([_, value]) => value.data.id !== agentId)
         .map(async ([key, value]) => {
-          const avatarUrl = await resolveUrl(value.avatarUrl, world);
+          const resolved = await resolveUrl(value.avatarUrl, world);
+          // The key the avatar was put into the page under (loadVRMBytes gets it from fetchAssetBytes)
+          const avatarUrl = typeof resolved === 'string' ? (dataUrlName(resolved) ?? resolved) : resolved;
           const { x, y, z, w } = value.base.quaternion;
           return {
             id: key,

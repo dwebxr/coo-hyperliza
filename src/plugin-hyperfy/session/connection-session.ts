@@ -47,9 +47,20 @@ export interface SessionParts {
 export interface SessionEvents {
   /** The agent's player spawned: a real session with the world is established. */
   onEstablished?(session: ConnectionSession): void
-  /** The world's socket closed. `kickCode`: the kick the server sent before it, if it was read. */
+  /**
+   * The world's socket closed, or the agent cannot join the world it reached (its snapshot could
+   * not be read, or none came: see SNAPSHOT_DEADLINE_MS). `kickCode`: the kick the server sent
+   * before it, if it was read.
+   */
   onDisconnect?(session: ConnectionSession, reason: unknown, kickCode: string | null): void
 }
+
+/**
+ * How long a connection may go without the agent's player spawning (the snapshot read and applied)
+ * before it is given up as one the agent cannot join: a snapshot of the largest frame comes in
+ * well within this over any usable link.
+ */
+export const SNAPSHOT_DEADLINE_MS = 60_000
 
 let lastGeneration = 0
 const sessions = new WeakMap<object, ConnectionSession>()
@@ -60,7 +71,8 @@ const sessions = new WeakMap<object, ConnectionSession>()
  * the signal that fires when it ends. A session is ended exactly once (a disconnect, a kick, a new
  * connection replacing it, the service stopping); from that moment its signal has fired, so every
  * turn that started on it may no longer act, and nothing of it runs on: no timer, no listener, no
- * navigation, no queued message.
+ * navigation, no queued message (a speech request already sent to its provider is not aborted;
+ * its result is dropped).
  *
  * What a session does not own is process-wide and outlives it: the Chromium render page
  * (managers/puppeteer-manager.ts; the session gives its page back when it ends), the usage budget,
@@ -104,6 +116,12 @@ export class ConnectionSession {
    */
   private readonly stops = new WeakMap<object, 'stopped' | 'claimed' | 'discarded'>()
   private started = false
+  /** The agent's player spawned on this connection: the world's snapshot was read and applied */
+  private established = false
+  private events: SessionEvents = {}
+  /** cannotJoin has given this connection up */
+  private joinRefused = false
+  private snapshotTimer: NodeJS.Timeout | null = null
   private init: ((authToken?: string) => Promise<void>) | null = null
 
   constructor({ runtime, world, worldId, wsUrl, tipWallet = null, renderPage = null }: SessionParts) {
@@ -160,6 +178,8 @@ export class ConnectionSession {
   private watch(agentWorld: AgentWorld, events: SessionEvents): void {
     const world = this.world
     this.init = agentWorld.init
+    this.events = events
+    agentWorld.protocol.onUnreadableBeforeSnapshot?.((why) => this.cannotJoin(`its snapshot could not be read (${why})`))
     // Nothing is uploaded to the world for a connection that has ended, whoever asks (the avatar
     // and emotes of this session, a scene edit): checked before each request of an upload
     const upload: (file: File, options?: UploadOptions) => Promise<unknown> = world.network.upload
@@ -183,9 +203,29 @@ export class ConnectionSession {
     // The local player only spawns after a real session is established.
     this.listen(world, 'player', () => {
       if (this.ended) return
+      this.established = true
+      this.clearSnapshotTimer()
       events.onEstablished?.(this)
       this.tipWallet?.begin()
     })
+  }
+
+  /**
+   * Gives up a connection whose world the agent cannot join (said once, at error level, with why),
+   * as the service gives up one whose socket closed: it is ended and tried again with the usual
+   * backoff (service.ts). Nothing after the player spawned counts here.
+   */
+  private cannotJoin(why: string): void {
+    if (this.ended || this.established || this.joinRefused) return
+    this.joinRefused = true
+    this.clearSnapshotTimer()
+    console.error(`[Hyperfy] Cannot join this world: ${why}. Leaving the connection; the agent tries again with the usual backoff.`)
+    this.events.onDisconnect?.(this, `the agent could not join: ${why}`, null)
+  }
+
+  private clearSnapshotTimer(): void {
+    if (this.snapshotTimer) clearTimeout(this.snapshotTimer)
+    this.snapshotTimer = null
   }
 
   /** `listener` on `emitter` until the session ends. */
@@ -204,9 +244,12 @@ export class ConnectionSession {
     return this.abort.signal.aborted
   }
 
-  /** Whether the world is initialised, the managers run, and the session has not ended. */
+  /**
+   * Whether the agent is in the world: it is initialised, its snapshot was read and the agent's
+   * player spawned, the managers run, and the session has not ended.
+   */
   get connected(): boolean {
-    return this.started && !this.ended
+    return this.started && this.established && !this.ended
   }
 
   /**
@@ -222,6 +265,10 @@ export class ConnectionSession {
       throw new Error('Hyperfy connection closed during initialization')
     }
     console.info('Hyperfy world initialized.')
+    if (!this.established && !this.joinRefused) {
+      this.snapshotTimer = setTimeout(() => this.cannotJoin(`no snapshot was read within ${SNAPSHOT_DEADLINE_MS / 1000} s`), SNAPSHOT_DEADLINE_MS)
+      this.snapshotTimer.unref?.()
+    }
     this.start()
   }
 
@@ -348,6 +395,7 @@ export class ConnectionSession {
     // First, and synchronously: from here on no turn of this session acts (the conversation queue
     // stops and navigation started by a turn in progress stops through the same signal)
     this.abort.abort(new TurnCancelled(`the connection it started on ended (${reason})`))
+    this.clearSnapshotTimer()
     for (const unsubscribe of this.subscriptions.splice(0)) {
       try {
         unsubscribe()
@@ -393,7 +441,7 @@ export function sessionOfTurn(turn: TurnContext): ConnectionSession | null {
 }
 
 function createTipWallet(world: any, wsUrl: string): TipWallet | null {
-  // Read once per process; the environment no longer has the key after the first read
+  // Read once per process; every call also deletes the variable from the environment again (lib/tip-wallet.ts)
   const account = takeTipWalletAccount()
   if (!account) return null
   const host = signInHost(wsUrl)

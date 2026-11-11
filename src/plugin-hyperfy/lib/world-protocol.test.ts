@@ -108,16 +108,23 @@ class FakeWebSocket {
 }
 
 describe('world protocol table', () => {
-  it("numbers packets as the world does", () => {
+  it("numbers packets as the world does: coo-world's table, every position, and the engine's own names in the same order", () => {
     expect(PROTOCOL_VERSION).toBe(2);
-    expect(PACKET_NAMES).toHaveLength(40);
-    expect(PACKET_NAMES.indexOf('requestEvmNonce')).toBe(30);
-    expect(PACKET_NAMES.indexOf('evmWalletStatus')).toBe(33);
-    expect(PACKET_NAMES.indexOf('setEvmTipReceive')).toBe(35);
-    expect(PACKET_NAMES.indexOf('entityModified')).toBe(7);
-    expect(PACKET_NAMES.indexOf('settingsModified')).toBe(15);
-    expect(PACKET_NAMES.indexOf('kick')).toBe(18);
-    expect(PACKET_NAMES.indexOf('ping')).toBe(20);
+    // coo-world src/core/packets.js as of 2d6cba2, in order: a packet's id is its position
+    // prettier-ignore
+    expect(PACKET_NAMES).toEqual([
+      'snapshot', 'command', 'chatAdded', 'chatCleared', 'blueprintAdded', 'blueprintModified', 'entityAdded', 'entityModified',
+      'entityEvent', 'entityRemoved', 'playerTeleport', 'playerPush', 'playerSessionAvatar', 'liveKitLevel', 'mute', 'settingsModified',
+      'spawnModified', 'modifyRank', 'kick', 'ai', 'ping', 'pong', 'requestBuilderByToken', 'revokeBuilderByToken',
+      'requestBuilderNonce', 'builderNonce', 'walletStatus', 'tokenBalanceRequest', 'tokenBalance', 'requestBuilderRecheck', 'requestEvmNonce', 'evmNonce',
+      'requestEvmVerify', 'evmWalletStatus', 'revokeEvmWallet', 'setEvmTipReceive', 'requestEvmTipIntent', 'evmTipIntent', 'evmTip', 'evmTipStatus',
+    ]);
+    // The bundled engine's table (its packets.js): each of its names is in the world's, in the same order
+    // prettier-ignore
+    const engine = ['snapshot', 'command', 'chatAdded', 'chatCleared', 'blueprintAdded', 'blueprintModified', 'entityAdded', 'entityModified', 'entityEvent', 'entityRemoved', 'playerTeleport', 'playerPush', 'playerSessionAvatar', 'settingsModified', 'spawnModified', 'kick', 'ping', 'pong'];
+    const positions = engine.map((name) => PACKET_NAMES.indexOf(name as (typeof PACKET_NAMES)[number]));
+    expect(positions.every((position) => position >= 0)).toBe(true);
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions);
   });
 });
 
@@ -243,6 +250,25 @@ describe('adaptToWorldProtocol on the engine ClientNetwork', () => {
   });
 
   const socket = () => FakeWebSocket.instances[0];
+
+  it('says why each frame it cannot read before the snapshot was read could not be read, and nothing after the snapshot', () => {
+    const protocol = adaptToWorldProtocol(network, () => null);
+    const heard: string[] = [];
+    protocol.onUnreadableBeforeSnapshot((why) => heard.push(why));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const loop: unknown[] = [];
+    loop.push(loop);
+    const cyclic = serverPackr.pack([0, loop]);
+    network.onPacket({ data: cyclic });
+    network.onPacket({ data: 'text' });
+    expect(heard).toEqual([`a frame of ${cyclic.byteLength} bytes is refused: cycle`, 'not a binary frame']);
+    // A snapshot read: from then on an unreadable frame is dropped as before and nothing more is said here
+    network.onPacket({ data: serverPackr.pack([0, cooWorldSnapshot()]) });
+    network.onPacket({ data: cyclic });
+    network.onPacket({ data: new Uint8Array([0xc1]) });
+    expect(heard).toHaveLength(2);
+  });
 
   it('connects with the session token and the protocol version', () => {
     adaptToWorldProtocol(network, () => TOKEN);
@@ -706,14 +732,26 @@ describe('outgoingPacketProblem', () => {
   });
 
   it('stops at the limit before packing a value the packer would write out in full at every reference to it', () => {
-    // 2^20 values to the packer, in a few objects
-    let chain: unknown = [0];
+    /** `items` as an array whose element reads are counted (a packer would read every element at every reference) */
+    const counted = <T>(items: T[]) => {
+      const reads = { count: 0 };
+      const array = new Proxy(items, {
+        get(target, key, receiver) {
+          if (typeof key === 'string' && /^\d+$/.test(key)) reads.count++;
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      return { array, reads };
+    };
+    // 2^20 values to the packer, in a few objects: the innermost list, held 2^20 times, is read a few thousand times
+    const leaf = counted([0]);
+    let chain: unknown = leaf.array;
     for (let i = 0; i < 20; i++) chain = [chain, chain];
-    const started = performance.now();
     expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: chain })).toBe('the blueprintAdded packet holds more than the 8192 values the world accepts');
-    // One 60 KB string 5,000 times: 300 MB to the packer
-    const text = 'z'.repeat(60_000);
-    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: new Array(5000).fill(text) })).toMatch(/^the blueprintAdded packet would be at least \d+ bytes, more than the 65536 the world accepts$/);
-    expect(performance.now() - started).toBeLessThan(100);
+    expect(leaf.reads.count).toBeLessThan(8192);
+    // One 60 KB string 5,000 times (300 MB to the packer): two of them are read
+    const strings = counted(new Array(5000).fill('z'.repeat(60_000)));
+    expect(outgoingPacketProblem('blueprintAdded', { id: 'b', props: strings.array })).toMatch(/^the blueprintAdded packet would be at least \d+ bytes, more than the 65536 the world accepts$/);
+    expect(strings.reads.count).toBe(2);
   });
 });

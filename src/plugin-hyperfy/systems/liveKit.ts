@@ -77,8 +77,16 @@ export class AgentLiveKit extends System {
     super(world);
   }
 
-  // Called by ClientNetwork without awaiting, so this must never reject.
+  // Called by ClientNetwork without awaiting, so this never rejects: whatever fails is logged here
   async deserialize(opts: LiveKitInitOptions): Promise<void> {
+    try {
+      await this.join(opts);
+    } catch (error: any) {
+      console.error('[LiveKit] Voice chat off: joining the voice room failed:', error?.message || error);
+    }
+  }
+
+  private async join(opts: LiveKitInitOptions): Promise<void> {
     if (!opts) {
       console.log('[LiveKit] No LiveKit options provided by server - voice chat not available');
       return;
@@ -181,18 +189,30 @@ export class AgentLiveKit extends System {
       console.log(`[LiveKit] TrackPublished by ${participant.identity}`);
     });
 
+    // Never rejects (the room does not await it): a listener that throws on a frame is said once
+    // for the track and the frames go on; a stream that fails ends there, said once
     room.on(RoomEvent.TrackSubscribed, async (track, _publication, participant) => {
       console.log(`[LiveKit] TrackSubscribed: ${track.kind} from ${participant.identity}`);
-      if (track.kind === TrackKind.KIND_AUDIO) {
+      if (track.kind !== TrackKind.KIND_AUDIO) return;
+      let listenerFailed = false;
+      try {
         const stream = new AudioStream(track);
         for await (const frame of stream) {
           if (!track.sid || this.room !== room) return;
           const int16 = frame.data;
-          (this as any).emit('audio', {
-            participant: participant.identity,
-            buffer: Buffer.from(int16.buffer, int16.byteOffset, int16.byteLength),
-          });
+          try {
+            (this as any).emit('audio', {
+              participant: participant.identity,
+              buffer: Buffer.from(int16.buffer, int16.byteOffset, int16.byteLength),
+            });
+          } catch (error: any) {
+            if (listenerFailed) continue;
+            listenerFailed = true;
+            console.error(`[LiveKit] Handling the audio of ${participant.identity} failed (further failures on this track are not logged):`, error?.message || error);
+          }
         }
+      } catch (error: any) {
+        console.error(`[LiveKit] The audio track of ${participant.identity} ended with an error:`, error?.message || error);
       }
     });
   }

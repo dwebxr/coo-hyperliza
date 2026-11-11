@@ -446,13 +446,10 @@ describe('decodeServerFrame limits', () => {
     // array 32 of 0x7fffffff elements, with enough bytes after it for the first few
     const frame = new Uint8Array(8_000_000).fill(0xc0);
     frame.set([0xdd, 0x7f, 0xff, 0xff, 0xff]);
-    const started = Date.now();
     expect(() => decode(frame)).toThrow(PacketRefused);
     const smaller = new Uint8Array(8_000_000).fill(0xc0);
     smaller.set([0xdd, 0x00, 0x7a, 0x11, 0xfb]);
     expect(() => decode(smaller)).toThrow(PacketOverLimit);
-    // Neither read 8 MB element by element
-    expect(Date.now() - started).toBeLessThan(1000);
     // The same two headers before elements that cannot be read (the reserved byte): refused for
     // what the header announces, so not one element was looked at
     const unreadable = (...header: number[]) => {

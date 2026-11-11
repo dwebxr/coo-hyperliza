@@ -140,7 +140,8 @@ function visibleText(value: string): string {
 
 /** Untrusted text as one line of at most `max` code points (visibleText). Runs of ordinary spaces are kept. */
 export function oneLine(value: string, max: number): string {
-  // A code point is at most two UTF-16 units: nothing beyond 2 x max units can survive the cut
+  // Only the first 2 x max UTF-16 units are read (a code point is at most two): what is removed or
+  // trimmed from them is not made up for from the rest of the value
   return truncateCodePoints(visibleText(head(value, max * 2)).trim(), max).trimEnd();
 }
 
@@ -156,7 +157,7 @@ export const SHOWN_NAME_MAX = 32;
 /**
  * A name from the world (a player, an entity, an action label) as it is logged, prompted and
  * spoken: the same as a line of chat (visibleText), with whitespace collapsed, cut to `max` code
- * points. Empty when nothing visible is left or the value is not a string.
+ * points. Empty when nothing is left after that, or the value is not a string.
  */
 export function shownName(value: unknown, max = SHOWN_NAME_MAX): string {
   if (typeof value !== 'string') return '';

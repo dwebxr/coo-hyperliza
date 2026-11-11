@@ -8,6 +8,7 @@ import { describeUrl } from "../lib/log-url";
 import { MAX_MODEL_BYTES, SafeFetchError, worldNet } from "../lib/net-policy";
 import type { MoveOutcome } from "../systems/controls";
 import { outgoingPacketProblem } from "../lib/world-protocol";
+import { isBlueprintURL, sanitizeBlueprintAdd, sanitizeEntityAdd } from "../lib/world-add-policy";
 
 const IMPORT_DOWNLOAD_TIMEOUT_MS = 60_000;
 
@@ -43,16 +44,34 @@ export type EditResult =
   | { outcome: 'failed'; reason: string };
 
 const applied: EditResult = { outcome: 'applied' };
+// How long a model's upload to the world may take before the import fails
+const UPLOAD_TIMEOUT_MS = 30_000;
+
+type Announcement = { blueprint: Record<string, unknown> | null; entity: Record<string, unknown> } | { problem: string };
 
 /**
- * Why announcing a new app (its blueprint, when it has one of its own, and its entity) would not
- * reach the world, or null: the world drops a packet unread that is over its size, value or depth
- * limit or holds a value its scan refuses (lib/world-protocol.ts outgoingPacketProblem). Asked
- * before anything is added locally, so an edit that cannot reach the world changes nothing here
- * either.
+ * A new app (its blueprint, when it has one of its own, and its entity) as coo-world's server would
+ * store it, or why the server would not: its field policies refuse it (lib/world-add-policy.ts), or
+ * a packet would be dropped unread (over its size, value or depth limit, or holding a value its
+ * scan refuses: lib/world-protocol.ts outgoingPacketProblem). Asked before anything is uploaded or
+ * added locally, so an edit that cannot reach the world changes nothing here or there; what is then
+ * added and announced is the value returned, normalised as the server normalises it.
  */
-function announcementProblem(blueprint: unknown, entity: unknown): string | null {
-  return (blueprint ? outgoingPacketProblem('blueprintAdded', blueprint) : null) ?? outgoingPacketProblem('entityAdded', entity);
+function announcement(world: any, blueprint: Record<string, unknown> | null, entity: Record<string, unknown>): Announcement {
+  let storedBlueprint: Record<string, unknown> | null = null;
+  if (blueprint) {
+    const sanitized = sanitizeBlueprintAdd(blueprint);
+    if (!sanitized.ok) return { problem: sanitized.problem };
+    storedBlueprint = sanitized.value;
+  }
+  const blueprints = world.blueprints;
+  const app = sanitizeEntityAdd(entity, world.network?.id, {
+    blueprintExists: (id) => id === storedBlueprint?.id || typeof blueprints?.get !== 'function' || !!blueprints.get(id),
+    entityExists: (id) => !!world.entities?.items?.has?.(id),
+  });
+  if (!app.ok) return { problem: app.problem };
+  const problem = (storedBlueprint ? outgoingPacketProblem('blueprintAdded', storedBlueprint) : null) ?? outgoingPacketProblem('entityAdded', app.value);
+  return problem ? { problem } : { blueprint: storedBlueprint, entity: app.value };
 }
 const skipped = (reason: string): EditResult => ({ outcome: 'skipped', reason });
 const failed = (reason: string): EditResult => ({ outcome: 'failed', reason });
@@ -102,22 +121,6 @@ const NOT_THERE: Record<Exclude<MoveOutcome, 'arrived'>, string> = {
   'timed-out': 'I could not get there in time',
   unreachable: 'I could not find a way there',
 };
-
-/** What coo-world's isBlueprintURL (src/core/extras/assetURL.js) accepts: asset://<one file name> or an http(s) URL. */
-function blueprintReference(value: unknown): boolean {
-  if (typeof value !== 'string') return false;
-  if (value.startsWith('asset://')) {
-    const name = value.slice('asset://'.length);
-    return /^[A-Za-z0-9._-]{1,128}$/.test(name) && name !== '.' && name !== '..';
-  }
-  if (!/^https?:\/\//.test(value)) return false;
-  try {
-    const { protocol } = new URL(value);
-    return protocol === 'http:' || protocol === 'https:';
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Why the agent leaves an app as it is, or null. These are the rules of coo-world's own builder
@@ -216,7 +219,7 @@ export class BuildManager {
     if (!scale) return invalid('scale');
     // ...and sanitizeBlueprintAdd refuses a new blueprint whose model, script or image is not an asset or an http(s) URL
     if (entity.blueprint.unique) {
-      const reference = [entity.blueprint.model, entity.blueprint.script, entity.blueprint.image?.url].find((value) => value != null && !blueprintReference(value));
+      const reference = [entity.blueprint.model, entity.blueprint.script, entity.blueprint.image?.url].find((value) => value != null && !isBlueprintURL(value));
       if (reference !== undefined) return failed("the app's blueprint names a file the world would refuse in a copy");
     }
     {
@@ -256,11 +259,11 @@ export class BuildManager {
         pinned: false,
         state: {},
       }
-      const tooLarge = announcementProblem(blueprint, data)
-      if (tooLarge) return failed(tooLarge)
+      const announced = announcement(world, blueprint, data)
+      if ('problem' in announced) return failed(announced.problem)
       guard.check();
-      if (blueprint) world.blueprints.add(blueprint, true)
-      world.entities.add(data, true)
+      if (announced.blueprint) world.blueprints.add(announced.blueprint, true)
+      world.entities.add(announced.entity, true)
       // The copy's id, for whoever asked (a later operation of the same plan can act on it)
       return { outcome: 'applied', newId: data.id };
     }
@@ -329,8 +332,6 @@ export class BuildManager {
       return failed(`download failed (HTTP ${resp.status})`)
     }
     const file = new File([new Uint8Array(resp.body)], url.split('?')[0].split('/').pop() ?? '', { type: resp.headers['content-type'] ?? '' })
-    
-    await new Promise(resolve => setTimeout(resolve, 100))
 
     const notThere = await this.walkTo(guard, position[0], position[2]);
     if (notThere) return notThere;
@@ -349,24 +350,16 @@ export class BuildManager {
   }
 
   /**
-   * Adds the app of a .hyp file. Its files are uploaded first, and only then are its blueprint and
-   * the app announced to the world, one right after the other with nothing awaited in between: an
-   * import that fails or is stopped has announced nothing, so there is nothing to take back. What
-   * a failed import leaves: the files it had uploaded by then, on the world's asset server, with
-   * nothing in the world referring to them.
+   * Adds the app of a .hyp file. Its blueprint and app are checked against what the world takes
+   * first (announcement), its files are uploaded next, and only then are the blueprint and the app
+   * announced to the world, one right after the other with nothing awaited in between: an import
+   * that fails or is stopped has announced nothing, so there is nothing to take back. What a failed
+   * import leaves: the files it had uploaded by then, on the world's asset server, with nothing in
+   * the world referring to them.
    */
   async addApp(guard: EditGuard, file: File, transform: PlacedAt): Promise<EditResult> {
     const world = guard.world;
     const info = await importApp(file)
-    guard.check();
-    try {
-      await Promise.all(info.assets.map(asset => world.network.upload(asset.file, { check: () => guard.check() })))
-    } catch (err) {
-      if (err instanceof SceneEditStopped) throw err
-      console.error('failed to upload .hyp assets')
-      console.error(err)
-      return failed(`upload failed: ${err instanceof Error ? err.message : String(err)}`)
-    }
     guard.check();
 
     const blueprint = {
@@ -399,10 +392,20 @@ export class BuildManager {
       pinned: false,
       state: {},
     }
-    const tooLarge = announcementProblem(blueprint, data)
-    if (tooLarge) return failed(tooLarge)
-    world.blueprints.add(blueprint, true)
-    const app = world.entities.add(data, true)
+    const announced = announcement(world, blueprint, data)
+    if ('problem' in announced) return failed(announced.problem)
+
+    try {
+      await Promise.all(info.assets.map(asset => world.network.upload(asset.file, { check: () => guard.check() })))
+    } catch (err) {
+      if (err instanceof SceneEditStopped) throw err
+      console.error('failed to upload .hyp assets')
+      console.error(err)
+      return failed(`upload failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    guard.check();
+    world.blueprints.add(announced.blueprint, true)
+    const app = world.entities.add(announced.entity, true)
     app.onUploaded()
     return applied
   }
@@ -415,15 +418,7 @@ export class BuildManager {
     
     const baseUrl = world.assetsUrl.replace(/\/$/, "");
     const url = `${baseUrl}/${filename}`;
-    guard.check();
-    const uploadPromise = world.network.upload(file, { check: () => guard.check() });
-    const timeoutPromise = new Promise((_resolve, reject) =>
-      setTimeout(() => reject(new Error("Upload timed out")), 30000)
-    );
 
-    await Promise.race([uploadPromise, timeoutPromise]);
-    guard.check();
-    
     const blueprint = {
       id: uuid(),
       version: 0,
@@ -454,10 +449,24 @@ export class BuildManager {
       pinned: false,
       state: {},
     }
-    const tooLarge = announcementProblem(blueprint, data)
-    if (tooLarge) return failed(tooLarge)
-    world.blueprints.add(blueprint, true)
-    const app = world.entities.add(data, true)
+    // Checked before the upload: a model whose app the world would refuse is not uploaded either
+    const announced = announcement(world, blueprint, data)
+    if ('problem' in announced) return failed(announced.problem)
+
+    guard.check();
+    const uploadPromise = world.network.upload(file, { check: () => guard.check() });
+    let timer: NodeJS.Timeout | undefined
+    const timeoutPromise = new Promise((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("Upload timed out")), UPLOAD_TIMEOUT_MS)
+    });
+    try {
+      await Promise.race([uploadPromise, timeoutPromise]);
+    } finally {
+      clearTimeout(timer)
+    }
+    guard.check();
+    world.blueprints.add(announced.blueprint, true)
+    const app = world.entities.add(announced.entity, true)
     app.onUploaded()
     return applied
   }

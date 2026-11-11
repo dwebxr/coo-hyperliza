@@ -87,6 +87,11 @@ const originOf = (url: string): string | null => {
     return null;
   }
 };
+// The origin of a URL for a log line; what has none is written as describeUrl writes it
+const shownOrigin = (url: string): string => {
+  const origin = originOf(url);
+  return origin && origin !== 'null' ? origin : describeUrl(url);
+};
 
 /**
  * Why the agent will not send its session token to `apiUrl`, or null when that is the world's own
@@ -117,7 +122,7 @@ export function worldEndpointProblems(net: NetPolicy, { apiUrl, assetsUrl }: { a
   if (typeof assetsUrl === 'string' && assetsUrl && !net.isWorldOrigin(assetsUrl)) {
     const problem = net.urlProblem(`${assetsUrl.replace(/\/$/, '')}/x`);
     if (problem) {
-      problems.push(`This world's assets (models, avatars, emotes, scripts) will not be loaded: its assets URL ${originOf(assetsUrl) ?? assetsUrl} is neither the world's own origin (${net.worldOrigin ?? 'unknown'}, from WS_URL) nor a public https address (${problem}). If it is the same server under another name, use that name in WS_URL.`);
+      problems.push(`This world's assets (models, avatars, emotes, scripts) will not be loaded: its assets URL ${shownOrigin(assetsUrl)} is neither the world's own origin (${net.worldOrigin ?? 'unknown'}, from WS_URL) nor a public https address (${problem}). If it is the same server under another name, use that name in WS_URL.`);
     }
   }
   return problems;

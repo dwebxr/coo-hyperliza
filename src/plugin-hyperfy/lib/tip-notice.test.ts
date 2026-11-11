@@ -30,7 +30,7 @@ describe('parseTipNotice', () => {
 });
 
 describe('parseTipNotice limits', () => {
-  it('cuts the name to 32 code points and removes what cannot be seen, as coo-world writes names', () => {
+  it('cuts the name to 32 code points and filters it as a chat sender name is (shownName: controls become spaces, format characters go)', () => {
     const tip = parseTipNotice(`A\u0000l\u202eice\u200b ${'x'.repeat(50)} tipped Coo 1 JPYC`, 'Coo')!;
     expect(tip.fromName).toBe(`A lice ${'x'.repeat(25)}`);
     expect(Array.from(tip.fromName)).toHaveLength(32);

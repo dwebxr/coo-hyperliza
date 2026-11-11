@@ -55,7 +55,7 @@ export class HyperfyService extends Service {
     return this.session?.world ?? null
   }
 
-  /** Whether the current connection's world is initialised and its managers run. */
+  /** Whether the agent is in the current connection's world (ConnectionSession.connected). */
   public isConnected(): boolean {
     return this.session?.connected ?? false
   }
@@ -98,10 +98,11 @@ export class HyperfyService extends Service {
     service
       .connect({ wsUrl, worldId: defaultWorldId })
       .then(() => console.info(`Automatic Hyperfy connection initiated.`))
-      .catch(err => {
-        console.error(`Automatic Hyperfy connection failed: ${err.message}`)
-        service.scheduleReconnect()
-      })
+      // doConnect has logged the failure. A connection that closed is tried again by
+      // onWorldDisconnect; one that failed before any socket opened (building the world, PhysX)
+      // has no such event and is tried again from here. Nothing is scheduled twice: schedule()
+      // does nothing while a retry is pending.
+      .catch(() => service.scheduleReconnect())
 
     return service
   }
@@ -177,7 +178,10 @@ export class HyperfyService extends Service {
         { wsUrl: config.wsUrl, worldId: config.worldId, sandboxedScripts: this.worldScriptsSandboxed, renderPage: this.puppeteerManager },
         {
           onEstablished: (established) => {
-            if (established === this.session) this.reconnectController.markEstablished()
+            if (established !== this.session) return
+            this.reconnectController.markEstablished()
+            // Only now is the agent in the world (isConnected): its snapshot was read and its player spawned
+            console.info(`HyperfyService connected successfully to ${describeUrl(config.wsUrl)}`)
           },
           onDisconnect: (closed, reason, kickCode) => {
             this.onWorldDisconnect(closed, reason, kickCode).catch(error => {
@@ -189,7 +193,6 @@ export class HyperfyService extends Service {
       // Current from here on, so a socket that closes during init ends this session
       this.session = session
       await session.connect(config.authToken)
-      console.info(`HyperfyService connected successfully to ${describeUrl(config.wsUrl)}`)
     } catch (error: any) {
       console.error(`HyperfyService connection failed for ${config.worldId} at ${describeUrl(config.wsUrl)}: ${error.message}`, error.stack)
       await this.handleDisconnect()

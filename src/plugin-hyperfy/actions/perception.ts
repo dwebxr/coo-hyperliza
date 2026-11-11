@@ -146,7 +146,8 @@ export const hyperfyScenePerceptionAction: Action = {
     const japanese = isJapanese(text);
     const budget = getUsageBudget();
     // The look is counted now, before the snapshot is taken: two looks that start together cannot
-    // both take the last one. It is given back below when it ends before any model call.
+    // both take the last one. It is given back below when it ends before its model request is sent
+    // (also when its turn is cancelled before then).
     const look = budget.aiAvailable() ? budget.reserveVision() : null;
     if (!look) {
       budget.recordSkip('vision');
@@ -273,8 +274,10 @@ export const hyperfyScenePerceptionAction: Action = {
     } catch (err) {
       // The turn's caller answers without Claude (handlers/messageReceivedHandler.ts); a reply sent
       // here would be dropped by core along with the error
-      // Refused by the Claude budget, or the turn was cancelled: no request was made for this look
-      if (err instanceof AiBudgetExceededError || err instanceof TurnCancelled) look.release();
+      // Refused by the Claude budget, or the turn was cancelled before the request went out: the
+      // look is given back. Cancelled while its request was in flight (afterRequest): it may have
+      // been billed, and stays counted
+      if (err instanceof AiBudgetExceededError || (err instanceof TurnCancelled && !err.afterRequest)) look.release();
       if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError || err instanceof TurnCancelled) throw err;
       logger.error(`Vision response failed: ${errorText(err)}`);
       await tellFailure(callback, SCENE_PERCEPTION, japanese ? LOOK_FAILED_JA : LOOK_FAILED_EN, { thought: 'Cannot understand the scene.', metadata: { error: 'vision_failure' } });

@@ -37,7 +37,7 @@ vi.mock('./managers/puppeteer-manager', () => {
 });
 
 import { HyperfyService, HyperfyUnavailable, actingSession, connectedSession, findQueuedKick, observedSession, requireHyperfy } from './service';
-import { sessionOfTurn } from './session/connection-session';
+import { SNAPSHOT_DEADLINE_MS, sessionOfTurn } from './session/connection-session';
 import { TurnCancelled } from './lib/turn-context';
 import { RECONNECT_MAX_DELAY_MS } from './lib/reconnect';
 import { hyperfyEventType } from './events';
@@ -47,7 +47,7 @@ import { trackWorldIdentity } from './lib/world-identity';
 import { SceneEditStopped } from './lib/authorization';
 import { SIGN_IN_STATEMENT, TipWallet, forgetTipWalletAccount, takeTipWalletAccount } from './lib/tip-wallet';
 import { PACKET_NAMES } from './lib/world-protocol';
-import { unpack } from 'msgpackr';
+import { Packr, unpack } from 'msgpackr';
 import { currentTurn } from './lib/turn-context';
 import type { ConnectionSession } from './session/connection-session';
 import { sessionFor } from './test-support/session';
@@ -195,6 +195,28 @@ describe('HyperfyService connection lifecycle (offline)', () => {
       expect(WebSocketSpy).not.toHaveBeenCalled();
       expect(errors.mock.calls.flat().join(' ')).toContain(reason);
     } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('start() schedules another attempt when the first connection fails before any socket opened (no disconnect event comes for that)', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    vi.stubEnv('WS_URL', 'ws://127.0.0.1:9/ws');
+    vi.stubEnv('HYPERFY_WORLD_SCRIPTS', undefined);
+    const { ConnectionSession: Session } = await import('./session/connection-session');
+    const open = vi.spyOn(Session, 'open').mockImplementation(() => {
+      throw new Error('the world could not be built');
+    });
+    const { runtime } = createRuntime();
+    try {
+      service = await HyperfyService.start(runtime);
+      const controller = (service as any).reconnectController;
+      await vi.waitFor(() => expect(controller.isPending).toBe(true));
+      expect(open).toHaveBeenCalledTimes(1);
+      expect(service.getWorld()).toBeNull();
+    } finally {
+      open.mockRestore();
       vi.unstubAllEnvs();
     }
   });
@@ -1297,10 +1319,58 @@ describe('HyperfyService and the session of each connection', () => {
     expect([service.getSession(), service.getWorld(), service.currentWorldId, service.isConnected()]).toEqual([null, null, null, false]);
     await service.connect(HERE);
     const session = service.getSession()!;
-    expect([service.getWorld(), service.currentWorldId, service.isConnected(), session.connected]).toEqual([session.world, HERE.worldId, true, true]);
+    // In the world only once its snapshot was read and the agent's player spawned
+    expect([service.getWorld(), service.currentWorldId, service.isConnected(), session.connected]).toEqual([session.world, HERE.worldId, false, false]);
+    expect(lines).not.toContain('HyperfyService connected successfully to wss://play.world.test/ws');
+    session.world.emit('player', {});
+    expect([service.isConnected(), session.connected]).toEqual([true, true]);
+    expect(lines.filter((line) => line === 'HyperfyService connected successfully to wss://play.world.test/ws')).toHaveLength(1);
     await service.disconnect();
     expect([service.getSession(), service.getWorld(), service.currentWorldId, service.isConnected()]).toEqual([null, null, null, false]);
     expect([session.ended, session.connected]).toEqual([true, false]);
+  });
+
+  it("gives up a connection whose snapshot it cannot read, says why once at error level, never counts as connected, and tries again with the usual backoff", async () => {
+    const created = createRuntime();
+    service = created.service;
+    const controller = (service as any).reconnectController;
+    await service.connect(HERE);
+    const session = service.getSession()!;
+    const loop: unknown[] = [];
+    loop.push(loop);
+    const frame = new Uint8Array(new Packr({ structuredClone: true }).pack([0, { id: 'coo', entities: [loop] }]));
+    session.world.network.onPacket({ data: frame });
+    await vi.waitFor(() => expect(session.ended).toBe(true));
+    expect(lines.filter((line) => line.startsWith('[Hyperfy] Cannot join'))).toEqual([
+      `[Hyperfy] Cannot join this world: its snapshot could not be read (a frame of ${frame.byteLength} bytes is refused: cycle). Leaving the connection; the agent tries again with the usual backoff.`,
+    ]);
+    expect(lines).toContain(`Hyperfy world disconnected: the agent could not join: its snapshot could not be read (a frame of ${frame.byteLength} bytes is refused: cycle)`);
+    expect([service.getSession(), service.isConnected(), session.connected]).toEqual([null, false, false]);
+    // Retried as after any close without a spawn: the backoff grows, up to its ceiling
+    await vi.waitFor(() => expect(controller.isPending).toBe(true));
+    expect(controller.attemptCount).toBe(1);
+    controller.stop();
+  });
+
+  // That an unreadable frame after a read snapshot (before the player spawns) reports nothing is
+  // the adapter's part: lib/world-protocol.test.ts
+  it('gives up a connection on which no snapshot is read within SNAPSHOT_DEADLINE_MS, and not one whose player spawned, whatever unreadable frame comes after that', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const { service } = start();
+    await service.connect(HERE);
+    const silent = service.getSession()!;
+    await vi.advanceTimersByTimeAsync(SNAPSHOT_DEADLINE_MS);
+    expect(silent.ended).toBe(true);
+    expect(lines.filter((line) => line.startsWith('[Hyperfy] Cannot join'))).toEqual([
+      '[Hyperfy] Cannot join this world: no snapshot was read within 60 s. Leaving the connection; the agent tries again with the usual backoff.',
+    ]);
+    await service.connect(HERE);
+    const joined = service.getSession()!;
+    joined.world.emit('player', {});
+    joined.world.network.onPacket({ data: new Uint8Array([0xc1]) });
+    await vi.advanceTimersByTimeAsync(SNAPSHOT_DEADLINE_MS * 2);
+    expect([joined.ended, service.isConnected()]).toEqual([false, true]);
+    expect(lines.filter((line) => line.startsWith('[Hyperfy] Cannot join'))).toHaveLength(1);
   });
 
   it("resets the reconnect backoff when the agent's player spawns on the current connection, and not for a connection that was replaced", async () => {

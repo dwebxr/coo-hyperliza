@@ -667,7 +667,9 @@ export function createScriptMembrane(options: MembraneOptions = {}): ScriptMembr
     if (Array.isArray(value)) {
       const copy: unknown[] = [];
       seen.set(value, copy);
-      const length = Math.min(Number(value.length) || 0, MAX_COPY_NODES);
+      const length = Number(value.length) || 0;
+      // Longer than the budget has left: refused, as any value over it (not cut short)
+      if (length > MAX_COPY_NODES - budget.nodes) throw new TypeError('Value is too large or too deeply nested to pass to the world');
       for (let i = 0; i < length; i++) copy[i] = copyToHost(value[i], budget, depth + 1, seen);
       return copy;
     }

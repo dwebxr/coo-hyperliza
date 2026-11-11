@@ -75,6 +75,23 @@ export function isBuilder(world: object, playerId: string, env: Env = process.en
   return rank >= Ranks.BUILDER;
 }
 
+/** sceneEditRefusal's reasons when the agent's own account may not build in the world */
+export const AGENT_NOT_BUILDER = "the agent's own player is not a builder in this world";
+export const AGENT_RANK_UNKNOWN = "the world's server does not say whether the agent's own player may build";
+
+/**
+ * Why the agent's own player may not build in this world, or null when it may: the same rule as
+ * for a requester (isBuilder), without HYPERFY_OPERATOR_IDS, which gives people rights with the
+ * agent, not the agent rights on the world's server. That server drops the edits of a player who
+ * may not build, and the agent would report them done. A world that reports no rank for the
+ * agent's player (upstream Hyperfy) does not tell; nothing is edited there.
+ */
+export function agentBuildRefusal(world: object): string | null {
+  const own = worldIdentity(world)?.ownRank();
+  if (own && own.rank >= Ranks.BUILDER) return null;
+  return own?.reported ? AGENT_NOT_BUILDER : AGENT_RANK_UNKNOWN;
+}
+
 /** Why the agent must not edit the world for this turn, or null when it may. */
 export function sceneEditRefusal(turn: TurnContext | undefined, env: Env = process.env): string | null {
   if (!turn) return 'scene edits run only for a player who asked in chat or voice';
@@ -82,7 +99,7 @@ export function sceneEditRefusal(turn: TurnContext | undefined, env: Env = proce
   if (readSceneEditsMode(env).mode === 'off') return `scene edits are off (${SCENE_EDITS_ENV})`;
   if (!turn.requesterId) return 'nobody asked for this edit';
   if (!isBuilder(turn.world, turn.requesterId, env)) return 'the requester is not a builder in this world';
-  return null;
+  return agentBuildRefusal(turn.world);
 }
 
 /** Thrown when an authorized scene edit may not go on (see sceneEditStillAllowed). */

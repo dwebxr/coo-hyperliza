@@ -21,12 +21,13 @@
  *    every record. Like nodes, a subtree is counted again for every reference to it: one long
  *    string the frame holds once and refers to thousands of times is small in memory and gigabytes
  *    to code that walks, copies or prints the value.
- *  - depth: how deep arrays, maps, records, Sets and reference wrappers nest; a reference to a
- *    subtree counts that subtree's height at the depth it is put at.
+ *  - depth: how deep arrays, maps, records, Sets, Errors, RegExps and reference wrappers nest; a
+ *    reference to a subtree counts that subtree's height at the depth it is put at.
  * Over any of these limits it throws PacketOverLimit before building any more of the value.
  *
  * What it reads, as msgpackr writes it: nil, booleans, integers (64-bit ones as BigInt), floats,
- * strings (a leading BOM kept), bin, arrays, maps (as Map: with records on, msgpackr writes only
+ * strings (a leading BOM kept; msgpackr's JS decoder drops one from a string over 64 bytes), bin,
+ * arrays, maps (as Map: with records on, msgpackr writes only
  * Map objects as maps), record definitions (one-byte ids; their keys a list of names, or a
  * reference to one) and records, `undefined`, dates (also an invalid one), Set, Error (its name
  * and message strings; the message may be nil), RegExp, typed arrays, ArrayBuffer and DataView, big
@@ -123,7 +124,8 @@ export interface Decoded {
   bytes: number;
 }
 
-// msgpackr keeps a leading BOM in a string; so does this
+// A leading BOM stays in the string. msgpackr keeps it too, except in its JS string decoder (no
+// msgpackr-extract) for a string over 64 bytes
 const utf8 = new TextDecoder('utf-8', { ignoreBOM: true });
 const EXT_UNDEFINED = 0x00;
 const EXT_BIGINT = 0x42;

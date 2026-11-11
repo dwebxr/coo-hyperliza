@@ -13,7 +13,7 @@ import {
   import { AnthropicRefusalError } from '../../anthropic-models';
   import { actionFailed, actionSucceeded, tellFailure } from '../lib/action-result';
   import { errorText } from '../lib/error-text';
-  import { EDIT_ENTITY_ACTION, SceneEditStopped, readSceneEditsMode, reportsPrivilegedAction, sceneEditRefusal, sceneEditStillAllowed } from '../lib/authorization';
+  import { AGENT_NOT_BUILDER, AGENT_RANK_UNKNOWN, EDIT_ENTITY_ACTION, SceneEditStopped, readSceneEditsMode, reportsPrivilegedAction, sceneEditRefusal, sceneEditStillAllowed } from '../lib/authorization';
   import type { EditGuard, EditResult } from '../managers/build-manager';
   import { MAX_OPERATIONS_PER_REQUEST, planLabelProblem, readPlanEntry } from '../lib/edit-plan';
   import { readString } from '../lib/model-output';
@@ -29,6 +29,11 @@ import {
   // Said without a model call to someone who may not have the world edited
   const REFUSAL_EN = 'Sorry, I can only change things in this world when a builder asks me to.';
   const REFUSAL_JA = 'ごめんなさい、ワールドの編集はビルダー権限のある方に頼まれたときだけできます。';
+  // ...when the agent's own account may not build there, or the world does not say whether it may
+  const AGENT_REFUSAL: Record<string, { en: string; ja: string }> = {
+    [AGENT_NOT_BUILDER]: { en: "I'm not allowed to build in this world.", ja: 'このワールドでは、私には編集の権限がありません。' },
+    [AGENT_RANK_UNKNOWN]: { en: "I can't build in this world: it doesn't tell me whether I'm allowed to.", ja: 'このワールドでは、私に編集の権限があるか分からないので、編集できません。' },
+  };
   // ...and when scene edits are off (HYPERFY_SCENE_EDITS)
   const OFF_EN = "Sorry, I can't change things in this world.";
   const OFF_JA = 'ごめんなさい、このワールドでは編集のお手伝いはできません。';
@@ -282,9 +287,10 @@ Don't list every action like a log — instead, summarize the overall outcome na
         logger.warn(`[EDIT_ENTITY Action] Refused: ${refusal}`);
         if (turn?.requesterId) {
           const off = readSceneEditsMode().mode === 'off';
+          const agent = refusal ? AGENT_REFUSAL[refusal] : undefined;
           await callback?.({
             thought: `I may not edit the world for this request (${refusal}).`,
-            text: off ? (japanese ? OFF_JA : OFF_EN) : japanese ? REFUSAL_JA : REFUSAL_EN,
+            text: off ? (japanese ? OFF_JA : OFF_EN) : agent ? (japanese ? agent.ja : agent.en) : japanese ? REFUSAL_JA : REFUSAL_EN,
             actions: [EDIT_ENTITY],
             source: 'hyperfy',
           });
@@ -363,8 +369,8 @@ Don't list every action like a log — instead, summarize the overall outcome na
           // neutral line, whatever the error was
           if ((noLongerPlanning = stillAllowed())) break;
           // Retrying cannot help: the budget is used up (the turn's caller falls back to scripted or
-          // offline behavior) or the model declined this request
-          if (error instanceof AiBudgetExceededError || error instanceof AnthropicRefusalError) throw error;
+          // offline behavior), the model declined this request, or the turn was cancelled
+          if (error instanceof AiBudgetExceededError || error instanceof AnthropicRefusalError || error instanceof TurnCancelled) throw error;
           logger.error(`[EDIT_ENTITY Action] Model error on attempt ${attempts + 1}: ${errorText(error)}`);
         }
     
@@ -558,6 +564,8 @@ Don't list every action like a log — instead, summarize the overall outcome na
       try {
         finalXml = await runtime.useModel(ModelType.TEXT_SMALL, forPurpose('build', { prompt: agentResponsePrompt }));
       } catch (err) {
+        // A cancelled turn says nothing more (its edits stand; what it would say is dropped anyway)
+        if (err instanceof TurnCancelled) throw err;
         if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError) {
           // A requester who lost the right meanwhile (on this connection) gets the neutral closing
           // line, as everywhere else, and the turn ends here

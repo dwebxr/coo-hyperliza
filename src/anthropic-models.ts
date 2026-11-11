@@ -12,7 +12,7 @@ import {
   logger,
 } from '@elizaos/core';
 import { AiBudgetExceededError, currentOrigin, getUsageBudget, isAiPurpose, maxTokensFor, purposeEnvKey } from './usage-budget';
-import { assertTurnLive, currentTurn } from './plugin-hyperfy/lib/turn-context';
+import { TurnCancelled, assertTurnLive, currentTurn } from './plugin-hyperfy/lib/turn-context';
 
 /**
  * Text/JSON generation with current Claude models.
@@ -170,6 +170,9 @@ async function generate(
   const deadline = AbortSignal.timeout(GENERATION_DEADLINE_MS);
   const turnSignal = currentTurn()?.signal;
   const signal = turnSignal ? AbortSignal.any([deadline, turnSignal]) : deadline;
+  /** Whether a request has gone out (a cancellation after that is marked: TurnCancelled.afterRequest) */
+  let sent = false;
+  const marked = (error: unknown): unknown => (sent && error instanceof TurnCancelled && !error.afterRequest ? new TurnCancelled(error.message, true) : error);
   /** One request, under a reservation of its own; settled with what the API billed, or failed. */
   const attempt = async (): Promise<Anthropic.Message> => {
     // A turn that may no longer act (its connection ended, or its slot ran out) asks nothing more
@@ -183,6 +186,7 @@ async function generate(
       throw new AiBudgetExceededError(reservation);
     }
     let response: Anthropic.Message;
+    sent = true;
     try {
       response = await client.messages.create(
         {
@@ -218,11 +222,13 @@ async function generate(
     response = await attempt();
   } catch (error) {
     const wait = retryWait(error, deadlineAt);
-    if (wait === null) throw error;
+    if (wait === null) throw marked(error);
     logger.warn(`[Anthropic] ${label}: the API answered ${(error as { status: number }).status}; trying once more in ${wait} ms`);
     await new Promise((resolve) => setTimeout(resolve, wait));
     // Reserved again: a second attempt the budget does not admit is not made (AiBudgetExceededError)
-    response = await attempt();
+    response = await attempt().catch((again: unknown) => {
+      throw marked(again);
+    });
   }
   if (response.stop_reason === 'max_tokens') {
     logger.warn(

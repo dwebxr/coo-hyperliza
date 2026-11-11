@@ -3,6 +3,7 @@
  * a bundled file, an inline data: URL, or a download under the world's network policy
  * (lib/net-policy.ts) with the agent's byte cap for that kind of asset.
  */
+import { createHash } from 'node:crypto';
 import { resolveUrl } from '../utils';
 import type { AssetLease } from './asset-memory';
 import { describeUrl } from './log-url';
@@ -26,8 +27,29 @@ export interface AssetBytes {
   bytes: Uint8Array;
   /** The Content-Type the source gave (lower case, without parameters), or '' */
   contentType: string;
-  /** What was asked for, as resolveUrl spelled it: the first URL (redirects do not show), or the whole data: URL for an inline or bundled file */
+  /**
+   * What was asked for, as resolveUrl spelled it: the first URL (redirects do not show); for a
+   * data: URL its short name (dataUrlName), never the URL itself, which holds the whole file
+   */
   url: string;
+}
+
+/**
+ * The name of a data: URL wherever it is kept or sent as an identifier: its media type and the
+ * SHA-256 of the URL's text (the same text always decodes to the same bytes), as
+ * `data:<type>;sha256=<hex>`. The page's image loader still reads the format from the type.
+ * Null for any other URL.
+ */
+export function dataUrlName(url: string): string | null {
+  if (!/^data:/i.test(url)) return null;
+  const type = url.slice(5, 5 + 100).split(/[;,]/)[0].trim().toLowerCase().replace(/[^a-z0-9.+/-]/g, '');
+  return `data:${type};sha256=${createHash('sha256').update(url).digest('hex')}`;
+}
+
+/** What names an asset of `kind` at `url` in a cache or a refusal list: data: URLs by dataUrlName */
+export function assetKey(kind: string, url: unknown): string {
+  const text = typeof url === 'string' ? url : String(url);
+  return `${kind}/${dataUrlName(text) ?? text}`;
 }
 
 export { describeUrl } from './log-url';
@@ -78,7 +100,7 @@ export async function fetchAssetBytes(
   if (resolved.startsWith('data:')) {
     const decoded = decodeDataUrl(resolved, maxBytes);
     lease?.shrink(2 * decoded.bytes.byteLength);
-    return { ...decoded, url: resolved };
+    return { ...decoded, url: dataUrlName(resolved)! };
   }
   // Nothing in the agent makes object URLs, so a blob: URL can only name nothing
   if (resolved.startsWith('blob:')) throw new Error('blob: URLs cannot be loaded by the agent');

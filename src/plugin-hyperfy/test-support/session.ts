@@ -16,8 +16,9 @@ export function sessionRuntime(extra: Record<string, unknown> = {}): IAgentRunti
  */
 export function sessionFor(world: object, { runtime = sessionRuntime(), connected = true, ...parts }: Partial<SessionParts> & { connected?: boolean } = {}): ConnectionSession {
   const session = new ConnectionSession({ runtime, world, worldId: TEST_WORLD_ID, wsUrl: 'wss://world.test/ws', ...parts });
-  // What connect() sets once the world is initialised, without starting the voice and behavior loops
-  if (connected) (session as unknown as { started: boolean }).started = true;
+  // What connect() sets once the world is initialised, and the spawn of the agent's player, without
+  // starting the voice and behavior loops
+  if (connected) Object.assign(session as unknown as { started: boolean; established: boolean }, { started: true, established: true });
   // So that the turn helpers (test-support/turns.ts) run their turns on this session
   registerSession(world, session);
   return session;

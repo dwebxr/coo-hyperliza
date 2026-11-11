@@ -19,6 +19,7 @@ import {
   SENTRY_DSN_OFF,
   characterSecrets,
   errorReportingDefaults,
+  modelEndpointWarnings,
   removeStaleStoredSecrets,
   secureServerDefaults,
   staleSecretKeys,
@@ -290,6 +291,16 @@ describe('secureServerDefaults', () => {
   });
 });
 
+
+describe('modelEndpointWarnings', () => {
+  it('says once where Claude requests go when ANTHROPIC_BASE_URL is set, without its credentials or query, and nothing otherwise', () => {
+    expect(modelEndpointWarnings({})).toEqual([]);
+    expect(modelEndpointWarnings({ ANTHROPIC_BASE_URL: '  ' })).toEqual([]);
+    expect(modelEndpointWarnings({ ANTHROPIC_BASE_URL: 'https://user:secret@proxy.example.com/v1?key=abc' })).toEqual([
+      "[Security] ANTHROPIC_BASE_URL is set: every Claude request, with the API key, goes to https://proxy.example.com/v1?key=… instead of Anthropic's API.",
+    ]);
+  });
+});
 
 describe('errorReportingDefaults', () => {
   it('turns elizaOS error reporting off when SENTRY_DSN is unset or empty, and says so', () => {

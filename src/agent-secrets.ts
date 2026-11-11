@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { type IAgentRuntime, MODEL_SETTINGS, ModelType, logger } from '@elizaos/core';
+import { describeUrl } from './plugin-hyperfy/lib/log-url';
 import { TIP_WALLET_ENV } from './plugin-hyperfy/lib/tip-wallet';
 
 /*
@@ -172,6 +173,17 @@ export function secureServerDefaults(env: Env, newToken: () => string = () => ra
     );
   }
   return lines;
+}
+
+/**
+ * The Anthropic SDK reads ANTHROPIC_BASE_URL (and ANTHROPIC_AUTH_TOKEN, ANTHROPIC_CUSTOM_HEADERS)
+ * from the environment: a base URL sends every Claude request, with the API key, there. The
+ * operator's .env is trusted, so this only says where (the URL as describeUrl writes it).
+ */
+export function modelEndpointWarnings(env: Env): string[] {
+  const base = env.ANTHROPIC_BASE_URL?.trim();
+  if (!base) return [];
+  return [`[Security] ANTHROPIC_BASE_URL is set: every Claude request, with the API key, goes to ${describeUrl(base)} instead of Anthropic's API.`];
 }
 
 /**

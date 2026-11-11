@@ -8,7 +8,7 @@ import { AgentActions } from '../systems/actions.js'
 import { type UploadOptions, uploadAsset, worldEndpointProblems } from '../lib/asset-upload'
 import { NetPolicy, installWorldNet } from '../lib/net-policy'
 import { createScriptNetwork } from '../lib/script-network'
-import { adaptToWorldProtocol } from '../lib/world-protocol'
+import { type WorldProtocol, adaptToWorldProtocol } from '../lib/world-protocol'
 import { worldHttpOrigin } from '../lib/world-url'
 import { installWorldChat } from '../lib/world-chat'
 import { trackWorldIdentity } from '../lib/world-identity'
@@ -47,7 +47,7 @@ export interface AgentWorld {
   world: any
   controls: AgentControls
   /** The session token the world's server issued on this connection (lib/world-protocol.ts) */
-  protocol: { sessionToken(): string | null }
+  protocol: WorldProtocol
   net: NetPolicy
   /** Opens the socket and starts the engine. Rejects when the engine cannot start. */
   init(authToken?: string): Promise<void>

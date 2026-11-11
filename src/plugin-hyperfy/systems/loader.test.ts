@@ -244,6 +244,19 @@ describe('AgentLoader', () => {
     expect(page.vrm).toEqual([[glb.byteLength, `${origin}/assets/me.vrm`]]);
   });
 
+  it('names an avatar given as a data: URL by its type and hash, to the page and in its cache, never by the URL that holds the file', async () => {
+    const glb = minimalGlb({ size: 4096 });
+    const { loader } = await setup({ handler: (_request, response) => response.end() });
+    const url = `data:model/gltf-binary;base64,${Buffer.from(glb).toString('base64')}`;
+    await loader.load('avatar', url);
+    const [[bytes, key]] = page.vrm;
+    expect(bytes).toBe(glb.byteLength);
+    expect(key).toMatch(/^data:model\/gltf-binary;sha256=[0-9a-f]{64}$/);
+    expect(loader.has('avatar', url)).toBe(true);
+    expect((loader as any).results.has(`avatar/${key}`)).toBe(true);
+    expect([...(loader as any).results.keys()].every((cached: string) => cached.length < 200)).toBe(true);
+  });
+
   it.each([
     ['another port on loopback', (internal: TestServer) => `http://127.0.0.1:${internal.port}/internal.glb`, "http:// is only allowed on the world's own origin"],
     ['the same machine by name', (internal: TestServer) => `http://localhost:${internal.port}/internal.glb`, "http:// is only allowed on the world's own origin"],

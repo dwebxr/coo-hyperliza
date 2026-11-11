@@ -20,7 +20,7 @@ import { elevenLabsSpeechPlugin } from './elevenlabs-speech';
 import { createOpenPayStorePlugin } from './openpay-store';
 import { planModelPlugins } from './llm-provider';
 import { startUsageReports, usageLimitProblems } from './usage-budget';
-import { characterSecrets, errorReportingDefaults, removeStaleStoredSecrets, secureServerDefaults } from './agent-secrets';
+import { characterSecrets, errorReportingDefaults, modelEndpointWarnings, removeStaleStoredSecrets, secureServerDefaults } from './agent-secrets';
 import { takeTipWalletAccount } from './plugin-hyperfy/lib/tip-wallet';
 import { guardErrorEventsForWorldScripts } from './plugin-hyperfy/lib/script-sandbox';
 
@@ -36,6 +36,8 @@ guardErrorEventsForWorldScripts(process.env);
 for (const line of secureServerDefaults(process.env)) logger.warn(line);
 // Before the server starts: no error reports to elizaOS's Sentry project unless SENTRY_DSN says where
 for (const line of errorReportingDefaults(process.env)) logger.warn(line);
+// Where Claude requests go, when that is not Anthropic's API
+for (const line of modelEndpointWarnings(process.env)) logger.warn(line);
 
 // A usage limit that cannot be read must not mean "no limit": say which one and stop
 const limitProblems = usageLimitProblems(process.env);

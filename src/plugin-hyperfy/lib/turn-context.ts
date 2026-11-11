@@ -19,7 +19,15 @@ export type TurnOrigin = 'chat' | 'voice' | 'autonomy';
 
 /** Thrown by assertLive(): the turn may no longer act. Nothing the turn planned is done after it. */
 export class TurnCancelled extends Error {
-  constructor(reason: string) {
+  /**
+   * `afterRequest`: the turn was cancelled after a paid request had gone out for it (a model
+   * request in flight, or one answered before a retry that is not made): what was reserved for that
+   * request stays counted.
+   */
+  constructor(
+    reason: string,
+    readonly afterRequest = false
+  ) {
     super(reason);
     this.name = 'TurnCancelled';
   }

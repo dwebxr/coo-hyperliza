@@ -292,6 +292,11 @@ describe('where the session token goes (real requests, against servers on loopba
     expect(api).toContain('Uploads to this world are refused');
     expect(assets).toContain("its assets URL http://world.lan:3000 is neither the world's own origin (http://192.168.1.5:3000, from WS_URL) nor a public https address");
     expect(worldEndpointProblems(net, {})).toEqual([]);
+    // An assets URL that is no URL is written as describeUrl writes it: not whole, and nothing of its query
+    const [odd] = worldEndpointProblems(net, { assetsUrl: `assets/${'a'.repeat(400)}?sig=secret-signature` });
+    expect(odd).toContain(`its assets URL assets/${'a'.repeat(20)}`);
+    expect(odd).not.toContain('secret-signature');
+    expect(odd).not.toContain('a'.repeat(300));
   });
 });
 

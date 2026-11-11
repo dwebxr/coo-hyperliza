@@ -580,6 +580,8 @@ let activation: Promise<boolean> | null = null;
  * any probe got through: the caller must then stop the process, because a realm that is half
  * tamed (or tamed but leaking) must not go on to run scripts, and it cannot be un-locked either.
  * Idempotent once it has succeeded; a call while an activation runs gets that activation's result.
+ * A call after one failed, also one made as that one's result arrives, runs it again (where
+ * lockdown had already run, it then fails at lockdown, which runs once per realm).
  */
 export function activateScriptSandbox(deps: ActivationDeps): Promise<boolean> {
   if (sandboxState === 'active') return Promise.resolve(true);
@@ -591,9 +593,12 @@ export function activateScriptSandbox(deps: ActivationDeps): Promise<boolean> {
     resolveActivation = resolve;
   });
   activation = current;
-  void activate(deps).then(resolveActivation, () => resolveActivation(false)).finally(() => {
+  // Cleared before the result is handed on: a caller that tries again as it arrives gets a new run
+  const settle = (ok: boolean) => {
     if (activation === current) activation = null;
-  });
+    resolveActivation(ok);
+  };
+  void activate(deps).then(settle, () => settle(false));
   return current;
 }
 

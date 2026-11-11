@@ -17,7 +17,9 @@ import { PacketOverLimit, PacketRefused, decodeServerFrame } from './packet-deco
 
 export const PROTOCOL_VERSION = 2;
 
-// The world's inboundPolicy.js silently drops packets above these byte limits
+// The world's inboundPolicy.js silently drops packets above these byte limits (of the packets the
+// agent may send; its table also limits tokenBalanceRequest, requestBuilderRecheck, revokeEvmWallet,
+// requestEvmTipIntent and evmTip, which the agent never sends)
 const INBOUND_BYTE_LIMITS: Record<string, number> = {
   requestEvmNonce: 128,
   requestEvmVerify: 8704,
@@ -96,7 +98,9 @@ const INBOUND_MAX_DEPTH = 32;
  * its node or depth limit, or holding a value its scan refuses (coo-world src/core/extras/
  * inboundPolicy.js and strictDecode.js). network.send does not send a packet over the byte limit
  * (adaptToWorldProtocol); a caller that must know whether its change reaches the world
- * (managers/build-manager.ts) asks first.
+ * (managers/build-manager.ts) asks first. Null is not a promise that the world takes it: coo-world
+ * also limits a client's rate, lets only builders send blueprint packets, and applies its field
+ * policies to what it then stores (lib/world-add-policy.ts), none of which is checked here.
  *
  * `data` is walked as clientPackr writes it before it is packed, and the walk stops at the first
  * limit it passes: clientPackr writes a value held twice in full each time, so a small value can
@@ -364,7 +368,7 @@ export const MAX_REPORTED_PACKET_IDS = 32;
  * before the first tick and a snapshot of the largest size four times over. Counted per packet:
  * its frame's size, or what it decoded into when that is more (QUEUED_NODE_BYTES for each value:
  * a frame of small containers takes several times its size in memory), or for a chat message
- * QUEUED_CHAT_BYTES (it is cut down before it waits). So what waits is at most
+ * at most QUEUED_CHAT_BYTES (it is cut down before it waits). So what waits is at most
  * MAX_QUEUED_BYTES / QUEUED_NODE_BYTES decoded values, whatever the frames looked like.
  */
 export const MAX_QUEUED_PACKETS = 4096;
@@ -404,7 +408,7 @@ export function resetReportedPacketIds(): void {
  * than the limits allow (lib/packet-decode.ts) is not read either: `overLimit`, when given, is
  * told why.
  */
-export function readServerPacket(packet: ArrayBuffer | Uint8Array, overLimit?: (why: string) => void): [string, unknown, number] | [] {
+export function readServerPacket(packet: ArrayBuffer | Uint8Array, overLimit?: (why: string) => void, refused?: (why: string) => void): [string, unknown, number] | [] {
   let id: unknown;
   let data: unknown;
   let nodes: number;
@@ -413,8 +417,13 @@ export function readServerPacket(packet: ArrayBuffer | Uint8Array, overLimit?: (
     [id, data] = decoded.value as [unknown, unknown];
     nodes = decoded.nodes;
   } catch (error) {
-    if (error instanceof PacketOverLimit && overLimit) overLimit(error.message);
-    else undecodable.note(`${packet.byteLength} bytes, refused: ${error instanceof PacketRefused ? error.kind : error instanceof PacketOverLimit ? 'over the limits' : 'unreadable'}`);
+    if (error instanceof PacketOverLimit && overLimit) {
+      overLimit(error.message);
+      return [];
+    }
+    const why = `refused: ${error instanceof PacketRefused ? error.kind : error instanceof PacketOverLimit ? 'over the limits' : 'unreadable'}`;
+    undecodable.note(`${packet.byteLength} bytes, ${why}`);
+    refused?.(why);
     return [];
   }
   const name = typeof id === 'number' ? PACKET_NAMES[id] : undefined;
@@ -442,6 +451,12 @@ export interface WorldProtocol {
    * issue a new one), or null when there is none or it was withheld from the socket URL.
    */
   sessionToken(): string | null;
+  /**
+   * Tells `listener` (the last one given) why, each time a frame cannot be read while no snapshot
+   * has been read on this connection yet: the world's server sends the snapshot first, so that is
+   * the snapshot, and without it the agent has no world to be in (session/connection-session.ts).
+   */
+  onUnreadableBeforeSnapshot(listener: (why: string) => void): void;
 }
 
 /**
@@ -476,6 +491,13 @@ export function adaptToWorldProtocol(network: any, getAuthToken: () => string | 
     log: (line) => console.warn(line),
   });
   const dropFrame = (why: string) => dropped.note(why);
+  let snapshotRead = false;
+  let beforeSnapshot: ((why: string) => void) | null = null;
+  /** Drops a frame that could not be read at all: before the snapshot, that one was the snapshot */
+  const unreadable = (why: string) => {
+    dropFrame(why);
+    if (!snapshotRead) beforeSnapshot?.(why);
+  };
 
   const reportClose = (event: unknown) => {
     if (closeReported) return;
@@ -560,12 +582,19 @@ export function adaptToWorldProtocol(network: any, getAuthToken: () => string | 
     if (overflowed) return;
     const frame = event?.data;
     // The world's packets are binary frames (the socket's binaryType is arraybuffer)
-    if (!(frame instanceof ArrayBuffer) && !(frame instanceof Uint8Array)) return dropFrame('not a binary frame');
+    if (!(frame instanceof ArrayBuffer) && !(frame instanceof Uint8Array)) return unreadable('not a binary frame');
     // Before unpack: see MAX_SERVER_FRAME_BYTES for what this does and does not bound
-    if (frame.byteLength > MAX_SERVER_FRAME_BYTES) return dropFrame(`${frame.byteLength} bytes exceeds the ${MAX_SERVER_FRAME_BYTES}-byte limit`);
+    if (frame.byteLength > MAX_SERVER_FRAME_BYTES) return unreadable(`${frame.byteLength} bytes exceeds the ${MAX_SERVER_FRAME_BYTES}-byte limit`);
     // Over the decode limits: dropped like a frame that is too large
-    const [method, data, nodes = 0] = readServerPacket(frame, (why) => dropFrame(`a frame of ${frame.byteLength} bytes is not decoded: ${why}`));
+    const [method, data, nodes = 0] = readServerPacket(
+      frame,
+      (why) => unreadable(`a frame of ${frame.byteLength} bytes is not decoded: ${why}`),
+      (why) => {
+        if (!snapshotRead) beforeSnapshot?.(`a frame of ${frame.byteLength} bytes is ${why}`);
+      }
+    );
     if (!method) return;
+    if (method === 'onSnapshot') snapshotRead = true;
     let queued = data;
     let size = Math.max(frame.byteLength, nodes * QUEUED_NODE_BYTES);
     if (method === 'onChatAdded') {
@@ -599,5 +628,10 @@ export function adaptToWorldProtocol(network: any, getAuthToken: () => string | 
   network.onSnapshot = (data: unknown) =>
     engineOnSnapshot.call(network, tokenWithheld && data && typeof data === 'object' ? { ...data, authToken: getAuthToken() } : data);
 
-  return { sessionToken: () => (tokenWithheld ? null : (getAuthToken() ?? null)) };
+  return {
+    sessionToken: () => (tokenWithheld ? null : (getAuthToken() ?? null)),
+    onUnreadableBeforeSnapshot: (listener) => {
+      beforeSnapshot = listener;
+    },
+  };
 }

@@ -140,6 +140,13 @@ function parseCount(raw: string | undefined, key: string): number | null {
   return n;
 }
 
+/**
+ * The longest USAGE_REPORT_INTERVAL_MIN: one report a day. The budget keeps 24 hours of usage, so a
+ * longer interval would report less than it covers (and a timer of 35,792 minutes or more, beyond
+ * a 32-bit delay, would fire without pause).
+ */
+export const MAX_USAGE_REPORT_INTERVAL_MIN = 24 * 60;
+
 const LIMIT_KEYS = [
   'AI_MAX_CALLS_PER_HOUR',
   'AI_MAX_TOKENS_PER_DAY',
@@ -169,6 +176,9 @@ export function usageLimitProblems(env: Env = process.env): string[] {
           : `[Usage] ${(error as Error).message}. Leave it empty for the default (for a limit: no limit), or set a number (0 turns that use off).`
       );
       continue;
+    }
+    if (key === 'USAGE_REPORT_INTERVAL_MIN' && value !== null && value > MAX_USAGE_REPORT_INTERVAL_MIN) {
+      problems.push(`[Usage] USAGE_REPORT_INTERVAL_MIN=${value} is more than ${MAX_USAGE_REPORT_INTERVAL_MIN} (one report a day; the agent keeps 24 hours of usage). Leave it empty for the default, or set a number from 0 (no reports) to ${MAX_USAGE_REPORT_INTERVAL_MIN}.`);
     }
     // A cap is the size of a reply, not a switch: 0 would not turn that use off, so it is refused
     if (value === 0 && capKeys.includes(key)) {
@@ -583,6 +593,8 @@ export function startUsageReports(env: Env = process.env): void {
   // Throws for a value that is not a number, like the limits (the agent does not start then)
   const minutes = parseCount(env.USAGE_REPORT_INTERVAL_MIN, 'USAGE_REPORT_INTERVAL_MIN') ?? 60;
   if (minutes === 0) return;
+  // (src/index.ts refuses to start on such a value: usageLimitProblems)
+  if (minutes > MAX_USAGE_REPORT_INTERVAL_MIN) throw new Error(`USAGE_REPORT_INTERVAL_MIN=${minutes} is more than ${MAX_USAGE_REPORT_INTERVAL_MIN}`);
   const intervalMs = minutes * 60_000;
   const budget = getUsageBudget();
   logger.info(`[Usage] Limits: ${JSON.stringify(budget.limits)}; reporting every ${minutes} min`);

@@ -368,6 +368,17 @@ describe('script values given to the host', () => {
     expect(() => m.toHost(wide(100_000))).toThrow('too large or too deeply nested');
   });
 
+  it('refuses an array longer than what is left of that budget, also one of primitives, instead of cutting it short', () => {
+    const m = membrane();
+    expect(m.toHost(new Array(99_999).fill(7))).toHaveLength(99_999);
+    expect(() => m.toHost(new Array(100_000).fill(7))).toThrow('too large or too deeply nested');
+    expect(() => m.toHost(new Array(2_000_000).fill(7))).toThrow('too large or too deeply nested');
+    // Each array against what is left of the budget when it is reached (primitives themselves are
+    // not counted: two arrays of 60,000 numbers fit, an array after two objects that leaves too little does not)
+    expect(() => m.toHost({ a: new Array(60_000).fill(1), b: new Array(60_000).fill(1) })).not.toThrow();
+    expect(() => m.toHost([{}, new Array(99_998).fill(1)])).toThrow('too large or too deeply nested');
+  });
+
   it('copies cyclic values without looping', () => {
     const m = membrane();
     const a: any = { name: 'a' };

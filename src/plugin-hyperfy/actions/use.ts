@@ -83,8 +83,9 @@ export const hyperfyUseItemAction: Action = {
         logger.warn('[USE ITEM] No valid entityId extracted.');
       }
     } catch (err) {
-      // The turn's caller handles these (scripted or offline fallback, a fixed decline)
-      if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError) throw err;
+      // The turn's caller handles these (scripted or offline fallback, a fixed decline); a cancelled
+      // turn does nothing more
+      if (err instanceof AiBudgetExceededError || err instanceof AnthropicRefusalError || err instanceof TurnCancelled) throw err;
       logger.error(`[USE ITEM] Extraction failed: ${errorText(err)}`);
     }
 

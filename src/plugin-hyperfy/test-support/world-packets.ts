@@ -33,11 +33,13 @@ export function cooWorldPlayer({ id, name, rank = 0 }: PlayerFixture) {
 /** The snapshot coo-world sends on connection; `hasAdminCode` is `!!process.env.ADMIN_CODE` there. */
 export function cooWorldSnapshot({
   selfId = 'coo-agent',
+  // The agent's own account: a builder, as it must be to edit the world
+  selfRank = 1,
   worldRank = 0,
   hasAdminCode = true,
   players = [],
   chat = [],
-}: { selfId?: string; worldRank?: number; hasAdminCode?: boolean; players?: PlayerFixture[]; chat?: unknown[] } = {}) {
+}: { selfId?: string; selfRank?: number; worldRank?: number; hasAdminCode?: boolean; players?: PlayerFixture[]; chat?: unknown[] } = {}) {
   return {
     id: selfId,
     serverTime: 1234.5,
@@ -59,7 +61,7 @@ export function cooWorldSnapshot({
     chat,
     ai: null,
     blueprints: [],
-    entities: [cooWorldPlayer({ id: selfId, name: 'Coo' }), ...players.map(cooWorldPlayer)],
+    entities: [cooWorldPlayer({ id: selfId, name: 'Coo', rank: selfRank }), ...players.map(cooWorldPlayer)],
     livekit: null,
     authToken: 'session-token',
     hasAdminCode,
