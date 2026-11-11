@@ -60,6 +60,13 @@ export function fakeWorld({ environment, skyTextureId }) {
   sun.position.set(10, 20, 20);
   sun.castShadow = true;
   scene.add(sun);
+  // Not a light the engine makes today, but one three-vrm's toon shader asks three.js about in its own way
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 0.2));
+  // A pane of glass, as a window or a sign in a world has: three.js draws a scene that holds a
+  // transmissive material in two passes, which the picture all around must survive
+  const glass = new THREE.Mesh(new THREE.BoxGeometry(1, 2, 0.1), new THREE.MeshPhysicalMaterial({ color: 0xffffff, transmission: 0.9, roughness: 0.1 }));
+  glass.position.set(2, 1, 0);
+  scene.add(glass);
 
   const entity = (id, position, avatarUrl) => ({
     data: { id },
@@ -73,6 +80,56 @@ export function fakeWorld({ environment, skyTextureId }) {
     stage: { scene },
     entities: { player: agent, players: new Map([['agent', agent], ['visitor', visitor]]) },
   };
+}
+
+/**
+ * The avatar with a normal map on every material and tangents on every mesh, which the bundled
+ * one has neither of: three-vrm's toon shader takes another path for such a mesh. Its first part
+ * is there twice, the second time drawn by a material that is not a toon one: the loader gives
+ * both the same geometry, and that one needs its tangents.
+ */
+export function withNormalMapAndTangents(vrm) {
+  const view = new DataView(vrm.buffer, vrm.byteOffset, vrm.byteLength);
+  const jsonLength = view.getUint32(12, true);
+  const json = JSON.parse(Buffer.from(vrm.subarray(20, 20 + jsonLength)).toString('utf8'));
+  const binLength = view.getUint32(20 + jsonLength, true);
+  const chunks = [Buffer.from(vrm.subarray(28 + jsonLength, 28 + jsonLength + binLength))];
+  let offset = binLength;
+  for (const mesh of json.meshes) {
+    for (const primitive of mesh.primitives) {
+      const count = json.accessors[primitive.attributes.POSITION].count;
+      const tangents = new Float32Array(count * 4);
+      for (let i = 0; i < count; i++) tangents.set([1, 0, 0, 1], i * 4);
+      json.bufferViews.push({ buffer: 0, byteOffset: offset, byteLength: tangents.byteLength });
+      json.accessors.push({ bufferView: json.bufferViews.length - 1, componentType: 5126, count, type: 'VEC4' });
+      primitive.attributes.TANGENT = json.accessors.length - 1;
+      chunks.push(Buffer.from(tangents.buffer));
+      offset += tangents.byteLength;
+    }
+  }
+  json.buffers[0].byteLength = offset;
+  for (const properties of json.extensions.VRM.materialProperties) {
+    properties.textureProperties = { ...properties.textureProperties, _BumpMap: properties.textureProperties?._MainTex ?? 0 };
+    properties.keywordMap = { ...properties.keywordMap, _NORMALMAP: true };
+    properties.floatProperties = { ...properties.floatProperties, _BumpScale: 1 };
+  }
+  for (const material of json.materials) material.normalTexture = { index: 0 };
+  const first = json.meshes[0].primitives[0];
+  json.materials.push({ name: 'plain', pbrMetallicRoughness: {}, normalTexture: { index: 0 } });
+  json.extensions.VRM.materialProperties.push({ name: 'plain', shader: 'VRM_USE_GLTFSHADER', renderQueue: 2000, floatProperties: {}, vectorProperties: {}, textureProperties: {}, keywordMap: {}, tagMap: {} });
+  json.meshes[0].primitives.push({ ...first, attributes: { ...first.attributes }, material: json.materials.length - 1 });
+  let text = Buffer.from(JSON.stringify(json), 'utf8');
+  if (text.length % 4) text = Buffer.concat([text, Buffer.alloc(4 - (text.length % 4), ' ')]);
+  const header = Buffer.alloc(20);
+  header.write('glTF', 0, 'latin1');
+  header.writeUInt32LE(2, 4);
+  header.writeUInt32LE(28 + text.length + offset, 8);
+  header.writeUInt32LE(text.length, 12);
+  header.writeUInt32LE(0x4e4f534a, 16);
+  const bin = Buffer.alloc(8);
+  bin.writeUInt32LE(offset, 0);
+  bin.writeUInt32LE(0x004e4942, 4);
+  return new Uint8Array(Buffer.concat([header, text, bin, ...chunks]));
 }
 
 /** Bundles managers/puppeteer-manager.ts alone (no service, no engine) into `outFile`. */
@@ -201,7 +258,7 @@ export function remoteEnds(rootPid) {
 }
 const isLoopback = (end) => /^(127\.\d+\.\d+\.\d+|\[::1\]|\[::ffff:127\.\d+\.\d+\.\d+\]):\d+$/.test(end);
 
-/** What a JPEG shows, measured in the page (Node cannot decode one): size, spread of brightness, number of colours */
+/** What a JPEG shows, measured in the page (Node cannot decode one): size, spread of brightness, number of colours, share of black */
 function describeJpeg(page, dataUrl) {
   return page.evaluate(async (dataUrl) => {
     const binary = atob(dataUrl.split(',')[1]);
@@ -215,15 +272,17 @@ function describeJpeg(page, dataUrl) {
     let sum = 0;
     let squares = 0;
     let count = 0;
+    let black = 0;
     for (let i = 0; i < data.length; i += 4 * 7) {
       const luma = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      if (luma < 8) black++;
       sum += luma;
       squares += luma * luma;
       count++;
       colours.add((data[i] << 16) | (data[i + 1] << 8) | data[i + 2]);
     }
     const mean = sum / count;
-    return { width: bitmap.width, height: bitmap.height, bytes: bytes.length, mean: Math.round(mean), deviation: Math.round(Math.sqrt(squares / count - mean * mean)), colours: colours.size };
+    return { width: bitmap.width, height: bitmap.height, bytes: bytes.length, mean: Math.round(mean), deviation: Math.round(Math.sqrt(squares / count - mean * mean)), colours: colours.size, black: black / count };
   }, dataUrl);
 }
 
@@ -281,6 +340,11 @@ async function main() {
     const sampler = setInterval(() => remoteEnds(chromium.pid).forEach((end) => sockets.add(end)), 150);
     const pageErrors = [];
     page.on('pageerror', (error) => pageErrors.push(String(error?.message ?? error)));
+    // three.js reports a shader that does not compile on the page's console, when it first draws with it
+    const shaderErrors = [];
+    page.on('console', (message) => {
+      if (message.type() === 'error' && message.text().includes('THREE.WebGLProgram')) shaderErrors.push(message.text().replace(/\s+/g, ' ').slice(0, 200));
+    });
 
     console.log(`\n== Chromium (${path.basename(chromium.spawnfile)}, pid ${chromium.pid})`);
     check('Chromium is started with the offline arguments', OFFLINE_CHROMIUM_ARGS.every((arg) => chromium.spawnargs.includes(arg)), OFFLINE_CHROMIUM_ARGS.join(' '));
@@ -404,6 +468,7 @@ async function main() {
     const hdrBytes = file('assets/day2.hdr');
     await manager.loadEnvironmentHDR(hdrBytes);
     check('day2.hdr: parsed from bytes and set as environment and background', await page.evaluate(() => window.environment?.isDataTexture === true && window.scene.environment === window.environment && window.environment.image.width > 0));
+    check('and it is taken for a picture of the whole sky, which is what lets it light the scene', await page.evaluate(() => window.environment.mapping === window.THREE.EquirectangularReflectionMapping));
     // An HDR load that fails after it was parsed (here: drawing throws) leaves the environment the page had
     await page.evaluate(() => {
       window.__smokeEnvironment = window.environment;
@@ -477,7 +542,54 @@ async function main() {
         dataUrl.startsWith('data:image/jpeg;base64,') && jpeg[0] === 0xff && jpeg[1] === 0xd8 && seen.width === size[0] && seen.height === size[1] && seen.deviation >= 8 && seen.colours >= 200,
         `${seen.width}x${seen.height}, ${seen.bytes} bytes, brightness ${seen.mean} +/- ${seen.deviation}, ${seen.colours} colours sampled`
       );
+      // Under a sky there is something in every direction: a side that was not drawn is black
+      if (name === 'equirectangular') check('equirectangular: every side around the agent is drawn, with glass in the scene', seen.black < 0.02, `${(seen.black * 100).toFixed(1)}% of it is black`);
     }
+    const shaders = await page.evaluate(() => {
+      let toon = 0;
+      let glass = 0;
+      window.scene.traverse((node) => {
+        if (!node.isMesh) return;
+        // A toon mesh with an outline has two materials
+        for (const material of [node.material].flat()) {
+          if (material.isMToonMaterial) toon++;
+          if (material.transmission > 0) glass++;
+        }
+      });
+      return { toon, glass, programs: (window.renderer.info.programs ?? []).length };
+    });
+    check(
+      "every shader the snapshots drew with compiled, the avatar's toon material (under a hemisphere light) and the glass among them",
+      shaderErrors.length === 0 && shaders.programs > 0 && shaders.toon > 0 && shaders.glass > 0,
+      `${JSON.stringify(shaders)}${shaderErrors.length ? `; ${shaderErrors[0]}` : ''}`
+    );
+    // The same avatar with a normal map and tangents, as many avatars have
+    const bumpyUrl = 'https://world.invalid/assets/normal-map.vrm';
+    await manager.loadVRMBytes(withNormalMapAndTangents(file('avatars/avatar.vrm')), bumpyUrl);
+    const visitor = world.entities.players.get('visitor');
+    visitor.avatarUrl = bumpyUrl;
+    await manager.capture(world, { kind: 'facing', direction: 'front' });
+    visitor.avatarUrl = VISITOR_AVATAR_URL;
+    const bumpy = await page.evaluate(() => {
+      let toonNormalMaps = 0;
+      let toonWithTangents = 0;
+      let plainWithTangents = 0;
+      for (const instance of window.activeVRMInstances) {
+        instance.raw.scene.traverse((node) => {
+          if (!node.isMesh) return;
+          const toon = [node.material].flat().every((material) => material.isMToonMaterial);
+          if (node.geometry.attributes.tangent) toon ? toonWithTangents++ : plainWithTangents++;
+          for (const material of [node.material].flat()) if (material.isMToonMaterial && material.normalMap) toonNormalMaps++;
+        });
+      }
+      return { avatars: window.activeVRMInstances.length, toonNormalMaps, toonWithTangents, plainWithTangents };
+    });
+    check(
+      'an avatar with a normal map and tangents is drawn too: its toon shaders compile, and a part that is not toon keeps the tangents it shares',
+      shaderErrors.length === 0 && bumpy.avatars === 1 && bumpy.toonNormalMaps > 0 && bumpy.toonWithTangents === 0 && bumpy.plainWithTangents > 0,
+      `${JSON.stringify(bumpy)}${shaderErrors.length ? `; ${shaderErrors[0]}` : ''}`
+    );
+    await manager.capture(world, { kind: 'facing', direction: 'front' });
     const drawn = await page.evaluate(() => ({
       avatars: window.activeVRMInstances.length,
       skyHasTexture: (() => {
@@ -591,7 +703,7 @@ async function main() {
     remoteEnds(chromium.pid).forEach((end) => sockets.add(end));
     const outside = [...sockets].filter((end) => !isLoopback(end));
     check('every socket of the Chromium process tree, sampled throughout, was to 127.0.0.1 (the DevTools connection)', sockets.size > 0 && outside.length === 0, `seen: ${[...sockets].join(', ') || 'none'}`);
-    check('the page raised no script error', pageErrors.length === 0, pageErrors.slice(0, 3).join(' | '));
+    check('the page raised no script error, and no shader failed to compile in it', pageErrors.length === 0 && shaderErrors.length === 0, [...pageErrors, ...shaderErrors].slice(0, 3).join(' | '));
 
     console.log('\n== a lost page is rebuilt');
     await page.close();
