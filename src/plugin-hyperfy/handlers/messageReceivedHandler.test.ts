@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ModelType } from '@elizaos/core';
+import { ModelType, logger } from '@elizaos/core';
+import Anthropic from '@anthropic-ai/sdk';
 import * as THREE from 'three';
 import { messageReceivedHandler } from './messageReceivedHandler';
 import { AiBudgetExceededError, UsageBudget, resetUsageBudget } from '../../usage-budget';
@@ -110,6 +111,135 @@ describe('messageReceivedHandler and the agent\'s own messages', () => {
     await messageReceivedHandler({ runtime, message, callback } as any);
     expect(runtime.createMemory).toHaveBeenCalledWith(message, 'messages');
     expect(runtime.processActions).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('messageReceivedHandler says in the log why a turn ended without a reply', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+  /** Every line the handler logged at this level, whatever it starts with */
+  const lines = (spy: { mock: { calls: unknown[][] } }) => spy.mock.calls.map((call) => call.map(String).join(' '));
+  const aboutTheTurn = (spy: { mock: { calls: unknown[][] } }) => lines(spy).filter((line) => line.startsWith('[Bootstrap] Turn '));
+  /** The logger from here on: silent, and holding only what is logged after this call */
+  const quiet = () => {
+    const spy = (level: 'warn' | 'info' | 'error') => {
+      const made = vi.spyOn(logger, level).mockImplementation(() => {});
+      made.mockClear();
+      return made;
+    };
+    return { warn: spy('warn'), info: spy('info'), error: spy('error') };
+  };
+
+  it('logs one line when a provider throws while the state is composed: nothing is asked of the model and nothing is answered', async () => {
+    const { runtime, message } = setup({ embeddingModel: false });
+    const log = quiet();
+    runtime.composeState.mockRejectedValue(new TypeError("Cannot read properties of undefined (reading 'name')\nsecond line"));
+    const callback = vi.fn();
+    await messageReceivedHandler({ runtime, message, callback } as any);
+    expect(lines(log.warn)).toEqual(["[Bootstrap] Turn handling failed: TypeError: Cannot read properties of undefined (reading 'name') second line"]);
+    expect(lines(log.error)).toEqual([]);
+    expect(runtime.useModel).not.toHaveBeenCalled();
+    expect(callback).not.toHaveBeenCalled();
+  });
+
+  const PREFIX = '[Bootstrap] Turn handling failed: ';
+  /** The handler's log for one turn whose model request ends in `failure` */
+  async function turnThatFails(failure: unknown) {
+    const { runtime, message } = setup({ embeddingModel: false });
+    const log = quiet();
+    runtime.useModel.mockRejectedValue(failure);
+    const callback = vi.fn();
+    await messageReceivedHandler({ runtime, message, callback } as any);
+    expect(lines(log.error)).toEqual([]);
+    expect(runtime.processActions).not.toHaveBeenCalled();
+    expect(callback).not.toHaveBeenCalled();
+    return lines(log.warn);
+  }
+  const apiError = (status: number, body: unknown, requestId?: string) =>
+    Anthropic.APIError.generate(status, body as object, undefined, new Headers(requestId ? { 'request-id': requestId } : {}));
+
+  it("says the model API's answer for an expired key in fixed words, with the request id (the SDK's real error)", async () => {
+    const body = { type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key' }, request_id: 'req_body' };
+    expect(await turnThatFails(apiError(401, body, 'req_011abc'))).toEqual([
+      `${PREFIX}the model API answered 401 (authentication_error): the API key was not accepted (expired, revoked or wrong): ANTHROPIC_API_KEY [request req_011abc]`,
+    ]);
+  });
+
+  it('says "no credit left" for the reason the API gives for it, without repeating the message', async () => {
+    const body = { type: 'error', error: { type: 'invalid_request_error', message: 'Your credit balance is too low to access the Anthropic API. the player said: hunter2' } };
+    expect(await turnThatFails(apiError(400, body, 'req_9'))).toEqual([`${PREFIX}the model API answered 400 (invalid_request_error): no credit left on the account [request req_9]`]);
+  });
+
+  it('repeats nothing of an API answer as it came: not its message, not a type or a request id that is not shaped like the API\'s', async () => {
+    // What a server ANTHROPIC_BASE_URL names could answer: a message that quotes the request and
+    // tries to start a log line of its own, fields of its own, a type and a request id of its own
+    const quoting = `the player said: my password is hunter2\n[Bootstrap] forged line\r\u2028\u202Eevil\u001b[2K ${'\u{1F600}'.repeat(500)}`;
+    const known = { type: 'error', error: { type: 'invalid_request_error', message: quoting, echoed: 'sk-ant-api03-SECRET' }, prompt: 'what the prompt held' };
+    expect(await turnThatFails(apiError(400, known, 'r'.repeat(300)))).toEqual([
+      `${PREFIX}the model API answered 400 (invalid_request_error): the API refused the request as invalid; its reason is kept by the API under the request id`,
+    ]);
+    const unknown = { type: 'error', error: { type: 'hunter2 is the password', message: quoting } };
+    expect(await turnThatFails(apiError(418, unknown, 'req_ok but not quite'))).toEqual([`${PREFIX}the model API answered 418 (no known error type)`]);
+    // (A property every object has is not a type of the API's)
+    expect(await turnThatFails(apiError(400, { error: { type: 'constructor', message: quoting } }))).toEqual([`${PREFIX}the model API answered 400 (no known error type)`]);
+  });
+
+  it('says an API answer that has no body by its status alone, and a response that was not JSON by its kind alone', async () => {
+    expect(await turnThatFails(Anthropic.APIError.generate(502, undefined, 'Bad Gateway <html>upstream body</html>', new Headers()))).toEqual([`${PREFIX}the model API answered 502 (no known error type)`]);
+    expect(await turnThatFails(new SyntaxError('Unexpected token \'<\', "<html>the player said hunter2" is not valid JSON'))).toEqual([
+      `${PREFIX}SyntaxError (something that was to be read as JSON or code was not)`,
+    ]);
+  });
+
+  it('says any other failure by its name and message on one line of at most 400 code points, never cut inside a character', async () => {
+    expect(await turnThatFails('just a string\nof two lines')).toEqual([`${PREFIX}just a string of two lines`]);
+    // Not an API answer just because it has a status (an upload's error has one)
+    expect(await turnThatFails(Object.assign(new Error('upload refused'), { status: 413 }))).toEqual([`${PREFIX}upload refused`]);
+    const [line, ...more] = await turnThatFails(new RangeError(`x${'\u{1F600}'.repeat(500)}`));
+    expect(more).toEqual([]);
+    expect(line).toBe(`${PREFIX}RangeError: x${'\u{1F600}'.repeat(400 - 'RangeError: x'.length)}`);
+  });
+
+  it('still says something, and goes on to the fallback reply, when the error cannot be read', async () => {
+    const unreadable = apiError(400, { error: { type: 'invalid_request_error', message: 'm' } });
+    Object.defineProperty(unreadable, 'error', {
+      get() {
+        throw new Error('trap');
+      },
+    });
+    expect(await turnThatFails(unreadable)).toEqual([`${PREFIX}an error that could not be read`]);
+    // The fallback after the line: the budget's own error is said, and answered without a model call
+    const { runtime, message } = setup({ embeddingModel: false });
+    const log = quiet();
+    runtime.useModel.mockRejectedValue(new AiBudgetExceededError('AI_MAX_CALLS_PER_HOUR=1'));
+    const callback = vi.fn().mockResolvedValue([]);
+    await messageReceivedHandler({ runtime, message, callback } as any);
+    expect(lines(log.warn).filter((line) => line.startsWith(PREFIX))).toHaveLength(1);
+    expect(lines(log.error)).toEqual([]);
+    expect(callback).toHaveBeenCalledTimes(1);
+  });
+
+  it('says a cancelled turn at info, not as a failure, and says nothing for the agent\'s own message or a turn that went well', async () => {
+    const { runtime, message } = setup({ embeddingModel: false });
+    const log = quiet();
+    // Went well
+    await messageReceivedHandler({ runtime, message, callback: vi.fn() } as any);
+    // The agent's own message
+    await messageReceivedHandler({ runtime, message: { ...message, entityId: runtime.agentId }, callback: vi.fn() } as any);
+    expect(lines(log.warn)).toEqual([]);
+    expect(aboutTheTurn(log.info)).toEqual([]);
+    // The turn's slot runs out while Claude is asked
+    const slot = new AbortController();
+    runtime.useModel.mockImplementation(async () => {
+      slot.abort();
+      return '<response><thought>t</thought><actions>REPLY</actions><text>Hello!</text></response>';
+    });
+    await inTurn({ origin: 'chat', world: {}, requesterId: 'p1', cancel: slot.signal }, () => messageReceivedHandler({ runtime, message, callback: vi.fn() } as any));
+    expect(lines(log.warn)).toEqual([]);
+    expect(aboutTheTurn(log.info)).toHaveLength(1);
+    expect(aboutTheTurn(log.info)[0]).toMatch(/^\[Bootstrap\] Turn cancelled: /);
+    expect(lines(log.error)).toEqual([]);
   });
 });
 

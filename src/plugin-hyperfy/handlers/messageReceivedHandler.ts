@@ -1,8 +1,9 @@
 import { Content, EventType, HandlerCallback, IAgentRuntime, Memory, ModelType, type UUID, asUUID, composePromptFromState, createUniqueUuid, logger, parseKeyValueXml, truncateToCompleteSentence } from "@elizaos/core";
 import { hyperfyShouldRespondTemplate, hyperfyMessageHandlerTemplate } from "../templates";
 import { AiBudgetExceededError, forPurpose, getUsageBudget } from "../../usage-budget";
-import { AnthropicRefusalError } from "../../anthropic-models";
-import { cancelTurn, currentTurn, turnDelivered } from "../lib/turn-context";
+import { AnthropicRefusalError, apiErrorSummary } from "../../anthropic-models";
+import { TurnCancelled, cancelTurn, currentTurn, turnDelivered } from "../lib/turn-context";
+import { oneLine } from "../lib/text";
 import { actingSession } from "../service";
 import { getShopProducts } from "../../openpay-store";
 import { parseAliases } from "../lib/addressing";
@@ -25,6 +26,30 @@ const latestResponseIds = new Map<string, Map<string, string>>();
 const COME_TELEPORT_BEYOND_M = 30;
 // One full reply attempt plus one retry when the reply could not be parsed at all
 const MAX_REPLY_ATTEMPTS = 2;
+
+// A failed turn's error in the log: one line, no longer than this
+const FAILED_TURN_LOG_MAX = 400;
+
+/**
+ * Why a turn failed, as one bounded line for the log.
+ *
+ * An answer of the model API is said in fixed words (apiErrorSummary: nothing of the response is
+ * repeated as it came). A response that could not be read as JSON is said by its kind alone: the
+ * runtime's message for it quotes the response. Anything else is its name and message. Whatever
+ * the error is, this returns: the fallback reply comes after it.
+ */
+function failedTurnText(error: unknown): string {
+  try {
+    const api = apiErrorSummary(error);
+    if (api) return api;
+    if (error instanceof SyntaxError) return 'SyntaxError (something that was to be read as JSON or code was not)';
+    const name = error instanceof Error && error.name !== 'Error' ? `${error.name}: ` : '';
+    const message = error instanceof Error ? error.message : String(error);
+    return oneLine(name + message, FAILED_TURN_LOG_MAX);
+  } catch {
+    return 'an error that could not be read';
+  }
+}
 
 const offlineNotices = new NoticeThrottle();
 
@@ -211,8 +236,9 @@ export const messageReceivedHandler = async ({
       // Set by the Hyperfy message/voice managers
       const metadata = (message.content?.metadata ?? {}) as { directlyAddressed?: boolean; soloPlayer?: boolean };
       const addressed = !!(metadata.directlyAddressed || metadata.soloPlayer);
+      const fromSelf = message.entityId === runtime.agentId;
       try {
-        if (message.entityId === runtime.agentId) {
+        if (fromSelf) {
           logger.debug(`[Bootstrap] Skipping message from self (${runtime.agentId})`);
           throw new Error('Message is from the agent itself');
         }
@@ -423,6 +449,17 @@ export const messageReceivedHandler = async ({
 
       } catch (error: any) {
         runError = error?.message || String(error);
+        // Said here, because nothing else says it: the turn ends without a reply, and the run event
+        // below is printed nowhere. A provider that throws, or a model request the API turns down
+        // (a retired model, a key it no longer takes, no credit left), otherwise leaves the agent
+        // silent with nothing in the log. (The agent's own message is not a failed turn.)
+        // A summary of the turn, whatever a callee logged itself. The fallback reply below may
+        // still follow it, and a reply that went out before the failure stays said.
+        if (error instanceof TurnCancelled) {
+          logger.info(`[Bootstrap] Turn cancelled: ${oneLine(String(runError), FAILED_TURN_LOG_MAX)}`);
+        } else if (!fromSelf) {
+          logger.warn(`[Bootstrap] Turn handling failed: ${failedTurnText(error)}`);
+        }
         // The budget ran out, or the model declined, before the player got anything: answer anyway,
         // without a model call. Nothing is added when a reply (e.g. REPLY before the failing
         // action) already reached them.
