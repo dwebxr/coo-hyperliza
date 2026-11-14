@@ -94,9 +94,48 @@ type Size = 'SMALL' | 'LARGE';
 
 export class AnthropicRefusalError extends Error {
   constructor(model: string, category: string | null | undefined) {
-    super(`[Anthropic] ${model} declined the request (${category ?? 'no category'})`);
+    // The category comes from the response: only something shaped like the API's labels is repeated
+    super(`[Anthropic] ${model} declined the request (${typeof category === 'string' && /^[a-z][a-z_]{0,39}$/.test(category) ? category : 'no category'})`);
     this.name = 'AnthropicRefusalError';
   }
+}
+
+// The API's error types, and what each means to whoever runs the agent (the words are ours)
+const API_ERROR_TYPES: Record<string, string> = {
+  authentication_error: 'the API key was not accepted (expired, revoked or wrong): ANTHROPIC_API_KEY',
+  permission_error: 'the API key may not use what was asked for',
+  not_found_error: 'not found, usually a model ID that does not exist: ANTHROPIC_LARGE_MODEL / ANTHROPIC_SMALL_MODEL',
+  billing_error: 'a billing problem on the account',
+  invalid_request_error: 'the API refused the request as invalid; its reason is kept by the API under the request id',
+  request_too_large: 'the request was too large',
+  rate_limit_error: 'rate limited',
+  timeout_error: 'the API timed out',
+  overloaded_error: 'the API is overloaded',
+  api_error: 'an error inside the API',
+};
+// Reasons the API gives in its message that have words of ours: the message itself is not repeated
+const API_ERROR_REASONS: [RegExp, string][] = [[/credit balance/i, 'no credit left on the account']];
+const API_REQUEST_ID = /^req_[A-Za-z0-9]{1,64}$/;
+
+/**
+ * An answer of the model API in which it turned a request down, as one line for a log; null when
+ * `error` is not one (the SDK's APIError with an HTTP status).
+ *
+ * Nothing of the answer is repeated as it came: the response body is whatever the server put in
+ * it (ANTHROPIC_BASE_URL can name another server than Anthropic's), and its message can quote the
+ * request. The line holds the status, the error type when it is one of the API's own, what that
+ * type (or a reason recognized in the message) means in fixed words, and the request id when it
+ * is shaped like one: the API's own reason can be looked up under it.
+ */
+export function apiErrorSummary(error: unknown): string | null {
+  if (!(error instanceof Anthropic.APIError) || typeof error.status !== 'number') return null;
+  const detail = ((error.error ?? {}) as { error?: unknown }).error as { type?: unknown; message?: unknown } | null | undefined;
+  const given = typeof error.type === 'string' ? error.type : detail?.type;
+  const type = typeof given === 'string' && Object.hasOwn(API_ERROR_TYPES, given) ? given : null;
+  const message = typeof detail?.message === 'string' ? detail.message : '';
+  const meaning = API_ERROR_REASONS.find(([pattern]) => pattern.test(message))?.[1] ?? (type ? API_ERROR_TYPES[type] : null);
+  const request = typeof error.requestID === 'string' && API_REQUEST_ID.test(error.requestID) ? ` [request ${error.requestID}]` : '';
+  return `the model API answered ${error.status} (${type ?? 'no known error type'})${meaning ? `: ${meaning}` : ''}${request}`;
 }
 
 // Keyed by API key so a changed secret takes effect and runtimes don't share credentials.
@@ -332,7 +371,9 @@ export function parseJsonResponse(text: string): any {
       // try the next candidate
     }
   }
-  throw new Error(`[Anthropic] Model did not return valid JSON: ${text.slice(0, 200)}`);
+  // What the model wrote is not part of the error: whoever catches it may log it, and the text can
+  // repeat what a player said or what the prompt held
+  throw new Error(`[Anthropic] Model did not return valid JSON (${text.length} characters)`);
 }
 
 async function generateText(runtime: IAgentRuntime, size: Size, params: GenerateTextParams): Promise<string> {

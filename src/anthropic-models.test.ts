@@ -467,4 +467,15 @@ describe('parseJsonResponse', () => {
     expect(() => parseJsonResponse('```json\n"some text"\n```')).toThrow('did not return valid JSON');
     expect(() => parseJsonResponse('[result]')).toThrow('did not return valid JSON');
   });
+
+  it('repeats a refusal category only when it is shaped like one of the API\'s labels', () => {
+    expect(new AnthropicRefusalError('claude-x', 'cyber').message).toBe('[Anthropic] claude-x declined the request (cyber)');
+    for (const category of ['the player said hunter2', 'x\n[Bootstrap] forged', 'A', '', null, undefined, 'a'.repeat(41)]) {
+      expect(new AnthropicRefusalError('claude-x', category as string).message).toBe('[Anthropic] claude-x declined the request (no category)');
+    }
+  });
+
+  it('does not repeat what the model wrote in the error (its catcher may log it): only how long it was', () => {
+    expect(() => parseJsonResponse('the player said: my password is hunter2')).toThrow(/^\[Anthropic\] Model did not return valid JSON \(39 characters\)$/);
+  });
 });

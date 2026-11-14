@@ -587,6 +587,12 @@ stubs/unused-elizaos-plugin/    # Stands in for plugins @elizaos/cli lists but n
 - Verify ElevenLabs API key is correct
 - Check LiveKit connection logs
 
+### Agent Receives Chat but Does Not Answer ("come here" Still Works)
+- The log says `[Bootstrap] Turn handling failed: the model API answered 401 (authentication_error): the API key was not accepted (expired, revoked or wrong): ANTHROPIC_API_KEY`: put a valid Claude API key in `ANTHROPIC_API_KEY` and restart. If the key in `.env` is valid, check whether the shell the agent is started from exports another `ANTHROPIC_API_KEY`.
+- Other answers of the API read the same way: `400 (invalid_request_error): no credit left on the account`, `404 (not_found_error)` for a model ID that does not exist, and so on. No free-form text of the API's answer is logged. The line holds the status, the error type when it is one of the API's own, what it means in fixed words, and the request id when it is shaped like one (`[request req_…]`), under which the API's own reason can be looked up in the Anthropic Console.
+- "Come here" and "stop" from the player talking to the agent are carried out without a model call, so they go on working while every other message gets no answer.
+- Any other `[Bootstrap] Turn handling failed: …` line names what threw while the turn was handled: its name and message, at most 400 characters. Two kinds are said without their message: a `SyntaxError` (its message quotes what could not be read), and an error that cannot be read at all (`an error that could not be read`).
+
 ### Voice Input Ignored
 - The log says `No TRANSCRIPTION model`: set `ELEVENLABS_XI_API_KEY`, and give the key the `speech_to_text` permission
 
