@@ -294,9 +294,9 @@ describe('describeRejection', () => {
 });
 
 describe('the residual-risk statement', () => {
-  it('is quoted word for word in README.md', () => {
-    const readme = readFileSync(new URL('../../../README.md', import.meta.url), 'utf8');
-    expect(readme).toContain(`> ${WORLD_SCRIPTS_RESIDUAL_RISK}`);
+  it('is quoted word for word in docs/world-scripts.md', () => {
+    const page = readFileSync(new URL('../../../docs/world-scripts.md', import.meta.url), 'utf8');
+    expect(page).toContain(`> ${WORLD_SCRIPTS_RESIDUAL_RISK}`);
   });
 
   it('names what the sandbox cannot stop', () => {

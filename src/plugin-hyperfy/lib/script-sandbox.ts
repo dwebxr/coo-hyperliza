@@ -19,7 +19,7 @@ export { describeRejection };
 export type WorldScriptsMode = 'off' | 'sandboxed';
 
 /**
- * What `sandboxed` does not protect against. README.md quotes this text word for word
+ * What `sandboxed` does not protect against. docs/world-scripts.md quotes this text word for word
  * (script-sandbox.test.ts checks that it does).
  */
 export const WORLD_SCRIPTS_RESIDUAL_RISK = [
