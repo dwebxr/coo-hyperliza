@@ -423,7 +423,7 @@ describe('StoreCatalog and what the API answers', () => {
  * A SYNTHETIC listings response (fixtures/listings.synthetic.json): written by hand from the shape
  * this module and its tests document, not recorded from the Store. It guards against a change here
  * that would silently empty the shop for responses of that shape. What only a recorded real
- * response would prove is listed in the fixture's own note and in the README.
+ * response would prove is listed in the fixture's own note and in docs/shop.md.
  */
 describe('the synthetic listings fixture (not a recorded response)', () => {
   const fixture = JSON.parse(readFileSync(new URL('./fixtures/listings.synthetic.json', import.meta.url), 'utf8')) as { _synthetic: string; ok: boolean; items: Record<string, any>[] };

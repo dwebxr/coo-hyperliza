@@ -981,7 +981,7 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     expect(report!.calls['after: EventEmitter.prototype.on']).toBe(runtime === 'node' ? 5 : undefined);
   });
 
-  test('W-03: installed at activation instead, a once listener registered before stays one-shot on Node; on Bun, which does not tell once listeners apart, it becomes an ordinary one (README)', () => {
+  test('W-03: installed at activation instead, a once listener registered before stays one-shot on Node; on Bun, which does not tell once listeners apart, it becomes an ordinary one (docs/world-scripts.md)', () => {
     const { status, stderr, report } = runEvents(runtime, { early: false });
 
     expect(status, stderr.slice(-2000)).toBe(0);
@@ -1009,7 +1009,7 @@ describe.each(runtimes)('world scripts in a locked-down %s process', (runtime, a
     }
   });
 
-  test('W-02, not covered on Bun (README): one prepended through process.prependListener taken before the guard gets one event\'s values, then the process ends; Node covers it', () => {
+  test('W-02, not covered on Bun (docs/world-scripts.md): one prepended through process.prependListener taken before the guard gets one event\'s values, then the process ends; Node covers it', () => {
     const { status, stderr, report } = runEvents(runtime, { early: true, capturedPrepend: true });
     const tag = 'after: process.prependListener taken before the guard';
 
