@@ -1,7 +1,7 @@
 import { ChannelType, Content, HandlerCallback, IAgentRuntime, Memory, ModelType, UUID, createUniqueUuid, logger } from "@elizaos/core";
 import type { ConnectionSession } from "../session/connection-session";
 import { deliverReply } from "../session/deliver-reply";
-import { TtsLimitReached, countOtherPlayers, generateSpeech, getWavHeader } from "../utils";
+import { TtsLimitReached, countOtherPlayers, generateSpeech, getWavHeader, isPartialSpeech } from "../utils";
 import { agentActivityLock } from "./guards";
 import { hyperfyEventType } from "../events";
 import { isDirectlyAddressed, parseAliases } from "../lib/addressing";
@@ -529,13 +529,13 @@ export class VoiceManager {
       // Each provider request is counted against the daily limit before it is sent (utils.ts)
       const audioBuffer = await generateSpeech(text);
       if (!audioBuffer) {
-        console.log('[VoiceManager] No audio generated - check ELEVENLABS_XI_API_KEY or OPENAI_API_KEY in .env');
+        console.log('[VoiceManager] No audio: the reply goes out as text (the speech lines before this one say why)');
         return 'none';
       }
       const played = await this.playAudio(audioBuffer, generation, admit);
       if (played !== 'none') noteDelivered();
-      // All of the capped text was played, but not all of the reply
-      return played === 'all' && (spoken.cut || hadLinks) ? 'partial' : played;
+      // All of the capped text was played, but not all of the reply (or the reading left something out)
+      return played === 'all' && (spoken.cut || hadLinks || isPartialSpeech(audioBuffer)) ? 'partial' : played;
     } catch (error) {
       if (error instanceof TurnCancelled) {
         logger.info(`[VoiceManager] Not speaking: ${error.message}`);

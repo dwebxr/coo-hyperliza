@@ -134,6 +134,21 @@ describe('VoiceManager playback queue', () => {
 describe('VoiceManager.speak and the turn it speaks for', () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it('counts a reading that left part of the reply out (decorative emoji) as partly spoken, so the reply is posted as well', async () => {
+    const utils = await import('../utils');
+    // The marker belongs to the very buffer generateSpeech returned, not to its bytes
+    const marked = new Set<Buffer>();
+    vi.spyOn(utils, 'generateSpeech').mockImplementation(async (text: string) => {
+      const audio = Buffer.from(text);
+      if (text.includes('😊')) marked.add(audio);
+      return audio;
+    });
+    vi.spyOn(utils, 'isPartialSpeech').mockImplementation((audio: Buffer) => marked.has(audio));
+    const { manager, session } = setup(() => Promise.resolve(PLAYED));
+    expect(await session.runTurn({ origin: 'voice', requesterId: 'p1' }, () => manager.speak('うれしいです😊'))).toBe('partial');
+    expect(await session.runTurn({ origin: 'voice', requesterId: 'p1' }, () => manager.speak('うれしいです'))).toBe('all');
+  });
+
   it('does not play an utterance whose turn was cancelled while it waited behind another one, and lets the one playing finish', async () => {
     const utils = await import('../utils');
     vi.spyOn(utils, 'generateSpeech').mockImplementation(async (text: string) => Buffer.from(text));

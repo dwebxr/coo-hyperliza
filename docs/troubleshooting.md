@@ -49,6 +49,15 @@ Start with the agent's log: most of these have a line of their own there.
 - The log says `[PuppeteerManager] Failed to launch browser`: the Chrome build puppeteer is pinned to is not in `~/.cache/puppeteer`. Run `bunx puppeteer browsers install chrome` (see [Chromium](setup.md#chromium)).
 - The log says `The render page is down until …`: Chromium was killed three times within 10 minutes for memory or time; it comes back after 10 minutes. See [What Bounds the Render Page](downloads.md#what-bounds-the-render-page).
 
+## The OpenAI Voice Does Not Speak
+- `[OpenAI TTS] The reading did not say the text as written (first difference at character N of M; the transcript has K): not played`: the model's transcript of its reading was not what was read exactly, so the reply went to chat as text; the numbers say where they part (neither text is logged). This is the check working; it also happens when the reading was right but written differently (a number in kanji, a final `。` added).
+- `[OpenAI TTS] Not read: the text has marks a reading cannot say`: the reply had an emoji that is not decorative (`👍`, `❓`, a flag), a mark such as `✅` or `○`, or a `×`; it went to chat as text, where they can be seen. Decorative emoji (`😊` `✨` `👀` …) followed by whitespace, a clause mark or the end do not stop a reading (the reply is then posted to chat as well); followed by a letter or a closing quote or bracket, or repeated, they do.
+- `[OpenAI TTS] The connection failed or was refused before the session started`: check `OPENAI_API_KEY`, and that the machine can reach `api.openai.com` without a proxy.
+- `[OpenAI TTS] No complete answer within 30000 ms`, `The answer was not completed (status …)`, `The API reported …` or `The API closed the connection (code N)`: one attempt failed; the reply went to chat as text. From the moment speech was asked for, its characters stay counted against `VOICE_TTS_MAX_CHARS_PER_DAY`. If it happens every time, check the key, this machine's network and the [OpenAI status page](https://status.openai.com).
+- `[OpenAI TTS] OPENAI_TTS_MODEL names a model this agent does not read text with`: leave `OPENAI_TTS_MODEL` empty (`gpt-realtime-2.1-mini`). `gpt-live-1.1` is a conversation model and is not used for reading.
+- `[OpenAI TTS] OPENAI_TTS_MODEL is not a model id`: the setting holds something other than a model id (upper case, spaces, a line break); fix or empty it.
+- `[OpenAI TTS] OPENAI_TTS_MODEL=tts-1 shuts down on 2027-01-06`: the old model still works until then; leave the setting empty to move to `gpt-realtime-2.1-mini`.
+
 ## Audio Distorted / Wrong Speed / No Voice
 - Set `ELEVENLABS_OUTPUT_FORMAT=mp3_44100_128` (a `pcm_*` format is not played at all; the log says "Not playing audio in a format that is neither MP3 nor WAV")
 - Check ffmpeg version

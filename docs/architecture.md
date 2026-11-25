@@ -37,6 +37,7 @@ src/
 │   │   ├── asset-bytes.ts       # An asset's bytes: bundled file, data: URL or policy download
 │   │   ├── asset-memory.ts      # Memory reserved for assets on their way: download and work pools, 1 GiB in all
 │   │   ├── asset-upload.ts      # Authenticated avatar/emote uploads
+│   │   ├── realtime-speech.ts   # The OpenAI fallback voice: gpt-realtime-2.1-mini reading a text, and the check that it said it as written
 │   │   ├── gltf-budget.ts       # Admission filter for models before they reach the render page
 │   │   ├── render-watchdog.ts   # Memory and time limit on the render page's Chromium; kill circuit breaker
 │   │   ├── page-work.ts         # Which assets got the render page killed; one page load at a time after a kill
