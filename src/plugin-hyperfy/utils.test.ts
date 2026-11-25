@@ -111,11 +111,14 @@ describe('speech API answers are read within a byte cap and a deadline', () => {
   beforeEach(() => {
     process.env.ELEVENLABS_XI_API_KEY = 'test-key';
     process.env.OPENAI_API_KEY = 'test-openai-key';
-    for (const method of ['log', 'error'] as const) vi.spyOn(console, method).mockImplementation(() => {});
+    // The OpenAI request these tests read is the /v1/audio/speech one of the legacy models
+    process.env.OPENAI_TTS_MODEL = 'tts-1';
+    delete process.env.OPENAI_TTS_VOICE;
+    for (const method of ['log', 'error', 'warn'] as const) vi.spyOn(console, method).mockImplementation(() => {});
   });
   afterEach(() => {
     globalThis.fetch = realFetch;
-    for (const key of ['ELEVENLABS_XI_API_KEY', 'OPENAI_API_KEY']) {
+    for (const key of ['ELEVENLABS_XI_API_KEY', 'OPENAI_API_KEY', 'OPENAI_TTS_MODEL', 'OPENAI_TTS_VOICE']) {
       if (env[key] === undefined) delete process.env[key];
       else process.env[key] = env[key];
     }
@@ -291,11 +294,14 @@ describe('generateSpeech: each provider request is reserved on its own', () => {
   beforeEach(() => {
     process.env.ELEVENLABS_XI_API_KEY = 'test-key';
     process.env.OPENAI_API_KEY = 'test-openai-key';
-    for (const method of ['log', 'error'] as const) vi.spyOn(console, method).mockImplementation(() => {});
+    // The OpenAI request these tests read is the /v1/audio/speech one of the legacy models
+    process.env.OPENAI_TTS_MODEL = 'tts-1';
+    delete process.env.OPENAI_TTS_VOICE;
+    for (const method of ['log', 'error', 'warn'] as const) vi.spyOn(console, method).mockImplementation(() => {});
   });
   afterEach(() => {
     globalThis.fetch = realFetch;
-    for (const key of ['ELEVENLABS_XI_API_KEY', 'OPENAI_API_KEY']) {
+    for (const key of ['ELEVENLABS_XI_API_KEY', 'OPENAI_API_KEY', 'OPENAI_TTS_MODEL', 'OPENAI_TTS_VOICE']) {
       if (env[key] === undefined) delete process.env[key];
       else process.env[key] = env[key];
     }
@@ -361,5 +367,235 @@ describe('generateSpeech: each provider request is reserved on its own', () => {
     expect((await generateSpeech(TEXT))?.toString()).toBe('openai-mp3');
     expect(hosts()).toEqual(['openai']);
     expect(budget.snapshot(60_000).ttsChars).toBe(100);
+  });
+});
+
+describe('the OpenAI fallback reads with gpt-realtime-2.1-mini unless a legacy model is named', () => {
+  const realFetch = globalThis.fetch;
+  const realWebSocket = globalThis.WebSocket;
+  const env = { ...process.env };
+  const KEYS = ['ELEVENLABS_XI_API_KEY', 'OPENAI_API_KEY', 'OPENAI_TTS_MODEL', 'OPENAI_TTS_VOICE'];
+  const noLimits = { aiCallsPerHour: null, aiTokensPerDay: null, visionPerHour: null, ttsCharsPerDay: null, sttSecondsPerDay: null, autonomyAiPerHour: null, autonomyAiMinIntervalMs: 0 };
+  const TEXT = 'いらっしゃいませ！今日は何をお探しですか？';
+
+  /** The Realtime API, answered here (the global WebSocket is replaced): what each session was sent */
+  let sockets: { url: string; headers: Record<string, string>; sent: any[] }[];
+  let realtimeAnswer: 'reads' | 'refuses' | 'other words';
+  let onSessionUpdate: () => void;
+  class FakeWebSocket {
+    binaryType = 'blob';
+    private readonly listeners = new Map<string, ((event: any) => void)[]>();
+    private readonly record: { url: string; headers: Record<string, string>; sent: any[] };
+    constructor(url: string, init: { headers: Record<string, string> }) {
+      this.record = { url, headers: init.headers, sent: [] };
+      sockets.push(this.record);
+      queueMicrotask(() => (realtimeAnswer === 'refuses' ? (this.emit('error', {}), this.emit('close', { code: 1006 })) : this.serve({ type: 'session.created' })));
+    }
+    addEventListener(type: string, listener: (event: any) => void) {
+      this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+    }
+    send(data: string) {
+      const event = JSON.parse(data);
+      this.record.sent.push(event);
+      if (event.type === 'session.update') {
+        onSessionUpdate();
+        queueMicrotask(() => this.serve({ type: 'session.updated' }));
+      }
+      if (event.type === 'response.create') {
+        const text = this.record.sent.find((e) => e.type === 'conversation.item.create').item.content[0].text;
+        queueMicrotask(() => {
+          this.serve({ type: 'response.output_audio.delta', delta: Buffer.alloc(4800).toString('base64') });
+          this.serve({ type: 'response.output_audio_transcript.done', transcript: realtimeAnswer === 'other words' ? 'はい、何でしょう？' : text });
+          this.serve({ type: 'response.done', response: { status: 'completed' } });
+        });
+      }
+    }
+    close() {}
+    private emit(type: string, event: any) {
+      for (const listener of this.listeners.get(type) ?? []) listener(event);
+    }
+    private serve(event: object) {
+      this.emit('message', { data: JSON.stringify(event) });
+    }
+  }
+
+  /** The speech module and the budget as a new process has them (no warning given yet) */
+  async function fresh(ttsCharsPerDay: number | null = null) {
+    vi.resetModules();
+    const budgetModule = await import('../usage-budget');
+    const utils = await import('./utils');
+    const turns = await import('./lib/turn-context');
+    const budget = new budgetModule.UsageBudget({ ...noLimits, ttsCharsPerDay });
+    budgetModule.resetUsageBudget(budget);
+    return { ...utils, ...turns, budget };
+  }
+  let fetchCalls: string[];
+  let elevenLabsAnswer: () => Response;
+  const warnings = () => vi.mocked(console.warn).mock.calls.map((args) => String(args[0]));
+
+  beforeEach(() => {
+    sockets = [];
+    fetchCalls = [];
+    realtimeAnswer = 'reads';
+    onSessionUpdate = () => {};
+    elevenLabsAnswer = () => new Response('busy', { status: 503 });
+    globalThis.WebSocket = FakeWebSocket as never;
+    globalThis.fetch = vi.fn(async (url: string) => {
+      fetchCalls.push(String(url));
+      return String(url).startsWith('https://api.elevenlabs.io/') ? elevenLabsAnswer() : new Response(Buffer.from('openai-mp3'), { status: 200 });
+    }) as never;
+    process.env.ELEVENLABS_XI_API_KEY = 'test-key';
+    process.env.OPENAI_API_KEY = 'test-openai-key';
+    delete process.env.OPENAI_TTS_MODEL;
+    delete process.env.OPENAI_TTS_VOICE;
+    for (const method of ['log', 'error', 'warn'] as const) vi.spyOn(console, method).mockImplementation(() => {});
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    globalThis.WebSocket = realWebSocket;
+    for (const key of KEYS) {
+      if (env[key] === undefined) delete process.env[key];
+      else process.env[key] = env[key];
+    }
+    vi.restoreAllMocks();
+    vi.resetModules();
+  });
+
+  it('with OPENAI_TTS_MODEL empty: ElevenLabs failed, the Realtime session reads the text in marin, each request reserved on its own', async () => {
+    const { generateSpeech, budget } = await fresh();
+    process.env.OPENAI_TTS_MODEL = '';
+    const audio = await generateSpeech(TEXT);
+    expect(audio?.toString('ascii', 0, 4)).toBe('RIFF');
+    expect(audio?.readUInt32LE(24)).toBe(24000);
+    expect(fetchCalls.map((url) => new URL(url).host)).toEqual(['api.elevenlabs.io']);
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0].url).toBe('wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1-mini');
+    expect(sockets[0].headers).toEqual({ Authorization: 'Bearer test-openai-key' });
+    expect(sockets[0].sent[0].session.audio.output.voice).toBe('marin');
+    expect(sockets[0].sent[1].item.content[0].text).toBe(TEXT);
+    expect(budget.snapshot(60_000).ttsChars).toBe(2 * TEXT.length);
+  });
+
+  it('named explicitly, the same; a voice of its own list is used, any other becomes marin with one warning', async () => {
+    const { generateSpeech } = await fresh();
+    process.env.OPENAI_TTS_MODEL = 'gpt-realtime-2.1-mini';
+    process.env.OPENAI_TTS_VOICE = 'cedar';
+    await generateSpeech(TEXT);
+    process.env.OPENAI_TTS_VOICE = 'nova';
+    await generateSpeech(TEXT);
+    await generateSpeech(TEXT);
+    expect(sockets.map((s) => s.sent[0].session.audio.output.voice)).toEqual(['cedar', 'marin', 'marin']);
+    expect(warnings()).toEqual([
+      '[OpenAI TTS] OPENAI_TTS_VOICE is not one of the voices of gpt-realtime-2.1-mini (alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar): using marin',
+    ]);
+  });
+
+  it('a refused connection gives the reservation back; a reading in other words keeps it and plays nothing', async () => {
+    const refused = await fresh(1000);
+    realtimeAnswer = 'refuses';
+    await expect(refused.generateSpeech(TEXT)).resolves.toBeNull();
+    expect(refused.budget.snapshot(60_000).ttsChars).toBe(TEXT.length);
+
+    const otherWords = await fresh(1000);
+    realtimeAnswer = 'other words';
+    await expect(otherWords.generateSpeech(TEXT)).resolves.toBeNull();
+    expect(otherWords.budget.snapshot(60_000).ttsChars).toBe(2 * TEXT.length);
+  });
+
+  it('another Realtime, Live or audio model is refused without a request, with one warning', async () => {
+    const { generateSpeech, budget } = await fresh();
+    for (const model of ['gpt-live-1.1', 'gpt-realtime-translate', 'gpt-audio-1.5', 'gpt-4o-realtime-preview', 'gpt-4o-mini-audio-preview']) {
+      process.env.OPENAI_TTS_MODEL = model;
+      await expect(generateSpeech(TEXT)).resolves.toBeNull();
+      await expect(generateSpeech(TEXT)).resolves.toBeNull();
+    }
+    expect(sockets).toEqual([]);
+    expect(fetchCalls.every((url) => url.startsWith('https://api.elevenlabs.io/'))).toBe(true);
+    expect(warnings()).toHaveLength(5);
+    expect(warnings()[0]).toBe('[OpenAI TTS] OPENAI_TTS_MODEL names a model this agent does not read text with: the OpenAI voice is off. Leave it empty for gpt-realtime-2.1-mini.');
+    // The refused fallback's characters were given back: only the ten ElevenLabs requests count
+    expect(budget.snapshot(60_000).ttsChars).toBe(10 * TEXT.length);
+  });
+
+  it('a setting that is not a model id is refused without a request, with one warning', async () => {
+    const { generateSpeech } = await fresh();
+    for (const model of ['gpt-realtime-2.1-mini\nX-Injected: 1', 'GPT-Realtime-2.1-Mini', 'tts 1']) {
+      process.env.OPENAI_TTS_MODEL = model;
+      await expect(generateSpeech(TEXT)).resolves.toBeNull();
+    }
+    expect(sockets).toEqual([]);
+    expect(fetchCalls.every((url) => url.startsWith('https://api.elevenlabs.io/'))).toBe(true);
+    expect(warnings()).toEqual(['[OpenAI TTS] OPENAI_TTS_MODEL is not a model id (lower-case letters, digits, ".", "_" and "-"): the OpenAI voice is off.']);
+  });
+
+  it('a legacy model keeps /v1/audio/speech and its own default voice, with one warning about its shutdown', async () => {
+    const { generateSpeech } = await fresh();
+    process.env.OPENAI_TTS_MODEL = 'tts-1';
+    expect((await generateSpeech(TEXT))?.toString()).toBe('openai-mp3');
+    expect((await generateSpeech(TEXT))?.toString()).toBe('openai-mp3');
+    expect(sockets).toEqual([]);
+    const speechRequest = vi.mocked(globalThis.fetch).mock.calls.find(([url]) => String(url) === 'https://api.openai.com/v1/audio/speech');
+    expect(JSON.parse(String((speechRequest![1] as RequestInit).body))).toMatchObject({ model: 'tts-1', voice: 'nova', response_format: 'mp3' });
+    expect(warnings()).toEqual(['[OpenAI TTS] OPENAI_TTS_MODEL=tts-1 shuts down on 2027-01-06: leave OPENAI_TTS_MODEL empty to use gpt-realtime-2.1-mini instead.']);
+  });
+
+  it('audio that reads a reply without its decorative emoji is marked as saying only part of it', async () => {
+    const { generateSpeech, isPartialSpeech } = await fresh();
+    const decorated = await generateSpeech('いらっしゃいませ😊');
+    expect(sockets.at(-1)!.sent[1].item.content[0].text).toBe('いらっしゃいませ');
+    expect(isPartialSpeech(decorated!)).toBe(true);
+    const plain = await generateSpeech(TEXT);
+    expect(isPartialSpeech(plain!)).toBe(false);
+  });
+
+  it('an ElevenLabs answer with no audio in it falls back to OpenAI, and stays counted', async () => {
+    const { generateSpeech, budget } = await fresh();
+    elevenLabsAnswer = () => new Response(new Uint8Array(0), { status: 200 });
+    const audio = await generateSpeech(TEXT);
+    expect(audio?.toString('ascii', 0, 4)).toBe('RIFF');
+    expect(sockets).toHaveLength(1);
+    expect(budget.snapshot(60_000).ttsChars).toBe(2 * TEXT.length);
+    expect(vi.mocked(console.error).mock.calls.map((args) => String(args[0]))).toContain('[TTS] ElevenLabs answered with no audio');
+  });
+
+  it('a turn cancelled while the session is set up sends no text, and its fallback reservation is given back', async () => {
+    const { generateSpeech, budget, runTurn, neverAbortedSignal } = await fresh();
+    delete process.env.ELEVENLABS_XI_API_KEY;
+    const slot = new AbortController();
+    onSessionUpdate = () => slot.abort();
+    const speaking = runTurn({ origin: 'voice', world: {}, generation: 1, signal: neverAbortedSignal(), cancel: slot.signal }, () => generateSpeech(TEXT));
+    await expect(speaking).resolves.toBeNull();
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0].sent.map((e) => e.type)).toEqual(['session.update']);
+    expect(budget.snapshot(60_000).ttsChars).toBe(0);
+  });
+
+  it("gives the reader the turn: its signal, and whether it may still act (a completed turn's signal no longer follows its session)", async () => {
+    const { generateSpeech, runTurn } = await fresh();
+    const reader = await import('./lib/realtime-speech');
+    const seen: { signal?: AbortSignal; live?: () => boolean }[] = [];
+    vi.spyOn(reader, 'realtimeSpeech').mockImplementation(async (_text, options) => (seen.push(options), { audio: null, mayBeBilled: false }));
+    delete process.env.ELEVENLABS_XI_API_KEY;
+    const session = new AbortController();
+    await runTurn({ origin: 'voice', world: {}, generation: 1, signal: session.signal }, () => generateSpeech(TEXT));
+    expect(seen).toHaveLength(1);
+    expect(seen[0].signal).toBeInstanceOf(AbortSignal);
+    expect(seen[0].live!()).toBe(true);
+    // The turn has completed; its session ends now. Its own signal no longer follows, live does
+    session.abort();
+    expect(seen[0].signal!.aborted).toBe(false);
+    expect(seen[0].live!()).toBe(false);
+    // Outside any turn there is neither
+    await generateSpeech(TEXT);
+    expect(seen[1].signal).toBeUndefined();
+    expect(seen[1].live).toBeUndefined();
+  });
+
+  it('opens no connection when the agent loads with an OpenAI key, until something is to be spoken', async () => {
+    vi.resetModules();
+    await import('./utils');
+    await import('./lib/realtime-speech');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(sockets).toEqual([]);
   });
 });

@@ -71,8 +71,8 @@ const sessions = new WeakMap<object, ConnectionSession>()
  * the signal that fires when it ends. A session is ended exactly once (a disconnect, a kick, a new
  * connection replacing it, the service stopping); from that moment its signal has fired, so every
  * turn that started on it may no longer act, and nothing of it runs on: no timer, no listener, no
- * navigation, no queued message (a speech request already sent to its provider is not aborted;
- * its result is dropped).
+ * navigation, no queued message (an HTTP speech request already sent to its provider is not
+ * aborted, and its result is dropped; the OpenAI voice's Realtime connection is closed at once).
  *
  * What a session does not own is process-wide and outlives it: the Chromium render page
  * (managers/puppeteer-manager.ts; the session gives its page back when it ends), the usage budget,

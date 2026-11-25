@@ -4,7 +4,8 @@ import path from 'path';
 import { bundledFile } from './lib/asset-root';
 import { describeUrl } from './lib/log-url';
 import { getUsageBudget } from '../usage-budget';
-import { assertTurnLive } from './lib/turn-context';
+import { REALTIME_DEFAULT_VOICE, REALTIME_SPEECH_MODEL, REALTIME_VOICES, realtimeSpeech } from './lib/realtime-speech';
+import { assertTurnLive, currentTurn } from './lib/turn-context';
 
 
 export async function hashFileBuffer(buffer: Buffer): Promise<string> {
@@ -234,10 +235,18 @@ export interface SpeechAttempt {
    * False when no request was sent (no key) or the provider refused it with a 4xx answer (408 and
    * 409 excepted: they can follow work already done). True otherwise: audio came, or the request
    * went out and its outcome is not known (a connection error, a timeout, a 5xx, a body that failed
-   * or stalled after the provider accepted the request).
+   * or stalled after the provider accepted the request). For the OpenAI voice's Realtime session:
+   * true from the moment speech was asked for (lib/realtime-speech.ts).
    */
   mayBeBilled: boolean;
+  /** True when the audio says only part of the text (the OpenAI reading left decorative emoji out) */
+  partial?: boolean;
 }
+
+// Audio generateSpeech returned that says only part of its text: the caller posts the text as well
+const partialAudio = new WeakSet<Buffer>();
+/** Whether `audio` from generateSpeech says only part of the text it was made for (isPartialSpeech) */
+export const isPartialSpeech = (audio: Buffer): boolean => partialAudio.has(audio);
 
 const refusedStatus = (status: number) => status >= 400 && status < 500 && status !== 408 && status !== 409;
 
@@ -306,7 +315,40 @@ export function elevenLabsSpeech(text: string): Promise<SpeechAttempt> {
   );
 }
 
-/** One OpenAI text-to-speech request, made directly (this project loads no OpenAI plugin). */
+// The models /v1/audio/speech still serves until OpenAI shuts them down on 2027-01-06
+const LEGACY_SPEECH_MODEL = /^(tts-1|tts-1-hd|gpt-4o-mini-tts(-\d{4}-\d{2}-\d{2})?)$/;
+// Realtime, Live and audio models other than the one the fallback is written for (also the
+// gpt-4o-… and gpt-4o-mini-… ones): not read with
+const UNSUPPORTED_SPEECH_MODEL = /^gpt-(?:4o-(?:mini-)?)?(?:realtime|live|audio)/;
+// What a model id looks like; anything else in OPENAI_TTS_MODEL is not sent anywhere
+const SPEECH_MODEL_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+const warnedOnce = new Set<string>();
+function warnOnce(key: string, line: string): void {
+  if (warnedOnce.has(key)) return;
+  warnedOnce.add(key);
+  console.warn(line);
+}
+
+/** OPENAI_TTS_VOICE for gpt-realtime-2.1-mini: empty means marin, and so does a voice it does not have */
+function realtimeVoice(): string {
+  const given = (process.env.OPENAI_TTS_VOICE ?? '').trim();
+  if (!given) return REALTIME_DEFAULT_VOICE;
+  if ((REALTIME_VOICES as readonly string[]).includes(given)) return given;
+  warnOnce(
+    'voice',
+    `[OpenAI TTS] OPENAI_TTS_VOICE is not one of the voices of ${REALTIME_SPEECH_MODEL} (${REALTIME_VOICES.join(', ')}): using ${REALTIME_DEFAULT_VOICE}`,
+  );
+  return REALTIME_DEFAULT_VOICE;
+}
+
+/**
+ * One OpenAI text-to-speech request, made directly (this project loads no OpenAI plugin).
+ * OPENAI_TTS_MODEL empty or gpt-realtime-2.1-mini: a Realtime session that reads the text
+ * (lib/realtime-speech.ts). Another Realtime, Live or audio model, or a value that is not a model
+ * id: refused, nothing is sent. Any other model (tts-1, tts-1-hd, gpt-4o-mini-tts until
+ * 2027-01-06): /v1/audio/speech as before.
+ */
 function openAISpeech(text: string): Promise<SpeechAttempt> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -314,7 +356,37 @@ function openAISpeech(text: string): Promise<SpeechAttempt> {
     return Promise.resolve({ audio: null, mayBeBilled: false });
   }
 
-  const model = process.env.OPENAI_TTS_MODEL || 'tts-1';
+  const model = (process.env.OPENAI_TTS_MODEL ?? '').trim() || REALTIME_SPEECH_MODEL;
+  if (!SPEECH_MODEL_ID.test(model)) {
+    warnOnce('model-id', '[OpenAI TTS] OPENAI_TTS_MODEL is not a model id (lower-case letters, digits, ".", "_" and "-"): the OpenAI voice is off.');
+    return Promise.resolve({ audio: null, mayBeBilled: false });
+  }
+  if (model === REALTIME_SPEECH_MODEL) {
+    const voice = realtimeVoice();
+    const turn = currentTurn();
+    console.log(`[OpenAI TTS] Generating speech with model=${model}, voice=${voice}`);
+    return realtimeSpeech(text, {
+      apiKey,
+      voice,
+      deadlineMs: TTS_REQUEST_TIMEOUT_MS,
+      maxAudioBytes: MAX_SPEECH_AUDIO_BYTES,
+      signal: turn?.signal,
+      live: turn ? () => turn.live : undefined,
+    });
+  }
+  if (UNSUPPORTED_SPEECH_MODEL.test(model)) {
+    warnOnce(
+      `model:${model}`,
+      `[OpenAI TTS] OPENAI_TTS_MODEL names a model this agent does not read text with: the OpenAI voice is off. Leave it empty for ${REALTIME_SPEECH_MODEL}.`,
+    );
+    return Promise.resolve({ audio: null, mayBeBilled: false });
+  }
+  if (LEGACY_SPEECH_MODEL.test(model)) {
+    warnOnce(
+      'legacy',
+      `[OpenAI TTS] OPENAI_TTS_MODEL=${model} shuts down on 2027-01-06: leave OPENAI_TTS_MODEL empty to use ${REALTIME_SPEECH_MODEL} instead.`,
+    );
+  }
   const voice = process.env.OPENAI_TTS_VOICE || 'nova';
 
   console.log(`[OpenAI TTS Direct] Generating speech with model=${model}, voice=${voice}`);
@@ -389,12 +461,12 @@ const SPEECH_PROVIDERS = [
 ] as const;
 
 /**
- * Speech audio for `text`: ElevenLabs, then OpenAI when that gave none. Each request is reserved
- * against VOICE_TTS_MAX_CHARS_PER_DAY on its own, before it is sent. A request the provider refused
- * (a 4xx answer other than 408 and 409) is given back; any other failed one stays counted, as it may
- * have been billed. A
- * fallback the limit does not admit is not made, and neither is one for a turn that may no longer
- * act (lib/turn-context.ts: TurnCancelled is thrown, the requests already sent stay counted).
+ * Speech audio for `text`: ElevenLabs, then OpenAI when that gave none (no audio, or an empty
+ * answer). Each request is reserved against VOICE_TTS_MAX_CHARS_PER_DAY on its own, before it is
+ * sent. A request that was never sent or that the provider refused (a 4xx answer other than 408 and
+ * 409) is given back; any other failed one stays counted, as it may have been billed. A fallback the
+ * limit does not admit is not made, and neither is one for a turn that may no longer act
+ * (lib/turn-context.ts: TurnCancelled is thrown, the requests already sent stay counted).
  * Resolves to null when no provider gave audio; throws TtsLimitReached when the limit admits not
  * even the first request.
  */
@@ -414,8 +486,12 @@ export async function generateSpeech(text: string): Promise<Buffer | null> {
     }
     if (sent) console.log(`[TTS] Trying ${provider.name}...`);
     sent = true;
-    const { audio, mayBeBilled } = await provider.attempt(text);
-    if (audio) return audio;
+    const { audio, mayBeBilled, partial } = await provider.attempt(text);
+    if (audio?.length) {
+      if (partial) partialAudio.add(audio);
+      return audio;
+    }
+    if (audio) console.error(`[TTS] ${provider.name} answered with no audio`);
     if (!mayBeBilled) reservation.release();
   }
   return null;

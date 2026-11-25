@@ -16,7 +16,7 @@ See [Cost Controls and Usage Limits](cost-controls.md) for the settings.
 
 ## Voice Features
 - **ElevenLabs TTS and speech-to-text**: High-quality voice output, and voice input from players
-- **OpenAI TTS Fallback**: Uses OpenAI TTS when ElevenLabs is unavailable (optional)
+- **OpenAI TTS Fallback**: Uses OpenAI when ElevenLabs gives no audio (optional). By default `gpt-realtime-2.1-mini` with the voice `marin`, played only when its transcript says the text as written; a legacy model named in `OPENAI_TTS_MODEL` (`tts-1` until 2027-01-06) is played without that check
 - **LiveKit Audio Streaming**: Real-time audio delivery to the Hyperfy world
 
 ## Avatar Features
